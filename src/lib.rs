@@ -1,3 +1,5 @@
+pub mod server;
+
 use std::{collections::HashSet, fmt::Write as _, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -102,6 +104,14 @@ impl Gateway {
         Ok(Self { config, client })
     }
 
+    pub async fn retrieve(&self, id: &str) -> Result<VerifiedData> {
+        decode_fixed::<32>(id, "data ID")?;
+        match self.discover(id).await? {
+            Some(hint) => self.retrieve_bundled_with_hint(id, hint).await,
+            None => self.retrieve_direct(id).await,
+        }
+    }
+
     pub async fn retrieve_direct(&self, id: &str) -> Result<VerifiedData> {
         let (verified, _) = self.retrieve_direct_with_tags(id).await?;
         Ok(verified)
@@ -109,7 +119,14 @@ impl Gateway {
 
     pub async fn retrieve_bundled(&self, id: &str) -> Result<VerifiedData> {
         decode_fixed::<32>(id, "data item ID")?;
-        let hint = self.discover_bundle(id).await?;
+        let hint = self
+            .discover(id)
+            .await?
+            .context("discovery returned an unbundled transaction")?;
+        self.retrieve_bundled_with_hint(id, hint).await
+    }
+
+    async fn retrieve_bundled_with_hint(&self, id: &str, hint: BundleHint) -> Result<VerifiedData> {
         let hinted_size = checked_data_size(
             parse_u128(&hint.data_size, "discovered data item size")?,
             self.config.max_data_size,
@@ -135,7 +152,7 @@ impl Gateway {
         })
     }
 
-    async fn discover_bundle(&self, id: &str) -> Result<BundleHint> {
+    async fn discover(&self, id: &str) -> Result<Option<BundleHint>> {
         let response: GraphQlResponse = self
             .request_json(
                 self.client
@@ -146,7 +163,7 @@ impl Gateway {
                     })),
             )
             .await
-            .context("failed to discover bundle parent")?;
+            .context("failed to discover data location")?;
         let mut edges = response.data.transactions.edges;
         ensure!(
             edges.len() == 1,
@@ -155,16 +172,16 @@ impl Gateway {
         let node = edges.pop().unwrap().node;
         ensure!(node.id == id, "discovery returned the wrong data item");
         decode_fixed::<32>(&node.id, "discovered data item ID")?;
-        let parent_id = node
-            .bundled_in
-            .context("discovery returned an unbundled transaction")?
-            .id;
+        let Some(parent) = node.bundled_in else {
+            return Ok(None);
+        };
+        let parent_id = parent.id;
         decode_fixed::<32>(&parent_id, "discovered parent ID")?;
         ensure!(parent_id != id, "data item cannot be its own parent");
-        Ok(BundleHint {
+        Ok(Some(BundleHint {
             parent_id,
             data_size: node.data.size,
-        })
+        }))
     }
 
     async fn retrieve_direct_with_tags(&self, id: &str) -> Result<(VerifiedData, Vec<Tag>)> {
