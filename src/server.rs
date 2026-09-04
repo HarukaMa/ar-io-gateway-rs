@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     net::SocketAddr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -21,11 +22,16 @@ use base64::{
 use reqwest::Url;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use solana_pubkey::Pubkey;
 
 use super::{Gateway, VerifiedData, decode_fixed};
 
+const ARNS_CONFIG_DISCRIMINATOR: [u8; 8] = [117, 20, 158, 16, 49, 85, 82, 24];
 const ARNS_RECORD_DISCRIMINATOR: [u8; 8] = [53, 158, 42, 125, 7, 132, 104, 188];
 const ANT_RECORD_DISCRIMINATOR: [u8; 8] = [225, 94, 70, 240, 82, 45, 135, 81];
+const ARNS_CONFIG_SEED: &[u8] = b"arns_config";
+const ARNS_RECORD_SEED: &[u8] = b"arns_record";
+const ANT_RECORD_SEED: &[u8] = b"ant_record";
 const MAX_SOLANA_ACCOUNT_BYTES: usize = 4096;
 const MAX_SOLANA_ACCOUNTS: usize = 1024;
 
@@ -86,6 +92,8 @@ struct Resolution {
 struct ArnsRecord {
     ant: [u8; 32],
     undername_limit: u16,
+    end_timestamp: Option<i64>,
+    bump: u8,
 }
 
 struct AntRecord {
@@ -94,8 +102,13 @@ struct AntRecord {
     target_protocol: u8,
     ttl: u32,
     priority: Option<u32>,
+    bump: u8,
 }
 
+struct DecodedProgramAccount {
+    pubkey: [u8; 32],
+    data: Vec<u8>,
+}
 pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
@@ -175,7 +188,26 @@ async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolutio
         arns_accounts.len() == 1,
         "ArNS lookup returned duplicate base names"
     );
-    let arns = decode_arns_record(&arns_accounts[0], &basename, &name_hash)?;
+    let arns_account = &arns_accounts[0];
+    let arns = decode_arns_record(&arns_account.data, &basename, &name_hash)?;
+    verify_pda(
+        &arns_account.pubkey,
+        &state.config.arns_program_id,
+        &[ARNS_RECORD_SEED, name_hash.as_slice()],
+        arns.bump,
+        "ArNS record",
+    )?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?;
+    if let Some(end_timestamp) = arns.end_timestamp {
+        ensure_arns_active(
+            end_timestamp,
+            arns_grace_period(state).await?,
+            now.as_secs(),
+        )?;
+    }
 
     let ant_accounts = program_accounts(
         &state.gateway,
@@ -187,9 +219,30 @@ async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolutio
         ],
     )
     .await?;
+    let mut seen = HashSet::new();
     let mut records = ant_accounts
         .iter()
-        .map(|account| decode_ant_record(account, &arns.ant))
+        .map(|account| {
+            ensure!(
+                seen.insert(account.pubkey),
+                "Solana RPC returned a duplicate ANT account"
+            );
+            let record = decode_ant_record(&account.data, &arns.ant)?;
+            let undername_hash: [u8; 32] =
+                Sha256::digest(record.undername.to_ascii_lowercase().as_bytes()).into();
+            verify_pda(
+                &account.pubkey,
+                &state.config.ant_program_id,
+                &[
+                    ANT_RECORD_SEED,
+                    arns.ant.as_slice(),
+                    undername_hash.as_slice(),
+                ],
+                record.bump,
+                "ANT record",
+            )?;
+            Ok(record)
+        })
         .collect::<Result<Vec<_>>>()?;
     records.sort_by(compare_ant_records);
     let Some((index, record)) = records
@@ -204,10 +257,6 @@ async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolutio
         "ANT record does not target Arweave"
     );
     decode_fixed::<32>(&record.target, "resolved data ID")?;
-    let resolved_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
-        .as_millis();
 
     Ok(Some(Resolution {
         name,
@@ -218,11 +267,50 @@ async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolutio
         ant_id: bs58::encode(arns.ant).into_string(),
         limit: arns.undername_limit,
         index,
-        resolved_at,
+        resolved_at: now.as_millis(),
     }))
 }
 
+async fn arns_grace_period(state: &AppState) -> Result<i64> {
+    let accounts = program_accounts(
+        &state.gateway,
+        &state.config.solana_rpc_url,
+        &state.config.arns_program_id,
+        &[(0, ARNS_CONFIG_DISCRIMINATOR.to_vec())],
+    )
+    .await?;
+    ensure!(
+        accounts.len() == 1,
+        "ArNS config lookup did not return exactly one account"
+    );
+    let account = &accounts[0];
+    let (grace_period, bump) = decode_arns_config(&account.data)?;
+    verify_pda(
+        &account.pubkey,
+        &state.config.arns_program_id,
+        &[ARNS_CONFIG_SEED],
+        bump,
+        "ArNS config",
+    )?;
+    Ok(grace_period)
+}
+fn ensure_arns_active(end_timestamp: i64, grace_period: i64, now: u64) -> Result<()> {
+    let expires_at = end_timestamp
+        .checked_add(grace_period)
+        .context("ArNS lease expiry overflow")?;
+    ensure!(
+        i64::try_from(now).context("system time is too large")? < expires_at,
+        "ArNS lease has expired"
+    );
+    Ok(())
+}
+
 fn compare_ant_records(left: &AntRecord, right: &AntRecord) -> Ordering {
+    match (left.undername == "@", right.undername == "@") {
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        _ => {}
+    }
     match (left.priority, right.priority) {
         (Some(left_priority), Some(right_priority)) => left_priority
             .cmp(&right_priority)
@@ -238,7 +326,7 @@ async fn program_accounts(
     rpc_url: &Url,
     program_id: &str,
     filters: &[(usize, Vec<u8>)],
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Vec<DecodedProgramAccount>> {
     let filters = filters
         .iter()
         .map(|(offset, bytes)| {
@@ -283,8 +371,11 @@ async fn program_accounts(
         .collect()
 }
 
-fn decode_program_account(account: ProgramAccount, program_id: &str) -> Result<Vec<u8>> {
-    decode_pubkey(&account.pubkey, "Solana account ID")?;
+fn decode_program_account(
+    account: ProgramAccount,
+    program_id: &str,
+) -> Result<DecodedProgramAccount> {
+    let pubkey = decode_pubkey(&account.pubkey, "Solana account ID")?;
     ensure!(
         account.account.owner == program_id,
         "Solana account owner mismatch"
@@ -308,7 +399,55 @@ fn decode_program_account(account: ProgramAccount, program_id: &str) -> Result<V
         data.len() == account.account.space,
         "Solana account size mismatch"
     );
-    Ok(data)
+    Ok(DecodedProgramAccount { pubkey, data })
+}
+fn decode_arns_config(bytes: &[u8]) -> Result<(i64, u8)> {
+    let mut cursor = 0;
+    ensure!(
+        take(bytes, &mut cursor, 8, "ArNS config discriminator")? == ARNS_CONFIG_DISCRIMINATOR,
+        "invalid ArNS config discriminator"
+    );
+    take(bytes, &mut cursor, 96, "ArNS config addresses")?;
+    let grace_period = read_i64(bytes, &mut cursor, "ArNS grace period")?;
+    ensure!(grace_period >= 0, "invalid ArNS grace period");
+    read_i64(bytes, &mut cursor, "ArNS return auction duration")?;
+    read_u8(bytes, &mut cursor, "ArNS maximum lease length")?;
+    read_u64(bytes, &mut cursor, "ArNS registered name count")?;
+    read_i64(bytes, &mut cursor, "ArNS next record prune time")?;
+    read_i64(bytes, &mut cursor, "ArNS next returned-name prune time")?;
+    ensure!(
+        read_u8(bytes, &mut cursor, "ArNS migration flag")? <= 1,
+        "invalid ArNS migration flag"
+    );
+    take(bytes, &mut cursor, 32, "ArNS migration authority")?;
+    let bump = read_u8(bytes, &mut cursor, "ArNS config bump")?;
+    ensure!(
+        take(bytes, &mut cursor, 3, "ArNS config schema version")? == [1, 0, 0],
+        "unsupported ArNS config schema version"
+    );
+    ensure!(
+        bytes[cursor..].iter().all(|byte| *byte == 0),
+        "ArNS config contains trailing data"
+    );
+    Ok((grace_period, bump))
+}
+
+fn verify_pda(
+    account: &[u8; 32],
+    program_id: &str,
+    seeds: &[&[u8]],
+    bump: u8,
+    label: &str,
+) -> Result<()> {
+    let program_id = Pubkey::new_from_array(decode_pubkey(program_id, "Solana program ID")?);
+    let (expected, expected_bump) = Pubkey::try_find_program_address(seeds, &program_id)
+        .with_context(|| format!("failed to derive {label} PDA"))?;
+    ensure!(
+        expected == Pubkey::new_from_array(*account),
+        "{label} address is not its canonical PDA"
+    );
+    ensure!(bump == expected_bump, "{label} bump mismatch");
+    Ok(())
 }
 
 fn decode_arns_record(
@@ -329,15 +468,16 @@ fn decode_arns_record(
     let ant: [u8; 32] = take(bytes, &mut cursor, 32, "ArNS ANT ID")?
         .try_into()
         .unwrap();
-    ensure!(
-        read_u8(bytes, &mut cursor, "ArNS purchase type")? <= 1,
-        "invalid ArNS purchase type"
-    );
+    let purchase_type = read_u8(bytes, &mut cursor, "ArNS purchase type")?;
     read_i64(bytes, &mut cursor, "ArNS start timestamp")?;
-    read_option_i64(bytes, &mut cursor, "ArNS end timestamp")?;
+    let end_timestamp = read_option_i64(bytes, &mut cursor, "ArNS end timestamp")?;
+    ensure!(
+        matches!((purchase_type, end_timestamp), (0, Some(_)) | (1, None)),
+        "invalid ArNS purchase type or end timestamp"
+    );
     let undername_limit = read_u16(bytes, &mut cursor, "ArNS undername limit")?;
     read_u64(bytes, &mut cursor, "ArNS purchase price")?;
-    read_u8(bytes, &mut cursor, "ArNS bump")?;
+    let bump = read_u8(bytes, &mut cursor, "ArNS bump")?;
     let name = read_string(bytes, &mut cursor, 64, "ArNS name")?;
     ensure!(name == expected_name, "ArNS account name mismatch");
     ensure!(
@@ -351,6 +491,8 @@ fn decode_arns_record(
     Ok(ArnsRecord {
         ant,
         undername_limit,
+        end_timestamp,
+        bump,
     })
 }
 
@@ -371,7 +513,7 @@ fn decode_ant_record(bytes: &[u8], expected_mint: &[u8; 32]) -> Result<AntRecord
     let priority = read_option_u32(bytes, &mut cursor, "ANT priority")?;
     read_option_bytes32(bytes, &mut cursor, "ANT owner")?;
     take(bytes, &mut cursor, 32, "ANT reconciled owner")?;
-    read_u8(bytes, &mut cursor, "ANT bump")?;
+    let bump = read_u8(bytes, &mut cursor, "ANT bump")?;
     ensure!(
         take(bytes, &mut cursor, 3, "ANT schema version")? == [1, 0, 0],
         "unsupported ANT schema version"
@@ -386,6 +528,7 @@ fn decode_ant_record(bytes: &[u8], expected_mint: &[u8; 32]) -> Result<AntRecord
         target_protocol,
         ttl,
         priority,
+        bump,
     })
 }
 
@@ -654,6 +797,28 @@ mod tests {
             "H8Pya8AGbnt39Em7Zy5EHiXGY1MEuV5MpSM2JXzNYYY3"
         );
         assert_eq!(arns.undername_limit, 100);
+        assert_eq!(arns.end_timestamp, None);
+        assert_eq!(arns.bump, 254);
+        let arns_pubkey =
+            decode_pubkey("E8Vm6GR2CDdsx5FRaxQ7iVoN832mTjufN8zuB2pvzpYn", "fixture").unwrap();
+        verify_pda(
+            &arns_pubkey,
+            ARNS_PROGRAM,
+            &[ARNS_RECORD_SEED, name_hash.as_slice()],
+            arns.bump,
+            "ArNS record",
+        )
+        .unwrap();
+        let mut lease_bytes = arns_bytes.clone();
+        lease_bytes[104] = 0;
+        lease_bytes[113] = 1;
+        lease_bytes.splice(114..114, 100_i64.to_le_bytes());
+        assert_eq!(
+            decode_arns_record(&lease_bytes, "lolcchekc", &name_hash)
+                .unwrap()
+                .end_timestamp,
+            Some(100)
+        );
 
         let ant_bytes = STANDARD.decode(ANT_ACCOUNT).unwrap();
         let ant = decode_ant_record(&ant_bytes, &arns.ant).unwrap();
@@ -662,9 +827,87 @@ mod tests {
         assert_eq!(ant.target_protocol, 0);
         assert_eq!(ant.ttl, 3600);
         assert_eq!(ant.priority, Some(0));
+        assert_eq!(ant.bump, 255);
+        let ant_pubkey =
+            decode_pubkey("3JEvMXaLmWvya2jtEX7pgzxHqZB5iiK2GQNdFXcjj26G", "fixture").unwrap();
+        let undername_hash: [u8; 32] = Sha256::digest(b"@").into();
+        verify_pda(
+            &ant_pubkey,
+            ANT_PROGRAM,
+            &[
+                ANT_RECORD_SEED,
+                arns.ant.as_slice(),
+                undername_hash.as_slice(),
+            ],
+            ant.bump,
+            "ANT record",
+        )
+        .unwrap();
+        let mut wrong_pubkey = ant_pubkey;
+        wrong_pubkey[0] ^= 1;
+        assert!(
+            verify_pda(
+                &wrong_pubkey,
+                ANT_PROGRAM,
+                &[
+                    ANT_RECORD_SEED,
+                    arns.ant.as_slice(),
+                    undername_hash.as_slice(),
+                ],
+                ant.bump,
+                "ANT record",
+            )
+            .is_err()
+        );
 
         assert!(decode_arns_record(&arns_bytes[..100], "lolcchekc", &name_hash).is_err());
         assert!(decode_ant_record(&ant_bytes[..100], &arns.ant).is_err());
+    }
+    #[test]
+    fn rejects_expired_leases_and_sorts_root_first() {
+        assert!(ensure_arns_active(100, 10, 109).is_ok());
+        assert!(ensure_arns_active(100, 10, 110).is_err());
+        let mut config = vec![0; 182];
+        config[..8].copy_from_slice(&ARNS_CONFIG_DISCRIMINATOR);
+        config[104..112].copy_from_slice(&10_i64.to_le_bytes());
+        config[178] = 255;
+        config[179..].copy_from_slice(&[1, 0, 0]);
+        assert_eq!(decode_arns_config(&config).unwrap(), (10, 255));
+        let config_pubkey =
+            decode_pubkey("ENuQZZYp778k5cCAovtD4gS2JxHQ3jVd3fKmNmtcZqQ2", "fixture").unwrap();
+        verify_pda(
+            &config_pubkey,
+            ARNS_PROGRAM,
+            &[ARNS_CONFIG_SEED],
+            255,
+            "ArNS config",
+        )
+        .unwrap();
+
+        assert!(ensure_arns_active(i64::MAX, 1, 0).is_err());
+
+        let record = |undername: &str, priority| AntRecord {
+            undername: undername.to_owned(),
+            target: String::new(),
+            target_protocol: 0,
+            ttl: 0,
+            priority,
+            bump: 0,
+        };
+        let mut records = vec![
+            record("z", Some(0)),
+            record("b", None),
+            record("@", None),
+            record("a", Some(0)),
+        ];
+        records.sort_by(compare_ant_records);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.undername.as_str())
+                .collect::<Vec<_>>(),
+            ["@", "a", "z", "b"]
+        );
     }
 
     #[test]
