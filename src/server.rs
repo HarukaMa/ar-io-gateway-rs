@@ -21,6 +21,7 @@ use reqwest::Url;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::{Gateway, VerifiedData, decode_fixed};
 
@@ -38,6 +39,7 @@ pub struct ServerConfig {
     solana_rpc_url: Url,
     arns_program_id: String,
     ant_program_id: String,
+    max_concurrent_requests: usize,
 }
 
 impl ServerConfig {
@@ -47,6 +49,7 @@ impl ServerConfig {
         solana_rpc_url: &str,
         arns_program_id: &str,
         ant_program_id: &str,
+        max_concurrent_requests: usize,
     ) -> Result<Self> {
         let listen_addr = listen_addr.parse().context("invalid AR_IO_LISTEN_ADDR")?;
         let arns_root_host = arns_root_host.trim_end_matches('.').to_ascii_lowercase();
@@ -58,6 +61,10 @@ impl ServerConfig {
         );
         decode_pubkey(arns_program_id, "ArNS program ID")?;
         decode_pubkey(ant_program_id, "ANT program ID")?;
+        ensure!(
+            max_concurrent_requests > 0,
+            "AR_IO_MAX_CONCURRENT_REQUESTS must be positive"
+        );
 
         Ok(Self {
             listen_addr,
@@ -65,6 +72,7 @@ impl ServerConfig {
             solana_rpc_url,
             arns_program_id: arns_program_id.to_owned(),
             ant_program_id: ant_program_id.to_owned(),
+            max_concurrent_requests,
         })
     }
 }
@@ -72,6 +80,7 @@ impl ServerConfig {
 struct AppState {
     gateway: Gateway,
     config: ServerConfig,
+    request_permits: Semaphore,
 }
 
 struct Resolution {
@@ -106,7 +115,11 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .await
         .context("failed to bind HTTP listener")?;
     println!("listening on http://{}", listener.local_addr()?);
-    let state = Arc::new(AppState { gateway, config });
+    let state = Arc::new(AppState {
+        request_permits: Semaphore::new(config.max_concurrent_requests),
+        gateway,
+        config,
+    });
     let app = Router::new()
         .route("/", get(serve_arns))
         .route("/{id}", get(serve_id))
@@ -115,8 +128,17 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .await
         .context("HTTP server failed")
 }
+fn request_permit(permits: &Semaphore) -> Result<SemaphorePermit<'_>, Response> {
+    permits
+        .try_acquire()
+        .map_err(|_| error_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"))
+}
 
 async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let _permit = match request_permit(&state.request_permits) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
     let Some(name) = arns_name(&headers, &state.config.arns_root_host) else {
         return error_response(StatusCode::NOT_FOUND, "Not Found");
     };
@@ -145,6 +167,10 @@ async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 }
 
 async fn serve_id(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let _permit = match request_permit(&state.request_permits) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
     if decode_fixed::<32>(&id, "data ID").is_err() {
         return error_response(StatusCode::NOT_FOUND, "Not Found");
     }
@@ -763,6 +789,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_saturated_requests_and_releases_permits() {
+        let permits = Semaphore::new(1);
+        let held = request_permit(&permits).unwrap();
+        let response = request_permit(&permits).unwrap_err();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(held);
+        assert!(request_permit(&permits).is_ok());
+        assert!(
+            ServerConfig::new(
+                "127.0.0.1:0",
+                "ar.mrx.im",
+                "http://127.0.0.1:1",
+                ARNS_PROGRAM,
+                ANT_PROGRAM,
+                0,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn builds_verified_arns_response_headers() {
         let bytes = b"hello".to_vec();
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
@@ -793,6 +840,7 @@ mod tests {
             "http://127.0.0.1:1",
             ARNS_PROGRAM,
             ANT_PROGRAM,
+            8,
         )
         .unwrap();
         let response = verified_response(verified, Some(&resolution), &config).unwrap();

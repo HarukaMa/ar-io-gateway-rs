@@ -51,6 +51,10 @@ async fn main() -> Result<()> {
         if args.next().is_some() {
             bail!("{USAGE}");
         }
+        let max_concurrent_requests = env::var("AR_IO_MAX_CONCURRENT_REQUESTS")
+            .unwrap_or_else(|_| "8".to_owned())
+            .parse()
+            .context("invalid AR_IO_MAX_CONCURRENT_REQUESTS")?;
         let config = ServerConfig::new(
             &env::var("AR_IO_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_owned()),
             &env::var("ARNS_ROOT_HOST").unwrap_or_else(|_| "ar.mrx.im".to_owned()),
@@ -60,6 +64,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ".to_owned()),
             &env::var("ARIO_ANT_PROGRAM_ID")
                 .unwrap_or_else(|_| "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5".to_owned()),
+            max_concurrent_requests,
         )?;
         return server::serve(gateway, config).await;
     }
