@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header::HOST, uri::Authority},
     response::Response,
@@ -122,6 +122,7 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     });
     let app = Router::new()
         .route("/", get(serve_arns))
+        .route("/raw/{id}", get(serve_id))
         .route("/{id}", get(serve_id))
         .with_state(state);
     axum::serve(listener, app)
@@ -154,7 +155,7 @@ async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         return error_response(StatusCode::PAYMENT_REQUIRED, "Payment Required");
     }
     match state.gateway.retrieve(&resolution.resolved_id).await {
-        Ok(verified) => verified_response(verified, Some(&resolution), &state.config)
+        Ok(verified) => verified_response(verified, Some(&resolution), &state.config, &headers)
             .unwrap_or_else(|error| {
                 eprintln!("response construction failed: {error:#}");
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
@@ -166,7 +167,11 @@ async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     }
 }
 
-async fn serve_id(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+async fn serve_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let _permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
         Err(response) => return response,
@@ -175,10 +180,12 @@ async fn serve_id(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
         return error_response(StatusCode::NOT_FOUND, "Not Found");
     }
     match state.gateway.retrieve(&id).await {
-        Ok(verified) => verified_response(verified, None, &state.config).unwrap_or_else(|error| {
-            eprintln!("response construction failed: {error:#}");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-        }),
+        Ok(verified) => {
+            verified_response(verified, None, &state.config, &headers).unwrap_or_else(|error| {
+                eprintln!("response construction failed: {error:#}");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            })
+        }
         Err(error) => {
             eprintln!("verified retrieval failed: {error:#}");
             error_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
@@ -460,11 +467,61 @@ fn decode_ant_record(bytes: &[u8], expected_mint: &[u8; 32]) -> Result<AntRecord
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ByteRangeError {
+    Malformed,
+    Unsatisfiable,
+}
+
+fn parse_byte_range(
+    value: &str,
+    total: usize,
+) -> std::result::Result<(usize, usize), ByteRangeError> {
+    let Some(value) = value.strip_prefix("bytes=") else {
+        return Err(ByteRangeError::Malformed);
+    };
+    if value.contains(',') {
+        return Err(ByteRangeError::Malformed);
+    }
+    let Some((start, end)) = value.split_once('-') else {
+        return Err(ByteRangeError::Malformed);
+    };
+
+    if start.is_empty() {
+        let suffix = end
+            .parse::<usize>()
+            .map_err(|_| ByteRangeError::Malformed)?;
+        if suffix == 0 || total == 0 {
+            return Err(ByteRangeError::Unsatisfiable);
+        }
+        return Ok((total.saturating_sub(suffix), total - 1));
+    }
+
+    let start = start
+        .parse::<usize>()
+        .map_err(|_| ByteRangeError::Malformed)?;
+    let end = if end.is_empty() {
+        total.saturating_sub(1)
+    } else {
+        end.parse::<usize>()
+            .map_err(|_| ByteRangeError::Malformed)?
+    };
+    if total == 0 || start >= total || start > end {
+        return Err(ByteRangeError::Unsatisfiable);
+    }
+    Ok((start, end.min(total - 1)))
+}
+
 fn verified_response(
     verified: VerifiedData,
     resolution: Option<&Resolution>,
     config: &ServerConfig,
+    request_headers: &HeaderMap,
 ) -> Result<Response> {
+    ensure!(
+        verified.bytes.len() == verified.content_length,
+        "verified content length mismatch"
+    );
     let digest = verified
         .etag
         .strip_prefix('"')
@@ -479,9 +536,7 @@ fn verified_response(
     );
     let content_digest = format!("sha-256=:{}:", STANDARD.encode(digest_bytes));
     let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", verified.content_type.as_str())
-        .header("content-length", verified.content_length.to_string())
+        .header("accept-ranges", "bytes")
         .header("etag", verified.etag.as_str())
         .header("content-digest", content_digest)
         .header("x-ar-io-data-id", verified.id.as_str())
@@ -510,9 +565,70 @@ fn verified_response(
             .header("x-arns-undername-limit", resolution.limit.to_string())
             .header("x-arns-record-index", resolution.index.to_string());
     }
-    builder
-        .body(Body::from(verified.bytes))
-        .context("failed to construct HTTP response")
+
+    let range = request_headers
+        .get("range")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ByteRangeError::Malformed)
+                .and_then(|value| parse_byte_range(value, verified.content_length))
+        })
+        .transpose();
+    let range = match range {
+        Ok(range) => range,
+        Err(error) => {
+            let (status, message) = match error {
+                ByteRangeError::Malformed => (StatusCode::BAD_REQUEST, "Malformed 'range' header"),
+                ByteRangeError::Unsatisfiable => {
+                    builder = builder.header(
+                        "content-range",
+                        format!("bytes */{}", verified.content_length),
+                    );
+                    (StatusCode::RANGE_NOT_SATISFIABLE, "Range not satisfiable")
+                }
+            };
+            return builder
+                .status(status)
+                .header("content-type", "text/plain; charset=utf-8")
+                .header("content-length", message.len().to_string())
+                .body(Body::from(message))
+                .context("failed to construct range error response");
+        }
+    };
+
+    if request_headers
+        .get("if-none-match")
+        .is_some_and(|value| value.as_bytes() == verified.etag.as_bytes())
+    {
+        return builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .context("failed to construct not-modified response");
+    }
+
+    match range {
+        Some((start, end)) => {
+            let content_length = end - start + 1;
+            let bytes = Bytes::from(verified.bytes);
+            builder
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header("content-type", verified.content_type.as_str())
+                .header("content-length", content_length.to_string())
+                .header(
+                    "content-range",
+                    format!("bytes {start}-{end}/{}", verified.content_length),
+                )
+                .body(Body::from(bytes.slice(start..end + 1)))
+                .context("failed to construct partial response")
+        }
+        None => builder
+            .status(StatusCode::OK)
+            .header("content-type", verified.content_type.as_str())
+            .header("content-length", verified.content_length.to_string())
+            .body(Body::from(verified.bytes))
+            .context("failed to construct HTTP response"),
+    }
 }
 
 fn error_response(status: StatusCode, message: &'static str) -> Response {
@@ -843,7 +959,8 @@ mod tests {
             8,
         )
         .unwrap();
-        let response = verified_response(verified, Some(&resolution), &config).unwrap();
+        let response =
+            verified_response(verified, Some(&resolution), &config, &HeaderMap::new()).unwrap();
         let headers = response.headers();
         assert_eq!(headers["content-type"], "text/html; charset=utf-8");
         assert_eq!(headers["content-length"], "5");
@@ -856,5 +973,73 @@ mod tests {
         let mut host_headers = HeaderMap::new();
         host_headers.insert(HOST, "lolcchekc.ar.mrx.im:3000".parse().unwrap());
         assert_eq!(arns_name(&host_headers, "ar.mrx.im").unwrap(), "lolcchekc");
+    }
+    #[tokio::test]
+    async fn serves_single_ranges_and_etag_conditionals() {
+        let config = ServerConfig::new(
+            "127.0.0.1:0",
+            "ar.mrx.im",
+            "http://127.0.0.1:1",
+            ARNS_PROGRAM,
+            ANT_PROGRAM,
+            8,
+        )
+        .unwrap();
+        let verified = || {
+            let bytes = b"hello".to_vec();
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            VerifiedData {
+                content_length: bytes.len(),
+                bytes,
+                id: "fqheRv90pWZYwxcsNyVafsoT9tOipnSa_8tVMMX9b3s".to_owned(),
+                block_height: 1_993_814,
+                content_type: "text/plain; charset=utf-8".to_owned(),
+                etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
+                sha256: super::super::hex(&digest),
+            }
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("range", "bytes=1-3".parse().unwrap());
+        let response = verified_response(verified(), None, &config, &headers).unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()["accept-ranges"], "bytes");
+        assert_eq!(response.headers()["content-range"], "bytes 1-3/5");
+        assert_eq!(response.headers()["content-length"], "3");
+        assert_eq!(
+            &axum::body::to_bytes(response.into_body(), 3).await.unwrap()[..],
+            b"ell"
+        );
+
+        headers.clear();
+        headers.insert("if-none-match", verified().etag.parse().unwrap());
+        let response = verified_response(verified(), None, &config, &headers).unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(!response.headers().contains_key("content-length"));
+        assert!(!response.headers().contains_key("content-type"));
+        assert!(
+            axum::body::to_bytes(response.into_body(), 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        headers.clear();
+        headers.insert("range", "bytes=5-".parse().unwrap());
+        let response = verified_response(verified(), None, &config, &headers).unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()["content-range"], "bytes */5");
+        assert_eq!(
+            &axum::body::to_bytes(response.into_body(), 21)
+                .await
+                .unwrap()[..],
+            b"Range not satisfiable"
+        );
+
+        assert_eq!(parse_byte_range("bytes=-2", 5), Ok((3, 4)));
+        assert_eq!(
+            parse_byte_range("bytes=1-2,4-5", 5),
+            Err(ByteRangeError::Malformed)
+        );
     }
 }
