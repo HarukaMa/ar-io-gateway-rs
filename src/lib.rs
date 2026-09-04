@@ -28,6 +28,7 @@ const LEAF_SIZE: usize = HASH_SIZE + NOTE_SIZE;
 const MAX_CHUNK_SIZE: u128 = 256 * 1024;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
 const MAX_PROOF_BYTES: usize = 64 * 1024;
+const MAX_BLOCK_INDEX_BYTES: usize = 256;
 const BUNDLE_ENTRY_SIZE: usize = 64;
 const MAX_DATA_ITEM_TAGS: usize = 128;
 const MAX_DATA_ITEM_TAG_BYTES: usize = 4096;
@@ -94,6 +95,21 @@ pub struct VerifiedData {
     pub sha256: String,
 }
 
+#[derive(Debug)]
+pub struct VerifiedChunk {
+    pub bytes: Vec<u8>,
+    pub chunk: String,
+    pub data_path: String,
+    pub tx_path: String,
+    pub data_root: String,
+    pub data_size: u128,
+    pub start_offset: u128,
+    pub relative_start_offset: u128,
+    pub read_offset: u128,
+    pub tx_start_offset: u128,
+    pub source_host: String,
+}
+
 pub struct Gateway {
     config: Config,
     client: Client,
@@ -128,6 +144,201 @@ impl Gateway {
             .await?
             .context("discovery returned an unbundled transaction")?;
         self.retrieve_bundled_with_hint(id, hint).await
+    }
+
+    pub async fn retrieve_chunk(&self, offset: u128) -> Result<Option<VerifiedChunk>> {
+        match tokio::time::timeout(
+            self.config.request_timeout,
+            self.retrieve_chunk_inner(offset),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn retrieve_chunk_inner(&self, offset: u128) -> Result<Option<VerifiedChunk>> {
+        let Some(geometry) = self.trusted_block_geometry(offset).await? else {
+            return Ok(None);
+        };
+        let mut invalid = Vec::new();
+
+        for source in self
+            .config
+            .chunk_sources
+            .iter()
+            .take(self.config.max_peer_attempts)
+        {
+            let candidate: Option<JsonChunk> = match self
+                .request_optional_json(
+                    self.client
+                        .get(endpoint(source, &format!("chunk/{offset}"))),
+                )
+                .await
+            {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    invalid.push(format!("{source}: {error:#}"));
+                    continue;
+                }
+            };
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            let proof = match verify_chunk_proof(candidate, offset, &geometry) {
+                Ok(proof) => proof,
+                Err(error) => {
+                    invalid.push(format!("{source}: {error:#}"));
+                    continue;
+                }
+            };
+            let start_offset = proof
+                .first_offset
+                .checked_add(proof.data.start)
+                .context("chunk start offset overflow")?;
+            let read_offset = proof
+                .relative_offset
+                .checked_sub(proof.data.start)
+                .context("chunk read offset underflow")?;
+            let source_host = Url::parse(source)?
+                .host_str()
+                .context("chunk source has no host")?
+                .to_owned();
+
+            return Ok(Some(VerifiedChunk {
+                data_root: URL_SAFE_NO_PAD.encode(proof.transaction.data_root),
+                data_size: proof.transaction.size,
+                relative_start_offset: proof.data.start,
+                tx_start_offset: proof.first_offset,
+                bytes: proof.bytes,
+                chunk: proof.chunk,
+                data_path: proof.data_path,
+                tx_path: proof.tx_path,
+                start_offset,
+                read_offset,
+                source_host,
+            }));
+        }
+
+        if invalid.is_empty() {
+            Ok(None)
+        } else {
+            bail!(
+                "all returned chunk proofs were invalid: {}",
+                invalid.join("; ")
+            )
+        }
+    }
+
+    async fn trusted_block_geometry(&self, offset: u128) -> Result<Option<BlockGeometry>> {
+        if offset == 0 {
+            return Ok(None);
+        }
+        let Some(info): Option<NodeInfo> = self
+            .request_optional_json(
+                self.client
+                    .get(endpoint(&self.config.trusted_node_url, "info")),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(stable_height) = info.height.checked_sub(CONSENSUS_DEPTH) else {
+            return Ok(None);
+        };
+        let Some(tip) = self
+            .trusted_block_index(stable_height, stable_height)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let tip_weave_size = tip[0].weave_size;
+        if offset > tip_weave_size {
+            return Ok(None);
+        }
+
+        let mut low = 0;
+        let mut high = stable_height;
+        while low < high {
+            let height = low + (high - low) / 2;
+            let Some(entry) = self.trusted_block_index(height, height).await? else {
+                return Ok(None);
+            };
+            let weave_size = entry[0].weave_size;
+            if offset <= weave_size {
+                high = height;
+            } else {
+                low = height + 1;
+            }
+        }
+
+        let (start, block_index) = if low == 0 { (0, 0) } else { (low - 1, 1) };
+        let Some(entries) = self.trusted_block_index(start, low).await? else {
+            return Ok(None);
+        };
+        let block = &entries[block_index];
+        let block_weave_size = block.weave_size;
+        let previous_weave_size = if low == 0 { 0 } else { entries[0].weave_size };
+        ensure!(
+            offset > previous_weave_size && offset <= block_weave_size,
+            "trusted block index returned inconsistent offset geometry"
+        );
+
+        Ok(Some(BlockGeometry {
+            tx_root: decode_fixed(&block.tx_root, "block tx_root")?,
+            block_weave_size,
+            previous_weave_size,
+        }))
+    }
+
+    async fn trusted_block_index(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<Vec<TrustedBlockIndexEntry>>> {
+        ensure!(start <= end, "invalid block index range");
+        let mut response = match self
+            .client
+            .get(endpoint(
+                &self.config.trusted_node_url,
+                &format!("block_index2/{start}/{end}"),
+            ))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return Ok(None),
+        };
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        if let Some(length) = response.content_length() {
+            ensure!(
+                length <= MAX_BLOCK_INDEX_BYTES as u64,
+                "trusted block index response exceeds size limit"
+            );
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .context("failed to read block index")?
+        {
+            ensure!(
+                body.len().saturating_add(chunk.len()) <= MAX_BLOCK_INDEX_BYTES,
+                "trusted block index response exceeds size limit"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        let entries = decode_block_index(&body)?;
+        let expected =
+            usize::try_from(end - start + 1).context("block index range is too large")?;
+        ensure!(
+            entries.len() == expected,
+            "trusted block index returned incomplete geometry"
+        );
+        Ok(Some(entries))
     }
 
     async fn retrieve_bundled_with_hint(&self, id: &str, hint: BundleHint) -> Result<VerifiedData> {
@@ -436,31 +647,47 @@ impl Gateway {
     }
 
     async fn request_json<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T> {
-        let mut response = request
+        let response = request
             .send()
             .await
             .context("HTTP request failed")?
             .error_for_status()
             .context("HTTP source rejected request")?;
-
-        if let Some(length) = response.content_length() {
-            ensure!(
-                length <= MAX_JSON_BYTES as u64,
-                "JSON response exceeds size limit"
-            );
-        }
-
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.context("failed to read HTTP body")? {
-            ensure!(
-                body.len().saturating_add(chunk.len()) <= MAX_JSON_BYTES,
-                "JSON response exceeds size limit"
-            );
-            body.extend_from_slice(&chunk);
-        }
-
-        serde_json::from_slice(&body).context("source returned malformed JSON")
+        read_json_response(response).await
     }
+
+    async fn request_optional_json<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<Option<T>> {
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(_) => return Ok(None),
+        };
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        Ok(Some(read_json_response(response).await?))
+    }
+}
+
+async fn read_json_response<T: DeserializeOwned>(mut response: reqwest::Response) -> Result<T> {
+    if let Some(length) = response.content_length() {
+        ensure!(
+            length <= MAX_JSON_BYTES as u64,
+            "JSON response exceeds size limit"
+        );
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("failed to read HTTP body")? {
+        ensure!(
+            body.len().saturating_add(chunk.len()) <= MAX_JSON_BYTES,
+            "JSON response exceeds size limit"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).context("source returned malformed JSON")
 }
 
 #[derive(Deserialize)]
@@ -472,6 +699,39 @@ struct NodeInfo {
 struct TxStatus {
     block_height: u64,
     block_indep_hash: String,
+}
+
+fn decode_block_index(bytes: &[u8]) -> Result<Vec<TrustedBlockIndexEntry>> {
+    let mut cursor = 0;
+    let mut entries = Vec::new();
+    while cursor < bytes.len() {
+        take(bytes, &mut cursor, 48, "block hash")?;
+        let weave_size_length =
+            u16::from_be_bytes(take(bytes, &mut cursor, 2, "weave size length")?.try_into()?)
+                as usize;
+        ensure!(weave_size_length <= 16, "block weave size exceeds u128");
+        let weave_size_bytes = take(bytes, &mut cursor, weave_size_length, "block weave size")?;
+        let mut encoded_weave_size = [0; 16];
+        encoded_weave_size[16 - weave_size_length..].copy_from_slice(weave_size_bytes);
+        let weave_size = u128::from_be_bytes(encoded_weave_size);
+        let tx_root_length = take(bytes, &mut cursor, 1, "tx_root length")?[0] as usize;
+        ensure!(
+            matches!(tx_root_length, 0 | 32),
+            "invalid block tx_root length"
+        );
+        let tx_root =
+            URL_SAFE_NO_PAD.encode(take(bytes, &mut cursor, tx_root_length, "block tx_root")?);
+        entries.push(TrustedBlockIndexEntry {
+            tx_root,
+            weave_size,
+        });
+    }
+    Ok(entries)
+}
+
+struct TrustedBlockIndexEntry {
+    tx_root: String,
+    weave_size: u128,
 }
 
 #[derive(Deserialize)]
@@ -1155,25 +1415,88 @@ struct Geometry {
     data_size: u128,
 }
 
+struct BlockGeometry {
+    tx_root: [u8; 32],
+    block_weave_size: u128,
+    previous_weave_size: u128,
+}
+
+struct ProvenChunk {
+    bytes: Vec<u8>,
+    chunk: String,
+    data_path: String,
+    tx_path: String,
+    transaction: TxPath,
+    data: DataPath,
+    relative_offset: u128,
+    first_offset: u128,
+}
+
 fn verify_chunk(
     chunk: JsonChunk,
     absolute_offset: u128,
     relative_offset: u128,
     geometry: &Geometry,
 ) -> Result<Vec<u8>> {
-    let bytes = decode_b64(&chunk.chunk, "chunk bytes")?;
-    let data_path = decode_b64(&chunk.data_path, "data_path")?;
-    let tx_path = decode_b64(&chunk.tx_path, "tx_path")?;
+    let proof = verify_chunk_proof(
+        chunk,
+        absolute_offset,
+        &BlockGeometry {
+            tx_root: geometry.tx_root,
+            block_weave_size: geometry.block_weave_size,
+            previous_weave_size: geometry.previous_weave_size,
+        },
+    )?;
+    ensure!(
+        proof.transaction.data_root == geometry.data_root,
+        "tx_path data root mismatch"
+    );
+    ensure!(
+        proof.transaction.end_offset == geometry.end_offset,
+        "tx_path end offset mismatch"
+    );
+    ensure!(
+        proof.transaction.size == geometry.data_size,
+        "tx_path transaction size mismatch"
+    );
+    ensure!(
+        proof.first_offset == geometry.first_offset,
+        "tx_path start offset mismatch"
+    );
+    ensure!(
+        proof.relative_offset == relative_offset,
+        "tx_path relative offset mismatch"
+    );
+    ensure!(
+        proof.data.start == relative_offset,
+        "data_path does not start at requested offset"
+    );
+    Ok(proof.bytes)
+}
+
+fn verify_chunk_proof(
+    chunk: JsonChunk,
+    absolute_offset: u128,
+    geometry: &BlockGeometry,
+) -> Result<ProvenChunk> {
+    let JsonChunk {
+        chunk,
+        data_path,
+        tx_path,
+    } = chunk;
+    let bytes = decode_b64(&chunk, "chunk bytes")?;
+    let data_path_bytes = decode_b64(&data_path, "data_path")?;
+    let tx_path_bytes = decode_b64(&tx_path, "tx_path")?;
     ensure!(
         bytes.len() <= MAX_CHUNK_SIZE as usize,
         "chunk exceeds protocol limit"
     );
     ensure!(
-        data_path.len() <= MAX_PROOF_BYTES,
+        data_path_bytes.len() <= MAX_PROOF_BYTES,
         "data_path exceeds size limit"
     );
     ensure!(
-        tx_path.len() <= MAX_PROOF_BYTES,
+        tx_path_bytes.len() <= MAX_PROOF_BYTES,
         "tx_path exceeds size limit"
     );
 
@@ -1182,38 +1505,28 @@ fn verify_chunk(
         absolute_offset,
         geometry.block_weave_size,
         geometry.previous_weave_size,
-        &tx_path,
+        &tx_path_bytes,
     )?;
-    ensure!(
-        transaction.data_root == geometry.data_root,
-        "tx_path data root mismatch"
-    );
-    ensure!(
-        transaction.end_offset == geometry.end_offset,
-        "tx_path end offset mismatch"
-    );
-    ensure!(
-        transaction.size == geometry.data_size,
-        "tx_path transaction size mismatch"
-    );
-    ensure!(
-        transaction.start_bound.checked_add(1) == Some(geometry.first_offset),
-        "tx_path start offset mismatch"
-    );
-
+    let first_offset = transaction
+        .start_bound
+        .checked_add(1)
+        .context("transaction start offset overflow")?;
+    let relative_offset = absolute_offset
+        .checked_sub(first_offset)
+        .context("requested offset precedes transaction")?;
     let data = validate_data_path(
-        &geometry.data_root,
-        geometry.data_size,
+        &transaction.data_root,
+        transaction.size,
         relative_offset,
         absolute_offset,
-        &data_path,
+        &data_path_bytes,
     )?;
     ensure!(
-        data.start == relative_offset,
-        "data_path does not start at requested offset"
+        data.start <= relative_offset && relative_offset < data.end,
+        "data_path does not contain requested offset"
     );
     ensure!(
-        data.end <= geometry.data_size,
+        data.end <= transaction.size,
         "data_path ends after transaction"
     );
     let proven_size = usize::try_from(data.end - data.start).context("chunk size overflow")?;
@@ -1226,7 +1539,16 @@ fn verify_chunk(
         "chunk hash does not match data_path"
     );
 
-    Ok(bytes)
+    Ok(ProvenChunk {
+        bytes,
+        chunk,
+        data_path,
+        tx_path,
+        transaction,
+        data,
+        relative_offset,
+        first_offset,
+    })
 }
 
 fn verify_transaction(transaction: &Transaction, expected_id: &str) -> Result<()> {
@@ -2274,6 +2596,7 @@ mod tests {
         let end = note(body.len() as u128);
         let root = hash_leaf(&data_hash, &end);
         let mut path = Vec::from(data_hash);
+
         path.extend_from_slice(&end);
 
         let data = validate_data_path(
@@ -2289,6 +2612,20 @@ mod tests {
 
         path[0] ^= 1;
         assert!(validate_data_path(&root, body.len() as u128, 0, 0, &path).is_err());
+    }
+    #[test]
+    fn decodes_binary_block_index() {
+        let mut encoded = vec![7; 48];
+        encoded.extend_from_slice(&2_u16.to_be_bytes());
+        encoded.extend_from_slice(&1_145_u16.to_be_bytes());
+        encoded.push(32);
+        encoded.extend_from_slice(&[9; 32]);
+        let entries = decode_block_index(&encoded).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].weave_size, 1_145);
+        assert_eq!(entries[0].tx_root, URL_SAFE_NO_PAD.encode([9; 32]));
+        encoded.pop();
+        assert!(decode_block_index(&encoded).is_err());
     }
 
     #[test]
@@ -2317,6 +2654,18 @@ mod tests {
         };
 
         assert_eq!(verify_chunk(chunk(), 1_001, 0, &geometry).unwrap(), body);
+        let proof = verify_chunk_proof(
+            chunk(),
+            1_006,
+            &BlockGeometry {
+                tx_root,
+                block_weave_size: 1_145,
+                previous_weave_size: 1_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(proof.relative_offset, 5);
+        assert_eq!((proof.data.start, proof.data.end), (0, body.len() as u128));
 
         let mut corrupt_bytes = chunk();
         corrupt_bytes.chunk = URL_SAFE_NO_PAD.encode(b"corrupt");

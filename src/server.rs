@@ -22,12 +22,12 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
-use super::{Gateway, VerifiedData, decode_fixed};
+use super::{Gateway, VerifiedChunk, VerifiedData, decode_fixed};
 
 const ARNS_CONFIG_DISCRIMINATOR: [u8; 8] = [117, 20, 158, 16, 49, 85, 82, 24];
 const ARNS_RECORD_DISCRIMINATOR: [u8; 8] = [53, 158, 42, 125, 7, 132, 104, 188];
@@ -119,6 +119,14 @@ struct ManifestResolution {
     fallback: bool,
 }
 
+#[derive(Serialize)]
+struct ChunkJsonResponse<'a> {
+    chunk: &'a str,
+    data_path: &'a str,
+    tx_path: &'a str,
+    packing: &'static str,
+}
+
 struct ArnsRecord {
     ant: [u8; 32],
     undername_limit: u16,
@@ -146,6 +154,8 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     });
     let app = Router::new()
         .route("/", get(serve_arns))
+        .route("/chunk/{offset}", get(serve_chunk))
+        .route("/chunk/{offset}/data", get(serve_chunk_data))
         .route("/raw/{id}", get(serve_raw))
         .route("/raw/{id}/", get(serve_raw))
         .route("/{*path}", get(serve_path))
@@ -158,6 +168,51 @@ fn request_permit(permits: &Semaphore) -> Result<SemaphorePermit<'_>, Response> 
     permits
         .try_acquire()
         .map_err(|_| error_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"))
+}
+
+async fn serve_chunk(
+    State(state): State<Arc<AppState>>,
+    Path(offset): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    serve_chunk_response(&state, &offset, &headers, false).await
+}
+
+async fn serve_chunk_data(
+    State(state): State<Arc<AppState>>,
+    Path(offset): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    serve_chunk_response(&state, &offset, &headers, true).await
+}
+
+async fn serve_chunk_response(
+    state: &AppState,
+    offset: &str,
+    headers: &HeaderMap,
+    raw: bool,
+) -> Response {
+    let _permit = match request_permit(&state.request_permits) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    if offset.is_empty() || !offset.bytes().all(|byte| byte.is_ascii_digit()) {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid offset");
+    }
+    let Ok(offset) = offset.parse::<u128>() else {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid offset");
+    };
+    match state.gateway.retrieve_chunk(offset).await {
+        Ok(Some(chunk)) => chunk_response(chunk, raw, headers).unwrap_or_else(|error| {
+            eprintln!("chunk response construction failed: {error:#}");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+        }),
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "Not Found"),
+        Err(error) => {
+            eprintln!("verified chunk retrieval failed: {error:#}");
+            empty_error_response(StatusCode::BAD_GATEWAY)
+        }
+    }
 }
 
 async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -877,6 +932,98 @@ fn verified_response(
     }
 }
 
+fn chunk_response(
+    chunk: VerifiedChunk,
+    raw: bool,
+    request_headers: &HeaderMap,
+) -> Result<Response> {
+    let VerifiedChunk {
+        bytes,
+        chunk,
+        data_path,
+        tx_path,
+        data_root,
+        data_size,
+        start_offset,
+        relative_start_offset,
+        read_offset,
+        tx_start_offset,
+        source_host,
+    } = chunk;
+    let body = if raw {
+        bytes
+    } else {
+        serde_json::to_vec(&ChunkJsonResponse {
+            chunk: &chunk,
+            data_path: &data_path,
+            tx_path: &tx_path,
+            packing: "unpacked",
+        })
+        .context("failed to encode chunk response")?
+    };
+    let digest: [u8; 32] = Sha256::digest(&body).into();
+    let digest_url = URL_SAFE_NO_PAD.encode(digest);
+    let etag = format!("\"{digest_url}\"");
+    let content_type = if raw {
+        "application/octet-stream"
+    } else {
+        "application/json; charset=utf-8"
+    };
+    let mut builder = Response::builder()
+        .header("content-type", content_type)
+        .header("content-length", body.len().to_string())
+        .header("etag", etag.as_str())
+        .header(
+            "content-digest",
+            format!("sha-256=:{}:", STANDARD.encode(digest)),
+        )
+        .header("x-ar-io-chunk-source-type", "arweave-network")
+        .header("x-ar-io-chunk-host", source_host)
+        .header("x-cache", "MISS")
+        .header("access-control-allow-origin", "*")
+        .header("access-control-expose-headers", "*");
+    if raw {
+        builder = builder
+            .header("x-arweave-chunk-data-path", data_path)
+            .header("x-arweave-chunk-data-root", data_root)
+            .header("x-arweave-chunk-start-offset", start_offset.to_string())
+            .header(
+                "x-arweave-chunk-relative-start-offset",
+                relative_start_offset.to_string(),
+            )
+            .header("x-arweave-chunk-read-offset", read_offset.to_string())
+            .header("x-arweave-chunk-tx-data-size", data_size.to_string())
+            .header("x-arweave-chunk-tx-path", tx_path)
+            .header(
+                "x-arweave-chunk-tx-start-offset",
+                tx_start_offset.to_string(),
+            );
+    }
+    if request_headers
+        .get("if-none-match")
+        .is_some_and(|value| value.as_bytes() == etag.as_bytes())
+    {
+        return builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .context("failed to construct chunk not-modified response");
+    }
+    builder
+        .status(StatusCode::OK)
+        .body(Body::from(body))
+        .context("failed to construct chunk response")
+}
+
+fn empty_error_response(status: StatusCode) -> Response {
+    Response::builder()
+        .status(status)
+        .header("content-length", "0")
+        .header("access-control-allow-origin", "*")
+        .header("access-control-expose-headers", "*")
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn error_response(status: StatusCode, message: &'static str) -> Response {
     Response::builder()
         .status(status)
@@ -1360,6 +1507,72 @@ mod tests {
         assert_eq!(
             parse_byte_range("bytes=1-2,4-5", 5),
             Err(ByteRangeError::Malformed)
+        );
+    }
+
+    #[tokio::test]
+    async fn builds_chunk_json_raw_and_conditional_responses() {
+        let verified = || VerifiedChunk {
+            bytes: b"hello".to_vec(),
+            chunk: "aGVsbG8".to_owned(),
+            data_path: "data-path".to_owned(),
+            tx_path: "tx-path".to_owned(),
+            data_root: "data-root".to_owned(),
+            data_size: 5,
+            start_offset: 100,
+            relative_start_offset: 2,
+            read_offset: 102,
+            tx_start_offset: 98,
+            source_host: "arweave.net".to_owned(),
+        };
+
+        let response = chunk_response(verified(), false, &HeaderMap::new()).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(response.headers()["x-ar-io-chunk-host"], "arweave.net");
+        let etag = response.headers()["etag"].clone();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            br#"{"chunk":"aGVsbG8","data_path":"data-path","tx_path":"tx-path","packing":"unpacked"}"#
+        );
+
+        let response = chunk_response(verified(), true, &HeaderMap::new()).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/octet-stream"
+        );
+        assert_eq!(response.headers()["x-arweave-chunk-data-path"], "data-path");
+        assert_eq!(response.headers()["x-arweave-chunk-data-root"], "data-root");
+        assert_eq!(response.headers()["x-arweave-chunk-start-offset"], "100");
+        assert_eq!(
+            response.headers()["x-arweave-chunk-relative-start-offset"],
+            "2"
+        );
+        assert_eq!(response.headers()["x-arweave-chunk-read-offset"], "102");
+        assert_eq!(response.headers()["x-arweave-chunk-tx-data-size"], "5");
+        assert_eq!(response.headers()["x-arweave-chunk-tx-path"], "tx-path");
+        assert_eq!(response.headers()["x-arweave-chunk-tx-start-offset"], "98");
+        assert_eq!(
+            &axum::body::to_bytes(response.into_body(), 5).await.unwrap()[..],
+            b"hello"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", etag);
+        let response = chunk_response(verified(), false, &headers).unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(
+            axum::body::to_bytes(response.into_body(), 0)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }
