@@ -3,20 +3,22 @@ use std::{env, fs, time::Duration};
 use anyhow::{Context, Result, bail};
 use ar_io_gateway::{Config, Gateway};
 
+const USAGE: &str = "usage: ar-io-gateway <fetch|fetch-bundled> <id> <output-file>";
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let Some(command) = args.next() else {
-        bail!("usage: ar-io-gateway fetch <transaction-id> <output-file>");
+        bail!("{USAGE}");
     };
     let Some(id) = args.next() else {
-        bail!("usage: ar-io-gateway fetch <transaction-id> <output-file>");
+        bail!("{USAGE}");
     };
     let Some(output) = args.next() else {
-        bail!("usage: ar-io-gateway fetch <transaction-id> <output-file>");
+        bail!("{USAGE}");
     };
-    if command != "fetch" || args.next().is_some() {
-        bail!("usage: ar-io-gateway fetch <transaction-id> <output-file>");
+    if !matches!(command.as_str(), "fetch" | "fetch-bundled") || args.next().is_some() {
+        bail!("{USAGE}");
     }
 
     let trusted_node =
@@ -50,7 +52,11 @@ async fn main() -> Result<()> {
         max_attempts,
         max_data_size,
     )?)?;
-    let verified = gateway.retrieve_direct(&id).await?;
+    let verified = match command.as_str() {
+        "fetch" => gateway.retrieve_direct(&id).await?,
+        "fetch-bundled" => gateway.retrieve_bundled(&id).await?,
+        _ => unreachable!(),
+    };
     fs::write(&output, &verified.bytes)
         .with_context(|| format!("failed to write verified data to {output}"))?;
     println!("{}", serde_json::to_string(&verified)?);

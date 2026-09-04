@@ -20,6 +20,11 @@ const LEAF_SIZE: usize = HASH_SIZE + NOTE_SIZE;
 const MAX_CHUNK_SIZE: u128 = 256 * 1024;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
 const MAX_PROOF_BYTES: usize = 64 * 1024;
+const BUNDLE_ENTRY_SIZE: usize = 64;
+const DATA_ITEM_SIGNATURE_SIZE: usize = 512;
+const DATA_ITEM_OWNER_SIZE: usize = 512;
+const MAX_DATA_ITEM_TAGS: usize = 128;
+const MAX_DATA_ITEM_TAG_BYTES: usize = 4096;
 const STRICT_DATA_SPLIT_THRESHOLD: u128 = 30_607_159_107_830;
 const MERKLE_REBASE_SUPPORT_THRESHOLD: u128 = 151_066_495_197_430;
 
@@ -98,6 +103,71 @@ impl Gateway {
     }
 
     pub async fn retrieve_direct(&self, id: &str) -> Result<VerifiedData> {
+        let (verified, _) = self.retrieve_direct_with_tags(id).await?;
+        Ok(verified)
+    }
+
+    pub async fn retrieve_bundled(&self, id: &str) -> Result<VerifiedData> {
+        decode_fixed::<32>(id, "data item ID")?;
+        let hint = self.discover_bundle(id).await?;
+        let hinted_size = checked_data_size(
+            parse_u128(&hint.data_size, "discovered data item size")?,
+            self.config.max_data_size,
+        )?;
+        let (parent, parent_tags) = self.retrieve_direct_with_tags(&hint.parent_id).await?;
+        require_bundle_tags(&parent_tags)?;
+        let item = verify_bundle_item(&parent.bytes, id)?;
+        ensure!(
+            item.data.len() == hinted_size,
+            "discovered data item size does not match verified payload"
+        );
+
+        let bytes = item.data.to_vec();
+        let body_hash = sha256(&[&bytes]);
+        Ok(VerifiedData {
+            content_length: bytes.len(),
+            bytes,
+            id: id.to_owned(),
+            block_height: parent.block_height,
+            content_type: item.content_type,
+            etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
+            sha256: hex(&body_hash),
+        })
+    }
+
+    async fn discover_bundle(&self, id: &str) -> Result<BundleHint> {
+        let response: GraphQlResponse = self
+            .request_json(
+                self.client
+                    .post(endpoint(&self.config.archive_url, "graphql"))
+                    .json(&serde_json::json!({
+                        "query": "query($ids: [ID!]!) { transactions(ids: $ids, first: 2) { edges { node { id bundledIn { id } data { size } } } } }",
+                        "variables": { "ids": [id] }
+                    })),
+            )
+            .await
+            .context("failed to discover bundle parent")?;
+        let mut edges = response.data.transactions.edges;
+        ensure!(
+            edges.len() == 1,
+            "discovery did not return exactly one data item"
+        );
+        let node = edges.pop().unwrap().node;
+        ensure!(node.id == id, "discovery returned the wrong data item");
+        decode_fixed::<32>(&node.id, "discovered data item ID")?;
+        let parent_id = node
+            .bundled_in
+            .context("discovery returned an unbundled transaction")?
+            .id;
+        decode_fixed::<32>(&parent_id, "discovered parent ID")?;
+        ensure!(parent_id != id, "data item cannot be its own parent");
+        Ok(BundleHint {
+            parent_id,
+            data_size: node.data.size,
+        })
+    }
+
+    async fn retrieve_direct_with_tags(&self, id: &str) -> Result<(VerifiedData, Vec<Tag>)> {
         decode_fixed::<32>(id, "transaction ID")?;
 
         let status: TxStatus = self
@@ -232,15 +302,18 @@ impl Gateway {
         let body_hash = sha256(&[&bytes]);
         let content_type = content_type(&transaction.tags)?;
 
-        Ok(VerifiedData {
-            bytes,
-            id: id.to_owned(),
-            block_height: status.block_height,
-            content_type,
-            content_length: expected_len,
-            etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
-            sha256: hex(&body_hash),
-        })
+        Ok((
+            VerifiedData {
+                bytes,
+                id: id.to_owned(),
+                block_height: status.block_height,
+                content_type,
+                content_length: expected_len,
+                etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
+                sha256: hex(&body_hash),
+            },
+            transaction.tags,
+        ))
     }
 
     async fn authenticate_block(
@@ -1002,6 +1075,49 @@ struct Tag {
 }
 
 #[derive(Deserialize)]
+struct GraphQlResponse {
+    data: GraphQlData,
+}
+
+#[derive(Deserialize)]
+struct GraphQlData {
+    transactions: GraphQlTransactions,
+}
+
+#[derive(Deserialize)]
+struct GraphQlTransactions {
+    edges: Vec<GraphQlEdge>,
+}
+
+#[derive(Deserialize)]
+struct GraphQlEdge {
+    node: GraphQlNode,
+}
+
+#[derive(Deserialize)]
+struct GraphQlNode {
+    id: String,
+    #[serde(rename = "bundledIn")]
+    bundled_in: Option<GraphQlBundledIn>,
+    data: GraphQlNodeData,
+}
+
+#[derive(Deserialize)]
+struct GraphQlBundledIn {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct GraphQlNodeData {
+    size: String,
+}
+
+struct BundleHint {
+    parent_id: String,
+    data_size: String,
+}
+
+#[derive(Deserialize)]
 struct JsonChunk {
     chunk: String,
     data_path: String,
@@ -1140,29 +1256,7 @@ fn verify_transaction(transaction: &Transaction, expected_id: &str) -> Result<()
     )?));
 
     let signature_payload = deep_hash_list(&fields);
-    let signature_digest = Sha256::digest(signature_payload);
-    let key = RsaPublicKey::new(BigUint::from_bytes_be(&owner), BigUint::from(65_537u32))
-        .context("invalid RSA transaction owner")?;
-    let encoded_len = (key.n().bits().saturating_sub(1) as usize).div_ceil(8);
-    let max_salt = encoded_len.saturating_sub(32 + 2);
-    let mut valid = false;
-
-    for salt_len in [0, 32, max_salt] {
-        if key
-            .verify(
-                Pss::new_with_salt::<Sha256>(salt_len),
-                &signature_digest,
-                &signature,
-            )
-            .is_ok()
-        {
-            valid = true;
-            break;
-        }
-    }
-
-    ensure!(valid, "transaction signature verification failed");
-    Ok(())
+    verify_rsa_pss(&owner, &signature, &signature_payload, "transaction")
 }
 
 fn content_type(tags: &[Tag]) -> Result<String> {
@@ -1198,6 +1292,283 @@ fn response_content_type(value: String) -> String {
     } else {
         value
     }
+}
+
+fn require_bundle_tags(tags: &[Tag]) -> Result<()> {
+    let mut format = false;
+    let mut version = false;
+    for tag in tags {
+        let name = decode_b64(&tag.name, "tag name")?;
+        let value = decode_b64(&tag.value, "tag value")?;
+        format |= name == b"Bundle-Format" && value == b"binary";
+        version |= name == b"Bundle-Version" && value == b"2.0.0";
+    }
+    ensure!(format, "parent is missing Bundle-Format: binary");
+    ensure!(version, "parent is missing Bundle-Version: 2.0.0");
+    Ok(())
+}
+
+struct VerifiedItem<'a> {
+    data: &'a [u8],
+    content_type: String,
+}
+
+struct ItemTag<'a> {
+    name: &'a [u8],
+    value: &'a [u8],
+}
+
+fn verify_bundle_item<'a>(bundle: &'a [u8], expected_id: &str) -> Result<VerifiedItem<'a>> {
+    let expected_id = decode_fixed::<32>(expected_id, "data item ID")?;
+    let mut cursor = 0;
+    let count = read_u256_usize(
+        take(bundle, &mut cursor, 32, "bundle item count")?,
+        "bundle item count",
+    )?;
+    ensure!(count > 0, "bundle is empty");
+    ensure!(
+        count <= (bundle.len() - cursor) / BUNDLE_ENTRY_SIZE,
+        "bundle item table exceeds parent bounds"
+    );
+    let table_size = count
+        .checked_mul(BUNDLE_ENTRY_SIZE)
+        .context("bundle item table size overflow")?;
+    let data_start = cursor
+        .checked_add(table_size)
+        .context("bundle item table offset overflow")?;
+    let mut item_start = data_start;
+    let mut found = None;
+
+    for _ in 0..count {
+        let size = read_u256_usize(
+            take(bundle, &mut cursor, 32, "bundle item size")?,
+            "bundle item size",
+        )?;
+        ensure!(size > 0, "bundle contains an empty item");
+        let id = take(bundle, &mut cursor, 32, "bundle item ID")?;
+        let item_end = item_start
+            .checked_add(size)
+            .context("bundle item offset overflow")?;
+        ensure!(
+            item_end <= bundle.len(),
+            "bundle item exceeds parent bounds"
+        );
+        if id == expected_id.as_slice() {
+            ensure!(found.is_none(), "bundle contains duplicate data item IDs");
+            found = Some((item_start, item_end));
+        }
+        item_start = item_end;
+    }
+
+    ensure!(cursor == data_start, "bundle item table is malformed");
+    ensure!(
+        item_start == bundle.len(),
+        "bundle item sizes do not consume the parent"
+    );
+    let (start, end) = found.context("data item is absent from verified parent")?;
+    verify_data_item(&bundle[start..end], &expected_id)
+}
+
+fn verify_data_item<'a>(item: &'a [u8], expected_id: &[u8; 32]) -> Result<VerifiedItem<'a>> {
+    let mut cursor = 0;
+    let signature_type = read_le_u16(item, &mut cursor, "data item signature type")?;
+    ensure!(
+        signature_type == 1,
+        "only ANS-104 RSA-PSS items are supported"
+    );
+    let signature = take(
+        item,
+        &mut cursor,
+        DATA_ITEM_SIGNATURE_SIZE,
+        "data item signature",
+    )?;
+    let owner = take(item, &mut cursor, DATA_ITEM_OWNER_SIZE, "data item owner")?;
+    let target = read_optional_32(item, &mut cursor, "data item target")?;
+    let anchor = read_optional_32(item, &mut cursor, "data item anchor")?;
+    let tag_count = usize::try_from(read_le_u64(item, &mut cursor, "data item tag count")?)
+        .context("data item tag count is too large")?;
+    ensure!(
+        tag_count <= MAX_DATA_ITEM_TAGS,
+        "data item tag count exceeds limit"
+    );
+    let tag_bytes_len =
+        usize::try_from(read_le_u64(item, &mut cursor, "data item tag byte length")?)
+            .context("data item tag byte length is too large")?;
+    ensure!(
+        tag_bytes_len <= MAX_DATA_ITEM_TAG_BYTES,
+        "data item tag bytes exceed limit"
+    );
+    let raw_tags = take(item, &mut cursor, tag_bytes_len, "data item tags")?;
+    let tags = parse_avro_tags(raw_tags, tag_count)?;
+    let data = &item[cursor..];
+
+    ensure!(
+        sha256(&[signature]) == *expected_id,
+        "data item ID is not the signature hash"
+    );
+    let fields = [
+        deep_hash_blob(b"dataitem"),
+        deep_hash_blob(b"1"),
+        deep_hash_blob(b"1"),
+        deep_hash_blob(owner),
+        deep_hash_blob(target),
+        deep_hash_blob(anchor),
+        deep_hash_blob(raw_tags),
+        deep_hash_blob(data),
+    ];
+    let signature_payload = deep_hash_list(&fields);
+    verify_rsa_pss(owner, signature, &signature_payload, "data item")?;
+
+    Ok(VerifiedItem {
+        data,
+        content_type: item_content_type(&tags)?,
+    })
+}
+
+fn item_content_type(tags: &[ItemTag<'_>]) -> Result<String> {
+    for tag in tags {
+        if tag.name == b"Content-Type" {
+            let value = HeaderValue::from_bytes(tag.value)
+                .context("invalid Content-Type tag")?
+                .to_str()
+                .context("non-ASCII Content-Type tag")?
+                .to_owned();
+            return Ok(response_content_type(value));
+        }
+    }
+    Ok("application/octet-stream".to_owned())
+}
+
+fn parse_avro_tags(bytes: &[u8], expected_count: usize) -> Result<Vec<ItemTag<'_>>> {
+    let mut cursor = 0;
+    let mut tags = Vec::with_capacity(expected_count);
+    loop {
+        let block_count = read_avro_long(bytes, &mut cursor)?;
+        if block_count == 0 {
+            break;
+        }
+        let count = block_count
+            .checked_abs()
+            .context("Avro tag block count overflow")?;
+        let count = usize::try_from(count).context("Avro tag block count is too large")?;
+        ensure!(
+            tags.len().saturating_add(count) <= expected_count,
+            "Avro tag count exceeds declared count"
+        );
+        let block_end = if block_count < 0 {
+            let block_size = read_avro_long(bytes, &mut cursor)?;
+            ensure!(block_size >= 0, "Avro tag block size is negative");
+            let block_size =
+                usize::try_from(block_size).context("Avro tag block size is too large")?;
+            Some(
+                cursor
+                    .checked_add(block_size)
+                    .context("Avro tag block size overflow")?,
+            )
+        } else {
+            None
+        };
+
+        for _ in 0..count {
+            let name_len = read_avro_length(bytes, &mut cursor, "Avro tag name")?;
+            let name = take(bytes, &mut cursor, name_len, "Avro tag name")?;
+            let value_len = read_avro_length(bytes, &mut cursor, "Avro tag value")?;
+            let value = take(bytes, &mut cursor, value_len, "Avro tag value")?;
+            tags.push(ItemTag { name, value });
+        }
+        if let Some(block_end) = block_end {
+            ensure!(cursor == block_end, "Avro tag block size mismatch");
+        }
+    }
+    ensure!(
+        cursor == bytes.len(),
+        "Avro tag bytes contain trailing data"
+    );
+    ensure!(
+        tags.len() == expected_count,
+        "Avro tag count does not match declared count"
+    );
+    Ok(tags)
+}
+
+fn read_avro_length(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<usize> {
+    let length = read_avro_long(bytes, cursor)?;
+    ensure!(length >= 0, "{label} length is negative");
+    usize::try_from(length).with_context(|| format!("{label} length is too large"))
+}
+
+fn read_avro_long(bytes: &[u8], cursor: &mut usize) -> Result<i64> {
+    let mut encoded = 0u64;
+    for index in 0..10 {
+        let byte = take(bytes, cursor, 1, "Avro long")?[0];
+        if index == 9 {
+            ensure!(byte <= 1, "Avro long overflows i64");
+        }
+        encoded |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok(((encoded >> 1) as i64) ^ -((encoded & 1) as i64));
+        }
+    }
+    bail!("Avro long is malformed")
+}
+
+fn read_optional_32<'a>(bytes: &'a [u8], cursor: &mut usize, label: &str) -> Result<&'a [u8]> {
+    match take(bytes, cursor, 1, label)?[0] {
+        0 => Ok(&[]),
+        1 => take(bytes, cursor, 32, label),
+        _ => bail!("{label} flag is invalid"),
+    }
+}
+
+fn read_le_u16(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<u16> {
+    Ok(u16::from_le_bytes(
+        take(bytes, cursor, 2, label)?.try_into().unwrap(),
+    ))
+}
+
+fn read_le_u64(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        take(bytes, cursor, 8, label)?.try_into().unwrap(),
+    ))
+}
+
+fn read_u256_usize(bytes: &[u8], label: &str) -> Result<usize> {
+    ensure!(bytes.len() == 32, "{label} has the wrong width");
+    ensure!(
+        bytes[8..].iter().all(|byte| *byte == 0),
+        "{label} exceeds u64"
+    );
+    usize::try_from(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+        .with_context(|| format!("{label} exceeds usize"))
+}
+
+fn take<'a>(bytes: &'a [u8], cursor: &mut usize, length: usize, label: &str) -> Result<&'a [u8]> {
+    let end = cursor
+        .checked_add(length)
+        .with_context(|| format!("{label} offset overflow"))?;
+    let value = bytes
+        .get(*cursor..end)
+        .with_context(|| format!("{label} is truncated"))?;
+    *cursor = end;
+    Ok(value)
+}
+
+fn verify_rsa_pss(owner: &[u8], signature: &[u8], payload: &[u8], label: &str) -> Result<()> {
+    let signature_digest = Sha256::digest(payload);
+    let key = RsaPublicKey::new(BigUint::from_bytes_be(owner), BigUint::from(65_537u32))
+        .with_context(|| format!("invalid RSA {label} owner"))?;
+    let encoded_len = (key.n().bits().saturating_sub(1) as usize).div_ceil(8);
+    let max_salt = encoded_len.saturating_sub(32 + 2);
+    let valid = [0, 32, max_salt].into_iter().any(|salt_len| {
+        key.verify(
+            Pss::new_with_salt::<Sha256>(salt_len),
+            &signature_digest,
+            signature,
+        )
+        .is_ok()
+    });
+    ensure!(valid, "{label} signature verification failed");
+    Ok(())
 }
 
 struct TxPath {
@@ -1782,6 +2153,57 @@ mod tests {
 
         block.txs[0] = absent_id;
         assert!(verify_block_header(&block, &entry, block.height, &transaction_id).is_err());
+    }
+
+    #[test]
+    fn verifies_ans104_item_and_rejects_mutations() {
+        const ID: &str = "3F_yldqW_zt6Ci_47w-7O76lPpegpu1rs7H2iyultVY";
+        let item = include_bytes!("../tests/fixtures/lolcchekc-item.bin");
+        let expected_id = decode_fixed::<32>(ID, "data item ID").unwrap();
+        let verified = verify_data_item(item, &expected_id).unwrap();
+        assert_eq!(verified.data.len(), 2_982);
+        assert_eq!(
+            hex(&sha256(&[verified.data])),
+            "4d02c735657b171d1a3d3bc9ddd7ee396cdf5232e11d6adb06826637c3b9070c"
+        );
+        assert_eq!(verified.content_type, "text/html; charset=utf-8");
+
+        let mut bundle = Vec::with_capacity(32 + BUNDLE_ENTRY_SIZE + item.len());
+        bundle.extend_from_slice(&1u64.to_le_bytes());
+        bundle.extend_from_slice(&[0; 24]);
+        bundle.extend_from_slice(&(item.len() as u64).to_le_bytes());
+        bundle.extend_from_slice(&[0; 24]);
+        bundle.extend_from_slice(&expected_id);
+        bundle.extend_from_slice(item);
+        assert_eq!(verify_bundle_item(&bundle, ID).unwrap().data, verified.data);
+
+        let mut wrong_id = bundle.clone();
+        wrong_id[64] ^= 1;
+        assert!(verify_bundle_item(&wrong_id, ID).is_err());
+
+        let mut wrong_size = bundle.clone();
+        wrong_size[32] ^= 1;
+        assert!(verify_bundle_item(&wrong_size, ID).is_err());
+
+        let mut truncated = bundle;
+        truncated.pop();
+        assert!(verify_bundle_item(&truncated, ID).is_err());
+
+        let mut wrong_signature = item.to_vec();
+        wrong_signature[2] ^= 1;
+        let wrong_signature_id = sha256(&[&wrong_signature[2..2 + DATA_ITEM_SIGNATURE_SIZE]]);
+        assert!(verify_data_item(&wrong_signature, &wrong_signature_id).is_err());
+
+        let mut wrong_owner = item.to_vec();
+        wrong_owner[2 + DATA_ITEM_SIGNATURE_SIZE] ^= 1;
+        assert!(verify_data_item(&wrong_owner, &expected_id).is_err());
+
+        let mut wrong_payload = item.to_vec();
+        let payload_start = item.len() - verified.data.len();
+        wrong_payload[payload_start] ^= 1;
+        assert!(verify_data_item(&wrong_payload, &expected_id).is_err());
+
+        assert!(verify_data_item(&item[..DATA_ITEM_SIGNATURE_SIZE], &expected_id).is_err());
     }
 
     #[test]
