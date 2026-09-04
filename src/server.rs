@@ -845,7 +845,7 @@ fn verified_response(
         .header("x-ar-io-stable", "true")
         .header("x-ar-io-verified", "true")
         .header("x-ar-io-trusted", "true")
-        .header("x-cache", "MISS")
+        .header("x-cache", if verified.cache_hit { "HIT" } else { "MISS" })
         .header("x-ar-io-hops", "1")
         .header("access-control-allow-origin", "*")
         .header("access-control-expose-headers", "*");
@@ -911,7 +911,7 @@ fn verified_response(
     match range {
         Some((start, end)) => {
             let content_length = end - start + 1;
-            let bytes = Bytes::from(verified.bytes);
+            let bytes = Bytes::from_owner(verified.bytes);
             builder
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header("content-type", verified.content_type.as_str())
@@ -927,7 +927,7 @@ fn verified_response(
             .status(StatusCode::OK)
             .header("content-type", verified.content_type.as_str())
             .header("content-length", verified.content_length.to_string())
-            .body(Body::from(verified.bytes))
+            .body(Body::from(Bytes::from_owner(verified.bytes)))
             .context("failed to construct HTTP response"),
     }
 }
@@ -1328,7 +1328,8 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         let digest_url = URL_SAFE_NO_PAD.encode(digest);
         let verified = VerifiedData {
-            bytes,
+            bytes: bytes.into(),
+            cache_hit: false,
             id: "3F_yldqW_zt6Ci_47w-7O76lPpegpu1rs7H2iyultVY".to_owned(),
             block_height: 1_118_819,
             content_type: "text/html; charset=utf-8".to_owned(),
@@ -1457,7 +1458,8 @@ mod tests {
             let digest: [u8; 32] = Sha256::digest(&bytes).into();
             VerifiedData {
                 content_length: bytes.len(),
-                bytes,
+                bytes: bytes.into(),
+                cache_hit: false,
                 id: "fqheRv90pWZYwxcsNyVafsoT9tOipnSa_8tVMMX9b3s".to_owned(),
                 block_height: 1_993_814,
                 content_type: "text/plain; charset=utf-8".to_owned(),

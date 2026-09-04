@@ -38,14 +38,23 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| (64 * 1024 * 1024).to_string())
         .parse()
         .context("invalid ARWEAVE_MAX_DATA_SIZE_BYTES")?;
-    let gateway = Gateway::new(Config::new(
+    let mut config = Config::new(
         trusted_node,
         archive,
         sources,
         Duration::from_secs(timeout),
         max_attempts,
         max_data_size,
-    )?)?;
+    )?;
+    config.cache_max_entries = env::var("AR_IO_CACHE_MAX_ENTRIES")
+        .unwrap_or_else(|_| config.cache_max_entries.to_string())
+        .parse()
+        .context("invalid AR_IO_CACHE_MAX_ENTRIES")?;
+    config.cache_max_bytes = env::var("AR_IO_CACHE_MAX_BYTES")
+        .unwrap_or_else(|_| config.cache_max_bytes.to_string())
+        .parse()
+        .context("invalid AR_IO_CACHE_MAX_BYTES")?;
+    let gateway = Gateway::new(config)?;
 
     if command == "serve" {
         if args.next().is_some() {
@@ -83,7 +92,7 @@ async fn main() -> Result<()> {
         "fetch-bundled" => gateway.retrieve_bundled(&id).await?,
         _ => unreachable!(),
     };
-    fs::write(&output, &verified.bytes)
+    fs::write(&output, verified.bytes.as_ref())
         .with_context(|| format!("failed to write verified data to {output}"))?;
     println!("{}", serde_json::to_string(&verified)?);
     Ok(())

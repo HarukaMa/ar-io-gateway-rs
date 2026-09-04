@@ -1,6 +1,11 @@
 pub mod server;
 
-use std::{collections::HashSet, fmt::Write as _, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -43,6 +48,8 @@ pub struct Config {
     pub request_timeout: Duration,
     pub max_peer_attempts: usize,
     pub max_data_size: usize,
+    pub cache_max_entries: usize,
+    pub cache_max_bytes: usize,
 }
 
 impl Config {
@@ -79,14 +86,18 @@ impl Config {
             request_timeout,
             max_peer_attempts,
             max_data_size,
+            cache_max_entries: 1024,
+            cache_max_bytes: 512 * 1024 * 1024,
         })
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct VerifiedData {
     #[serde(skip_serializing)]
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
+    #[serde(skip_serializing)]
+    pub cache_hit: bool,
     pub id: String,
     pub block_height: u64,
     pub content_type: String,
@@ -110,9 +121,71 @@ pub struct VerifiedChunk {
     pub source_host: String,
 }
 
+type RetrievalResult = Option<std::result::Result<VerifiedData, String>>;
+
+#[derive(Default)]
+struct ContentCache {
+    entries: HashMap<String, (VerifiedData, u128)>,
+    inflight: HashMap<String, tokio::sync::watch::Sender<RetrievalResult>>,
+    bytes: usize,
+    clock: u128,
+}
+
+impl ContentCache {
+    fn get(&mut self, id: &str) -> Option<VerifiedData> {
+        let (data, accessed) = self.entries.get_mut(id)?;
+        self.clock += 1;
+        *accessed = self.clock;
+        let mut data = data.clone();
+        data.cache_hit = true;
+        Some(data)
+    }
+
+    fn insert(&mut self, data: VerifiedData, max_entries: usize, max_bytes: usize) {
+        let size = data.bytes.len();
+        if max_entries == 0 || size > max_bytes || max_bytes == 0 {
+            return;
+        }
+        if let Some((old, _)) = self.entries.remove(&data.id) {
+            self.bytes -= old.bytes.len();
+        }
+        // ponytail: bounded O(n) eviction, use an ordered LRU if insertion throughput demands it.
+        while self.entries.len() >= max_entries || self.bytes > max_bytes - size {
+            let victim = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, accessed))| *accessed)
+                .map(|(id, _)| id.clone())
+                .unwrap();
+            self.bytes -= self.entries.remove(&victim).unwrap().0.bytes.len();
+        }
+        self.clock += 1;
+        self.bytes += size;
+        self.entries.insert(data.id.clone(), (data, self.clock));
+    }
+}
+
+struct RetrievalLeader<'a> {
+    cache: &'a Mutex<ContentCache>,
+    id: &'a str,
+    completed: bool,
+}
+
+impl Drop for RetrievalLeader<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Some(sender) = self.cache.lock().unwrap().inflight.remove(self.id) {
+            sender.send_replace(Some(Err("verified retrieval canceled".to_owned())));
+        }
+    }
+}
+
 pub struct Gateway {
     config: Config,
     client: Client,
+    cache: Mutex<ContentCache>,
 }
 
 impl Gateway {
@@ -121,14 +194,85 @@ impl Gateway {
             .timeout(config.request_timeout)
             .build()
             .context("failed to build HTTP client")?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            cache: Mutex::new(ContentCache::default()),
+        })
     }
 
     pub async fn retrieve(&self, id: &str) -> Result<VerifiedData> {
         decode_fixed::<32>(id, "data ID")?;
-        match self.discover(id).await? {
-            Some(hint) => self.retrieve_bundled_with_hint(id, hint).await,
-            None => self.retrieve_direct(id).await,
+        self.retrieve_cached(id, async {
+            match self.discover(id).await? {
+                Some(hint) => self.retrieve_bundled_with_hint(id, hint).await,
+                None => self.retrieve_direct(id).await,
+            }
+        })
+        .await
+    }
+
+    async fn retrieve_cached(
+        &self,
+        id: &str,
+        retrieve: impl Future<Output = Result<VerifiedData>>,
+    ) -> Result<VerifiedData> {
+        let (mut receiver, leader) = {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(data) = cache.get(id) {
+                return Ok(data);
+            }
+            match cache.inflight.get(id) {
+                Some(sender) => (sender.subscribe(), None),
+                None => {
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    cache.inflight.insert(id.to_owned(), sender);
+                    (
+                        receiver,
+                        Some(RetrievalLeader {
+                            cache: &self.cache,
+                            id,
+                            completed: false,
+                        }),
+                    )
+                }
+            }
+        };
+        if let Some(mut leader) = leader {
+            let result = tokio::time::timeout(self.config.request_timeout, retrieve)
+                .await
+                .context("verified retrieval timed out")
+                .and_then(|result| result);
+            {
+                let mut cache = self.cache.lock().unwrap();
+                if let Ok(data) = &result {
+                    cache.insert(
+                        data.clone(),
+                        self.config.cache_max_entries,
+                        self.config.cache_max_bytes,
+                    );
+                }
+                if let Some(sender) = cache.inflight.remove(id) {
+                    sender.send_replace(Some(match &result {
+                        Ok(data) => Ok(data.clone()),
+                        Err(error) => Err(format!("{error:#}")),
+                    }));
+                }
+                leader.completed = true;
+            }
+            drop(leader);
+            result
+        } else {
+            tokio::time::timeout(self.config.request_timeout, receiver.changed())
+                .await
+                .context("coalesced retrieval timed out")?
+                .context("coalesced retrieval canceled")?;
+            receiver
+                .borrow_and_update()
+                .as_ref()
+                .context("coalesced retrieval returned no result")?
+                .clone()
+                .map_err(anyhow::Error::msg)
         }
     }
 
@@ -358,7 +502,8 @@ impl Gateway {
         let body_hash = sha256(&[&bytes]);
         Ok(VerifiedData {
             content_length: bytes.len(),
-            bytes,
+            bytes: bytes.into(),
+            cache_hit: false,
             id: id.to_owned(),
             block_height: parent.block_height,
             content_type: item.content_type,
@@ -536,7 +681,8 @@ impl Gateway {
 
         Ok((
             VerifiedData {
-                bytes,
+                bytes: bytes.into(),
+                cache_hit: false,
                 id: id.to_owned(),
                 block_height: status.block_height,
                 content_type,
@@ -2875,5 +3021,142 @@ mod tests {
         assert_eq!(transaction.size, 145);
 
         assert!(validate_tx_path(&[0; 32], 1_001, 1_145, 1_000, &path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    fn data(id: &str) -> VerifiedData {
+        VerifiedData {
+            bytes: Arc::from(&b"hello"[..]),
+            cache_hit: false,
+            id: id.to_owned(),
+            block_height: 1,
+            content_type: "text/plain".to_owned(),
+            content_length: 5,
+            etag: String::new(),
+            sha256: String::new(),
+        }
+    }
+
+    fn gateway() -> Gateway {
+        Gateway::new(
+            Config::new(
+                "http://127.0.0.1:1",
+                "http://127.0.0.1:1",
+                vec!["http://127.0.0.1:1".to_owned()],
+                Duration::from_millis(50),
+                1,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bounds_cache_and_retains_recently_used_content() {
+        for (entries, bytes) in [(2, 100), (100, 10)] {
+            let mut cache = ContentCache::default();
+            cache.insert(data("a"), entries, bytes);
+            cache.insert(data("b"), entries, bytes);
+            assert!(cache.get("a").unwrap().cache_hit);
+            cache.insert(data("c"), entries, bytes);
+            assert!(cache.get("b").is_none());
+            assert!(cache.get("a").is_some());
+            assert!(cache.get("c").is_some());
+            cache.insert(data("oversized"), entries, 4);
+            assert!(cache.get("oversized").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn shares_cold_results_and_only_caches_success() {
+        let mut gateway = gateway();
+        for limit in [1024, 4] {
+            gateway.config.cache_max_bytes = limit;
+            let id = limit.to_string();
+            let (leader, follower) = tokio::join!(
+                gateway.retrieve_cached(&id, async {
+                    tokio::task::yield_now().await;
+                    Ok(data(&id))
+                }),
+                gateway.retrieve_cached(&id, async { panic!("duplicate retrieval") })
+            );
+            let leader = leader.unwrap();
+            let follower = follower.unwrap();
+            assert!(!leader.cache_hit && !follower.cache_hit);
+            assert!(Arc::ptr_eq(&leader.bytes, &follower.bytes));
+            let next = gateway
+                .retrieve_cached(&id, async { Ok(data(&id)) })
+                .await
+                .unwrap();
+            assert_eq!(next.cache_hit, limit >= 5);
+        }
+        let (leader, follower) = tokio::join!(
+            gateway.retrieve_cached("failure", async {
+                tokio::task::yield_now().await;
+                bail!("bad proof")
+            }),
+            gateway.retrieve_cached("failure", async { panic!("duplicate retrieval") })
+        );
+        assert!(leader.is_err() && follower.is_err());
+        assert!(
+            !gateway
+                .retrieve_cached("failure", async { Ok(data("failure")) })
+                .await
+                .unwrap()
+                .cache_hit
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_deadlines_release_followers() {
+        let gateway = gateway();
+        let mut leader = Box::pin(gateway.retrieve_cached("cancel", std::future::pending()));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(leader.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        let mut follower =
+            Box::pin(gateway.retrieve_cached("cancel", async { panic!("duplicate") }));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(follower.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        drop(leader);
+        assert!(follower.await.unwrap_err().to_string().contains("canceled"));
+        assert!(
+            !gateway
+                .retrieve_cached("cancel", async { Ok(data("cancel")) })
+                .await
+                .unwrap()
+                .cache_hit
+        );
+
+        let mut leader = Box::pin(gateway.retrieve_cached("timeout", std::future::pending()));
+        std::future::poll_fn(|cx| {
+            assert!(leader.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let follower = gateway
+            .retrieve_cached("timeout", async { panic!("duplicate") })
+            .await;
+        assert!(follower.unwrap_err().to_string().contains("timed out"));
+        assert!(leader.await.unwrap_err().to_string().contains("timed out"));
+        assert!(
+            !gateway
+                .retrieve_cached("timeout", async { Ok(data("timeout")) })
+                .await
+                .unwrap()
+                .cache_hit
+        );
     }
 }
