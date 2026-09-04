@@ -37,6 +37,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "3".to_owned())
         .parse()
         .context("invalid ARWEAVE_MAX_PEER_ATTEMPTS")?;
+    let max_data_size = env::var("ARWEAVE_MAX_DATA_SIZE_BYTES")
+        .unwrap_or_else(|_| (64 * 1024 * 1024).to_string())
+        .parse()
+        .context("invalid ARWEAVE_MAX_DATA_SIZE_BYTES")?;
 
     let gateway = Gateway::new(Config::new(
         trusted_node,
@@ -44,6 +48,7 @@ async fn main() -> Result<()> {
         sources,
         Duration::from_secs(timeout),
         max_attempts,
+        max_data_size,
     )?)?;
     let verified = gateway.retrieve_direct(&id).await?;
     fs::write(&output, &verified.bytes)

@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, time::Duration};
+use std::{collections::HashSet, fmt::Write as _, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256, Sha384};
 
 const CONSENSUS_DEPTH: u64 = 50;
+const FORK_2_5_HEIGHT: u64 = 812_970;
+const FORK_2_6_HEIGHT: u64 = 1_132_210;
+const FORK_2_7_HEIGHT: u64 = 1_275_480;
+const FORK_2_8_HEIGHT: u64 = 1_547_120;
+const FORK_2_9_HEIGHT: u64 = 1_602_350;
 const HASH_SIZE: usize = 32;
 const NOTE_SIZE: usize = 32;
 const BRANCH_SIZE: usize = HASH_SIZE * 2 + NOTE_SIZE;
@@ -25,6 +30,7 @@ pub struct Config {
     pub chunk_sources: Vec<String>,
     pub request_timeout: Duration,
     pub max_peer_attempts: usize,
+    pub max_data_size: usize,
 }
 
 impl Config {
@@ -34,6 +40,7 @@ impl Config {
         chunk_sources: Vec<String>,
         request_timeout: Duration,
         max_peer_attempts: usize,
+        max_data_size: usize,
     ) -> Result<Self> {
         let trusted_node_url = normalize_base_url(&trusted_node_url.into())?;
         let archive_url = normalize_base_url(&archive_url.into())?;
@@ -47,6 +54,7 @@ impl Config {
             "at least one chunk source is required"
         );
         ensure!(max_peer_attempts > 0, "max peer attempts must be positive");
+        ensure!(max_data_size > 0, "maximum data size must be positive");
         ensure!(
             !request_timeout.is_zero(),
             "request timeout must be positive"
@@ -58,6 +66,7 @@ impl Config {
             chunk_sources,
             request_timeout,
             max_peer_attempts,
+            max_data_size,
         })
     }
 }
@@ -133,6 +142,8 @@ impl Gateway {
             block.hash == status.block_indep_hash,
             "archival status does not match the trusted block index"
         );
+        self.authenticate_block(block, status.block_height, id)
+            .await?;
 
         let transaction: Transaction = self
             .get_json(&self.config.archive_url, &format!("tx/{id}"))
@@ -185,7 +196,7 @@ impl Gateway {
             data_size,
         };
 
-        let expected_len = usize::try_from(data_size).context("transaction is too large")?;
+        let expected_len = checked_data_size(data_size, self.config.max_data_size)?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(expected_len)
@@ -230,6 +241,68 @@ impl Gateway {
             etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
             sha256: hex(&body_hash),
         })
+    }
+
+    async fn authenticate_block(
+        &self,
+        entry: &BlockIndexEntry,
+        height: u64,
+        transaction_id: &str,
+    ) -> Result<()> {
+        let path = format!("block/hash/{}", entry.hash);
+        let mut failures = Vec::new();
+
+        match self
+            .fetch_and_authenticate_block(
+                &self.config.trusted_node_url,
+                &path,
+                entry,
+                height,
+                transaction_id,
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => failures.push(format!("{}: {error:#}", self.config.trusted_node_url)),
+        }
+
+        let mut attempted = HashSet::new();
+        for source in
+            std::iter::once(&self.config.archive_url).chain(self.config.chunk_sources.iter())
+        {
+            if source == &self.config.trusted_node_url || attempted.contains(source.as_str()) {
+                continue;
+            }
+            if attempted.len() >= self.config.max_peer_attempts {
+                break;
+            }
+            attempted.insert(source.as_str());
+
+            match self
+                .fetch_and_authenticate_block(source, &path, entry, height, transaction_id)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => failures.push(format!("{source}: {error:#}")),
+            }
+        }
+
+        bail!(
+            "all bounded block header attempts failed: {}",
+            failures.join("; ")
+        )
+    }
+
+    async fn fetch_and_authenticate_block(
+        &self,
+        source: &str,
+        path: &str,
+        entry: &BlockIndexEntry,
+        height: u64,
+        transaction_id: &str,
+    ) -> Result<()> {
+        let block: BlockHeader = self.get_json(source, path).await?;
+        verify_block_header(&block, entry, height, transaction_id)
     }
 
     async fn fetch_verified_chunk(
@@ -312,6 +385,593 @@ struct BlockIndexEntry {
     tx_root: String,
     weave_size: String,
     hash: String,
+}
+#[derive(Deserialize, Default)]
+struct BlockHeader {
+    indep_hash: String,
+    height: u64,
+    previous_block: String,
+    timestamp: u64,
+    nonce: String,
+    last_retarget: u64,
+    diff: String,
+    cumulative_diff: String,
+    reward_pool: String,
+    wallet_list: String,
+    hash_list_merkle: String,
+    hash: String,
+    block_size: String,
+    weave_size: String,
+    tx_root: String,
+    reward_addr: String,
+    tags: Vec<String>,
+    txs: Vec<String>,
+    packing_2_5_threshold: String,
+    strict_data_split_threshold: String,
+    usd_to_ar_rate: [String; 2],
+    scheduled_usd_to_ar_rate: [String; 2],
+    poa: BlockPoa,
+    #[serde(default)]
+    signature: String,
+    #[serde(default)]
+    reward: String,
+    #[serde(default)]
+    recall_byte: String,
+    #[serde(default)]
+    recall_byte2: String,
+    #[serde(default)]
+    hash_preimage: String,
+    #[serde(default)]
+    reward_key: String,
+    #[serde(default)]
+    partition_number: u64,
+    #[serde(default)]
+    nonce_limiter_info: NonceLimiterInfo,
+    #[serde(default)]
+    previous_solution_hash: String,
+    #[serde(default)]
+    price_per_gib_minute: String,
+    #[serde(default)]
+    scheduled_price_per_gib_minute: String,
+    #[serde(default)]
+    reward_history_hash: String,
+    #[serde(default)]
+    block_time_history_hash: String,
+    #[serde(default)]
+    debt_supply: String,
+    #[serde(default)]
+    kryder_plus_rate_multiplier: String,
+    #[serde(default)]
+    kryder_plus_rate_multiplier_latch: String,
+    #[serde(default)]
+    denomination: String,
+    #[serde(default)]
+    redenomination_height: u64,
+    #[serde(default)]
+    double_signing_proof: serde_json::Value,
+    #[serde(default)]
+    previous_cumulative_diff: String,
+    #[serde(default)]
+    merkle_rebase_support_threshold: String,
+    #[serde(default)]
+    poa2: BlockPoa,
+    #[serde(default)]
+    chunk_hash: String,
+    #[serde(default)]
+    chunk2_hash: String,
+    #[serde(default)]
+    packing_difficulty: u8,
+    #[serde(default)]
+    unpacked_chunk_hash: String,
+    #[serde(default)]
+    unpacked_chunk2_hash: String,
+    #[serde(default)]
+    replica_format: u8,
+}
+
+#[derive(Deserialize, Default)]
+struct BlockPoa {
+    #[serde(default)]
+    option: String,
+    #[serde(default)]
+    tx_path: String,
+    #[serde(default)]
+    data_path: String,
+    #[serde(default)]
+    chunk: String,
+}
+
+#[derive(Deserialize, Default)]
+struct NonceLimiterInfo {
+    #[serde(default)]
+    output: String,
+    #[serde(default)]
+    global_step_number: u64,
+    #[serde(default)]
+    seed: String,
+    #[serde(default)]
+    next_seed: String,
+    #[serde(default)]
+    zone_upper_bound: u64,
+    #[serde(default)]
+    next_zone_upper_bound: u64,
+    #[serde(default)]
+    prev_output: String,
+    #[serde(default)]
+    checkpoints: Vec<String>,
+    #[serde(default)]
+    last_step_checkpoints: Vec<String>,
+    #[serde(default)]
+    vdf_difficulty: String,
+    #[serde(default)]
+    next_vdf_difficulty: String,
+}
+
+fn verify_block_header(
+    block: &BlockHeader,
+    entry: &BlockIndexEntry,
+    height: u64,
+    transaction_id: &str,
+) -> Result<()> {
+    ensure!(block.height == height, "block header height mismatch");
+    let expected_hash = decode_fixed::<48>(&entry.hash, "trusted block hash")?;
+    ensure!(
+        decode_fixed::<48>(&block.indep_hash, "block indep_hash")? == expected_hash,
+        "block header identifier mismatch"
+    );
+    ensure!(
+        block_indep_hash(block)? == expected_hash,
+        "block indep_hash verification failed"
+    );
+    ensure!(
+        decode_fixed::<32>(&block.tx_root, "block tx_root")?
+            == decode_fixed::<32>(&entry.tx_root, "trusted block tx_root")?,
+        "block tx_root does not match trusted index"
+    );
+    ensure!(
+        parse_u128(&block.weave_size, "block weave size")?
+            == parse_u128(&entry.weave_size, "trusted block weave size")?,
+        "block weave size does not match trusted index"
+    );
+    ensure!(
+        block.txs.iter().any(|id| id == transaction_id),
+        "transaction ID is absent from authenticated block"
+    );
+    Ok(())
+}
+
+fn block_indep_hash(block: &BlockHeader) -> Result<[u8; 48]> {
+    if block.height >= FORK_2_6_HEIGHT {
+        let signed_hash = post_2_6_signed_hash(block)?;
+        let signature = decode_b64(&block.signature, "block signature")?;
+        Ok(sha384(&[&signed_hash, &signature]))
+    } else {
+        pre_2_6_indep_hash(block)
+    }
+}
+
+fn pre_2_6_indep_hash(block: &BlockHeader) -> Result<[u8; 48]> {
+    ensure!(
+        block.height >= FORK_2_5_HEIGHT,
+        "block versions before fork 2.5 are unsupported"
+    );
+
+    let core = [
+        deep_hash_decimal(&block.height.to_string(), "block height")?,
+        deep_hash_blob(&decode_b64(&block.previous_block, "previous block")?),
+        deep_hash_blob(&decode_b64(&block.tx_root, "block tx_root")?),
+        deep_hash_b64_list(&block.txs, "block transaction ID")?,
+        deep_hash_decimal(&block.block_size, "block size")?,
+        deep_hash_decimal(&block.weave_size, "block weave size")?,
+        deep_hash_blob(&reward_address(&block.reward_addr, false)?),
+        deep_hash_b64_list(&block.tags, "block tag")?,
+    ];
+    let mut base = Vec::with_capacity(14);
+    for (value, label) in [
+        (&block.usd_to_ar_rate[0], "USD rate dividend"),
+        (&block.usd_to_ar_rate[1], "USD rate divisor"),
+        (
+            &block.scheduled_usd_to_ar_rate[0],
+            "scheduled USD rate dividend",
+        ),
+        (
+            &block.scheduled_usd_to_ar_rate[1],
+            "scheduled USD rate divisor",
+        ),
+        (&block.packing_2_5_threshold, "packing threshold"),
+        (
+            &block.strict_data_split_threshold,
+            "strict data split threshold",
+        ),
+    ] {
+        base.push(deep_hash_decimal(value, label)?);
+    }
+    base.extend_from_slice(&core);
+    let base_hash = deep_hash_list(&base);
+    let data_segment = deep_hash_list(&[
+        deep_hash_blob(&base_hash),
+        deep_hash_decimal(&block.timestamp.to_string(), "block timestamp")?,
+        deep_hash_decimal(&block.last_retarget.to_string(), "last retarget")?,
+        deep_hash_decimal(&block.diff, "block difficulty")?,
+        deep_hash_decimal(&block.cumulative_diff, "cumulative difficulty")?,
+        deep_hash_decimal(&block.reward_pool, "reward pool")?,
+        deep_hash_blob(&decode_b64(&block.wallet_list, "wallet list")?),
+        deep_hash_blob(&decode_b64(&block.hash_list_merkle, "hash_list_merkle")?),
+    ]);
+    let poa = deep_hash_list(&[
+        deep_hash_decimal(&block.poa.option, "proof option")?,
+        deep_hash_blob(&decode_b64(&block.poa.tx_path, "block tx_path")?),
+        deep_hash_blob(&decode_b64(&block.poa.data_path, "block data_path")?),
+        deep_hash_blob(&decode_b64(&block.poa.chunk, "block chunk")?),
+    ]);
+
+    Ok(deep_hash_list(&[
+        deep_hash_blob(&data_segment),
+        deep_hash_blob(&decode_b64(&block.hash, "block hash")?),
+        deep_hash_blob(&decode_b64(&block.nonce, "block nonce")?),
+        poa,
+    ]))
+}
+
+fn post_2_6_signed_hash(block: &BlockHeader) -> Result<[u8; 32]> {
+    let nonce = decode_b64(&block.nonce, "block nonce")?;
+    ensure!(!nonce.is_empty(), "block nonce is empty");
+    let nonce_start = nonce
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(nonce.len() - 1);
+    let nonce = &nonce[nonce_start..];
+    let nonce_info = &block.nonce_limiter_info;
+    let mut segment = Vec::new();
+
+    append_b64(&mut segment, &block.previous_block, 1, "previous block")?;
+    append_u64(&mut segment, block.timestamp, 1)?;
+    append_bytes(&mut segment, nonce, 2)?;
+    append_u64(&mut segment, block.height, 1)?;
+    append_decimal(&mut segment, &block.diff, 2, "block difficulty")?;
+    append_decimal(
+        &mut segment,
+        &block.cumulative_diff,
+        2,
+        "cumulative difficulty",
+    )?;
+    append_u64(&mut segment, block.last_retarget, 1)?;
+    append_b64(&mut segment, &block.hash, 1, "block hash")?;
+    append_decimal(&mut segment, &block.block_size, 2, "block size")?;
+    append_decimal(&mut segment, &block.weave_size, 2, "block weave size")?;
+    append_bytes(&mut segment, &reward_address(&block.reward_addr, true)?, 1)?;
+    append_b64(&mut segment, &block.tx_root, 1, "block tx_root")?;
+    append_b64(&mut segment, &block.wallet_list, 1, "wallet list")?;
+    append_b64(&mut segment, &block.hash_list_merkle, 1, "hash_list_merkle")?;
+    append_decimal(&mut segment, &block.reward_pool, 1, "reward pool")?;
+    append_decimal(
+        &mut segment,
+        &block.packing_2_5_threshold,
+        1,
+        "packing threshold",
+    )?;
+    append_decimal(
+        &mut segment,
+        &block.strict_data_split_threshold,
+        1,
+        "strict data split threshold",
+    )?;
+    append_decimal(
+        &mut segment,
+        &block.usd_to_ar_rate[0],
+        1,
+        "USD rate dividend",
+    )?;
+    append_decimal(
+        &mut segment,
+        &block.usd_to_ar_rate[1],
+        1,
+        "USD rate divisor",
+    )?;
+    append_decimal(
+        &mut segment,
+        &block.scheduled_usd_to_ar_rate[0],
+        1,
+        "scheduled USD rate dividend",
+    )?;
+    append_decimal(
+        &mut segment,
+        &block.scheduled_usd_to_ar_rate[1],
+        1,
+        "scheduled USD rate divisor",
+    )?;
+    append_b64_list(&mut segment, &block.tags, 2, 2, "block tag")?;
+    append_b64_list(&mut segment, &block.txs, 2, 1, "block transaction ID")?;
+    append_decimal(&mut segment, &block.reward, 1, "block reward")?;
+    append_decimal(&mut segment, &block.recall_byte, 2, "recall byte")?;
+    append_b64(&mut segment, &block.hash_preimage, 1, "hash preimage")?;
+    append_optional_decimal(&mut segment, &block.recall_byte2, 2, "second recall byte")?;
+    append_b64(&mut segment, &block.reward_key, 2, "reward key")?;
+    append_u64(&mut segment, block.partition_number, 1)?;
+    append_fixed_b64(&mut segment, &nonce_info.output, 32, "VDF output")?;
+    append_fixed_u64(&mut segment, nonce_info.global_step_number, 8)?;
+    append_fixed_b64(&mut segment, &nonce_info.seed, 48, "VDF seed")?;
+    append_fixed_b64(&mut segment, &nonce_info.next_seed, 48, "next VDF seed")?;
+    append_fixed_u64(&mut segment, nonce_info.zone_upper_bound, 32)?;
+    append_fixed_u64(&mut segment, nonce_info.next_zone_upper_bound, 32)?;
+    append_b64(
+        &mut segment,
+        &nonce_info.prev_output,
+        1,
+        "previous VDF output",
+    )?;
+    append_hashes(&mut segment, &nonce_info.checkpoints, "VDF checkpoint")?;
+    append_hashes(
+        &mut segment,
+        &nonce_info.last_step_checkpoints,
+        "last VDF checkpoint",
+    )?;
+    append_b64(
+        &mut segment,
+        &block.previous_solution_hash,
+        1,
+        "previous solution hash",
+    )?;
+    append_decimal(
+        &mut segment,
+        &block.price_per_gib_minute,
+        1,
+        "price per GiB minute",
+    )?;
+    append_decimal(
+        &mut segment,
+        &block.scheduled_price_per_gib_minute,
+        1,
+        "scheduled price per GiB minute",
+    )?;
+    append_fixed_b64(
+        &mut segment,
+        &block.reward_history_hash,
+        32,
+        "reward history hash",
+    )?;
+    append_decimal(&mut segment, &block.debt_supply, 1, "debt supply")?;
+    append_fixed_decimal(
+        &mut segment,
+        &block.kryder_plus_rate_multiplier,
+        3,
+        "Kryder+ rate multiplier",
+    )?;
+    append_fixed_decimal(
+        &mut segment,
+        &block.kryder_plus_rate_multiplier_latch,
+        1,
+        "Kryder+ rate multiplier latch",
+    )?;
+    append_fixed_decimal(&mut segment, &block.denomination, 3, "denomination")?;
+    append_u64(&mut segment, block.redenomination_height, 1)?;
+    append_double_signing_proof(&mut segment, &block.double_signing_proof)?;
+    append_decimal(
+        &mut segment,
+        &block.previous_cumulative_diff,
+        2,
+        "previous cumulative difficulty",
+    )?;
+
+    if block.height >= FORK_2_7_HEIGHT {
+        append_decimal(
+            &mut segment,
+            &block.merkle_rebase_support_threshold,
+            2,
+            "Merkle rebase threshold",
+        )?;
+        append_b64(&mut segment, &block.poa.data_path, 3, "block data_path")?;
+        append_b64(&mut segment, &block.poa.tx_path, 3, "block tx_path")?;
+        append_b64(
+            &mut segment,
+            &block.poa2.data_path,
+            3,
+            "second block data_path",
+        )?;
+        append_b64(&mut segment, &block.poa2.tx_path, 3, "second block tx_path")?;
+        append_fixed_b64(&mut segment, &block.chunk_hash, 32, "chunk hash")?;
+        append_optional_b64(&mut segment, &block.chunk2_hash, 1, "second chunk hash")?;
+        append_fixed_b64(
+            &mut segment,
+            &block.block_time_history_hash,
+            32,
+            "block time history hash",
+        )?;
+        append_decimal(
+            &mut segment,
+            &nonce_info.vdf_difficulty,
+            1,
+            "VDF difficulty",
+        )?;
+        append_decimal(
+            &mut segment,
+            &nonce_info.next_vdf_difficulty,
+            1,
+            "next VDF difficulty",
+        )?;
+    }
+    if block.height >= FORK_2_8_HEIGHT {
+        segment.push(block.packing_difficulty);
+        append_optional_b64(
+            &mut segment,
+            &block.unpacked_chunk_hash,
+            1,
+            "unpacked chunk hash",
+        )?;
+        append_optional_b64(
+            &mut segment,
+            &block.unpacked_chunk2_hash,
+            1,
+            "second unpacked chunk hash",
+        )?;
+    }
+    if block.height >= FORK_2_9_HEIGHT {
+        segment.push(block.replica_format);
+    }
+
+    Ok(sha256(&[&segment]))
+}
+
+fn append_size(output: &mut Vec<u8>, value: usize, bytes: usize) -> Result<()> {
+    ensure!(
+        bytes > 0 && bytes <= size_of::<u128>(),
+        "invalid size prefix width"
+    );
+    let max = 1u128.checked_shl((bytes * 8) as u32).unwrap_or(u128::MAX);
+    ensure!((value as u128) < max, "encoded size exceeds prefix width");
+    let encoded = (value as u128).to_be_bytes();
+    let prefix = &encoded[size_of::<u128>() - bytes..];
+    output.extend_from_slice(prefix);
+    Ok(())
+}
+
+fn append_bytes(output: &mut Vec<u8>, value: &[u8], size_bytes: usize) -> Result<()> {
+    let max = 1u128
+        .checked_shl((size_bytes * 8) as u32)
+        .unwrap_or(u128::MAX);
+    ensure!((value.len() as u128) < max, "value exceeds size prefix");
+    append_size(output, value.len(), size_bytes)?;
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn append_b64(output: &mut Vec<u8>, value: &str, size_bytes: usize, label: &str) -> Result<()> {
+    append_bytes(output, &decode_b64(value, label)?, size_bytes)
+}
+
+fn append_optional_b64(
+    output: &mut Vec<u8>,
+    value: &str,
+    size_bytes: usize,
+    label: &str,
+) -> Result<()> {
+    if value.is_empty() {
+        append_bytes(output, &[], size_bytes)
+    } else {
+        append_b64(output, value, size_bytes, label)
+    }
+}
+
+fn append_decimal(output: &mut Vec<u8>, value: &str, size_bytes: usize, label: &str) -> Result<()> {
+    let mut encoded = parse_biguint(value, label)?.to_bytes_be();
+    if encoded.is_empty() {
+        encoded.push(0);
+    }
+    append_bytes(output, &encoded, size_bytes)
+}
+
+fn append_optional_decimal(
+    output: &mut Vec<u8>,
+    value: &str,
+    size_bytes: usize,
+    label: &str,
+) -> Result<()> {
+    if value.is_empty() {
+        append_bytes(output, &[], size_bytes)
+    } else {
+        append_decimal(output, value, size_bytes, label)
+    }
+}
+
+fn append_u64(output: &mut Vec<u8>, value: u64, size_bytes: usize) -> Result<()> {
+    append_decimal(output, &value.to_string(), size_bytes, "integer")
+}
+
+fn append_fixed_decimal(
+    output: &mut Vec<u8>,
+    value: &str,
+    bytes: usize,
+    label: &str,
+) -> Result<()> {
+    let encoded = parse_biguint(value, label)?.to_bytes_be();
+    ensure!(encoded.len() <= bytes, "{label} exceeds fixed width");
+    output.resize(output.len() + bytes - encoded.len(), 0);
+    output.extend_from_slice(&encoded);
+    Ok(())
+}
+
+fn append_fixed_u64(output: &mut Vec<u8>, value: u64, bytes: usize) -> Result<()> {
+    append_fixed_decimal(output, &value.to_string(), bytes, "integer")
+}
+
+fn append_fixed_b64(output: &mut Vec<u8>, value: &str, bytes: usize, label: &str) -> Result<()> {
+    let decoded = decode_b64(value, label)?;
+    ensure!(decoded.len() == bytes, "invalid {label} length");
+    output.extend_from_slice(&decoded);
+    Ok(())
+}
+
+fn append_b64_list(
+    output: &mut Vec<u8>,
+    values: &[String],
+    list_size_bytes: usize,
+    element_size_bytes: usize,
+    label: &str,
+) -> Result<()> {
+    append_size(output, values.len(), list_size_bytes)?;
+    for value in values.iter().rev() {
+        append_b64(output, value, element_size_bytes, label)?;
+    }
+    Ok(())
+}
+
+fn append_hashes(output: &mut Vec<u8>, values: &[String], label: &str) -> Result<()> {
+    append_size(output, values.len(), 2)?;
+    for value in values {
+        append_fixed_b64(output, value, 32, label)?;
+    }
+    Ok(())
+}
+
+fn append_double_signing_proof(output: &mut Vec<u8>, proof: &serde_json::Value) -> Result<()> {
+    match proof {
+        serde_json::Value::Null => output.push(0),
+        serde_json::Value::Object(fields) if fields.is_empty() => output.push(0),
+        _ => bail!("non-empty double-signing proofs are unsupported"),
+    }
+    Ok(())
+}
+
+fn reward_address(value: &str, post_2_6: bool) -> Result<Vec<u8>> {
+    if value == "unclaimed" {
+        Ok(if post_2_6 {
+            Vec::new()
+        } else {
+            b"unclaimed".to_vec()
+        })
+    } else {
+        decode_b64(value, "reward address")
+    }
+}
+
+fn parse_biguint(value: &str, label: &str) -> Result<BigUint> {
+    ensure!(
+        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+        "invalid {label}: {value}"
+    );
+    BigUint::parse_bytes(value.as_bytes(), 10).with_context(|| format!("invalid {label}: {value}"))
+}
+
+fn deep_hash_decimal(value: &str, label: &str) -> Result<[u8; 48]> {
+    Ok(deep_hash_blob(
+        parse_biguint(value, label)?.to_str_radix(10).as_bytes(),
+    ))
+}
+
+fn deep_hash_b64_list(values: &[String], label: &str) -> Result<[u8; 48]> {
+    let hashes = values
+        .iter()
+        .map(|value| Ok(deep_hash_blob(&decode_b64(value, label)?)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(deep_hash_list(&hashes))
+}
+
+fn checked_data_size(data_size: u128, maximum: usize) -> Result<usize> {
+    ensure!(
+        data_size <= maximum as u128,
+        "transaction exceeds configured data size limit"
+    );
+    usize::try_from(data_size).context("transaction is too large")
 }
 
 #[derive(Deserialize)]
@@ -514,20 +1174,30 @@ fn content_type(tags: &[Tag]) -> Result<String> {
                 .to_str()
                 .context("non-ASCII Content-Type tag")?
                 .to_owned();
-            let media_type = value.split(';').next().unwrap_or_default().trim();
-            return Ok(if value.contains("charset=") {
-                value
-            } else if media_type.starts_with("text/")
-                || media_type == "application/json"
-                || media_type.ends_with("+json")
-            {
-                format!("{value}; charset=utf-8")
-            } else {
-                value
-            });
+            return Ok(response_content_type(value));
         }
     }
     Ok("application/octet-stream".to_owned())
+}
+
+fn response_content_type(value: String) -> String {
+    let mut parts = value.split(';');
+    let media_type = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    let has_charset = parts.any(|parameter| {
+        parameter
+            .split_once('=')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("charset"))
+    });
+
+    if !has_charset
+        && (media_type.starts_with("text/")
+            || media_type == "application/json"
+            || media_type.ends_with("+json"))
+    {
+        format!("{value}; charset=utf-8")
+    } else {
+        value
+    }
 }
 
 struct TxPath {
@@ -1038,11 +1708,11 @@ mod tests {
         assert!(verify_chunk(corrupt_bytes, 1_001, 0, &geometry).is_err());
 
         let mut incomplete_data_path = chunk();
-        incomplete_data_path.data_path.pop();
+        incomplete_data_path.data_path = URL_SAFE_NO_PAD.encode(&data_path[..data_path.len() - 1]);
         assert!(verify_chunk(incomplete_data_path, 1_001, 0, &geometry).is_err());
 
         let mut incomplete_tx_path = chunk();
-        incomplete_tx_path.tx_path.pop();
+        incomplete_tx_path.tx_path = URL_SAFE_NO_PAD.encode(&tx_path[..tx_path.len() - 1]);
         assert!(verify_chunk(incomplete_tx_path, 1_001, 0, &geometry).is_err());
 
         geometry.data_root[0] ^= 1;
@@ -1051,6 +1721,67 @@ mod tests {
 
         geometry.end_offset += 1;
         assert!(verify_chunk(chunk(), 1_001, 0, &geometry).is_err());
+    }
+
+    #[test]
+    fn normalizes_content_type_and_bounds_data_size() {
+        assert_eq!(
+            response_content_type("Application/JSON".to_owned()),
+            "Application/JSON; charset=utf-8"
+        );
+        assert_eq!(
+            response_content_type("Text/Plain; Charset=ISO-8859-1".to_owned()),
+            "Text/Plain; Charset=ISO-8859-1"
+        );
+        assert_eq!(response_content_type("image/png".to_owned()), "image/png");
+        assert_eq!(checked_data_size(145, 1024).unwrap(), 145);
+        assert!(checked_data_size(1025, 1024).is_err());
+    }
+
+    #[test]
+    fn authenticates_block_metadata_and_transaction_ids() {
+        let transaction_id = URL_SAFE_NO_PAD.encode([3u8; 32]);
+        let tx_root = URL_SAFE_NO_PAD.encode([2u8; 32]);
+        let mut block = BlockHeader {
+            height: 1_000_000,
+            previous_block: String::new(),
+            timestamp: 1,
+            nonce: URL_SAFE_NO_PAD.encode([1u8]),
+            last_retarget: 1,
+            diff: "1".to_owned(),
+            cumulative_diff: "1".to_owned(),
+            reward_pool: "0".to_owned(),
+            wallet_list: String::new(),
+            hash_list_merkle: String::new(),
+            hash: String::new(),
+            block_size: "1".to_owned(),
+            weave_size: "1".to_owned(),
+            tx_root: tx_root.clone(),
+            reward_addr: "unclaimed".to_owned(),
+            txs: vec![transaction_id.clone()],
+            packing_2_5_threshold: "0".to_owned(),
+            strict_data_split_threshold: "0".to_owned(),
+            usd_to_ar_rate: ["1".to_owned(), "1".to_owned()],
+            scheduled_usd_to_ar_rate: ["1".to_owned(), "1".to_owned()],
+            poa: BlockPoa {
+                option: "1".to_owned(),
+                ..BlockPoa::default()
+            },
+            ..BlockHeader::default()
+        };
+        block.indep_hash = URL_SAFE_NO_PAD.encode(block_indep_hash(&block).unwrap());
+        let entry = BlockIndexEntry {
+            tx_root,
+            weave_size: "1".to_owned(),
+            hash: block.indep_hash.clone(),
+        };
+
+        verify_block_header(&block, &entry, block.height, &transaction_id).unwrap();
+        let absent_id = URL_SAFE_NO_PAD.encode([4u8; 32]);
+        assert!(verify_block_header(&block, &entry, block.height, &absent_id).is_err());
+
+        block.txs[0] = absent_id;
+        assert!(verify_block_header(&block, &entry, block.height, &transaction_id).is_err());
     }
 
     #[test]
