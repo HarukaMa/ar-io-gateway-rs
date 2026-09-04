@@ -9,7 +9,11 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header::HOST, uri::Authority},
+    http::{
+        HeaderMap, HeaderValue, StatusCode, Uri,
+        header::{CACHE_CONTROL, HOST},
+        uri::Authority,
+    },
     response::Response,
     routing::get,
 };
@@ -32,6 +36,9 @@ const ARNS_CONFIG_SEED: &[u8] = b"arns_config";
 const ARNS_RECORD_SEED: &[u8] = b"arns_record";
 const ANT_RECORD_SEED: &[u8] = b"ant_record";
 const MAX_SOLANA_ACCOUNT_BYTES: usize = 4096;
+const MANIFEST_CONTENT_TYPE: &str = "application/x.arweave-manifest+json";
+const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
+const MAX_MANIFEST_PATH_BYTES: usize = 4096;
 
 pub struct ServerConfig {
     listen_addr: SocketAddr,
@@ -95,6 +102,23 @@ struct Resolution {
     resolved_at: u128,
 }
 
+#[derive(Deserialize)]
+struct Manifest {
+    manifest: String,
+    version: String,
+    #[serde(default)]
+    index: serde_json::Value,
+    #[serde(default)]
+    fallback: serde_json::Value,
+    #[serde(default)]
+    paths: serde_json::Map<String, serde_json::Value>,
+}
+
+struct ManifestResolution {
+    id: String,
+    fallback: bool,
+}
+
 struct ArnsRecord {
     ant: [u8; 32],
     undername_limit: u16,
@@ -122,8 +146,9 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     });
     let app = Router::new()
         .route("/", get(serve_arns))
-        .route("/raw/{id}", get(serve_id))
-        .route("/{id}", get(serve_id))
+        .route("/raw/{id}", get(serve_raw))
+        .route("/raw/{id}/", get(serve_raw))
+        .route("/{*path}", get(serve_path))
         .with_state(state);
     axum::serve(listener, app)
         .await
@@ -140,34 +165,10 @@ async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         Ok(permit) => permit,
         Err(response) => return response,
     };
-    let Some(name) = arns_name(&headers, &state.config.arns_root_host) else {
-        return error_response(StatusCode::NOT_FOUND, "Not Found");
-    };
-    let resolution = match resolve_arns(&state, name).await {
-        Ok(Some(resolution)) => resolution,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not Found"),
-        Err(error) => {
-            eprintln!("ArNS resolution failed: {error:#}");
-            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
-        }
-    };
-    if resolution.index > usize::from(resolution.limit) {
-        return error_response(StatusCode::PAYMENT_REQUIRED, "Payment Required");
-    }
-    match state.gateway.retrieve(&resolution.resolved_id).await {
-        Ok(verified) => verified_response(verified, Some(&resolution), &state.config, &headers)
-            .unwrap_or_else(|error| {
-                eprintln!("response construction failed: {error:#}");
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-            }),
-        Err(error) => {
-            eprintln!("verified retrieval failed: {error:#}");
-            error_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
-        }
-    }
+    serve_arns_path(&state, &headers, "").await
 }
 
-async fn serve_id(
+async fn serve_raw(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -191,6 +192,251 @@ async fn serve_id(
             error_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
         }
     }
+}
+
+async fn serve_path(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let _permit = match request_permit(&state.request_permits) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let (id, manifest_path) = path.split_once('/').unwrap_or((&path, ""));
+    if let Ok(decoded_id) = decode_fixed::<32>(id, "data ID") {
+        let sandbox = sandbox_name(&decoded_id);
+        let sandbox_host = format!("{sandbox}.{}", state.config.arns_root_host);
+        if request_host(&headers).as_deref() != Some(sandbox_host.as_str()) {
+            let location = format!(
+                "https://{sandbox_host}{}?{}",
+                uri.path(),
+                uri.query().unwrap_or("")
+            );
+            return redirect_response(StatusCode::FOUND, location);
+        }
+        return retrieve_response(
+            &state,
+            id,
+            manifest_path,
+            manifest_path.is_empty() && !uri.path().ends_with('/'),
+            uri.query(),
+            None,
+            &headers,
+        )
+        .await;
+    }
+    serve_arns_path(&state, &headers, &path).await
+}
+
+async fn serve_arns_path(state: &AppState, headers: &HeaderMap, path: &str) -> Response {
+    let Some(name) = arns_name(headers, &state.config.arns_root_host) else {
+        return error_response(StatusCode::NOT_FOUND, "Not Found");
+    };
+    let resolution = match resolve_arns(state, name).await {
+        Ok(Some(resolution)) => resolution,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not Found"),
+        Err(error) => {
+            eprintln!("ArNS resolution failed: {error:#}");
+            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
+        }
+    };
+    if resolution.index > usize::from(resolution.limit) {
+        return error_response(StatusCode::PAYMENT_REQUIRED, "Payment Required");
+    }
+    retrieve_response(
+        state,
+        &resolution.resolved_id,
+        path,
+        false,
+        None,
+        Some(&resolution),
+        headers,
+    )
+    .await
+}
+
+async fn retrieve_response(
+    state: &AppState,
+    id: &str,
+    manifest_path: &str,
+    add_trailing_slash: bool,
+    query: Option<&str>,
+    resolution: Option<&Resolution>,
+    headers: &HeaderMap,
+) -> Response {
+    let verified = match state.gateway.retrieve(id).await {
+        Ok(verified) => verified,
+        Err(error) => {
+            eprintln!("verified retrieval failed: {error:#}");
+            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
+        }
+    };
+    if !is_manifest_content_type(&verified.content_type) {
+        return verified_response(verified, resolution, &state.config, headers).unwrap_or_else(
+            |error| {
+                eprintln!("response construction failed: {error:#}");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            },
+        );
+    }
+
+    let target = match resolve_manifest(&verified.bytes, manifest_path) {
+        Ok(Some(target)) => target,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not Found"),
+        Err(error) => {
+            eprintln!("manifest resolution failed: {error:#}");
+            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
+        }
+    };
+    if add_trailing_slash {
+        let mut location = format!("/{}/", verified.id);
+        if let Some(query) = query {
+            location.push('?');
+            location.push_str(query);
+        }
+        return redirect_response(StatusCode::MOVED_PERMANENTLY, location);
+    }
+
+    let fallback = target.fallback;
+    let verified_target = match state.gateway.retrieve(&target.id).await {
+        Ok(verified) => verified,
+        Err(error) => {
+            eprintln!("verified manifest target retrieval failed: {error:#}");
+            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
+        }
+    };
+    let mut response = verified_response(verified_target, resolution, &state.config, headers)
+        .unwrap_or_else(|error| {
+            eprintln!("response construction failed: {error:#}");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+        });
+    if fallback {
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=60, must-revalidate"),
+        );
+    }
+    response
+}
+
+fn is_manifest_content_type(value: &str) -> bool {
+    value.split(';').next().is_some_and(|media_type| {
+        media_type
+            .trim()
+            .eq_ignore_ascii_case(MANIFEST_CONTENT_TYPE)
+    })
+}
+
+fn resolve_manifest(bytes: &[u8], path: &str) -> Result<Option<ManifestResolution>> {
+    ensure!(
+        bytes.len() <= MAX_MANIFEST_BYTES,
+        "manifest exceeds size limit"
+    );
+    ensure!(
+        path.len() <= MAX_MANIFEST_PATH_BYTES,
+        "manifest path exceeds size limit"
+    );
+    let manifest: Manifest = serde_json::from_slice(bytes).context("invalid manifest JSON")?;
+    ensure!(
+        manifest.manifest == "arweave/paths",
+        "invalid manifest type"
+    );
+    ensure!(
+        matches!(manifest.version.as_str(), "0.1.0" | "0.2.0"),
+        "unsupported manifest version"
+    );
+
+    let path = path.trim_end_matches('/');
+    let mut resolved = None;
+    if path.is_empty() {
+        if manifest.version == "0.2.0"
+            && let Some(id) = manifest_field(&manifest.index, "id", "manifest index ID")?
+        {
+            resolved = Some((id, false));
+        }
+        if resolved.is_none()
+            && let Some(index_path) =
+                manifest_field(&manifest.index, "path", "manifest index path")?
+            && let Some(target) = manifest.paths.get(index_path)
+        {
+            resolved = Some((
+                required_manifest_id(target, "manifest index target")?,
+                false,
+            ));
+        }
+    } else if let Some((_, target)) = manifest
+        .paths
+        .iter()
+        .find(|(manifest_path, _)| manifest_path.trim_end_matches('/') == path)
+    {
+        resolved = Some((required_manifest_id(target, "manifest path target")?, false));
+    }
+
+    if resolved.is_none() && manifest.version == "0.2.0" && !manifest.fallback.is_null() {
+        resolved = Some((
+            required_manifest_id(&manifest.fallback, "manifest fallback")?,
+            true,
+        ));
+    }
+    let Some((id, fallback)) = resolved else {
+        return Ok(None);
+    };
+    decode_fixed::<32>(id, "manifest target ID")?;
+    Ok(Some(ManifestResolution {
+        id: id.to_owned(),
+        fallback,
+    }))
+}
+
+fn manifest_field<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+    label: &str,
+) -> Result<Option<&'a str>> {
+    value
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .with_context(|| format!("{label} must be a string"))
+        })
+        .transpose()
+}
+
+fn required_manifest_id<'a>(value: &'a serde_json::Value, label: &str) -> Result<&'a str> {
+    manifest_field(value, "id", label)?.with_context(|| format!("{label} is missing an ID"))
+}
+
+fn sandbox_name(id: &[u8; 32]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut encoded = String::with_capacity(52);
+    let mut buffer = 0_u16;
+    let mut bits = 0_u8;
+    for byte in id {
+        buffer = (buffer << 8) | u16::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            encoded.push(ALPHABET[usize::from((buffer >> bits) & 31)] as char);
+        }
+        buffer &= (1 << bits) - 1;
+    }
+    if bits > 0 {
+        encoded.push(ALPHABET[usize::from((buffer << (5 - bits)) & 31)] as char);
+    }
+    encoded
+}
+
+fn redirect_response(status: StatusCode, location: String) -> Response {
+    Response::builder()
+        .status(status)
+        .header("location", location)
+        .header("access-control-allow-origin", "*")
+        .header("access-control-expose-headers", "*")
+        .body(Body::empty())
+        .unwrap()
 }
 
 async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolution>> {
@@ -642,14 +888,18 @@ fn error_response(status: StatusCode, message: &'static str) -> Response {
         .unwrap()
 }
 
-fn arns_name(headers: &HeaderMap, root_host: &str) -> Option<String> {
+fn request_host(headers: &HeaderMap) -> Option<String> {
     let authority = headers
         .get(HOST)?
         .to_str()
         .ok()?
         .parse::<Authority>()
         .ok()?;
-    let host = authority.host().trim_end_matches('.').to_ascii_lowercase();
+    Some(authority.host().trim_end_matches('.').to_ascii_lowercase())
+}
+
+fn arns_name(headers: &HeaderMap, root_host: &str) -> Option<String> {
+    let host = request_host(headers)?;
     let name = host.strip_suffix(&format!(".{root_host}"))?;
     split_arns_name(name).ok()?;
     Some(name.to_owned())
@@ -973,6 +1223,76 @@ mod tests {
         let mut host_headers = HeaderMap::new();
         host_headers.insert(HOST, "lolcchekc.ar.mrx.im:3000".parse().unwrap());
         assert_eq!(arns_name(&host_headers, "ar.mrx.im").unwrap(), "lolcchekc");
+    }
+
+    #[test]
+    fn resolves_manifests_and_encodes_sandbox_hosts() {
+        const INDEX_ID: &str = "cG7Hdi_iTQPoEYgQJFqJ8NMpN4KoZ-vH_j7pG4iP7NI";
+        const PATH_ID: &str = "fZ4d7bkCAUiXSfo3zFsPiQvpLVKVtXUKB6kiLNt2XVQ";
+        const FALLBACK_ID: &str = "0543SMRGYuGKTaqLzmpOyK4AxAB96Fra2guHzYxjRGo";
+        assert!(is_manifest_content_type(
+            "application/x.arweave-manifest+json; charset=utf-8"
+        ));
+        let v1 = format!(
+            r#"{{"manifest":"arweave/paths","version":"0.1.0","index":{{"path":"index.html"}},"paths":{{"index.html":{{"id":"{INDEX_ID}"}},"css/style.css":{{"id":"{PATH_ID}"}}}}}}"#
+        );
+        assert_eq!(
+            resolve_manifest(v1.as_bytes(), "").unwrap().unwrap().id,
+            INDEX_ID
+        );
+        assert_eq!(
+            resolve_manifest(v1.as_bytes(), "css/style.css/")
+                .unwrap()
+                .unwrap()
+                .id,
+            PATH_ID
+        );
+        assert!(
+            resolve_manifest(v1.as_bytes(), "missing")
+                .unwrap()
+                .is_none()
+        );
+
+        let v2 = format!(
+            r#"{{"manifest":"arweave/paths","version":"0.2.0","index":{{"id":"{INDEX_ID}"}},"fallback":{{"id":"{FALLBACK_ID}"}},"paths":{{}}}}"#
+        );
+        assert_eq!(
+            resolve_manifest(v2.as_bytes(), "").unwrap().unwrap().id,
+            INDEX_ID
+        );
+        let fallback = resolve_manifest(v2.as_bytes(), "missing").unwrap().unwrap();
+        assert_eq!(fallback.id, FALLBACK_ID);
+        assert!(fallback.fallback);
+
+        let missing_index = format!(
+            r#"{{"manifest":"arweave/paths","version":"0.1.0","index":"0","paths":{{"0":{{"id":"{PATH_ID}"}}}}}}"#
+        );
+        assert!(
+            resolve_manifest(missing_index.as_bytes(), "")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            resolve_manifest(missing_index.as_bytes(), "0")
+                .unwrap()
+                .unwrap()
+                .id,
+            PATH_ID
+        );
+        assert!(
+            resolve_manifest(
+                br#"{"manifest":"arweave/paths","version":"0.2.0","index":{"id":"bad"},"paths":{}}"#,
+                ""
+            )
+            .is_err()
+        );
+
+        let id =
+            decode_fixed::<32>("TB2wJyKrPnkAW79DAwlJYwpgdHKpijEJWQfcwX715Co", "data ID").unwrap();
+        assert_eq!(
+            sandbox_name(&id),
+            "jqo3ajzcvm7hsac3x5bqgckjmmfga5dsvgfdcckza7omc7xv4qva"
+        );
     }
     #[tokio::test]
     async fn serves_single_ranges_and_etag_conditionals() {

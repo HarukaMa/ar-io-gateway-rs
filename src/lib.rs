@@ -4,10 +4,16 @@ use std::{collections::HashSet, fmt::Write as _, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
+use k256::ecdsa::{
+    RecoveryId, Signature as Secp256k1Signature, VerifyingKey as Secp256k1VerifyingKey,
+    signature::hazmat::PrehashVerifier,
+};
 use reqwest::{Client, RequestBuilder, Url, header::HeaderValue};
 use rsa::{BigUint, Pss, RsaPublicKey, traits::PublicKeyParts};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256, Sha384};
+use sha3::Keccak256;
 
 const CONSENSUS_DEPTH: u64 = 50;
 const FORK_2_5_HEIGHT: u64 = 812_970;
@@ -23,8 +29,6 @@ const MAX_CHUNK_SIZE: u128 = 256 * 1024;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
 const MAX_PROOF_BYTES: usize = 64 * 1024;
 const BUNDLE_ENTRY_SIZE: usize = 64;
-const DATA_ITEM_SIGNATURE_SIZE: usize = 512;
-const DATA_ITEM_OWNER_SIZE: usize = 512;
 const MAX_DATA_ITEM_TAGS: usize = 128;
 const MAX_DATA_ITEM_TAG_BYTES: usize = 4096;
 const STRICT_DATA_SPLIT_THRESHOLD: u128 = 30_607_159_107_830;
@@ -1386,20 +1390,45 @@ fn verify_bundle_item<'a>(bundle: &'a [u8], expected_id: &str) -> Result<Verifie
     verify_data_item(&bundle[start..end], &expected_id)
 }
 
+fn data_item_signature_sizes(signature_type: u16) -> Result<(usize, usize)> {
+    match signature_type {
+        1 => Ok((512, 512)),
+        2 => Ok((64, 32)),
+        3 => Ok((65, 65)),
+        4 | 5 => Ok((64, 32)),
+        6 => Ok((2_052, 1_025)),
+        7 => Ok((65, 42)),
+        _ => bail!("unsupported ANS-104 signature type {signature_type}"),
+    }
+}
+
+fn data_item_signature_payload(
+    signature_type: u16,
+    owner: &[u8],
+    target: &[u8],
+    anchor: &[u8],
+    raw_tags: &[u8],
+    data: &[u8],
+) -> [u8; 48] {
+    let signature_type = signature_type.to_string();
+    deep_hash_list(&[
+        deep_hash_blob(b"dataitem"),
+        deep_hash_blob(b"1"),
+        deep_hash_blob(signature_type.as_bytes()),
+        deep_hash_blob(owner),
+        deep_hash_blob(target),
+        deep_hash_blob(anchor),
+        deep_hash_blob(raw_tags),
+        deep_hash_blob(data),
+    ])
+}
+
 fn verify_data_item<'a>(item: &'a [u8], expected_id: &[u8; 32]) -> Result<VerifiedItem<'a>> {
     let mut cursor = 0;
     let signature_type = read_le_u16(item, &mut cursor, "data item signature type")?;
-    ensure!(
-        signature_type == 1,
-        "only ANS-104 RSA-PSS items are supported"
-    );
-    let signature = take(
-        item,
-        &mut cursor,
-        DATA_ITEM_SIGNATURE_SIZE,
-        "data item signature",
-    )?;
-    let owner = take(item, &mut cursor, DATA_ITEM_OWNER_SIZE, "data item owner")?;
+    let (signature_size, owner_size) = data_item_signature_sizes(signature_type)?;
+    let signature = take(item, &mut cursor, signature_size, "data item signature")?;
+    let owner = take(item, &mut cursor, owner_size, "data item owner")?;
     let target = read_optional_32(item, &mut cursor, "data item target")?;
     let anchor = read_optional_32(item, &mut cursor, "data item anchor")?;
     let tag_count = usize::try_from(read_le_u64(item, &mut cursor, "data item tag count")?)
@@ -1423,18 +1452,9 @@ fn verify_data_item<'a>(item: &'a [u8], expected_id: &[u8; 32]) -> Result<Verifi
         sha256(&[signature]) == *expected_id,
         "data item ID is not the signature hash"
     );
-    let fields = [
-        deep_hash_blob(b"dataitem"),
-        deep_hash_blob(b"1"),
-        deep_hash_blob(b"1"),
-        deep_hash_blob(owner),
-        deep_hash_blob(target),
-        deep_hash_blob(anchor),
-        deep_hash_blob(raw_tags),
-        deep_hash_blob(data),
-    ];
-    let signature_payload = deep_hash_list(&fields);
-    verify_rsa_pss(owner, signature, &signature_payload, "data item")?;
+    let payload =
+        data_item_signature_payload(signature_type, owner, target, anchor, raw_tags, data);
+    verify_data_item_signature(signature_type, owner, signature, &payload)?;
 
     Ok(VerifiedItem {
         data,
@@ -1568,6 +1588,160 @@ fn take<'a>(bytes: &'a [u8], cursor: &mut usize, length: usize, label: &str) -> 
         .with_context(|| format!("{label} is truncated"))?;
     *cursor = end;
     Ok(value)
+}
+
+fn verify_data_item_signature(
+    signature_type: u16,
+    owner: &[u8],
+    signature: &[u8],
+    payload: &[u8],
+) -> Result<()> {
+    match signature_type {
+        1 => verify_rsa_pss(owner, signature, payload, "data item"),
+        2 => verify_ed25519(owner, signature, payload),
+        3 => verify_ethereum(owner, signature, payload),
+        4 => verify_ed25519(owner, signature, hex(payload).as_bytes()),
+        5 => verify_ed25519(
+            owner,
+            signature,
+            format!("APTOS\nmessage: {}\nnonce: bundlr", hex(payload)).as_bytes(),
+        ),
+        6 => verify_aptos_multisignature(owner, signature, payload),
+        7 => verify_typed_ethereum(owner, signature, payload),
+        _ => bail!("unsupported ANS-104 signature type {signature_type}"),
+    }
+}
+
+fn verify_ed25519(owner: &[u8], signature: &[u8], message: &[u8]) -> Result<()> {
+    let owner: &[u8; 32] = owner
+        .try_into()
+        .context("invalid Ed25519 data item owner length")?;
+    let signature =
+        Ed25519Signature::try_from(signature).context("invalid Ed25519 signature length")?;
+    let key = Ed25519VerifyingKey::from_bytes(owner).context("invalid Ed25519 data item owner")?;
+    key.verify_strict(message, &signature)
+        .context("data item signature verification failed")
+}
+
+fn verify_ethereum(owner: &[u8], signature: &[u8], message: &[u8]) -> Result<()> {
+    ensure!(signature.len() == 65, "invalid Ethereum signature length");
+    let key = Secp256k1VerifyingKey::from_sec1_bytes(owner)
+        .context("invalid Ethereum data item owner")?;
+    let signature = Secp256k1Signature::try_from(&signature[..64])
+        .context("invalid Ethereum data item signature")?;
+    key.verify_prehash(&ethereum_message_hash(message), &signature)
+        .context("data item signature verification failed")
+}
+
+fn ethereum_message_hash(message: &[u8]) -> [u8; 32] {
+    let length = message.len().to_string();
+    keccak256(&[
+        b"\x19Ethereum Signed Message:\n",
+        length.as_bytes(),
+        message,
+    ])
+}
+
+fn verify_aptos_multisignature(owner: &[u8], signature: &[u8], message: &[u8]) -> Result<()> {
+    ensure!(owner.len() == 1_025, "invalid Aptos multisig owner length");
+    ensure!(
+        signature.len() == 2_052,
+        "invalid Aptos multisig signature length"
+    );
+    let threshold = usize::from(owner[1_024]);
+    ensure!(
+        (1..=32).contains(&threshold),
+        "invalid Aptos multisig threshold"
+    );
+    let bitmap = &signature[2_048..];
+    let signature_count = bitmap.iter().map(|byte| byte.count_ones()).sum::<u32>() as usize;
+    ensure!(
+        signature_count >= threshold,
+        "Aptos multisig threshold is not met"
+    );
+
+    for index in 0..32 {
+        if bitmap[index / 8] & (0x80 >> (index % 8)) != 0 {
+            verify_ed25519(
+                &owner[index * 32..(index + 1) * 32],
+                &signature[index * 64..(index + 1) * 64],
+                message,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_typed_ethereum(owner: &[u8], signature: &[u8], message: &[u8]) -> Result<()> {
+    ensure!(
+        signature.len() == 65,
+        "invalid typed Ethereum signature length"
+    );
+    let address = ethereum_address_from_owner(owner)?;
+    let recovery_id = match signature[64] {
+        value @ 0..=1 => value,
+        value @ 27..=28 => value - 27,
+        _ => bail!("invalid typed Ethereum recovery ID"),
+    };
+    let signature = Secp256k1Signature::try_from(&signature[..64])
+        .context("invalid typed Ethereum data item signature")?;
+    let key = Secp256k1VerifyingKey::recover_from_prehash(
+        &typed_ethereum_message_hash(message, &address),
+        &signature,
+        RecoveryId::try_from(recovery_id).context("invalid typed Ethereum recovery ID")?,
+    )
+    .context("typed Ethereum data item signature recovery failed")?;
+    let public_key = key.to_sec1_point(false);
+    let recovered = keccak256(&[&public_key.as_bytes()[1..]]);
+    ensure!(
+        recovered[12..] == address,
+        "data item signature verification failed"
+    );
+    Ok(())
+}
+
+fn typed_ethereum_message_hash(message: &[u8], address: &[u8; 20]) -> [u8; 32] {
+    let domain_type = keccak256(&[b"EIP712Domain(string name,string version)"]);
+    let domain_name = keccak256(&[b"Bundlr"]);
+    let domain_version = keccak256(&[b"1"]);
+    let domain = keccak256(&[&domain_type, &domain_name, &domain_version]);
+    let message_type = keccak256(&[b"Bundlr(bytes Transaction hash, address address)"]);
+    let transaction_hash = keccak256(&[message]);
+    let mut encoded_address = [0; 32];
+    encoded_address[12..].copy_from_slice(address);
+    let value = keccak256(&[&message_type, &transaction_hash, &encoded_address]);
+    keccak256(&[b"\x19\x01", &domain, &value])
+}
+
+fn ethereum_address_from_owner(owner: &[u8]) -> Result<[u8; 20]> {
+    ensure!(
+        owner.len() == 42 && owner[..2].eq_ignore_ascii_case(b"0x"),
+        "invalid typed Ethereum data item owner"
+    );
+    let mut address = [0; 20];
+    for (byte, encoded) in address.iter_mut().zip(owner[2..].chunks_exact(2)) {
+        *byte = decode_hex_nibble(encoded[0])
+            .and_then(|high| decode_hex_nibble(encoded[1]).map(|low| high << 4 | low))
+            .context("invalid typed Ethereum data item owner")?;
+    }
+    Ok(address)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn keccak256(parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Keccak256::default();
+    for part in parts {
+        sha3::Digest::update(&mut hasher, part);
+    }
+    sha3::Digest::finalize(hasher).into()
 }
 
 fn verify_rsa_pss(owner: &[u8], signature: &[u8], payload: &[u8], label: &str) -> Result<()> {
@@ -2033,11 +2207,64 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
+    use k256::ecdsa::SigningKey as Secp256k1SigningKey;
 
     fn note(value: u128) -> [u8; 32] {
         let mut note = [0; 32];
         note[16..].copy_from_slice(&value.to_be_bytes());
         note
+    }
+
+    fn encode_data_item(
+        signature_type: u16,
+        signature: &[u8],
+        owner: &[u8],
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut item = Vec::new();
+        item.extend_from_slice(&signature_type.to_le_bytes());
+        item.extend_from_slice(signature);
+        item.extend_from_slice(owner);
+        item.extend_from_slice(&[0, 0]);
+        item.extend_from_slice(&0u64.to_le_bytes());
+        item.extend_from_slice(&1u64.to_le_bytes());
+        item.push(0);
+        item.extend_from_slice(data);
+        item
+    }
+
+    fn check_data_item(
+        signature_type: u16,
+        owner: &[u8],
+        signature: &[u8],
+        data: &[u8],
+    ) -> Vec<u8> {
+        let item = encode_data_item(signature_type, signature, owner, data);
+        let expected_id = sha256(&[signature]);
+        assert_eq!(verify_data_item(&item, &expected_id).unwrap().data, data);
+
+        let (signature_size, _) = data_item_signature_sizes(signature_type).unwrap();
+        let mut wrong_signature = item.clone();
+        wrong_signature[2] ^= 1;
+        let wrong_id = sha256(&[&wrong_signature[2..2 + signature_size]]);
+        assert!(verify_data_item(&wrong_signature, &wrong_id).is_err());
+
+        let mut wrong_owner = item.clone();
+        wrong_owner[2 + signature_size] ^= 1;
+        assert!(verify_data_item(&wrong_owner, &expected_id).is_err());
+
+        let mut wrong_data = item.clone();
+        *wrong_data.last_mut().unwrap() ^= 1;
+        assert!(verify_data_item(&wrong_data, &expected_id).is_err());
+        item
+    }
+
+    fn recoverable_signature(key: &Secp256k1SigningKey, digest: &[u8; 32]) -> Vec<u8> {
+        let (signature, recovery_id) = key.sign_prehash_recoverable(digest);
+        let mut bytes = signature.to_bytes().to_vec();
+        bytes.push(recovery_id.to_byte() + 27);
+        bytes
     }
 
     #[test]
@@ -2173,6 +2400,66 @@ mod tests {
     }
 
     #[test]
+    fn verifies_all_supported_ans104_signature_types() {
+        const DATA: &[u8] = b"ANS-104 signature parity";
+        const RAW_TAGS: &[u8] = &[0];
+
+        let ed25519 = Ed25519SigningKey::from_bytes(&[2; 32]);
+        let ed25519_owner = ed25519.verifying_key().to_bytes();
+        let payload = data_item_signature_payload(2, &ed25519_owner, &[], &[], RAW_TAGS, DATA);
+        let signature = ed25519.sign(&payload).to_bytes();
+        check_data_item(2, &ed25519_owner, &signature, DATA);
+
+        let secp256k1 = Secp256k1SigningKey::from_slice(&[3; 32]).unwrap();
+        let ethereum_owner = secp256k1
+            .verifying_key()
+            .to_sec1_point(false)
+            .as_bytes()
+            .to_vec();
+        let payload = data_item_signature_payload(3, &ethereum_owner, &[], &[], RAW_TAGS, DATA);
+        let signature = recoverable_signature(&secp256k1, &ethereum_message_hash(&payload));
+        check_data_item(3, &ethereum_owner, &signature, DATA);
+
+        let payload = data_item_signature_payload(4, &ed25519_owner, &[], &[], RAW_TAGS, DATA);
+        let signature = ed25519.sign(hex(&payload).as_bytes()).to_bytes();
+        check_data_item(4, &ed25519_owner, &signature, DATA);
+
+        let payload = data_item_signature_payload(5, &ed25519_owner, &[], &[], RAW_TAGS, DATA);
+        let message = format!("APTOS\nmessage: {}\nnonce: bundlr", hex(&payload));
+        let signature = ed25519.sign(message.as_bytes()).to_bytes();
+        check_data_item(5, &ed25519_owner, &signature, DATA);
+
+        let second_ed25519 = Ed25519SigningKey::from_bytes(&[4; 32]);
+        let mut multisig_owner = vec![0; 1_025];
+        multisig_owner[..32].copy_from_slice(&ed25519_owner);
+        multisig_owner[32..64].copy_from_slice(&second_ed25519.verifying_key().to_bytes());
+        multisig_owner[1_024] = 2;
+        let payload = data_item_signature_payload(6, &multisig_owner, &[], &[], RAW_TAGS, DATA);
+        let mut multisignature = vec![0; 2_052];
+        multisignature[..64].copy_from_slice(&ed25519.sign(&payload).to_bytes());
+        multisignature[64..128].copy_from_slice(&second_ed25519.sign(&payload).to_bytes());
+        multisignature[2_048] = 0b1100_0000;
+        check_data_item(6, &multisig_owner, &multisignature, DATA);
+        multisignature[2_048] = 0b1000_0000;
+        let insufficient = encode_data_item(6, &multisignature, &multisig_owner, DATA);
+        assert!(
+            verify_data_item(&insufficient, &sha256(&[&multisignature])).is_err(),
+            "Aptos multisignature must meet its owner threshold"
+        );
+
+        let public_key = secp256k1.verifying_key().to_sec1_point(false);
+        let public_key_hash = keccak256(&[&public_key.as_bytes()[1..]]);
+        let address: [u8; 20] = public_key_hash[12..].try_into().unwrap();
+        let typed_owner = format!("0x{}", hex(&address)).into_bytes();
+        let payload = data_item_signature_payload(7, &typed_owner, &[], &[], RAW_TAGS, DATA);
+        let signature =
+            recoverable_signature(&secp256k1, &typed_ethereum_message_hash(&payload, &address));
+        check_data_item(7, &typed_owner, &signature, DATA);
+
+        assert!(data_item_signature_sizes(8).is_err());
+    }
+
+    #[test]
     fn verifies_ans104_item_and_rejects_mutations() {
         const ID: &str = "3F_yldqW_zt6Ci_47w-7O76lPpegpu1rs7H2iyultVY";
         let item = include_bytes!("../tests/fixtures/lolcchekc-item.bin");
@@ -2206,13 +2493,14 @@ mod tests {
         truncated.pop();
         assert!(verify_bundle_item(&truncated, ID).is_err());
 
+        let (signature_size, _) = data_item_signature_sizes(1).unwrap();
         let mut wrong_signature = item.to_vec();
         wrong_signature[2] ^= 1;
-        let wrong_signature_id = sha256(&[&wrong_signature[2..2 + DATA_ITEM_SIGNATURE_SIZE]]);
+        let wrong_signature_id = sha256(&[&wrong_signature[2..2 + signature_size]]);
         assert!(verify_data_item(&wrong_signature, &wrong_signature_id).is_err());
 
         let mut wrong_owner = item.to_vec();
-        wrong_owner[2 + DATA_ITEM_SIGNATURE_SIZE] ^= 1;
+        wrong_owner[2 + signature_size] ^= 1;
         assert!(verify_data_item(&wrong_owner, &expected_id).is_err());
 
         let mut wrong_payload = item.to_vec();
@@ -2220,7 +2508,7 @@ mod tests {
         wrong_payload[payload_start] ^= 1;
         assert!(verify_data_item(&wrong_payload, &expected_id).is_err());
 
-        assert!(verify_data_item(&item[..DATA_ITEM_SIGNATURE_SIZE], &expected_id).is_err());
+        assert!(verify_data_item(&item[..2 + signature_size], &expected_id).is_err());
     }
 
     #[test]
