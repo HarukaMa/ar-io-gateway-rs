@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| "8".to_owned())
             .parse()
             .context("invalid AR_IO_MAX_CONCURRENT_REQUESTS")?;
-        let config = ServerConfig::new(
+        let mut config = ServerConfig::new(
             &env::var("AR_IO_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_owned()),
             &env::var("ARNS_ROOT_HOST").unwrap_or_else(|_| "ar.mrx.im".to_owned()),
             &env::var("SOLANA_RPC_URL")
@@ -75,6 +75,54 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5".to_owned()),
             max_concurrent_requests,
         )?;
+        let wallet = env::var("AR_IO_WALLET")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let key_path = env::var("OBSERVER_KEYPAIR_PATH")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let private_key = env::var("OBSERVER_PRIVATE_KEY")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let signing_requested = wallet.is_some() || key_path.is_some() || private_key.is_some();
+        let enabled = env::var("HTTPSIG_ENABLED")
+            .unwrap_or_else(|_| signing_requested.to_string())
+            .parse::<bool>()
+            .context("invalid HTTPSIG_ENABLED")?;
+        if enabled {
+            let wallet = wallet.context("AR_IO_WALLET is required for signing")?;
+            let mut keypair = match (key_path, private_key) {
+                (Some(path), None) => {
+                    let mut raw = fs::read(path).context("cannot read OBSERVER_KEYPAIR_PATH")?;
+                    let result = serde_json::from_slice::<Vec<u8>>(&raw);
+                    raw.fill(0);
+                    let mut bytes = result
+                        .map_err(|_| anyhow::anyhow!("invalid OBSERVER_KEYPAIR_PATH keypair"))?;
+                    let keypair = <[u8; 64]>::try_from(bytes.as_slice());
+                    bytes.fill(0);
+                    keypair.context("OBSERVER_KEYPAIR_PATH must contain 64 bytes")?
+                }
+                (None, Some(encoded)) => {
+                    let mut bytes = [0_u8; 64];
+                    let result = bs58::decode(&encoded).onto(&mut bytes);
+                    let mut encoded = encoded.into_bytes();
+                    encoded.fill(0);
+                    if !matches!(result, Ok(64)) {
+                        bytes.fill(0);
+                        bail!("invalid OBSERVER_PRIVATE_KEY keypair");
+                    }
+                    bytes
+                }
+                _ => bail!("set exactly one of OBSERVER_KEYPAIR_PATH or OBSERVER_PRIVATE_KEY"),
+            };
+            let bind_request = env::var("HTTPSIG_BIND_REQUEST")
+                .unwrap_or_else(|_| "true".to_owned())
+                .parse::<bool>()
+                .context("invalid HTTPSIG_BIND_REQUEST")?;
+            let result = config.with_signing(&wallet, &keypair, bind_request);
+            keypair.fill(0);
+            config = result?;
+        }
         return server::serve(gateway, config).await;
     }
 

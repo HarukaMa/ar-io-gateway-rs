@@ -10,10 +10,11 @@ use axum::{
     body::{Body, Bytes},
     extract::{Path, State},
     http::{
-        HeaderMap, HeaderValue, StatusCode, Uri,
+        HeaderMap, HeaderValue, Method, Request, StatusCode, Uri,
         header::{CACHE_CONTROL, HOST},
         uri::Authority,
     },
+    middleware::{self, Next},
     response::Response,
     routing::get,
 };
@@ -21,6 +22,7 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+use ed25519_dalek::{Signer, SigningKey};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -47,6 +49,7 @@ pub struct ServerConfig {
     arns_program_id: String,
     ant_program_id: String,
     max_concurrent_requests: usize,
+    signer: Option<HttpSigner>,
 }
 
 impl ServerConfig {
@@ -80,7 +83,30 @@ impl ServerConfig {
             arns_program_id: arns_program_id.to_owned(),
             ant_program_id: ant_program_id.to_owned(),
             max_concurrent_requests,
+            signer: None,
         })
+    }
+
+    pub fn with_signing(
+        mut self,
+        wallet: &str,
+        keypair: &[u8; 64],
+        bind_request: bool,
+    ) -> Result<Self> {
+        let key = SigningKey::from_keypair_bytes(keypair).context("invalid signing keypair")?;
+        let address = bs58::encode(key.verifying_key().as_bytes()).into_string();
+        ensure!(address == wallet, "signing key does not match AR_IO_WALLET");
+        let key_id = format!(
+            "ed25519:{}",
+            URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes())
+        );
+        self.signer = Some(HttpSigner {
+            key,
+            address,
+            key_id,
+            bind_request,
+        });
+        Ok(self)
     }
 }
 
@@ -153,17 +179,159 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         config,
     });
     let app = Router::new()
+        .route("/ar-io/info", get(serve_info))
         .route("/", get(serve_arns))
         .route("/chunk/{offset}", get(serve_chunk))
         .route("/chunk/{offset}/data", get(serve_chunk_data))
         .route("/raw/{id}", get(serve_raw))
         .route("/raw/{id}/", get(serve_raw))
         .route("/{*path}", get(serve_path))
+        .layer(middleware::from_fn_with_state(state.clone(), sign_response))
         .with_state(state);
     axum::serve(listener, app)
         .await
         .context("HTTP server failed")
 }
+struct HttpSigner {
+    key: SigningKey,
+    address: String,
+    key_id: String,
+    bind_request: bool,
+}
+
+const SIGNATURE_TRIGGERS: &[&str] = &[
+    "x-ar-io-data-id",
+    "x-ar-io-verified",
+    "x-ar-io-stable",
+    "x-ar-io-trusted",
+    "x-ar-io-root-transaction-id",
+    "x-arweave-owner-address",
+    "x-arweave-tags-truncated",
+    "x-arns-name",
+    "x-arns-resolved-id",
+    "x-arns-ttl-seconds",
+    "x-arns-ant-program-id",
+    "x-arns-ant-id",
+    "x-arweave-chunk-data-root",
+    "x-arweave-chunk-tx-id",
+    "x-ar-io-chunk-source-type",
+];
+const SIGNATURE_EXTRA_HEADERS: &[&str] = &[
+    "content-type",
+    "content-digest",
+    "x-ar-io-root-data-item-offset",
+    "x-ar-io-root-data-offset",
+    "x-ar-io-root-item-offset",
+    "x-ar-io-root-item-size",
+    "x-ar-io-root-path",
+];
+
+impl HttpSigner {
+    fn sign(&self, response: &mut Response, method: &Method, path: &str) -> Result<()> {
+        response.headers_mut().remove("signature");
+        response.headers_mut().remove("signature-input");
+        if !SIGNATURE_TRIGGERS
+            .iter()
+            .any(|name| response.headers().contains_key(*name))
+        {
+            return Ok(());
+        }
+        let mut covered: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(|name| name.as_str())
+            .filter(|name| {
+                SIGNATURE_TRIGGERS.contains(name)
+                    || SIGNATURE_EXTRA_HEADERS.contains(name)
+                    || name.starts_with("x-arweave-tag-")
+            })
+            .collect();
+        covered.sort_unstable();
+        let mut components = vec!["\"@status\"".to_owned()];
+        let mut base = format!("\"@status\": {}", response.status().as_u16()).into_bytes();
+        for name in covered {
+            components.push(format!("\"{name}\""));
+            base.extend_from_slice(format!("\n\"{name}\": ").as_bytes());
+            for (index, value) in response.headers().get_all(name).iter().enumerate() {
+                if index != 0 {
+                    base.extend_from_slice(b", ");
+                }
+                base.extend_from_slice(value.as_bytes());
+            }
+        }
+        if self.bind_request {
+            components.extend(["\"@method\";req".to_owned(), "\"@path\";req".to_owned()]);
+            base.extend_from_slice(
+                format!("\n\"@method\";req: {method}\n\"@path\";req: {path}").as_bytes(),
+            );
+        }
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_secs();
+        let params = format!(
+            "({});created={created};keyid=\"{}\";alg=\"ed25519\"",
+            components.join(" "),
+            self.key_id
+        );
+        base.extend_from_slice(format!("\n\"@signature-params\": {params}").as_bytes());
+        let signature = self.key.sign(&base);
+        response
+            .headers_mut()
+            .insert("signature-input", format!("sig1={params}").parse()?);
+        response.headers_mut().insert(
+            "signature",
+            format!("sig1=:{}:", STANDARD.encode(signature.to_bytes())).parse()?,
+        );
+        Ok(())
+    }
+}
+
+async fn sign_response(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+    if let Some(signer) = &state.config.signer {
+        if let Err(error) = signer.sign(&mut response, &method, &path) {
+            eprintln!("response signing failed: {error:#}");
+            return empty_error_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+    response
+}
+
+async fn serve_info(State(state): State<Arc<AppState>>) -> Response {
+    let mut info = serde_json::json!({
+        "programIds": {
+            "arns": state.config.arns_program_id,
+            "ant": state.config.ant_program_id,
+        },
+        "supportedManifestVersions": ["0.1.0", "0.2.0"],
+        "release": env!("CARGO_PKG_VERSION"),
+        "services": {"bundlers": []},
+    });
+    if let Some(signer) = &state.config.signer {
+        info["wallet"] = serde_json::json!(signer.address);
+        info["httpsig"] = serde_json::json!({
+            "algorithm": "ed25519",
+            "solanaAddress": signer.address,
+        });
+    }
+    let body = serde_json::to_vec(&info).expect("info contains only JSON values");
+    Response::builder()
+        .header("content-type", "application/json; charset=utf-8")
+        .header("content-length", body.len().to_string())
+        .header("cache-control", "public, max-age=30")
+        .header("access-control-allow-origin", "*")
+        .header("access-control-expose-headers", "*")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 fn request_permit(permits: &Semaphore) -> Result<SemaphorePermit<'_>, Response> {
     permits
         .try_acquire()
@@ -1576,5 +1744,93 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod signing_tests {
+    use super::*;
+    use ed25519_dalek::Signature;
+
+    #[test]
+    fn signs_response_and_request_components_and_rejects_tampering() {
+        let key = SigningKey::from_bytes(&[17; 32]);
+        let signer = HttpSigner {
+            address: bs58::encode(key.verifying_key().as_bytes()).into_string(),
+            key_id: format!(
+                "ed25519:{}",
+                URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes())
+            ),
+            key,
+            bind_request: true,
+        };
+        let mut response = Response::builder()
+            .status(206)
+            .header("content-digest", "sha-256=:YWJj:")
+            .header("x-ar-io-verified", "true")
+            .body(Body::empty())
+            .unwrap();
+        signer.sign(&mut response, &Method::GET, "/raw/id").unwrap();
+        let params = response.headers()["signature-input"]
+            .to_str()
+            .unwrap()
+            .strip_prefix("sig1=")
+            .unwrap();
+        let encoded = response.headers()["signature"]
+            .to_str()
+            .unwrap()
+            .strip_prefix("sig1=:")
+            .unwrap()
+            .strip_suffix(':')
+            .unwrap();
+        let signature = Signature::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+        let base = format!(
+            "\"@status\": 206\n\"content-digest\": sha-256=:YWJj:\n\"x-ar-io-verified\": true\n\"@method\";req: GET\n\"@path\";req: /raw/id\n\"@signature-params\": {params}"
+        );
+        let public = signer.key.verifying_key();
+        public.verify_strict(base.as_bytes(), &signature).unwrap();
+        for (before, after) in [
+            ("206", "200"),
+            ("YWJj", "YWJk"),
+            ("true", "false"),
+            ("GET", "HEAD"),
+            ("/raw/id", "/raw/other"),
+        ] {
+            assert!(
+                public
+                    .verify_strict(base.replacen(before, after, 1).as_bytes(), &signature)
+                    .is_err()
+            );
+        }
+        let mut ordinary = Response::new(Body::empty());
+        ordinary
+            .headers_mut()
+            .insert("signature", "untrusted".parse().unwrap());
+        signer
+            .sign(&mut ordinary, &Method::GET, "/ar-io/info")
+            .unwrap();
+        assert!(!ordinary.headers().contains_key("signature"));
+        assert!(!ordinary.headers().contains_key("signature-input"));
+    }
+
+    #[test]
+    fn rejects_mismatched_wallet_and_corrupted_keypair() {
+        let config = || {
+            ServerConfig::new(
+                "127.0.0.1:0",
+                "example.com",
+                "http://127.0.0.1:1",
+                "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ",
+                "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5",
+                1,
+            )
+            .unwrap()
+        };
+        let key = SigningKey::from_bytes(&[17; 32]);
+        let wallet = bs58::encode(key.verifying_key().as_bytes()).into_string();
+        let mut bytes = key.to_keypair_bytes();
+        assert!(config().with_signing("wrong-wallet", &bytes, true).is_err());
+        bytes[63] ^= 1;
+        assert!(config().with_signing(&wallet, &bytes, true).is_err());
     }
 }
