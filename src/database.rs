@@ -111,6 +111,34 @@ impl BlockStore {
             .transpose()
     }
 
+    pub(crate) async fn advance_checkpoint(
+        &self,
+        previous: &Checkpoint,
+        next: &Checkpoint,
+        source: &str,
+    ) -> Result<()> {
+        ensure!(next.height > previous.height, "checkpoint must advance");
+        ensure!(next.hash.len() == 48, "checkpoint hash must be 48 bytes");
+        let changed = self
+            .client
+            .execute(
+                "UPDATE public.block_index_state
+             SET checkpoint_height = $1, checkpoint_hash = $2
+             WHERE singleton AND checkpoint_height = $3 AND checkpoint_hash = $4
+               AND source = $5",
+                &[
+                    &sql_height(next.height)?,
+                    &next.hash,
+                    &sql_height(previous.height)?,
+                    &previous.hash,
+                    &source,
+                ],
+            )
+            .await?;
+        ensure!(changed == 1, "stored checkpoint or trusted source changed");
+        Ok(())
+    }
+
     /// The caller includes the requested interval's predecessor in start_height.
     pub async fn initialize(
         &mut self,
@@ -475,6 +503,48 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL for an initialized test block index"]
+    async fn checkpoint_advance_rejects_stale_writers_and_preserves_coverage() {
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        store.client.batch_execute("BEGIN").await.unwrap();
+        let original = store.state().await.unwrap().unwrap();
+        let next = Checkpoint {
+            height: original.checkpoint.height + 1,
+            hash: vec![42; 48],
+        };
+        assert!(
+            store
+                .advance_checkpoint(&original.checkpoint, &next, "wrong-source")
+                .await
+                .is_err()
+        );
+        store
+            .advance_checkpoint(&original.checkpoint, &next, &original.source)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .advance_checkpoint(&original.checkpoint, &next, &original.source)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .advance_checkpoint(&next, &original.checkpoint, &original.source)
+                .await
+                .is_err()
+        );
+        let changed = store.state().await.unwrap().unwrap();
+        assert_eq!(changed.checkpoint, next);
+        assert_eq!(changed.imported_through, original.imported_through);
+        assert_eq!(changed.start_height, original.start_height);
+        store.client.batch_execute("ROLLBACK").await.unwrap();
+        assert_eq!(store.state().await.unwrap(), Some(original));
+    }
 
     #[test]
     fn resumed_batches_preserve_linkage_and_allow_empty_blocks() {

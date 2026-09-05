@@ -59,12 +59,18 @@ pub async fn import_range(
                     state.checkpoint.height <= stable_height,
                     "stored checkpoint is no longer stable at the trusted node"
                 );
-                ensure!(
-                    end <= state.checkpoint.height,
-                    "import end exceeds the stored checkpoint"
-                );
                 verify_checkpoint(gateway, &state.checkpoint).await?;
-                state.checkpoint
+                if end > state.checkpoint.height {
+                    let next = read_checkpoint(gateway, stable_height).await?;
+                    verify_checkpoint(gateway, &state.checkpoint).await?;
+                    verify_checkpoint(gateway, &next).await?;
+                    store
+                        .advance_checkpoint(&state.checkpoint, &next, source)
+                        .await?;
+                    next
+                } else {
+                    state.checkpoint
+                }
             }
             None => read_checkpoint(gateway, stable_height).await?,
         };
