@@ -1,7 +1,7 @@
 use std::{
     net::SocketAddr,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -27,7 +27,11 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::{
+    sync::{Semaphore, SemaphorePermit},
+    task::JoinSet,
+    time::{MissedTickBehavior, interval},
+};
 
 use super::{Gateway, VerifiedChunk, VerifiedData, decode_fixed};
 
@@ -46,9 +50,14 @@ pub struct ServerConfig {
     listen_addr: SocketAddr,
     arns_root_host: String,
     solana_rpc_url: Url,
+    core_program_id: String,
+    gar_program_id: String,
     arns_program_id: String,
     ant_program_id: String,
     max_concurrent_requests: usize,
+    bundler_urls: Vec<String>,
+    wallet: Option<String>,
+    max_expected_data_item_indexing_interval_seconds: Option<u64>,
     signer: Option<HttpSigner>,
 }
 
@@ -80,11 +89,67 @@ impl ServerConfig {
             listen_addr,
             arns_root_host,
             solana_rpc_url,
+            core_program_id: "73YoECm6NKXpVRoe5f1Q9BcP5DJGPFUjnFy6AxBE5Nvh".to_owned(),
+            gar_program_id: "89fNiiwgpFSPHKuqfNUkgYTYjtAJAhyqHjXmgXeppGpf".to_owned(),
             arns_program_id: arns_program_id.to_owned(),
             ant_program_id: ant_program_id.to_owned(),
             max_concurrent_requests,
+            bundler_urls: vec!["https://turbo.ardrive.io/".to_owned()],
+            wallet: None,
+            max_expected_data_item_indexing_interval_seconds: None,
             signer: None,
         })
+    }
+
+    pub fn with_info(
+        mut self,
+        core_program_id: Option<&str>,
+        gar_program_id: Option<&str>,
+        bundler_urls: Option<&str>,
+        wallet: Option<&str>,
+        max_expected_data_item_indexing_interval_seconds: Option<u64>,
+    ) -> Result<Self> {
+        if let Some(program_id) = core_program_id {
+            decode_pubkey(program_id, "ARIO_CORE_PROGRAM_ID")?;
+            self.core_program_id = program_id.to_owned();
+        }
+        if let Some(program_id) = gar_program_id {
+            decode_pubkey(program_id, "ARIO_GAR_PROGRAM_ID")?;
+            self.gar_program_id = program_id.to_owned();
+        }
+        if let Some(urls) = bundler_urls {
+            self.bundler_urls = urls
+                .split(',')
+                .map(|url| {
+                    let url = url.trim();
+                    let parsed = Url::parse(url).context("invalid URL in BUNDLER_URLS")?;
+                    ensure!(
+                        matches!(parsed.scheme(), "http" | "https"),
+                        "BUNDLER_URLS must use HTTP or HTTPS"
+                    );
+                    ensure!(
+                        parsed.username().is_empty()
+                            && parsed.password().is_none()
+                            && parsed.fragment().is_none(),
+                        "BUNDLER_URLS must not contain credentials or fragments"
+                    );
+                    Ok(url.to_owned())
+                })
+                .collect::<Result<Vec<_>>>()?;
+        }
+        if let Some(wallet) = wallet {
+            decode_pubkey(wallet, "AR_IO_WALLET")?;
+            ensure!(
+                self.signer
+                    .as_ref()
+                    .is_none_or(|signer| signer.address == wallet),
+                "AR_IO_WALLET does not match the signing wallet"
+            );
+            self.wallet = Some(wallet.to_owned());
+        }
+        self.max_expected_data_item_indexing_interval_seconds =
+            max_expected_data_item_indexing_interval_seconds;
+        Ok(self)
     }
 
     pub fn with_signing(
@@ -106,6 +171,7 @@ impl ServerConfig {
             key_id,
             bind_request,
         });
+        self.wallet = Some(wallet.to_owned());
         Ok(self)
     }
 }
@@ -114,6 +180,7 @@ struct AppState {
     gateway: Gateway,
     config: ServerConfig,
     request_permits: Semaphore,
+    started_at: Instant,
 }
 
 struct Resolution {
@@ -175,11 +242,46 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     println!("listening on http://{}", listener.local_addr()?);
     let state = Arc::new(AppState {
         request_permits: Semaphore::new(config.max_concurrent_requests),
+        started_at: Instant::now(),
         gateway,
         config,
     });
+    let mut refresh_tasks = JoinSet::new();
+    let node_state = state.clone();
+    refresh_tasks.spawn(async move {
+        let mut ticks = interval(Duration::from_secs(10 * 60));
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            if let Err(error) = node_state.gateway.peers.refresh_arweave().await {
+                eprintln!("Arweave peer refresh failed: {error:#}");
+            }
+        }
+    });
+    let gateway_state = state.clone();
+    refresh_tasks.spawn(async move {
+        let mut ticks = interval(Duration::from_secs(60 * 60));
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            if let Err(error) = gateway_state
+                .gateway
+                .peers
+                .refresh_gateways(
+                    &gateway_state.config.solana_rpc_url,
+                    &gateway_state.config.gar_program_id,
+                    gateway_state.config.wallet.as_deref(),
+                )
+                .await
+            {
+                eprintln!("Gateway peer refresh failed: {error:#}");
+            }
+        }
+    });
     let app = Router::new()
         .route("/ar-io/info", get(serve_info))
+        .route("/ar-io/healthcheck", get(serve_healthcheck))
+        .route("/ar-io/peers", get(serve_peers))
         .route("/", get(serve_arns))
         .route("/chunk/{offset}", get(serve_chunk))
         .route("/chunk/{offset}/data", get(serve_chunk_data))
@@ -188,9 +290,11 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .route("/{*path}", get(serve_path))
         .layer(middleware::from_fn_with_state(state.clone(), sign_response))
         .with_state(state);
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .await
-        .context("HTTP server failed")
+        .context("HTTP server failed");
+    refresh_tasks.shutdown().await;
+    result
 }
 struct HttpSigner {
     key: SigningKey,
@@ -307,21 +411,96 @@ async fn sign_response(
 async fn serve_info(State(state): State<Arc<AppState>>) -> Response {
     let mut info = serde_json::json!({
         "programIds": {
+            "core": state.config.core_program_id,
+            "gar": state.config.gar_program_id,
             "arns": state.config.arns_program_id,
             "ant": state.config.ant_program_id,
         },
+        "ans104UnbundleFilter": {"never": true},
+        "ans104IndexFilter": {"never": true},
         "supportedManifestVersions": ["0.1.0", "0.2.0"],
         "release": env!("CARGO_PKG_VERSION"),
-        "services": {"bundlers": []},
+        "services": {
+            "bundlers": state.config.bundler_urls.iter()
+                .map(|url| serde_json::json!({"url": url})).collect::<Vec<_>>(),
+        },
     });
+    if let Some(wallet) = &state.config.wallet {
+        info["wallet"] = serde_json::json!(wallet);
+    }
     if let Some(signer) = &state.config.signer {
-        info["wallet"] = serde_json::json!(signer.address);
         info["httpsig"] = serde_json::json!({
             "algorithm": "ed25519",
             "solanaAddress": signer.address,
         });
     }
-    let body = serde_json::to_vec(&info).expect("info contains only JSON values");
+    json_response(&info)
+}
+
+async fn serve_healthcheck(State(state): State<Arc<AppState>>) -> Response {
+    let now = SystemTime::now();
+    let date = match iso_utc_date(now) {
+        Ok(date) => date,
+        Err(error) => {
+            eprintln!("healthcheck date failed: {error:#}");
+            return empty_error_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let mut health = serde_json::json!({
+        "status": "ok",
+        "uptime": state.started_at.elapsed().as_secs_f64(),
+        "date": date,
+    });
+    if let Some(seconds) = state
+        .config
+        .max_expected_data_item_indexing_interval_seconds
+        && now.duration_since(UNIX_EPOCH).unwrap().as_secs() > seconds
+    {
+        // No data item has been indexed, so the last-indexed timestamp is zero.
+        health["status"] = serde_json::json!("unhealthy");
+        health["reasons"] = serde_json::json!([format!(
+            "Last data item indexed more than {seconds} seconds ago."
+        )]);
+    }
+    json_response(&health)
+}
+
+async fn serve_peers(State(state): State<Arc<AppState>>) -> Response {
+    json_response(&state.gateway.peers.snapshot())
+}
+
+fn iso_utc_date(now: SystemTime) -> Result<String> {
+    let elapsed = now
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?;
+    // Gregorian civil date from days since epoch, using 400-year eras.
+    let days = elapsed.as_secs() / 86_400 + 719_468;
+    let era = days / 146_097;
+    let day_of_era = days % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 {
+        month_from_march + 3
+    } else {
+        month_from_march - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    ensure!(year <= 9999, "system clock is outside the ISO date range");
+    let seconds = elapsed.as_secs() % 86_400;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60,
+        elapsed.subsec_millis(),
+    ))
+}
+
+fn json_response(value: &serde_json::Value) -> Response {
+    let body = serde_json::to_vec(value).expect("response contains only JSON values");
     Response::builder()
         .header("content-type", "application/json; charset=utf-8")
         .header("content-length", body.len().to_string())
@@ -1393,6 +1572,22 @@ mod tests {
     const ANT_ACCOUNT: &str = "4V5G8FIth1HvoAjpa37s8c/C2Ag+tWaWAF3YqgG8LaURyc0NNzQfLAEAAABAKwAAADNGX3lsZHFXX3p0NkNpXzQ3dy03Tzc2bFBwZWdwdTFyczdIMml5dWx0VlkAEA4AAAEAAAAAAC2+lbeF1KeVB3WX89Ksp18jfWPgMFBF9tJsgtCTCP9M/wEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
     const ARNS_PROGRAM: &str = "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ";
     const ANT_PROGRAM: &str = "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5";
+
+    #[test]
+    fn formats_utc_milliseconds_across_leap_year_boundaries() {
+        for (millis, expected) in [
+            (0, "1970-01-01T00:00:00.000Z"),
+            (951_782_399_999, "2000-02-28T23:59:59.999Z"),
+            (951_782_400_007, "2000-02-29T00:00:00.007Z"),
+            (4_107_542_399_999, "2100-02-28T23:59:59.999Z"),
+            (4_107_542_400_000, "2100-03-01T00:00:00.000Z"),
+        ] {
+            assert_eq!(
+                iso_utc_date(UNIX_EPOCH + Duration::from_millis(millis)).unwrap(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn decodes_captured_arns_and_ant_accounts() {

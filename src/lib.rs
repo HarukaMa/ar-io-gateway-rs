@@ -1,3 +1,4 @@
+mod peers;
 pub mod server;
 
 use std::{
@@ -186,6 +187,7 @@ pub struct Gateway {
     config: Config,
     client: Client,
     cache: Mutex<ContentCache>,
+    peers: peers::PeerState,
 }
 
 impl Gateway {
@@ -194,10 +196,12 @@ impl Gateway {
             .timeout(config.request_timeout)
             .build()
             .context("failed to build HTTP client")?;
+        let peers = peers::PeerState::new(&config.trusted_node_url)?;
         Ok(Self {
             config,
             client,
             cache: Mutex::new(ContentCache::default()),
+            peers,
         })
     }
 
@@ -307,32 +311,44 @@ impl Gateway {
             return Ok(None);
         };
         let mut invalid = Vec::new();
+        let discovered = self.peers.candidates(
+            Some(offset),
+            self.config
+                .max_peer_attempts
+                .saturating_sub(self.config.chunk_sources.len()),
+            &self.config.chunk_sources,
+        );
 
         for source in self
             .config
             .chunk_sources
             .iter()
+            .chain(discovered.iter())
             .take(self.config.max_peer_attempts)
         {
             let candidate: Option<JsonChunk> = match self
-                .request_optional_json(
-                    self.client
-                        .get(endpoint(source, &format!("chunk/{offset}"))),
-                )
+                .request_optional_json(self.source_request(
+                    source,
+                    &format!("chunk/{offset}"),
+                    &discovered,
+                ))
                 .await
             {
                 Ok(candidate) => candidate,
                 Err(error) => {
+                    self.peers.record_result(source, false);
                     invalid.push(format!("{source}: {error:#}"));
                     continue;
                 }
             };
             let Some(candidate) = candidate else {
+                self.peers.record_result(source, false);
                 continue;
             };
             let proof = match verify_chunk_proof(candidate, offset, &geometry) {
                 Ok(proof) => proof,
                 Err(error) => {
+                    self.peers.record_result(source, false);
                     invalid.push(format!("{source}: {error:#}"));
                     continue;
                 }
@@ -350,6 +366,7 @@ impl Gateway {
                 .context("chunk source has no host")?
                 .to_owned();
 
+            self.peers.record_result(source, true);
             return Ok(Some(VerifiedChunk {
                 data_root: URL_SAFE_NO_PAD.encode(proof.transaction.data_root),
                 data_size: proof.transaction.size,
@@ -705,8 +722,8 @@ impl Gateway {
 
         match self
             .fetch_and_authenticate_block(
-                &self.config.trusted_node_url,
-                &path,
+                self.client
+                    .get(endpoint(&self.config.trusted_node_url, &path)),
                 entry,
                 height,
                 transaction_id,
@@ -718,8 +735,14 @@ impl Gateway {
         }
 
         let mut attempted = HashSet::new();
-        for source in
-            std::iter::once(&self.config.archive_url).chain(self.config.chunk_sources.iter())
+        let discovered = self.peers.candidates(
+            None,
+            self.config.max_peer_attempts,
+            &self.config.chunk_sources,
+        );
+        for source in std::iter::once(&self.config.archive_url)
+            .chain(self.config.chunk_sources.iter())
+            .chain(discovered.iter())
         {
             if source == &self.config.trusted_node_url || attempted.contains(source.as_str()) {
                 continue;
@@ -730,11 +753,22 @@ impl Gateway {
             attempted.insert(source.as_str());
 
             match self
-                .fetch_and_authenticate_block(source, &path, entry, height, transaction_id)
+                .fetch_and_authenticate_block(
+                    self.source_request(source, &path, &discovered),
+                    entry,
+                    height,
+                    transaction_id,
+                )
                 .await
             {
-                Ok(()) => return Ok(()),
-                Err(error) => failures.push(format!("{source}: {error:#}")),
+                Ok(()) => {
+                    self.peers.record_result(source, true);
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.peers.record_result(source, false);
+                    failures.push(format!("{source}: {error:#}"));
+                }
             }
         }
 
@@ -746,14 +780,22 @@ impl Gateway {
 
     async fn fetch_and_authenticate_block(
         &self,
-        source: &str,
-        path: &str,
+        request: RequestBuilder,
         entry: &BlockIndexEntry,
         height: u64,
         transaction_id: &str,
     ) -> Result<()> {
-        let block: BlockHeader = self.get_json(source, path).await?;
+        let block: BlockHeader = self.request_json(request).await?;
         verify_block_header(&block, entry, height, transaction_id)
+    }
+
+    fn source_request(&self, source: &str, path: &str, discovered: &[String]) -> RequestBuilder {
+        let url = endpoint(source, path);
+        if discovered.iter().any(|peer| peer == source) {
+            self.peers.get(url)
+        } else {
+            self.client.get(url)
+        }
     }
 
     async fn fetch_verified_chunk(
@@ -763,21 +805,34 @@ impl Gateway {
         geometry: &Geometry,
     ) -> Result<Vec<u8>> {
         let mut failures = Vec::new();
+        let discovered = self.peers.candidates(
+            Some(absolute_offset),
+            self.config
+                .max_peer_attempts
+                .saturating_sub(self.config.chunk_sources.len()),
+            &self.config.chunk_sources,
+        );
         let sources = self
             .config
             .chunk_sources
             .iter()
+            .chain(discovered.iter())
             .take(self.config.max_peer_attempts);
 
         for source in sources {
             let result = async {
                 let chunk: JsonChunk = self
-                    .get_json(source, &format!("chunk/{absolute_offset}"))
+                    .request_json(self.source_request(
+                        source,
+                        &format!("chunk/{absolute_offset}"),
+                        &discovered,
+                    ))
                     .await?;
                 verify_chunk(chunk, absolute_offset, relative_offset, geometry)
             }
             .await;
 
+            self.peers.record_result(source, result.is_ok());
             match result {
                 Ok(chunk) => return Ok(chunk),
                 Err(error) => failures.push(format!("{source}: {error:#}")),

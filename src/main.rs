@@ -60,6 +60,15 @@ async fn main() -> Result<()> {
         if args.next().is_some() {
             bail!("{USAGE}");
         }
+        for name in ["ANS104_UNBUNDLE_FILTER", "ANS104_INDEX_FILTER"] {
+            if let Ok(value) = env::var(name) {
+                let filter: serde_json::Value =
+                    serde_json::from_str(&value).with_context(|| format!("invalid {name}"))?;
+                if filter != serde_json::json!({"never": true}) {
+                    bail!("{name} must be {{\"never\":true}}; indexing is not supported");
+                }
+            }
+        }
         let max_concurrent_requests = env::var("AR_IO_MAX_CONCURRENT_REQUESTS")
             .unwrap_or_else(|_| "8".to_owned())
             .parse()
@@ -78,6 +87,18 @@ async fn main() -> Result<()> {
         let wallet = env::var("AR_IO_WALLET")
             .ok()
             .filter(|value| !value.is_empty());
+        let indexing_interval = env::var("MAX_EXPECTED_DATA_ITEM_INDEXING_INTERVAL_SECONDS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .context("invalid MAX_EXPECTED_DATA_ITEM_INDEXING_INTERVAL_SECONDS")?;
+        config = config.with_info(
+            env::var("ARIO_CORE_PROGRAM_ID").ok().as_deref(),
+            env::var("ARIO_GAR_PROGRAM_ID").ok().as_deref(),
+            env::var("BUNDLER_URLS").ok().as_deref(),
+            wallet.as_deref(),
+            indexing_interval,
+        )?;
         let key_path = env::var("OBSERVER_KEYPAIR_PATH")
             .ok()
             .filter(|value| !value.is_empty());
