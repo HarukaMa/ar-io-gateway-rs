@@ -313,9 +313,7 @@ impl Gateway {
         let mut invalid = Vec::new();
         let discovered = self.peers.candidates(
             Some(offset),
-            self.config
-                .max_peer_attempts
-                .saturating_sub(self.config.chunk_sources.len()),
+            self.config.max_peer_attempts,
             &self.config.chunk_sources,
         );
 
@@ -323,6 +321,7 @@ impl Gateway {
             .config
             .chunk_sources
             .iter()
+            .take(self.config.max_peer_attempts - usize::from(!discovered.is_empty()))
             .chain(discovered.iter())
             .take(self.config.max_peer_attempts)
         {
@@ -750,6 +749,12 @@ impl Gateway {
             if attempted.len() >= self.config.max_peer_attempts {
                 break;
             }
+            if attempted.len()
+                >= self.config.max_peer_attempts - usize::from(!discovered.is_empty())
+                && !discovered.iter().any(|peer| peer == source)
+            {
+                continue;
+            }
             attempted.insert(source.as_str());
 
             match self
@@ -807,15 +812,14 @@ impl Gateway {
         let mut failures = Vec::new();
         let discovered = self.peers.candidates(
             Some(absolute_offset),
-            self.config
-                .max_peer_attempts
-                .saturating_sub(self.config.chunk_sources.len()),
+            self.config.max_peer_attempts,
             &self.config.chunk_sources,
         );
         let sources = self
             .config
             .chunk_sources
             .iter()
+            .take(self.config.max_peer_attempts - usize::from(!discovered.is_empty()))
             .chain(discovered.iter())
             .take(self.config.max_peer_attempts);
 

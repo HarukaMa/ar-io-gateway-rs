@@ -935,4 +935,105 @@ mod tests {
         bytes[48] = b'/';
         assert!(decode_gateway(&bytes, &operator, 3, bump).is_err());
     }
+
+    #[tokio::test]
+    async fn discovered_chunks_remain_reachable_with_a_full_configured_attempt_budget() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let body = br#"{"hello":"arweave"}"#;
+        let mut end = [0; 32];
+        end[16..].copy_from_slice(&(body.len() as u128).to_be_bytes());
+        let hash = crate::sha256(&[body]);
+        let root = crate::hash_leaf(&hash, &end);
+        let tx_root = crate::hash_leaf(&root, &end);
+        let chunk = serde_json::to_vec(&json!({
+            "chunk": crate::URL_SAFE_NO_PAD.encode(body),
+            "data_path": crate::URL_SAFE_NO_PAD.encode([hash.as_slice(), end.as_slice()].concat()),
+            "tx_path": crate::URL_SAFE_NO_PAD.encode([root.as_slice(), end.as_slice()].concat()),
+        }))
+        .unwrap();
+        let index_entry = |weave: u128, root: [u8; 32]| {
+            let mut bytes = vec![0; 48];
+            bytes.extend_from_slice(&16_u16.to_be_bytes());
+            bytes.extend_from_slice(&weave.to_be_bytes());
+            bytes.push(32);
+            bytes.extend_from_slice(&root);
+            bytes
+        };
+        let previous = index_entry(1000, [0; 32]);
+        let current = index_entry(1145, tx_root);
+        let replies = Arc::new(BTreeMap::from([
+            ("/trusted/peers", br#"["8.8.8.8:1984"]"#.to_vec()),
+            ("/trusted/info", br#"{"height":51}"#.to_vec()),
+            ("/info", br#"{"height":51,"blocks":51}"#.to_vec()),
+            ("/trusted/block_index2/0/0", previous.clone()),
+            ("/trusted/block_index2/1/1", current.clone()),
+            ("/trusted/block_index2/0/1", [previous, current].concat()),
+            ("/chunk/1001", chunk),
+        ]));
+        let failed_attempts = Arc::new(AtomicUsize::new(0));
+        let attempts = failed_attempts.clone();
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let replies = replies.clone();
+            let attempts = attempts.clone();
+            async move {
+                if let Some(body) = replies.get(request.uri().path()) {
+                    (axum::http::StatusCode::OK, body.clone())
+                } else {
+                    if request.uri().path().starts_with("/unavailable") {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    (axum::http::StatusCode::NOT_FOUND, Vec::new())
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = crate::Config::new(
+            format!("{base}/trusted"),
+            format!("{base}/archive"),
+            (0..3)
+                .map(|index| format!("{base}/unavailable{index}"))
+                .collect(),
+            Duration::from_secs(5),
+            3,
+            1024,
+        )
+        .unwrap();
+        let mut gateway = crate::Gateway::new(config).unwrap();
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(&base).unwrap())
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        gateway.client = client.clone();
+        gateway.peers.client = client;
+        gateway.peers.refresh_arweave().await.unwrap();
+        let geometry = crate::Geometry {
+            tx_root,
+            data_root: root,
+            block_weave_size: 1145,
+            previous_weave_size: 1000,
+            first_offset: 1001,
+            end_offset: 1019,
+            data_size: body.len() as u128,
+        };
+        assert_eq!(
+            gateway
+                .fetch_verified_chunk(1001, 0, &geometry)
+                .await
+                .unwrap(),
+            body
+        );
+        assert_eq!(
+            gateway.retrieve_chunk(1001).await.unwrap().unwrap().bytes,
+            body
+        );
+        assert_eq!(failed_attempts.load(Ordering::Relaxed), 4);
+        server.abort();
+    }
 }
