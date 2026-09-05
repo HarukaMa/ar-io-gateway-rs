@@ -279,7 +279,7 @@ pub(super) fn verify_transaction(
     })
 }
 
-fn optional_text_tag(tags: &[(Vec<u8>, Vec<u8>)], expected: &[u8]) -> Option<String> {
+pub(super) fn optional_text_tag(tags: &[(Vec<u8>, Vec<u8>)], expected: &[u8]) -> Option<String> {
     tags.iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case(expected))
         .find_map(|(_, value)| {

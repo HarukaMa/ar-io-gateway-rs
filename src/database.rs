@@ -2,7 +2,7 @@ use std::{net::IpAddr, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use tokio::{task::JoinHandle, time::timeout};
-use tokio_postgres::{Client, Config, IsolationLevel, NoTls, Row, config::Host};
+use tokio_postgres::{Client, Config, IsolationLevel, NoTls, Row, Transaction, config::Host};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -14,6 +14,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "002_metadata",
         include_str!("../migrations/002_metadata.sql"),
     ),
+    ("003_bundles", include_str!("../migrations/003_bundles.sql")),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -60,6 +61,24 @@ pub(crate) struct ObjectMetadata {
     pub(crate) denomination: Option<u32>,
     pub(crate) data_root: Option<Vec<u8>>,
     pub(crate) tags: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BundleLocation {
+    pub(crate) id: Vec<u8>,
+    pub(crate) parent_id: Vec<u8>,
+    pub(crate) parent_offset: Option<u128>,
+    pub(crate) item_offset: u128,
+    pub(crate) item_size: u128,
+    pub(crate) data_offset: u128,
+    pub(crate) root_offset: u128,
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexedBundle {
+    pub(crate) root_id: Vec<u8>,
+    pub(crate) data_size: u128,
+    pub(crate) locations: Vec<BundleLocation>,
 }
 
 pub struct BlockStore {
@@ -418,6 +437,11 @@ impl BlockStore {
         identities.sort_unstable();
         identities.dedup();
         if stored_timestamp.is_none() {
+            for ids in identities.chunks(ROW_BATCH_SIZE) {
+                Self::lock_bundle_roots(&transaction, ids).await?;
+            }
+        }
+        if stored_timestamp.is_none() {
             // Consistent identity order also bounds uniqueness-lock acquisition across writers.
             for ids in identities.chunks(ROW_BATCH_SIZE) {
                 transaction
@@ -496,6 +520,28 @@ impl BlockStore {
                     &[&block.hash, &timestamp],
                 )
                 .await?;
+            // A root can first be observed in a later block, then gain an earlier placement.
+            let mut after = 0_i64;
+            loop {
+                let keys = transaction
+                    .query(
+                        "SELECT DISTINCT l.object_key
+                     FROM public.block_transactions bt
+                     JOIN public.item_locations l ON l.root_key=bt.object_key
+                     WHERE bt.block_hash=$1 AND l.object_key>$2
+                     ORDER BY l.object_key LIMIT 256",
+                        &[&block.hash, &after],
+                    )
+                    .await?
+                    .iter()
+                    .map(|row| row.try_get(0))
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                let Some(&last) = keys.last() else {
+                    break;
+                };
+                Self::refresh_item_placements(&transaction, &keys).await?;
+                after = last;
+            }
         }
         transaction.commit().await?;
         Ok(())
@@ -537,13 +583,467 @@ impl BlockStore {
             .collect()
     }
 
+    pub(crate) async fn pending_bundles(
+        &self,
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, u64)>> {
+        ensure!(start <= end, "bundle range is reversed");
+        ensure!(
+            (1..=METADATA_BATCH_SIZE).contains(&limit),
+            "bundle query limit must be between 1 and 256"
+        );
+        self.client.query(
+            "SELECT o.id, p.block_height
+             FROM public.canonical_placements p
+             JOIN public.objects o ON o.key=p.object_key
+             LEFT JOIN public.bundle_progress progress ON progress.root_key=o.key
+             WHERE o.kind=0 AND o.metadata_complete AND NOT coalesce(progress.complete, false)
+               AND p.block_height BETWEEN $1 AND $2
+               AND EXISTS (
+                   SELECT 1 FROM public.block_index_state s
+                   JOIN public.canonical_blocks cb
+                     ON cb.height > s.start_height AND cb.height <= s.imported_through
+                   JOIN public.blocks b ON b.hash=cb.block_hash
+                   JOIN public.block_transactions bt ON bt.block_hash=cb.block_hash
+                   WHERE s.singleton AND cb.height=p.block_height AND bt.position=p.position
+                     AND bt.object_key=o.key AND b.timestamp IS NOT NULL)
+               AND EXISTS (
+                   SELECT 1 FROM public.object_tags t
+                   JOIN public.tag_names n ON n.key=t.name_key
+                   JOIN public.tag_values v ON v.key=t.value_key
+                   WHERE t.object_key=o.key AND n.value='Bundle-Format'::bytea AND v.value='binary'::bytea)
+               AND EXISTS (
+                   SELECT 1 FROM public.object_tags t
+                   JOIN public.tag_names n ON n.key=t.name_key
+                   JOIN public.tag_values v ON v.key=t.value_key
+                   WHERE t.object_key=o.key AND n.value='Bundle-Version'::bytea AND v.value='2.0.0'::bytea)
+             ORDER BY p.block_height, p.position, p.id LIMIT $3",
+            &[&sql_height(start)?, &sql_height(end)?, &i64::try_from(limit)?],
+        ).await?.iter().map(|row| Ok((row.try_get(0)?, u64::try_from(row.try_get::<_, i64>(1)?)?))).collect()
+    }
+
+    pub(crate) async fn commit_bundle_batch(
+        &mut self,
+        root_id: &[u8],
+        objects: &[ObjectMetadata],
+        locations: &[BundleLocation],
+        complete: bool,
+    ) -> Result<()> {
+        ensure!(root_id.len() == 32, "bundle root ID must be 32 bytes");
+        ensure!(
+            locations.len() <= METADATA_BATCH_SIZE && objects.len() <= METADATA_BATCH_SIZE,
+            "bundle batch exceeds 256 occurrences or objects"
+        );
+        let mut locations: Vec<_> = locations.iter().collect();
+        locations.sort_unstable_by_key(|location| location.root_offset);
+        ensure!(
+            locations
+                .windows(2)
+                .all(|pair| pair[0].root_offset != pair[1].root_offset),
+            "duplicate bundle offset in batch"
+        );
+        let metadata: std::collections::BTreeMap<_, _> = objects
+            .iter()
+            .map(|object| (object.id.as_slice(), object))
+            .collect();
+        for object in objects {
+            ensure!(
+                object.kind == 1
+                    && object.id != root_id
+                    && object.format.is_none()
+                    && object.quantity.is_none()
+                    && object.reward.is_none()
+                    && object.denomination.is_none()
+                    && object.data_root.is_none(),
+                "bundle metadata must describe data items"
+            );
+            ensure!(
+                locations.iter().any(|location| location.id == object.id),
+                "bundle metadata has no occurrence"
+            );
+        }
+        for location in &locations {
+            ensure!(
+                location.id.len() == 32 && location.parent_id.len() == 32,
+                "bundle item and parent IDs must be 32 bytes"
+            );
+            let object = metadata
+                .get(location.id.as_slice())
+                .context("bundle occurrence lacks metadata")?;
+            ensure!(
+                location.item_offset >= 96
+                    && location.data_offset > 0
+                    && location.item_size.checked_sub(location.data_offset)
+                        == Some(object.data_size),
+                "invalid bundle item offsets or size"
+            );
+            match location.parent_offset {
+                None => ensure!(
+                    location.parent_id == root_id && location.root_offset == location.item_offset,
+                    "direct bundle occurrence has an invalid parent or root offset"
+                ),
+                Some(parent) => ensure!(
+                    parent < location.root_offset && location.parent_id != root_id,
+                    "nested bundle occurrence has an invalid parent"
+                ),
+            }
+        }
+        let transaction = self
+            .client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
+        Self::lock_bundle_roots(&transaction, &[root_id]).await?;
+        let root = transaction.query_opt(
+            "SELECT o.key, o.data_size::text
+             FROM public.objects o
+             WHERE o.id=$1 AND o.kind=0 AND o.metadata_complete
+               AND EXISTS (
+                   SELECT 1 FROM public.block_index_state s
+                   JOIN public.canonical_blocks cb
+                     ON cb.height > s.start_height AND cb.height <= s.imported_through
+                   JOIN public.blocks b ON b.hash=cb.block_hash
+                   JOIN public.block_transactions bt ON bt.block_hash=cb.block_hash
+                   WHERE s.singleton AND bt.object_key=o.key AND b.timestamp IS NOT NULL)
+               AND EXISTS (
+                   SELECT 1 FROM public.object_tags t
+                   JOIN public.tag_names n ON n.key=t.name_key
+                   JOIN public.tag_values v ON v.key=t.value_key
+                   WHERE t.object_key=o.key AND n.value='Bundle-Format'::bytea AND v.value='binary'::bytea)
+               AND EXISTS (
+                   SELECT 1 FROM public.object_tags t
+                   JOIN public.tag_names n ON n.key=t.name_key
+                   JOIN public.tag_values v ON v.key=t.value_key
+                   WHERE t.object_key=o.key AND n.value='Bundle-Version'::bytea AND v.value='2.0.0'::bytea)",
+            &[&root_id],
+        ).await?.context("bundle root lacks completed canonical ANS-104 metadata")?;
+        let root_key: i64 = root.try_get(0)?;
+        let root_size: u128 = root.try_get::<_, String>(1)?.parse()?;
+        for location in &locations {
+            ensure!(
+                location
+                    .root_offset
+                    .checked_add(location.item_size)
+                    .is_some_and(|end| end <= root_size),
+                "bundle occurrence exceeds root payload"
+            );
+        }
+        let was_complete: bool = transaction
+            .query_one(
+                "INSERT INTO public.bundle_progress AS stored (root_key) VALUES ($1)
+             ON CONFLICT (root_key) DO UPDATE SET complete=stored.complete RETURNING complete",
+                &[&root_key],
+            )
+            .await?
+            .try_get(0)?;
+        let keys = Self::write_objects(&transaction, objects).await?;
+        let ids: Vec<_> = locations
+            .iter()
+            .map(|location| location.id.as_slice())
+            .collect();
+        let parents: Vec<_> = locations
+            .iter()
+            .map(|location| location.parent_id.as_slice())
+            .collect();
+        let parent_offsets: Vec<_> = locations
+            .iter()
+            .map(|location| location.parent_offset.map(|offset| offset.to_string()))
+            .collect();
+        let item_offsets: Vec<_> = locations
+            .iter()
+            .map(|location| location.item_offset.to_string())
+            .collect();
+        let item_sizes: Vec<_> = locations
+            .iter()
+            .map(|location| location.item_size.to_string())
+            .collect();
+        let data_offsets: Vec<_> = locations
+            .iter()
+            .map(|location| location.data_offset.to_string())
+            .collect();
+        let root_offsets: Vec<_> = locations
+            .iter()
+            .map(|location| location.root_offset.to_string())
+            .collect();
+        const INPUT: &str = "unnest($2::bytea[], $3::bytea[], $4::text[], $5::text[],
+            $6::text[], $7::text[], $8::text[]) AS incoming(
+            id, parent_id, parent_offset, item_offset, item_size, data_offset, root_offset)";
+        let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &root_key,
+            &ids,
+            &parents,
+            &parent_offsets,
+            &item_offsets,
+            &item_sizes,
+            &data_offsets,
+            &root_offsets,
+        ];
+        let inserted = transaction.query(&format!(
+            "INSERT INTO public.item_locations
+                (object_key, parent_key, root_key, parent_offset, item_offset, item_size, data_offset, root_offset)
+             SELECT o.key, p.key, $1, incoming.parent_offset::public.uint128,
+                incoming.item_offset::public.uint128, incoming.item_size::public.uint128,
+                incoming.data_offset::public.uint128, incoming.root_offset::public.uint128
+             FROM {INPUT}
+             JOIN public.objects o ON o.id=incoming.id AND o.kind=1 AND o.metadata_complete
+             JOIN public.objects p ON p.id=incoming.parent_id AND p.metadata_complete
+             ORDER BY incoming.root_offset::numeric
+             ON CONFLICT (root_key, root_offset) DO NOTHING RETURNING key"
+        ), parameters).await?;
+        ensure!(
+            !was_complete || inserted.is_empty(),
+            "completed bundle cannot acquire new occurrences"
+        );
+        let matched = transaction.query(&format!(
+            "SELECT l.key FROM {INPUT}
+             JOIN public.item_locations l ON l.root_key=$1 AND l.root_offset=incoming.root_offset::numeric
+             JOIN public.objects o ON o.key=l.object_key
+             JOIN public.objects p ON p.key=l.parent_key
+             WHERE ROW(o.id, p.id, l.parent_offset, l.item_offset, l.item_size, l.data_offset)
+                IS NOT DISTINCT FROM ROW(incoming.id, incoming.parent_id, incoming.parent_offset::numeric,
+                    incoming.item_offset::numeric, incoming.item_size::numeric, incoming.data_offset::numeric)"
+        ), parameters).await?;
+        ensure!(
+            matched.len() == locations.len(),
+            "conflicting immutable bundle occurrence or missing parent"
+        );
+        let conflict = transaction.query_opt(
+            "SELECT l.key FROM public.item_locations l
+             LEFT JOIN public.item_locations p ON p.root_key=l.root_key AND p.root_offset=l.parent_offset
+             WHERE l.root_key=$1 AND l.root_offset IN (SELECT unnest($2::text[])::numeric)
+               AND l.parent_offset IS NOT NULL AND (
+                   p.object_key IS DISTINCT FROM l.parent_key
+                   OR l.root_offset <> p.root_offset + p.data_offset + l.item_offset
+                   OR l.item_offset + l.item_size > p.item_size - p.data_offset
+                   OR NOT EXISTS (
+                       SELECT 1 FROM public.object_tags t
+                       JOIN public.tag_names n ON n.key=t.name_key
+                       JOIN public.tag_values v ON v.key=t.value_key
+                       WHERE t.object_key=l.parent_key AND n.value='Bundle-Format'::bytea AND v.value='binary'::bytea)
+                   OR NOT EXISTS (
+                       SELECT 1 FROM public.object_tags t
+                       JOIN public.tag_names n ON n.key=t.name_key
+                       JOIN public.tag_values v ON v.key=t.value_key
+                       WHERE t.object_key=l.parent_key AND n.value='Bundle-Version'::bytea AND v.value='2.0.0'::bytea))
+             LIMIT 1",
+            &[&root_key, &root_offsets],
+        ).await?;
+        ensure!(
+            conflict.is_none(),
+            "invalid nested bundle parent or offsets"
+        );
+        let conflict = transaction
+            .query_opt(
+                "SELECT l.key FROM public.item_locations l
+             JOIN public.item_locations sibling ON sibling.root_key=l.root_key
+               AND sibling.parent_offset IS NOT DISTINCT FROM l.parent_offset AND sibling.key<>l.key
+               AND sibling.item_offset < l.item_offset + l.item_size
+               AND l.item_offset < sibling.item_offset + sibling.item_size
+             WHERE l.root_key=$1 AND l.root_offset IN (SELECT unnest($2::text[])::numeric) LIMIT 1",
+                &[&root_key, &root_offsets],
+            )
+            .await?;
+        ensure!(conflict.is_none(), "overlapping bundle siblings");
+        let conflict = transaction.query_opt(
+            "WITH RECURSIVE ancestors AS (
+                SELECT root_offset AS target, parent_offset, 1 AS depth
+                FROM public.item_locations
+                WHERE root_key=$1 AND root_offset IN (SELECT unnest($2::text[])::numeric)
+                UNION ALL
+                SELECT a.target, p.parent_offset, a.depth+1
+                FROM ancestors a JOIN public.item_locations p ON p.root_key=$1 AND p.root_offset=a.parent_offset
+                WHERE a.depth < 32
+             )
+             SELECT target FROM ancestors GROUP BY target HAVING NOT bool_or(parent_offset IS NULL) LIMIT 1",
+            &[&root_key, &root_offsets],
+        ).await?;
+        ensure!(
+            conflict.is_none(),
+            "bundle parent chain is missing or exceeds 32 levels"
+        );
+        Self::refresh_item_placements(&transaction, &keys).await?;
+        if complete {
+            transaction
+                .execute(
+                    "UPDATE public.bundle_progress SET complete=true WHERE root_key=$1",
+                    &[&root_key],
+                )
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn refresh_item_placements(transaction: &Transaction<'_>, keys: &[i64]) -> Result<()> {
+        transaction.execute(
+            "INSERT INTO public.canonical_placements AS stored
+                (object_key, block_height, position, location_key, kind, id)
+             SELECT candidate.object_key, candidate.height, candidate.position, candidate.key, o.kind, o.id
+             FROM (
+                 SELECT DISTINCT ON (l.object_key) l.object_key, cb.height, bt.position, l.key
+                 FROM public.item_locations l
+                 JOIN public.block_transactions bt ON bt.object_key=l.root_key
+                 JOIN public.canonical_blocks cb ON cb.block_hash=bt.block_hash
+                 JOIN public.blocks b ON b.hash=cb.block_hash AND b.timestamp IS NOT NULL
+                 JOIN public.block_index_state s
+                   ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
+                 WHERE l.object_key=ANY($1::bigint[])
+                 ORDER BY l.object_key, cb.height, bt.position, l.root_offset
+             ) candidate JOIN public.objects o ON o.key=candidate.object_key
+             ORDER BY o.id
+             ON CONFLICT (object_key) DO UPDATE SET block_height=EXCLUDED.block_height,
+                 position=EXCLUDED.position, location_key=EXCLUDED.location_key,
+                 kind=EXCLUDED.kind, id=EXCLUDED.id
+             WHERE ROW(EXCLUDED.block_height, EXCLUDED.position,
+                       (SELECT root_offset FROM public.item_locations WHERE key=EXCLUDED.location_key))
+                 < ROW(stored.block_height, stored.position,
+                       (SELECT root_offset FROM public.item_locations WHERE key=stored.location_key))",
+            &[&keys],
+        ).await?;
+        Ok(())
+    }
+
+    async fn lock_bundle_roots(transaction: &Transaction<'_>, ids: &[&[u8]]) -> Result<()> {
+        // Serialize root membership changes with indexing, including roots with no progress row yet.
+        transaction
+            .query(
+                "SELECT pg_advisory_xact_lock(hashtextextended(encode(id, 'hex'), 1))
+             FROM (SELECT id FROM unnest($1::bytea[]) AS roots(id) ORDER BY id) ordered",
+                &[&ids],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn bundle_location(&self, id: &[u8]) -> Result<Option<IndexedBundle>> {
+        ensure!(id.len() == 32, "bundle item ID must be 32 bytes");
+        let installed: bool = self
+            .client
+            .query_one(
+                "SELECT to_regclass('public.item_locations') IS NOT NULL",
+                &[],
+            )
+            .await?
+            .try_get(0)?;
+        if !installed {
+            return Ok(None);
+        }
+        // Read current membership, not just the cached placement, so stale hints fail closed.
+        let rows = self.client.query(
+            "WITH RECURSIVE selected AS (
+                SELECT l.*, root.id AS root_id, root.data_size AS root_size, o.data_size AS target_size
+                FROM public.objects o
+                JOIN public.item_locations l ON l.object_key=o.key
+                JOIN public.objects root ON root.key=l.root_key AND root.kind=0 AND root.metadata_complete
+                JOIN public.block_transactions bt ON bt.object_key=l.root_key
+                JOIN public.canonical_blocks cb ON cb.block_hash=bt.block_hash
+                JOIN public.blocks b ON b.hash=cb.block_hash AND b.timestamp IS NOT NULL
+                JOIN public.block_index_state s
+                  ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
+                WHERE o.id=$1 AND o.kind=1 AND o.metadata_complete
+                ORDER BY cb.height, bt.position, l.root_offset LIMIT 1
+             ), path AS (
+                SELECT selected.*, 1 AS depth FROM selected
+                UNION ALL
+                SELECT p.*, path.root_id, path.root_size, path.target_size, path.depth+1
+                FROM path JOIN public.item_locations p
+                  ON p.root_key=path.root_key AND p.root_offset=path.parent_offset
+                WHERE path.depth < 32
+             )
+             SELECT o.id, parent.id, path.parent_offset::text, path.item_offset::text,
+                path.item_size::text, path.data_offset::text, path.root_offset::text,
+                path.root_id, path.root_size::text, path.target_size::text
+             FROM path
+             JOIN public.objects o ON o.key=path.object_key AND o.kind=1 AND o.metadata_complete
+             JOIN public.objects parent ON parent.key=path.parent_key AND parent.metadata_complete
+             ORDER BY path.depth DESC",
+            &[&id],
+        ).await?;
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let root_id: Vec<u8> = first.try_get(7)?;
+        let root_size: u128 = first.try_get::<_, String>(8)?.parse()?;
+        let data_size: u128 = first.try_get::<_, String>(9)?.parse()?;
+        let mut locations: Vec<BundleLocation> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let location = BundleLocation {
+                id: row.try_get(0)?,
+                parent_id: row.try_get(1)?,
+                parent_offset: row
+                    .try_get::<_, Option<String>>(2)?
+                    .map(|offset| offset.parse())
+                    .transpose()?,
+                item_offset: row.try_get::<_, String>(3)?.parse()?,
+                item_size: row.try_get::<_, String>(4)?.parse()?,
+                data_offset: row.try_get::<_, String>(5)?.parse()?,
+                root_offset: row.try_get::<_, String>(6)?.parse()?,
+            };
+            let (parent_id, parent_offset, payload_start, payload_size) = match locations.last() {
+                Some(parent) => (
+                    parent.id.as_slice(),
+                    Some(parent.root_offset),
+                    parent
+                        .root_offset
+                        .checked_add(parent.data_offset)
+                        .context("bundle parent offset overflow")?,
+                    parent.item_size - parent.data_offset,
+                ),
+                None => (root_id.as_slice(), None, 0, root_size),
+            };
+            ensure!(
+                location.parent_id == parent_id
+                    && location.parent_offset == parent_offset
+                    && payload_start.checked_add(location.item_offset)
+                        == Some(location.root_offset)
+                    && location.item_offset >= 96
+                    && location.data_offset > 0
+                    && location.data_offset <= location.item_size
+                    && location
+                        .item_offset
+                        .checked_add(location.item_size)
+                        .is_some_and(|end| end <= payload_size),
+                "invalid stored bundle parent chain or offsets"
+            );
+            locations.push(location);
+        }
+        let target = locations.last().context("missing stored bundle target")?;
+        ensure!(
+            target.id == id && target.item_size - target.data_offset == data_size,
+            "invalid stored bundle target identity or size"
+        );
+        Ok(Some(IndexedBundle {
+            root_id,
+            data_size,
+            locations,
+        }))
+    }
+
     pub(crate) async fn record_objects(&mut self, objects: &[ObjectMetadata]) -> Result<()> {
+        let transaction = self
+            .client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
+        Self::write_objects(&transaction, objects).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn write_objects(
+        transaction: &Transaction<'_>,
+        objects: &[ObjectMetadata],
+    ) -> Result<Vec<i64>> {
         ensure!(
             objects.len() <= METADATA_BATCH_SIZE,
             "metadata batch exceeds 256 objects"
         );
         if objects.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut objects: Vec<_> = objects.iter().collect();
         objects.sort_unstable_by(|a, b| a.id.cmp(&b.id));
@@ -569,12 +1069,6 @@ impl BlockStore {
                 );
             }
         }
-        let transaction = self
-            .client
-            .build_transaction()
-            .isolation_level(IsolationLevel::ReadCommitted)
-            .start()
-            .await?;
         let addresses: Vec<_> = owners.keys().copied().collect();
         let public_keys: Vec<_> = owners.values().copied().collect();
         transaction
@@ -902,8 +1396,7 @@ impl BlockStore {
             )
             .await?;
         ensure!(conflict.is_none(), "conflicting immutable tag count");
-        transaction.commit().await?;
-        Ok(())
+        Ok(keys)
     }
 
     pub(crate) async fn analyze_metadata(&self) -> Result<()> {
@@ -1125,6 +1618,128 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires indexed bundles in ar_io_rust_test"]
+    async fn bundle_replay_and_conflicts_are_atomic() -> Result<()> {
+        use sha2::Digest;
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .try_get(0)?;
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let row = store
+            .client
+            .query_one(
+                "SELECT o.id, o.signature, o.anchor, o.owner_address, w.public_key, o.target,
+                o.data_size::text, o.content_type, o.content_encoding, o.signature_type, o.key,
+                root.id, l.root_key, l.item_offset::text, l.item_size::text, l.data_offset::text
+             FROM public.item_locations l
+             JOIN public.objects o ON o.key=l.object_key AND o.metadata_complete
+             JOIN public.owners w ON w.address=o.owner_address
+             JOIN public.objects root ON root.key=l.root_key
+             JOIN public.bundle_progress progress ON progress.root_key=l.root_key
+             JOIN public.canonical_placements p ON p.object_key=root.key
+             WHERE l.parent_offset IS NULL AND o.data_size>0 AND l.data_offset>1
+             ORDER BY l.key LIMIT 1",
+                &[],
+            )
+            .await?;
+        let key: i64 = row.try_get(10)?;
+        let tags = store
+            .client
+            .query(
+                "SELECT n.value, v.value FROM public.object_tags t
+             JOIN public.tag_names n ON n.key=t.name_key
+             JOIN public.tag_values v ON v.key=t.value_key
+             WHERE t.object_key=$1 ORDER BY t.ordinal",
+                &[&key],
+            )
+            .await?
+            .iter()
+            .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut object = ObjectMetadata {
+            id: row.try_get(0)?,
+            kind: 1,
+            signature: row.try_get(1)?,
+            anchor: row.try_get(2)?,
+            owner_address: row.try_get(3)?,
+            owner_public_key: row.try_get(4)?,
+            target: row.try_get(5)?,
+            data_size: row.try_get::<_, String>(6)?.parse()?,
+            content_type: row.try_get(7)?,
+            content_encoding: row.try_get(8)?,
+            signature_type: row.try_get(9)?,
+            format: None,
+            quantity: None,
+            reward: None,
+            denomination: None,
+            data_root: None,
+            tags,
+        };
+        let root_id: Vec<u8> = row.try_get(11)?;
+        let root_key: i64 = row.try_get(12)?;
+        let item_offset = row.try_get::<_, String>(13)?.parse()?;
+        let mut location = BundleLocation {
+            id: object.id.clone(),
+            parent_id: root_id.clone(),
+            parent_offset: None,
+            item_offset,
+            item_size: row.try_get::<_, String>(14)?.parse()?,
+            data_offset: row.try_get::<_, String>(15)?.parse()?,
+            root_offset: item_offset,
+        };
+        let snapshot = "SELECT ARRAY[
+            (SELECT count(*) FROM public.objects), (SELECT count(*) FROM public.owners),
+            (SELECT count(*) FROM public.object_tags), (SELECT count(*) FROM public.tag_names),
+            (SELECT count(*) FROM public.tag_values), (SELECT count(*) FROM public.item_locations),
+            (SELECT count(*) FROM public.canonical_placements), (SELECT count(*) FROM public.bundle_progress)],
+            (SELECT complete FROM public.bundle_progress WHERE root_key=$1)";
+        let before = store.client.query_one(snapshot, &[&root_key]).await?;
+        store
+            .commit_bundle_batch(
+                &root_id,
+                std::slice::from_ref(&object),
+                std::slice::from_ref(&location),
+                false,
+            )
+            .await?;
+        object.id = sha2::Sha256::digest([b"bundle-rollback-item".as_slice(), &object.id].concat())
+            .to_vec();
+        object.owner_address =
+            sha2::Sha256::digest([b"bundle-rollback-owner".as_slice(), &object.id].concat())
+                .to_vec();
+        object.tags.push((
+            [b"bundle-rollback-tag".as_slice(), &object.id].concat(),
+            vec![0; 4096],
+        ));
+        location.id = object.id.clone();
+        let mut new_occurrence = location.clone();
+        new_occurrence.item_offset += 1;
+        new_occurrence.root_offset += 1;
+        new_occurrence.item_size -= 1;
+        new_occurrence.data_offset -= 1;
+        ensure!(
+            store
+                .commit_bundle_batch(&root_id, &[object], &[location, new_occurrence], true)
+                .await
+                .is_err(),
+            "conflicting occurrence or completed bundle extension was accepted"
+        );
+        let after = store.client.query_one(snapshot, &[&root_key]).await?;
+        ensure!(
+            before.try_get::<_, Vec<i64>>(0)? == after.try_get::<_, Vec<i64>>(0)?
+                && before.try_get::<_, bool>(1)? == after.try_get::<_, bool>(1)?,
+            "failed bundle batch changed facts, tags, occurrences, placements, or progress"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires indexed transaction metadata in ar_io_rust_test"]

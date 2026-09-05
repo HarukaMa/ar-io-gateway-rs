@@ -43,6 +43,7 @@ const MAX_BLOCK_INDEX_BYTES: usize = 256 * 99;
 const BUNDLE_ENTRY_SIZE: usize = 64;
 const MAX_DATA_ITEM_TAGS: usize = 128;
 const MAX_DATA_ITEM_TAG_BYTES: usize = 4096;
+const MAX_BUNDLE_DEPTH: usize = 32;
 const STRICT_DATA_SPLIT_THRESHOLD: u128 = 30_607_159_107_830;
 const MERKLE_REBASE_SUPPORT_THRESHOLD: u128 = 151_066_495_197_430;
 
@@ -544,13 +545,32 @@ impl Gateway {
     }
 
     async fn retrieve_bundled_with_hint(&self, id: &str, hint: BundleHint) -> Result<VerifiedData> {
-        let hinted_size = checked_data_size(
-            parse_u128(&hint.data_size, "discovered data item size")?,
-            self.config.max_data_size,
-        )?;
-        let (parent, parent_tags) = self.retrieve_direct_with_tags(&hint.parent_id).await?;
+        let expected_id = decode_fixed::<32>(id, "data item ID")?;
+        let (parent_id, size) = match &hint {
+            BundleHint::Indexed(indexed) => {
+                (URL_SAFE_NO_PAD.encode(&indexed.root_id), indexed.data_size)
+            }
+            BundleHint::External {
+                parent_id,
+                data_size,
+            } => (
+                parent_id.clone(),
+                parse_u128(data_size, "discovered data item size")?,
+            ),
+        };
+        let hinted_size = checked_data_size(size, self.config.max_data_size)?;
+        let (parent, parent_tags) = self.retrieve_direct_with_tags(&parent_id).await?;
         require_bundle_tags(&parent_tags)?;
-        let item = verify_bundle_item(&parent.bytes, id)?;
+        let item = match &hint {
+            BundleHint::Indexed(indexed) => {
+                verify_indexed_bundle(&parent.bytes, &expected_id, indexed).await?
+            }
+            BundleHint::External { .. } => {
+                verify_bundle_item(&parent.bytes, &expected_id, None)
+                    .await?
+                    .0
+            }
+        };
         ensure!(
             item.data.len() == hinted_size,
             "discovered data item size does not match verified payload"
@@ -564,13 +584,19 @@ impl Gateway {
             cache_hit: false,
             id: id.to_owned(),
             block_height: parent.block_height,
-            content_type: item.content_type,
+            content_type: item_content_type(&item.tags)?,
             etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
             sha256: hex(&body_hash),
         })
     }
 
     async fn discover(&self, id: &str) -> Result<Option<BundleHint>> {
+        if let Some(store) = &self.block_store {
+            let id = decode_fixed::<32>(id, "data ID")?;
+            if let Some(indexed) = store.bundle_location(&id).await? {
+                return Ok(Some(BundleHint::Indexed(indexed)));
+            }
+        }
         let response: GraphQlResponse = self
             .request_json(
                 self.client
@@ -596,7 +622,7 @@ impl Gateway {
         let parent_id = parent.id;
         decode_fixed::<32>(&parent_id, "discovered parent ID")?;
         ensure!(parent_id != id, "data item cannot be its own parent");
-        Ok(Some(BundleHint {
+        Ok(Some(BundleHint::External {
             parent_id,
             data_size: node.data.size,
         }))
@@ -1815,9 +1841,12 @@ struct GraphQlNodeData {
     size: String,
 }
 
-struct BundleHint {
-    parent_id: String,
-    data_size: String,
+enum BundleHint {
+    Indexed(database::IndexedBundle),
+    External {
+        parent_id: String,
+        data_size: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -2024,7 +2053,52 @@ fn require_bundle_tags(tags: &[Tag]) -> Result<()> {
 
 struct VerifiedItem<'a> {
     data: &'a [u8],
-    content_type: String,
+    data_offset: usize,
+    signature_type: u16,
+    signature: &'a [u8],
+    owner: &'a [u8],
+    target: &'a [u8],
+    anchor: &'a [u8],
+    tags: Vec<ItemTag<'a>>,
+}
+
+impl VerifiedItem<'_> {
+    fn is_bundle(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|tag| tag.name == b"Bundle-Format" && tag.value == b"binary")
+            && self
+                .tags
+                .iter()
+                .any(|tag| tag.name == b"Bundle-Version" && tag.value == b"2.0.0")
+    }
+
+    fn metadata(&self, id: &[u8; 32]) -> database::ObjectMetadata {
+        let tags = self
+            .tags
+            .iter()
+            .map(|tag| (tag.name.to_vec(), tag.value.to_vec()))
+            .collect::<Vec<_>>();
+        database::ObjectMetadata {
+            id: id.to_vec(),
+            kind: 1,
+            signature: self.signature.to_vec(),
+            anchor: self.anchor.to_vec(),
+            owner_address: sha256(&[self.owner]).to_vec(),
+            owner_public_key: self.owner.to_vec(),
+            target: self.target.to_vec(),
+            data_size: self.data.len() as u128,
+            content_type: transactions::optional_text_tag(&tags, b"Content-Type"),
+            content_encoding: transactions::optional_text_tag(&tags, b"Content-Encoding"),
+            signature_type: self.signature_type as i16,
+            format: None,
+            quantity: None,
+            reward: None,
+            denomination: None,
+            data_root: None,
+            tags,
+        }
+    }
 }
 
 struct ItemTag<'a> {
@@ -2032,55 +2106,159 @@ struct ItemTag<'a> {
     value: &'a [u8],
 }
 
-fn verify_bundle_item<'a>(bundle: &'a [u8], expected_id: &str) -> Result<VerifiedItem<'a>> {
-    let expected_id = decode_fixed::<32>(expected_id, "data item ID")?;
-    let mut cursor = 0;
-    let count = read_u256_usize(
-        take(bundle, &mut cursor, 32, "bundle item count")?,
-        "bundle item count",
-    )?;
-    ensure!(count > 0, "bundle is empty");
-    ensure!(
-        count <= (bundle.len() - cursor) / BUNDLE_ENTRY_SIZE,
-        "bundle item table exceeds parent bounds"
-    );
-    let table_size = count
-        .checked_mul(BUNDLE_ENTRY_SIZE)
-        .context("bundle item table size overflow")?;
-    let data_start = cursor
-        .checked_add(table_size)
-        .context("bundle item table offset overflow")?;
-    let mut item_start = data_start;
-    let mut found = None;
+struct BundleEntry<'a> {
+    id: &'a [u8; 32],
+    bytes: &'a [u8],
+    offset: usize,
+}
 
-    for _ in 0..count {
+struct BundleItems<'a> {
+    bundle: &'a [u8],
+    remaining: usize,
+    cursor: usize,
+    item_start: usize,
+}
+
+impl<'a> BundleItems<'a> {
+    fn new(bundle: &'a [u8]) -> Result<Self> {
+        let mut cursor = 0;
+        let count = read_u256_usize(
+            take(bundle, &mut cursor, 32, "bundle item count")?,
+            "bundle item count",
+        )?;
+        ensure!(
+            count <= (bundle.len() - cursor) / BUNDLE_ENTRY_SIZE,
+            "bundle item table exceeds parent bounds"
+        );
+        let item_start = cursor + count * BUNDLE_ENTRY_SIZE;
+        ensure!(
+            count != 0 || item_start == bundle.len(),
+            "empty bundle contains trailing data"
+        );
+        Ok(Self {
+            bundle,
+            remaining: count,
+            cursor,
+            item_start,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<BundleEntry<'a>>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
         let size = read_u256_usize(
-            take(bundle, &mut cursor, 32, "bundle item size")?,
+            take(self.bundle, &mut self.cursor, 32, "bundle item size")?,
             "bundle item size",
         )?;
         ensure!(size > 0, "bundle contains an empty item");
-        let id = take(bundle, &mut cursor, 32, "bundle item ID")?;
-        let item_end = item_start
+        let id = take(self.bundle, &mut self.cursor, 32, "bundle item ID")?
+            .try_into()
+            .context("invalid bundle item ID length")?;
+        let end = self
+            .item_start
             .checked_add(size)
             .context("bundle item offset overflow")?;
         ensure!(
-            item_end <= bundle.len(),
+            end <= self.bundle.len(),
             "bundle item exceeds parent bounds"
         );
-        if id == expected_id.as_slice() {
-            ensure!(found.is_none(), "bundle contains duplicate data item IDs");
-            found = Some((item_start, item_end));
+        self.remaining -= 1;
+        if self.remaining == 0 {
+            ensure!(
+                end == self.bundle.len(),
+                "bundle item sizes do not consume the parent"
+            );
         }
-        item_start = item_end;
+        let entry = BundleEntry {
+            id,
+            bytes: &self.bundle[self.item_start..end],
+            offset: self.item_start,
+        };
+        self.item_start = end;
+        Ok(Some(entry))
     }
+}
 
-    ensure!(cursor == data_start, "bundle item table is malformed");
+async fn verify_bundle_item<'a>(
+    bundle: &'a [u8],
+    expected_id: &[u8; 32],
+    expected_offset: Option<u128>,
+) -> Result<(VerifiedItem<'a>, usize)> {
+    let mut entries = BundleItems::new(bundle)?;
+    let mut found = None;
+    let mut scanned = 0;
+    while let Some(entry) = entries.next()? {
+        if entry.id == expected_id
+            && expected_offset.is_none_or(|offset| offset == entry.offset as u128)
+            && found.is_none()
+        {
+            // Repeated IDs are distinct occurrences; absent an offset, use the first.
+            found = Some(entry);
+        }
+        scanned += 1;
+        if scanned % 256 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let entry = found.context("data item is absent from verified parent at the expected offset")?;
+    Ok((verify_data_item(entry.bytes, expected_id)?, entry.offset))
+}
+
+async fn verify_indexed_bundle<'a>(
+    root: &'a [u8],
+    expected_id: &[u8; 32],
+    indexed: &database::IndexedBundle,
+) -> Result<VerifiedItem<'a>> {
     ensure!(
-        item_start == bundle.len(),
-        "bundle item sizes do not consume the parent"
+        indexed.root_id.len() == 32 && (1..=MAX_BUNDLE_DEPTH).contains(&indexed.locations.len()),
+        "invalid indexed bundle path"
     );
-    let (start, end) = found.context("data item is absent from verified parent")?;
-    verify_data_item(&bundle[start..end], &expected_id)
+    let mut parent = root;
+    let mut parent_id = indexed.root_id.as_slice();
+    let mut parent_offset = None;
+    let mut payload_offset = 0u128;
+    for (depth, location) in indexed.locations.iter().enumerate() {
+        ensure!(
+            location.parent_id == parent_id && location.parent_offset == parent_offset,
+            "indexed bundle parent does not match authenticated path"
+        );
+        let id = location
+            .id
+            .as_slice()
+            .try_into()
+            .context("invalid indexed item ID")?;
+        let (item, offset) = verify_bundle_item(parent, id, Some(location.item_offset)).await?;
+        let root_offset = payload_offset
+            .checked_add(offset as u128)
+            .context("indexed root offset overflow")?;
+        ensure!(
+            location.root_offset == root_offset
+                && location.data_offset == item.data_offset as u128
+                && location.item_size == (item.data_offset + item.data.len()) as u128,
+            "indexed bundle offsets or size do not match authenticated item"
+        );
+        if depth + 1 == indexed.locations.len() {
+            ensure!(id == expected_id, "indexed path ends at a different item");
+            ensure!(
+                item.data.len() as u128 == indexed.data_size,
+                "indexed data size does not match authenticated payload"
+            );
+            return Ok(item);
+        }
+        ensure!(
+            item.is_bundle(),
+            "indexed ancestor is not an ANS-104 bundle"
+        );
+        parent = item.data;
+        parent_id = &location.id;
+        parent_offset = Some(root_offset);
+        payload_offset = root_offset
+            .checked_add(item.data_offset as u128)
+            .context("indexed payload offset overflow")?;
+        tokio::task::yield_now().await;
+    }
+    bail!("indexed bundle path is empty")
 }
 
 fn data_item_signature_sizes(signature_type: u16) -> Result<(usize, usize)> {
@@ -2151,7 +2329,13 @@ fn verify_data_item<'a>(item: &'a [u8], expected_id: &[u8; 32]) -> Result<Verifi
 
     Ok(VerifiedItem {
         data,
-        content_type: item_content_type(&tags)?,
+        data_offset: cursor,
+        signature_type,
+        signature,
+        owner,
+        target,
+        anchor,
+        tags,
     })
 }
 
@@ -2170,6 +2354,9 @@ fn item_content_type(tags: &[ItemTag<'_>]) -> Result<String> {
 }
 
 fn parse_avro_tags(bytes: &[u8], expected_count: usize) -> Result<Vec<ItemTag<'_>>> {
+    if bytes.is_empty() && expected_count == 0 {
+        return Ok(Vec::new());
+    }
     let mut cursor = 0;
     let mut tags = Vec::with_capacity(expected_count);
     loop {
@@ -2981,17 +3168,66 @@ mod tests {
         signature: &[u8],
         owner: &[u8],
         data: &[u8],
+        raw_tags: &[u8],
+        tag_count: u64,
     ) -> Vec<u8> {
         let mut item = Vec::new();
         item.extend_from_slice(&signature_type.to_le_bytes());
         item.extend_from_slice(signature);
         item.extend_from_slice(owner);
         item.extend_from_slice(&[0, 0]);
-        item.extend_from_slice(&0u64.to_le_bytes());
-        item.extend_from_slice(&1u64.to_le_bytes());
-        item.push(0);
+        item.extend_from_slice(&tag_count.to_le_bytes());
+        item.extend_from_slice(&(raw_tags.len() as u64).to_le_bytes());
+        item.extend_from_slice(raw_tags);
         item.extend_from_slice(data);
         item
+    }
+
+    pub(super) fn signed_data_item(data: &[u8], tags: &[(&[u8], &[u8])]) -> (Vec<u8>, [u8; 32]) {
+        let mut raw_tags = Vec::new();
+        let write_length = |bytes: &mut Vec<u8>, length: usize| {
+            let mut value = (length as u64) << 1;
+            while value >= 0x80 {
+                bytes.push(value as u8 | 0x80);
+                value >>= 7;
+            }
+            bytes.push(value as u8);
+        };
+        if !tags.is_empty() {
+            write_length(&mut raw_tags, tags.len());
+            for (name, value) in tags {
+                write_length(&mut raw_tags, name.len());
+                raw_tags.extend_from_slice(name);
+                write_length(&mut raw_tags, value.len());
+                raw_tags.extend_from_slice(value);
+            }
+        }
+        raw_tags.push(0);
+        let key = Ed25519SigningKey::from_bytes(&[2; 32]);
+        let owner = key.verifying_key().to_bytes();
+        let payload = data_item_signature_payload(2, &owner, &[], &[], &raw_tags, data);
+        let signature = key.sign(&payload).to_bytes();
+        (
+            encode_data_item(2, &signature, &owner, data, &raw_tags, tags.len() as u64),
+            sha256(&[&signature]),
+        )
+    }
+
+    pub(super) fn encode_bundle(items: &[&[u8]]) -> Vec<u8> {
+        let mut bundle = Vec::new();
+        bundle.extend_from_slice(&(items.len() as u64).to_le_bytes());
+        bundle.extend_from_slice(&[0; 24]);
+        for item in items {
+            bundle.extend_from_slice(&(item.len() as u64).to_le_bytes());
+            bundle.extend_from_slice(&[0; 24]);
+            let signature_type = u16::from_le_bytes(item[..2].try_into().unwrap());
+            let (size, _) = data_item_signature_sizes(signature_type).unwrap();
+            bundle.extend_from_slice(&sha256(&[&item[2..2 + size]]));
+        }
+        for item in items {
+            bundle.extend_from_slice(item);
+        }
+        bundle
     }
 
     fn check_data_item(
@@ -3000,7 +3236,7 @@ mod tests {
         signature: &[u8],
         data: &[u8],
     ) -> Vec<u8> {
-        let item = encode_data_item(signature_type, signature, owner, data);
+        let item = encode_data_item(signature_type, signature, owner, data, &[0], 0);
         let expected_id = sha256(&[signature]);
         assert_eq!(verify_data_item(&item, &expected_id).unwrap().data, data);
 
@@ -3018,6 +3254,45 @@ mod tests {
         *wrong_data.last_mut().unwrap() ^= 1;
         assert!(verify_data_item(&wrong_data, &expected_id).is_err());
         item
+    }
+
+    #[test]
+    fn verifies_items_with_zero_tag_bytes() {
+        let data = b"untagged";
+        let key = Ed25519SigningKey::from_bytes(&[2; 32]);
+        let owner = key.verifying_key().to_bytes();
+        let payload = data_item_signature_payload(2, &owner, &[], &[], &[], data);
+        let signature = key.sign(&payload).to_bytes();
+        let id = sha256(&[&signature]);
+        let bytes = encode_data_item(2, &signature, &owner, data, &[], 0);
+        let item = verify_data_item(&bytes, &id).unwrap();
+        assert_eq!(item.data, data);
+        assert!(item.metadata(&id).tags.is_empty());
+        let inconsistent = encode_data_item(2, &signature, &owner, data, &[], 1);
+        assert!(verify_data_item(&inconsistent, &id).is_err());
+    }
+
+    #[test]
+    fn verified_item_metadata_preserves_raw_tags_and_derives_only_valid_text() {
+        let tags: &[(&[u8], &[u8])] = &[
+            (b"Content-Type", b"\xff"),
+            (b"content-type", b"text/plain"),
+            (b"Content-Encoding", b"\0gzip"),
+            (b"content-encoding", b"gzip"),
+            (b"\0\xff", b"\xff\0"),
+        ];
+        let (encoded, id) = signed_data_item(b"raw tag payload", tags);
+        let verified = verify_data_item(&encoded, &id).unwrap();
+        let metadata = verified.metadata(&id);
+        assert_eq!(
+            metadata.tags,
+            tags.iter()
+                .map(|(name, value)| (name.to_vec(), value.to_vec()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(metadata.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(metadata.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(metadata.owner_address, sha256(&[verified.owner]));
     }
 
     fn recoverable_signature(key: &Secp256k1SigningKey, digest: &[u8; 32]) -> Vec<u8> {
@@ -3235,7 +3510,7 @@ mod tests {
         multisignature[2_048] = 0b1100_0000;
         check_data_item(6, &multisig_owner, &multisignature, DATA);
         multisignature[2_048] = 0b1000_0000;
-        let insufficient = encode_data_item(6, &multisignature, &multisig_owner, DATA);
+        let insufficient = encode_data_item(6, &multisignature, &multisig_owner, DATA, &[0], 0);
         assert!(
             verify_data_item(&insufficient, &sha256(&[&multisignature])).is_err(),
             "Aptos multisignature must meet its owner threshold"
@@ -3253,8 +3528,8 @@ mod tests {
         assert!(data_item_signature_sizes(8).is_err());
     }
 
-    #[test]
-    fn verifies_ans104_item_and_rejects_mutations() {
+    #[tokio::test]
+    async fn verifies_ans104_item_and_rejects_mutations() {
         const ID: &str = "3F_yldqW_zt6Ci_47w-7O76lPpegpu1rs7H2iyultVY";
         let item = include_bytes!("../tests/fixtures/lolcchekc-item.bin");
         let expected_id = decode_fixed::<32>(ID, "data item ID").unwrap();
@@ -3264,7 +3539,10 @@ mod tests {
             hex(&sha256(&[verified.data])),
             "4d02c735657b171d1a3d3bc9ddd7ee396cdf5232e11d6adb06826637c3b9070c"
         );
-        assert_eq!(verified.content_type, "text/html; charset=utf-8");
+        assert_eq!(
+            item_content_type(&verified.tags).unwrap(),
+            "text/html; charset=utf-8"
+        );
 
         let mut bundle = Vec::with_capacity(32 + BUNDLE_ENTRY_SIZE + item.len());
         bundle.extend_from_slice(&1u64.to_le_bytes());
@@ -3273,19 +3551,38 @@ mod tests {
         bundle.extend_from_slice(&[0; 24]);
         bundle.extend_from_slice(&expected_id);
         bundle.extend_from_slice(item);
-        assert_eq!(verify_bundle_item(&bundle, ID).unwrap().data, verified.data);
+        assert_eq!(
+            verify_bundle_item(&bundle, &expected_id, None)
+                .await
+                .unwrap()
+                .0
+                .data,
+            verified.data
+        );
 
         let mut wrong_id = bundle.clone();
         wrong_id[64] ^= 1;
-        assert!(verify_bundle_item(&wrong_id, ID).is_err());
+        assert!(
+            verify_bundle_item(&wrong_id, &expected_id, None)
+                .await
+                .is_err()
+        );
 
         let mut wrong_size = bundle.clone();
         wrong_size[32] ^= 1;
-        assert!(verify_bundle_item(&wrong_size, ID).is_err());
+        assert!(
+            verify_bundle_item(&wrong_size, &expected_id, None)
+                .await
+                .is_err()
+        );
 
         let mut truncated = bundle;
         truncated.pop();
-        assert!(verify_bundle_item(&truncated, ID).is_err());
+        assert!(
+            verify_bundle_item(&truncated, &expected_id, None)
+                .await
+                .is_err()
+        );
 
         let (signature_size, _) = data_item_signature_sizes(1).unwrap();
         let mut wrong_signature = item.to_vec();

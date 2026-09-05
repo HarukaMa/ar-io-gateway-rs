@@ -4,17 +4,17 @@ use anyhow::{Context, Result, ensure};
 use ar_io_gateway::{
     Config, Gateway,
     database::BlockStore,
-    indexer::{import_metadata, import_range},
+    indexer::{import_bundles, import_metadata, import_range},
 };
 
-const USAGE: &str = "usage: ar-io-index <blocks|transactions> <start-height> <end-height>";
+const USAGE: &str = "usage: ar-io-index <blocks|transactions|bundles> <start-height> <end-height>";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().context(USAGE)?;
     ensure!(
-        matches!(command.as_str(), "blocks" | "transactions"),
+        matches!(command.as_str(), "blocks" | "transactions" | "bundles"),
         "{USAGE}"
     );
     let start: u64 = args
@@ -74,6 +74,9 @@ async fn main() -> Result<()> {
         "blocks" => serde_json::to_string(&import_range(&gateway, &mut store, start, end).await?)?,
         "transactions" => {
             serde_json::to_string(&import_metadata(&gateway, &mut store, start, end).await?)?
+        }
+        "bundles" => {
+            serde_json::to_string(&import_bundles(&gateway, &mut store, start, end).await?)?
         }
         _ => unreachable!(),
     };

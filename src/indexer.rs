@@ -4,9 +4,9 @@ use serde::Serialize;
 use tokio::time::timeout;
 
 use crate::{
-    CONSENSUS_DEPTH, Gateway, NodeInfo,
-    database::{BlockStore, Checkpoint, IndexBlock},
-    decode_b64, endpoint,
+    BundleItems, CONSENSUS_DEPTH, Gateway, MAX_BUNDLE_DEPTH, NodeInfo,
+    database::{BlockStore, BundleLocation, Checkpoint, IndexBlock, ObjectMetadata},
+    decode_b64, endpoint, require_bundle_tags, verify_data_item,
 };
 
 #[derive(Debug, Serialize)]
@@ -25,6 +25,14 @@ pub struct MetadataSummary {
     pub end_height: u64,
     pub imported_blocks: u64,
     pub imported_transactions: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BundleSummary {
+    pub start_height: u64,
+    pub end_height: u64,
+    pub imported_roots: u64,
+    pub imported_occurrences: u64,
 }
 
 pub async fn import_range(
@@ -268,6 +276,361 @@ pub async fn import_metadata(
         imported_blocks,
         imported_transactions,
     })
+}
+
+pub async fn import_bundles(
+    gateway: &Gateway,
+    store: &mut BlockStore,
+    start: u64,
+    end: u64,
+) -> Result<BundleSummary> {
+    ensure!(start <= end, "invalid bundle import range");
+    let deadline = gateway.config.request_timeout;
+    timeout(deadline, async {
+        let state = store
+            .state()
+            .await?
+            .context("block index is not initialized")?;
+        ensure!(
+            state.source == gateway.config.trusted_node_url,
+            "trusted node source does not match stored import"
+        );
+        let imported_through = state
+            .imported_through
+            .context("block index has no imported canonical coverage")?;
+        ensure!(
+            start >= state.start_height && end <= imported_through,
+            "bundle range is outside imported block-index coverage"
+        );
+        ensure!(
+            store
+                .pending_metadata_blocks(start, end, 1)
+                .await?
+                .is_empty()
+                && store.pending_transactions(start, end, 1).await?.is_empty(),
+            "bundle range has incomplete transaction metadata; import transactions first"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("bundle import initialization timed out")??;
+
+    let mut summary = BundleSummary {
+        start_height: start,
+        end_height: end,
+        imported_roots: 0,
+        imported_occurrences: 0,
+    };
+    loop {
+        let pending = timeout(deadline, store.pending_bundles(start, end, 1))
+            .await
+            .context("pending bundle query timed out")??;
+        let Some((root_id, height)) = pending.into_iter().next() else {
+            break;
+        };
+        let encoded_id = URL_SAFE_NO_PAD.encode(&root_id);
+        let (root, tags) = timeout(deadline, gateway.retrieve_direct_with_tags(&encoded_id))
+            .await
+            .with_context(|| format!("retrieving bundle {encoded_id} timed out"))??;
+        ensure!(
+            root.block_height == height,
+            "bundle root canonical height changed"
+        );
+        require_bundle_tags(&tags)?;
+        let root_id = root_id
+            .as_slice()
+            .try_into()
+            .context("invalid bundle root ID")?;
+        let mut traversal = BundleTraversal::new(&root.bytes, root_id)?;
+        loop {
+            let (count, complete) = timeout(deadline, async {
+                let mut objects = Vec::with_capacity(256);
+                let mut locations = Vec::with_capacity(256);
+                let mut complete = false;
+                while locations.len() < 256 {
+                    let Some((object, location)) = traversal.next().await? else {
+                        complete = true;
+                        break;
+                    };
+                    objects.push(object);
+                    locations.push(location);
+                }
+                store
+                    .commit_bundle_batch(root_id, &objects, &locations, complete)
+                    .await?;
+                Ok::<_, anyhow::Error>((locations.len() as u64, complete))
+            })
+            .await
+            .with_context(|| format!("indexing bundle {encoded_id} batch timed out"))?
+            .with_context(|| format!("indexing bundle {encoded_id}"))?;
+            summary.imported_occurrences += count;
+            if complete {
+                break;
+            }
+        }
+        summary.imported_roots += 1;
+    }
+    if summary.imported_roots > 0 {
+        timeout(deadline, store.analyze_metadata())
+            .await
+            .context("bundle statistics refresh timed out")??;
+    }
+    Ok(summary)
+}
+
+struct BundleFrame<'a> {
+    items: BundleItems<'a>,
+    id: [u8; 32],
+    item_offset: Option<u128>,
+    payload_offset: u128,
+    framing_checked: bool,
+}
+
+struct BundleTraversal<'a> {
+    stack: Vec<BundleFrame<'a>>,
+}
+
+impl<'a> BundleTraversal<'a> {
+    fn new(root: &'a [u8], root_id: &[u8; 32]) -> Result<Self> {
+        Ok(Self {
+            stack: vec![BundleFrame {
+                items: BundleItems::new(root)?,
+                id: *root_id,
+                item_offset: None,
+                payload_offset: 0,
+                framing_checked: false,
+            }],
+        })
+    }
+
+    async fn next(&mut self) -> Result<Option<(ObjectMetadata, BundleLocation)>> {
+        while let Some(parent) = self.stack.last_mut() {
+            if !parent.framing_checked {
+                let mut table = BundleItems::new(parent.items.bundle)?;
+                let mut checked = 0;
+                while table.next()?.is_some() {
+                    checked += 1;
+                    if checked % 256 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                parent.framing_checked = true;
+            }
+            tokio::task::yield_now().await;
+            let Some(entry) = parent.items.next()? else {
+                self.stack.pop();
+                continue;
+            };
+            let item = verify_data_item(entry.bytes, entry.id)?;
+            let root_offset = parent
+                .payload_offset
+                .checked_add(entry.offset as u128)
+                .context("bundle root offset overflow")?;
+            let location = BundleLocation {
+                id: entry.id.to_vec(),
+                parent_id: parent.id.to_vec(),
+                parent_offset: parent.item_offset,
+                item_offset: entry.offset as u128,
+                item_size: entry.bytes.len() as u128,
+                data_offset: item.data_offset as u128,
+                root_offset,
+            };
+            if item.is_bundle() {
+                let items = BundleItems::new(item.data)?;
+                if items.remaining > 0 {
+                    ensure!(
+                        self.stack.len() < MAX_BUNDLE_DEPTH,
+                        "nested bundle exceeds maximum depth {MAX_BUNDLE_DEPTH}"
+                    );
+                    self.stack.push(BundleFrame {
+                        items,
+                        id: *entry.id,
+                        item_offset: Some(root_offset),
+                        payload_offset: root_offset
+                            .checked_add(item.data_offset as u128)
+                            .context("nested bundle payload offset overflow")?,
+                        framing_checked: false,
+                    });
+                }
+            }
+            return Ok(Some((item.metadata(entry.id), location)));
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+    use crate::{
+        database::IndexedBundle,
+        tests::{encode_bundle, signed_data_item},
+        verify_bundle_item, verify_indexed_bundle,
+    };
+
+    const BUNDLE_TAGS: &[(&[u8], &[u8])] =
+        &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+
+    #[tokio::test]
+    async fn nested_repeated_occurrences_authenticate_exact_stored_paths() {
+        let root_id = [9; 32];
+        let data = b"nested repeated payload";
+        let (leaf, leaf_id) = signed_data_item(data, &[]);
+        let nested_data = encode_bundle(&[&leaf, &leaf]);
+        let (nested, nested_id) = signed_data_item(&nested_data, BUNDLE_TAGS);
+        let root = encode_bundle(&[&nested, &nested]);
+        let mut traversal = BundleTraversal::new(&root, &root_id).unwrap();
+        let mut locations = Vec::new();
+        while let Some((_, location)) = traversal.next().await.unwrap() {
+            locations.push(location);
+        }
+        assert_eq!(
+            locations
+                .iter()
+                .map(|location| location.id.as_slice())
+                .collect::<Vec<_>>(),
+            [nested_id, leaf_id, leaf_id, nested_id, leaf_id, leaf_id]
+                .iter()
+                .map(|id| id.as_slice())
+                .collect::<Vec<_>>()
+        );
+        let payload_start = nested.len() - nested_data.len();
+        let second_parent = 160 + nested.len();
+        let second_leaf = second_parent + payload_start + 160 + leaf.len();
+        assert_eq!(locations[5].root_offset, second_leaf as u128);
+        assert_eq!(locations[5].parent_offset, Some(second_parent as u128));
+        let indexed = || IndexedBundle {
+            root_id: root_id.to_vec(),
+            data_size: data.len() as u128,
+            locations: vec![locations[3].clone(), locations[5].clone()],
+        };
+        assert_eq!(
+            verify_indexed_bundle(&root, &leaf_id, &indexed())
+                .await
+                .unwrap()
+                .data,
+            data
+        );
+        for field in 0..8 {
+            let mut hint = indexed();
+            let location = &mut hint.locations[1];
+            match field {
+                0 => location.item_offset += 1,
+                1 => location.root_offset += 1,
+                2 => location.parent_offset = Some(0),
+                3 => location.data_offset += 1,
+                4 => location.item_size += 1,
+                5 => location.parent_id[0] ^= 1,
+                6 => location.id[0] ^= 1,
+                7 => hint.data_size += 1,
+                _ => unreachable!(),
+            }
+            assert!(verify_indexed_bundle(&root, &leaf_id, &hint).await.is_err());
+        }
+        let mut missing_ancestor = indexed();
+        missing_ancestor.locations.remove(0);
+        assert!(
+            verify_indexed_bundle(&root, &leaf_id, &missing_ancestor)
+                .await
+                .is_err()
+        );
+        let mut corrupt_parent = root.clone();
+        corrupt_parent[second_parent + 2] ^= 1;
+        assert!(
+            verify_indexed_bundle(&corrupt_parent, &leaf_id, &indexed())
+                .await
+                .is_err()
+        );
+        let mut corrupt_table = root.clone();
+        corrupt_table[96] ^= 1;
+        assert!(
+            verify_indexed_bundle(&corrupt_table, &leaf_id, &indexed())
+                .await
+                .is_err()
+        );
+
+        let mut corrupt_leaf = leaf.clone();
+        *corrupt_leaf.last_mut().unwrap() ^= 1;
+        let repeated = encode_bundle(&[&corrupt_leaf, &leaf]);
+        assert_eq!(
+            verify_bundle_item(&repeated, &leaf_id, Some((160 + leaf.len()) as u128))
+                .await
+                .unwrap()
+                .0
+                .data,
+            data
+        );
+        assert!(verify_bundle_item(&repeated, &leaf_id, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn valid_prefix_replays_after_a_later_signature_failure() {
+        let (leaf, _) = signed_data_item(b"resumable", &[]);
+        let mut corrupt = leaf.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let mut items = vec![leaf.as_slice(); 256];
+        items.push(&corrupt);
+        let root = encode_bundle(&items);
+        let mut first = BundleTraversal::new(&root, &[9; 32]).unwrap();
+        let mut replay = BundleTraversal::new(&root, &[9; 32]).unwrap();
+        for index in 0..256 {
+            let original = first.next().await.unwrap().unwrap();
+            assert_eq!(original, replay.next().await.unwrap().unwrap());
+            assert_eq!(
+                original.1.root_offset,
+                (32 + 257 * 64 + index * leaf.len()) as u128
+            );
+        }
+        assert!(first.next().await.is_err());
+        assert!(replay.next().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_tail_is_rejected_before_yielding_locations() {
+        let (leaf, _) = signed_data_item(b"framing", &[]);
+        let mut root = encode_bundle(&vec![leaf.as_slice(); 257]);
+        root.push(0);
+        let mut traversal = BundleTraversal::new(&root, &[9; 32]).unwrap();
+        assert!(traversal.next().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn traversal_accepts_empty_bundles_and_enforces_table_and_depth_bounds() {
+        let empty = encode_bundle(&[]);
+        assert!(
+            BundleTraversal::new(&empty, &[9; 32])
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut trailing = empty.clone();
+        trailing.push(0);
+        assert!(BundleTraversal::new(&trailing, &[9; 32]).is_err());
+        let mut oversized = empty;
+        oversized[31] = 1;
+        assert!(BundleTraversal::new(&oversized, &[9; 32]).is_err());
+
+        let (leaf, _) = signed_data_item(b"deep", &[]);
+        let mut root = encode_bundle(&[&leaf]);
+        for _ in 1..MAX_BUNDLE_DEPTH {
+            let (parent, _) = signed_data_item(&root, BUNDLE_TAGS);
+            root = encode_bundle(&[&parent]);
+        }
+        let mut traversal = BundleTraversal::new(&root, &[9; 32]).unwrap();
+        for _ in 0..MAX_BUNDLE_DEPTH {
+            assert!(traversal.next().await.unwrap().is_some());
+        }
+        assert!(traversal.next().await.unwrap().is_none());
+        let (parent, _) = signed_data_item(&root, BUNDLE_TAGS);
+        let too_deep = encode_bundle(&[&parent]);
+        let mut traversal = BundleTraversal::new(&too_deep, &[9; 32]).unwrap();
+        for _ in 1..MAX_BUNDLE_DEPTH {
+            traversal.next().await.unwrap().unwrap();
+        }
+        assert!(traversal.next().await.is_err());
+    }
 }
 
 async fn read_checkpoint(gateway: &Gateway, height: u64) -> Result<Checkpoint> {
