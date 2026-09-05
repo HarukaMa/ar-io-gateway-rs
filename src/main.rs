@@ -54,7 +54,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| config.cache_max_bytes.to_string())
         .parse()
         .context("invalid AR_IO_CACHE_MAX_BYTES")?;
-    let gateway = Gateway::new(config)?;
+    let mut gateway = Gateway::new(config)?;
+    if let Ok(url) = env::var("DATABASE_URL") {
+        gateway = gateway.with_database(&url).await?;
+    }
 
     if command == "serve" {
         if args.next().is_some() {

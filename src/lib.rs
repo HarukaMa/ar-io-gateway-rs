@@ -1,3 +1,5 @@
+pub mod database;
+pub mod indexer;
 mod peers;
 pub mod server;
 
@@ -34,7 +36,7 @@ const LEAF_SIZE: usize = HASH_SIZE + NOTE_SIZE;
 const MAX_CHUNK_SIZE: u128 = 256 * 1024;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
 const MAX_PROOF_BYTES: usize = 64 * 1024;
-const MAX_BLOCK_INDEX_BYTES: usize = 256;
+const MAX_BLOCK_INDEX_BYTES: usize = 256 * 99;
 const BUNDLE_ENTRY_SIZE: usize = 64;
 const MAX_DATA_ITEM_TAGS: usize = 128;
 const MAX_DATA_ITEM_TAG_BYTES: usize = 4096;
@@ -188,6 +190,7 @@ pub struct Gateway {
     client: Client,
     cache: Mutex<ContentCache>,
     peers: peers::PeerState,
+    block_store: Option<database::BlockStore>,
 }
 
 impl Gateway {
@@ -202,7 +205,22 @@ impl Gateway {
             client,
             cache: Mutex::new(ContentCache::default()),
             peers,
+            block_store: None,
         })
+    }
+
+    pub async fn with_database(mut self, url: &str) -> Result<Self> {
+        let store = database::BlockStore::connect(url).await?;
+        let state = store
+            .state()
+            .await?
+            .context("block index has not been initialized")?;
+        ensure!(
+            state.source == self.config.trusted_node_url,
+            "block index belongs to a different trusted node"
+        );
+        self.block_store = Some(store);
+        Ok(self)
     }
 
     pub async fn retrieve(&self, id: &str) -> Result<VerifiedData> {
@@ -395,6 +413,23 @@ impl Gateway {
         if offset == 0 {
             return Ok(None);
         }
+        if let Some(store) = &self.block_store
+            && let Some((previous, block)) = store.block_for_offset(offset).await?
+        {
+            ensure!(
+                offset > previous.weave_size && offset <= block.weave_size,
+                "stored block index returned inconsistent offset geometry"
+            );
+            return Ok(Some(BlockGeometry {
+                tx_root: block
+                    .tx_root
+                    .as_slice()
+                    .try_into()
+                    .context("invalid stored tx_root")?,
+                block_weave_size: block.weave_size,
+                previous_weave_size: previous.weave_size,
+            }));
+        }
         let Some(info): Option<NodeInfo> = self
             .request_optional_json(
                 self.client
@@ -457,7 +492,12 @@ impl Gateway {
         start: u64,
         end: u64,
     ) -> Result<Option<Vec<TrustedBlockIndexEntry>>> {
-        ensure!(start <= end, "invalid block index range");
+        let expected = end
+            .checked_sub(start)
+            .and_then(|n| n.checked_add(1))
+            .context("invalid block index range")?;
+        ensure!(expected <= 256, "block index range exceeds 256 entries");
+        let byte_limit = expected as usize * 99;
         let mut response = match self
             .client
             .get(endpoint(
@@ -475,7 +515,7 @@ impl Gateway {
         }
         if let Some(length) = response.content_length() {
             ensure!(
-                length <= MAX_BLOCK_INDEX_BYTES as u64,
+                length <= byte_limit.min(MAX_BLOCK_INDEX_BYTES) as u64,
                 "trusted block index response exceeds size limit"
             );
         }
@@ -486,14 +526,13 @@ impl Gateway {
             .context("failed to read block index")?
         {
             ensure!(
-                body.len().saturating_add(chunk.len()) <= MAX_BLOCK_INDEX_BYTES,
+                body.len().saturating_add(chunk.len()) <= byte_limit,
                 "trusted block index response exceeds size limit"
             );
             body.extend_from_slice(&chunk);
         }
         let entries = decode_block_index(&body)?;
-        let expected =
-            usize::try_from(end - start + 1).context("block index range is too large")?;
+        let expected = expected as usize;
         ensure!(
             entries.len() == expected,
             "trusted block index returned incomplete geometry"
@@ -573,28 +612,41 @@ impl Gateway {
         );
         decode_fixed::<48>(&status.block_indep_hash, "status block hash")?;
 
-        let info: NodeInfo = self
-            .get_json(&self.config.trusted_node_url, "info")
-            .await
-            .context("failed to fetch trusted node height")?;
-        ensure!(
-            info.height >= status.block_height.saturating_add(CONSENSUS_DEPTH),
-            "transaction block is inside the trusted node consensus window"
-        );
-
-        let index_path = format!(
-            "block_index/{}/{}",
-            status.block_height - 1,
-            status.block_height
-        );
-        let entries: Vec<BlockIndexEntry> = self
-            .request_json(
+        let indexed = match &self.block_store {
+            Some(store) => store.block_pair(status.block_height).await?,
+            None => None,
+        };
+        let entries: Vec<BlockIndexEntry> = if let Some((previous, block)) = indexed {
+            [block, previous]
+                .into_iter()
+                .map(|entry| BlockIndexEntry {
+                    hash: URL_SAFE_NO_PAD.encode(&entry.hash),
+                    tx_root: URL_SAFE_NO_PAD.encode(&entry.tx_root),
+                    weave_size: entry.weave_size.to_string(),
+                })
+                .collect()
+        } else {
+            let info: NodeInfo = self
+                .get_json(&self.config.trusted_node_url, "info")
+                .await
+                .context("failed to fetch trusted node height")?;
+            ensure!(
+                info.height >= status.block_height.saturating_add(CONSENSUS_DEPTH),
+                "transaction block is inside the trusted node consensus window"
+            );
+            let index_path = format!(
+                "block_index/{}/{}",
+                status.block_height - 1,
+                status.block_height
+            );
+            self.request_json(
                 self.client
                     .get(endpoint(&self.config.trusted_node_url, &index_path))
                     .header("x-block-format", "1"),
             )
             .await
-            .context("failed to fetch trusted block index")?;
+            .context("failed to fetch trusted block index")?
+        };
         ensure!(
             entries.len() == 2,
             "trusted block index returned incomplete geometry"
@@ -910,7 +962,7 @@ fn decode_block_index(bytes: &[u8]) -> Result<Vec<TrustedBlockIndexEntry>> {
     let mut cursor = 0;
     let mut entries = Vec::new();
     while cursor < bytes.len() {
-        take(bytes, &mut cursor, 48, "block hash")?;
+        let hash = URL_SAFE_NO_PAD.encode(take(bytes, &mut cursor, 48, "block hash")?);
         let weave_size_length =
             u16::from_be_bytes(take(bytes, &mut cursor, 2, "weave size length")?.try_into()?)
                 as usize;
@@ -927,6 +979,7 @@ fn decode_block_index(bytes: &[u8]) -> Result<Vec<TrustedBlockIndexEntry>> {
         let tx_root =
             URL_SAFE_NO_PAD.encode(take(bytes, &mut cursor, tx_root_length, "block tx_root")?);
         entries.push(TrustedBlockIndexEntry {
+            hash,
             tx_root,
             weave_size,
         });
@@ -935,6 +988,7 @@ fn decode_block_index(bytes: &[u8]) -> Result<Vec<TrustedBlockIndexEntry>> {
 }
 
 struct TrustedBlockIndexEntry {
+    hash: String,
     tx_root: String,
     weave_size: u128,
 }
@@ -2827,6 +2881,7 @@ mod tests {
         encoded.extend_from_slice(&[9; 32]);
         let entries = decode_block_index(&encoded).unwrap();
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, URL_SAFE_NO_PAD.encode([7; 48]));
         assert_eq!(entries[0].weave_size, 1_145);
         assert_eq!(entries[0].tx_root, URL_SAFE_NO_PAD.encode([9; 32]));
         encoded.pop();
