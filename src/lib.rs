@@ -1,7 +1,9 @@
 pub mod database;
+mod historical;
 pub mod indexer;
 mod peers;
 pub mod server;
+mod transactions;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -18,10 +20,11 @@ use k256::ecdsa::{
     signature::hazmat::PrehashVerifier,
 };
 use reqwest::{Client, RequestBuilder, Url, header::HeaderValue};
-use rsa::{BigUint, Pss, RsaPublicKey, traits::PublicKeyParts};
+use rsa::BigUint;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256, Sha384};
 use sha3::Keccak256;
+use transactions::{verify_rsa_pss, verify_transaction};
 
 const CONSENSUS_DEPTH: u64 = 50;
 const FORK_2_5_HEIGHT: u64 = 812_970;
@@ -606,10 +609,6 @@ impl Gateway {
             .get_json(&self.config.archive_url, &format!("tx/{id}/status"))
             .await
             .context("failed to fetch transaction status")?;
-        ensure!(
-            status.block_height > 0,
-            "genesis transactions are unsupported"
-        );
         decode_fixed::<48>(&status.block_indep_hash, "status block hash")?;
 
         let indexed = match &self.block_store {
@@ -636,7 +635,7 @@ impl Gateway {
             );
             let index_path = format!(
                 "block_index/{}/{}",
-                status.block_height - 1,
+                status.block_height.saturating_sub(1),
                 status.block_height
             );
             self.request_json(
@@ -648,43 +647,54 @@ impl Gateway {
             .context("failed to fetch trusted block index")?
         };
         ensure!(
-            entries.len() == 2,
+            entries.len() == if status.block_height == 0 { 1 } else { 2 },
             "trusted block index returned incomplete geometry"
         );
         let block = &entries[0];
-        let previous_block = &entries[1];
+        let previous_block = entries.get(1);
         ensure!(
             block.hash == status.block_indep_hash,
             "archival status does not match the trusted block index"
         );
-        self.authenticate_block(block, status.block_height, id)
+        self.authenticate_block(block, status.block_height, Some(id))
             .await?;
 
-        let transaction: Transaction = self
-            .get_json(&self.config.archive_url, &format!("tx/{id}"))
-            .await
-            .context("failed to fetch transaction header")?;
-        verify_transaction(&transaction, id)?;
+        let (transaction, verified) = self.verified_transaction(id, status.block_height).await?;
+        let data_size = verified.metadata.data_size;
+        if let Some(bytes) = verified.inline_data {
+            let body_hash = sha256(&[&bytes]);
+            let content_length = bytes.len();
+            return Ok((
+                VerifiedData {
+                    bytes: bytes.into(),
+                    cache_hit: false,
+                    id: id.to_owned(),
+                    block_height: status.block_height,
+                    content_type: content_type(&transaction.tags)?,
+                    content_length,
+                    etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
+                    sha256: hex(&body_hash),
+                },
+                transaction.tags,
+            ));
+        }
 
         let offset: TxOffset = self
             .get_json(&self.config.archive_url, &format!("tx/{id}/offset"))
             .await
             .context("failed to fetch transaction offset")?;
-        let data_size = parse_u128(&transaction.data_size, "transaction data size")?;
         let offset_size = parse_u128(&offset.size, "offset data size")?;
         let end_offset = parse_u128(&offset.offset, "transaction end offset")?;
-        ensure!(
-            data_size > 0,
-            "zero-byte direct transactions are unsupported"
-        );
         ensure!(
             offset_size == data_size,
             "transaction size and offset size differ"
         );
 
         let block_weave_size = parse_u128(&block.weave_size, "block weave size")?;
-        let previous_weave_size =
-            parse_u128(&previous_block.weave_size, "previous block weave size")?;
+        let previous_weave_size = previous_block
+            .map(|previous| parse_u128(&previous.weave_size, "previous block weave size"))
+            .transpose()?
+            .unwrap_or(0);
         ensure!(
             block_weave_size > previous_weave_size,
             "invalid block weave geometry"
@@ -762,12 +772,98 @@ impl Gateway {
         ))
     }
 
+    async fn verified_block(&self, block: &database::IndexBlock) -> Result<BlockHeader> {
+        let entry = BlockIndexEntry {
+            hash: URL_SAFE_NO_PAD.encode(&block.hash),
+            tx_root: URL_SAFE_NO_PAD.encode(&block.tx_root),
+            weave_size: block.weave_size.to_string(),
+        };
+        let header = self.authenticate_block(&entry, block.height, None).await?;
+        if let Some(previous) = &block.previous_hash {
+            ensure!(
+                decode_b64(&header.previous_block, "previous block")? == *previous,
+                "block predecessor does not match trusted index"
+            );
+        }
+        Ok(header)
+    }
+
+    async fn verified_transaction(
+        &self,
+        id: &str,
+        height: u64,
+    ) -> Result<(Transaction, transactions::VerifiedTransaction)> {
+        decode_fixed::<32>(id, "transaction ID")?;
+        let limit = self
+            .config
+            .max_data_size
+            .checked_mul(4)
+            .and_then(|size| size.checked_div(3))
+            .and_then(|size| size.checked_add(MAX_JSON_BYTES))
+            .context("transaction response limit overflow")?;
+        let mut failures = Vec::new();
+        for (source, trusted) in [
+            (&self.config.trusted_node_url, true),
+            (&self.config.archive_url, false),
+        ] {
+            if !trusted && source == &self.config.trusted_node_url {
+                continue;
+            }
+            let result = async {
+                let response = self
+                    .client
+                    .get(endpoint(source, &format!("tx/{id}")))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                if trusted {
+                    ensure!(
+                        response.url().origin() == Url::parse(source)?.origin(),
+                        "trusted transaction source redirected outside its origin"
+                    );
+                }
+                let value = read_json_response_with_limit(response, limit).await?;
+                let mut transaction = transactions::decode_transaction(value)?;
+                ensure!(
+                    trusted
+                        || (!transaction.owner.is_empty()
+                            && (transaction.format != 1 || transaction.denomination != 0)),
+                    "this transaction format requires trusted-node metadata"
+                );
+                let verified = verify_transaction(&transaction, id, height)?;
+                ensure!(
+                    verified
+                        .inline_data
+                        .as_ref()
+                        .is_none_or(|data| data.len() <= self.config.max_data_size),
+                    "transaction exceeds configured size limit"
+                );
+                transaction.data = String::new();
+                Ok::<_, anyhow::Error>((transaction, verified))
+            }
+            .await;
+            match result {
+                Ok(verified) => return Ok(verified),
+                Err(error) => failures.push(format!("{source}: {error:#}")),
+            }
+        }
+        bail!("transaction metadata unavailable: {}", failures.join("; "))
+    }
+
+    async fn verified_transaction_metadata(
+        &self,
+        id: &str,
+        height: u64,
+    ) -> Result<database::ObjectMetadata> {
+        Ok(self.verified_transaction(id, height).await?.1.metadata)
+    }
+
     async fn authenticate_block(
         &self,
         entry: &BlockIndexEntry,
         height: u64,
-        transaction_id: &str,
-    ) -> Result<()> {
+        transaction_id: Option<&str>,
+    ) -> Result<BlockHeader> {
         let path = format!("block/hash/{}", entry.hash);
         let mut failures = Vec::new();
 
@@ -775,13 +871,14 @@ impl Gateway {
             .fetch_and_authenticate_block(
                 self.client
                     .get(endpoint(&self.config.trusted_node_url, &path)),
+                &self.config.trusted_node_url,
                 entry,
                 height,
                 transaction_id,
             )
             .await
         {
-            Ok(()) => return Ok(()),
+            Ok(block) => return Ok(block),
             Err(error) => failures.push(format!("{}: {error:#}", self.config.trusted_node_url)),
         }
 
@@ -812,15 +909,16 @@ impl Gateway {
             match self
                 .fetch_and_authenticate_block(
                     self.source_request(source, &path, &discovered),
+                    source,
                     entry,
                     height,
                     transaction_id,
                 )
                 .await
             {
-                Ok(()) => {
+                Ok(block) => {
                     self.peers.record_result(source, true);
-                    return Ok(());
+                    return Ok(block);
                 }
                 Err(error) => {
                     self.peers.record_result(source, false);
@@ -838,12 +936,42 @@ impl Gateway {
     async fn fetch_and_authenticate_block(
         &self,
         request: RequestBuilder,
+        source: &str,
         entry: &BlockIndexEntry,
         height: u64,
-        transaction_id: &str,
-    ) -> Result<()> {
-        let block: BlockHeader = self.request_json(request).await?;
-        verify_block_header(&block, entry, height, transaction_id)
+        transaction_id: Option<&str>,
+    ) -> Result<BlockHeader> {
+        let value = self.request_json(request).await?;
+        let mut block = historical::decode_header(value)?;
+        ensure!(
+            block.height == height && block.indep_hash == entry.hash,
+            "block header identifier mismatch"
+        );
+        if height < 422_250 && block.legacy_wallets.is_none() {
+            let path = format!("block/hash/{}/wallet_list", entry.hash);
+            let response = self
+                .client
+                .get(endpoint(source, &path))
+                .send()
+                .await?
+                .error_for_status()?;
+            let wallets =
+                read_json_response_with_limit(response, self.config.max_data_size).await?;
+            block.legacy_wallets = Some(historical::decode_wallets(wallets)?);
+        }
+        if height < 95_000 && block.hash_list.len() as u64 != height {
+            let path = format!("block/hash/{}/hash_list", entry.hash);
+            let response = self
+                .client
+                .get(endpoint(source, &path))
+                .send()
+                .await?
+                .error_for_status()?;
+            block.hash_list =
+                read_json_response_with_limit(response, self.config.max_data_size).await?;
+        }
+        verify_block_header(&block, entry, height, transaction_id)?;
+        Ok(block)
     }
 
     fn source_request(&self, source: &str, path: &str, discovered: &[String]) -> RequestBuilder {
@@ -928,18 +1056,22 @@ impl Gateway {
     }
 }
 
-async fn read_json_response<T: DeserializeOwned>(mut response: reqwest::Response) -> Result<T> {
+async fn read_json_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
+    read_json_response_with_limit(response, MAX_JSON_BYTES).await
+}
+
+async fn read_json_response_with_limit<T: DeserializeOwned>(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<T> {
     if let Some(length) = response.content_length() {
-        ensure!(
-            length <= MAX_JSON_BYTES as u64,
-            "JSON response exceeds size limit"
-        );
+        ensure!(length <= limit as u64, "JSON response exceeds size limit");
     }
 
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.context("failed to read HTTP body")? {
         ensure!(
-            body.len().saturating_add(chunk.len()) <= MAX_JSON_BYTES,
+            body.len().saturating_add(chunk.len()) <= limit,
             "JSON response exceeds size limit"
         );
         body.extend_from_slice(&chunk);
@@ -1011,13 +1143,17 @@ struct BlockHeader {
     cumulative_diff: String,
     reward_pool: String,
     wallet_list: String,
+    #[serde(skip)]
+    legacy_wallets: Option<Vec<historical::LegacyWallet>>,
+    #[serde(default)]
+    hash_list: Vec<String>,
     hash_list_merkle: String,
     hash: String,
     block_size: String,
     weave_size: String,
     tx_root: String,
     reward_addr: String,
-    tags: Vec<String>,
+    tags: Vec<serde_json::Value>,
     txs: Vec<String>,
     packing_2_5_threshold: String,
     strict_data_split_threshold: String,
@@ -1124,7 +1260,7 @@ fn verify_block_header(
     block: &BlockHeader,
     entry: &BlockIndexEntry,
     height: u64,
-    transaction_id: &str,
+    transaction_id: Option<&str>,
 ) -> Result<()> {
     ensure!(block.height == height, "block header height mismatch");
     let expected_hash = decode_fixed::<48>(&entry.hash, "trusted block hash")?;
@@ -1136,20 +1272,25 @@ fn verify_block_header(
         block_indep_hash(block)? == expected_hash,
         "block indep_hash verification failed"
     );
-    ensure!(
-        decode_fixed::<32>(&block.tx_root, "block tx_root")?
-            == decode_fixed::<32>(&entry.tx_root, "trusted block tx_root")?,
-        "block tx_root does not match trusted index"
-    );
+    if height >= 422_250 {
+        let tx_root = decode_b64(&block.tx_root, "block tx_root")?;
+        ensure!(
+            matches!(tx_root.len(), 0 | 32)
+                && tx_root == decode_b64(&entry.tx_root, "trusted block tx_root")?,
+            "block tx_root does not match trusted index"
+        );
+    }
     ensure!(
         parse_u128(&block.weave_size, "block weave size")?
             == parse_u128(&entry.weave_size, "trusted block weave size")?,
         "block weave size does not match trusted index"
     );
-    ensure!(
-        block.txs.iter().any(|id| id == transaction_id),
-        "transaction ID is absent from authenticated block"
-    );
+    if let Some(transaction_id) = transaction_id {
+        ensure!(
+            block.txs.iter().any(|id| id == transaction_id),
+            "transaction ID is absent from authenticated block"
+        );
+    }
     Ok(())
 }
 
@@ -1158,17 +1299,14 @@ fn block_indep_hash(block: &BlockHeader) -> Result<[u8; 48]> {
         let signed_hash = post_2_6_signed_hash(block)?;
         let signature = decode_b64(&block.signature, "block signature")?;
         Ok(sha384(&[&signed_hash, &signature]))
-    } else {
+    } else if block.height >= FORK_2_5_HEIGHT {
         pre_2_6_indep_hash(block)
+    } else {
+        historical::indep_hash(block)
     }
 }
 
 fn pre_2_6_indep_hash(block: &BlockHeader) -> Result<[u8; 48]> {
-    ensure!(
-        block.height >= FORK_2_5_HEIGHT,
-        "block versions before fork 2.5 are unsupported"
-    );
-
     let core = [
         deep_hash_decimal(&block.height.to_string(), "block height")?,
         deep_hash_blob(&decode_b64(&block.previous_block, "previous block")?),
@@ -1177,7 +1315,18 @@ fn pre_2_6_indep_hash(block: &BlockHeader) -> Result<[u8; 48]> {
         deep_hash_decimal(&block.block_size, "block size")?,
         deep_hash_decimal(&block.weave_size, "block weave size")?,
         deep_hash_blob(&reward_address(&block.reward_addr, false)?),
-        deep_hash_b64_list(&block.tags, "block tag")?,
+        deep_hash_list(
+            &block
+                .tags
+                .iter()
+                .map(|tag| {
+                    Ok(deep_hash_blob(&decode_b64(
+                        tag.as_str().context("invalid block tag")?,
+                        "block tag",
+                    )?))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
     ];
     let mut base = Vec::with_capacity(14);
     for (value, label) in [
@@ -1293,7 +1442,15 @@ fn post_2_6_signed_hash(block: &BlockHeader) -> Result<[u8; 32]> {
         1,
         "scheduled USD rate divisor",
     )?;
-    append_b64_list(&mut segment, &block.tags, 2, 2, "block tag")?;
+    append_size(&mut segment, block.tags.len(), 2)?;
+    for tag in block.tags.iter().rev() {
+        append_b64(
+            &mut segment,
+            tag.as_str().context("invalid block tag")?,
+            2,
+            "block tag",
+        )?;
+    }
     append_b64_list(&mut segment, &block.txs, 2, 1, "block transaction ID")?;
     append_decimal(&mut segment, &block.reward, 1, "block reward")?;
     append_decimal(&mut segment, &block.recall_byte, 2, "recall byte")?;
@@ -1602,10 +1759,16 @@ struct Transaction {
     tags: Vec<Tag>,
     target: String,
     quantity: String,
+    #[serde(default)]
     data_size: String,
+    #[serde(default)]
     data_root: String,
     reward: String,
     signature: String,
+    #[serde(default)]
+    data: String,
+    #[serde(default)]
+    denomination: u32,
 }
 
 #[derive(Deserialize)]
@@ -1808,57 +1971,6 @@ fn verify_chunk_proof(
         relative_offset,
         first_offset,
     })
-}
-
-fn verify_transaction(transaction: &Transaction, expected_id: &str) -> Result<()> {
-    ensure!(
-        transaction.format == 2,
-        "only format-2 transactions are supported"
-    );
-    ensure!(
-        transaction.id == expected_id,
-        "transaction header ID mismatch"
-    );
-
-    let signature = decode_b64(&transaction.signature, "transaction signature")?;
-    let actual_id = sha256(&[&signature]);
-    ensure!(
-        decode_fixed::<32>(&transaction.id, "transaction ID")? == actual_id,
-        "transaction ID is not the signature hash"
-    );
-
-    let owner = decode_b64(&transaction.owner, "transaction owner")?;
-    ensure!(!owner.is_empty(), "ECDSA transactions are unsupported");
-    let mut fields = Vec::with_capacity(9);
-    fields.push(deep_hash_blob(b"2"));
-    fields.push(deep_hash_blob(&owner));
-    fields.push(deep_hash_blob(&decode_b64(
-        &transaction.target,
-        "transaction target",
-    )?));
-    fields.push(deep_hash_blob(transaction.quantity.as_bytes()));
-    fields.push(deep_hash_blob(transaction.reward.as_bytes()));
-    fields.push(deep_hash_blob(&decode_b64(
-        &transaction.last_tx,
-        "transaction anchor",
-    )?));
-
-    let mut tag_hashes = Vec::with_capacity(transaction.tags.len());
-    for tag in &transaction.tags {
-        tag_hashes.push(deep_hash_list(&[
-            deep_hash_blob(&decode_b64(&tag.name, "tag name")?),
-            deep_hash_blob(&decode_b64(&tag.value, "tag value")?),
-        ]));
-    }
-    fields.push(deep_hash_list(&tag_hashes));
-    fields.push(deep_hash_blob(transaction.data_size.as_bytes()));
-    fields.push(deep_hash_blob(&decode_fixed::<32>(
-        &transaction.data_root,
-        "transaction data root",
-    )?));
-
-    let signature_payload = deep_hash_list(&fields);
-    verify_rsa_pss(&owner, &signature, &signature_payload, "transaction")
 }
 
 fn content_type(tags: &[Tag]) -> Result<String> {
@@ -2325,24 +2437,6 @@ fn keccak256(parts: &[&[u8]]) -> [u8; 32] {
     sha3::Digest::finalize(hasher).into()
 }
 
-fn verify_rsa_pss(owner: &[u8], signature: &[u8], payload: &[u8], label: &str) -> Result<()> {
-    let signature_digest = Sha256::digest(payload);
-    let key = RsaPublicKey::new(BigUint::from_bytes_be(owner), BigUint::from(65_537u32))
-        .with_context(|| format!("invalid RSA {label} owner"))?;
-    let encoded_len = (key.n().bits().saturating_sub(1) as usize).div_ceil(8);
-    let max_salt = encoded_len.saturating_sub(32 + 2);
-    let valid = [0, 32, max_salt].into_iter().any(|salt_len| {
-        key.verify(
-            Pss::new_with_salt::<Sha256>(salt_len),
-            &signature_digest,
-            signature,
-        )
-        .is_ok()
-    });
-    ensure!(valid, "{label} signature verification failed");
-    Ok(())
-}
-
 struct TxPath {
     data_root: [u8; 32],
     start_bound: u128,
@@ -2791,6 +2885,91 @@ mod tests {
     use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
     use k256::ecdsa::SigningKey as Secp256k1SigningKey;
 
+    #[test]
+    fn verifies_empty_transactions_and_rejects_size_root_mismatches() {
+        let mut transaction: Transaction =
+            serde_json::from_str(include_str!("../tests/fixtures/empty-transaction.json")).unwrap();
+        verify_transaction(&transaction, &transaction.id, 1_000_000).unwrap();
+        transaction.data_root = URL_SAFE_NO_PAD.encode([1; 32]);
+        assert!(verify_transaction(&transaction, &transaction.id, 1_000_000).is_err());
+        transaction.data_root.clear();
+        transaction.data_size = "1".to_owned();
+        assert!(verify_transaction(&transaction, &transaction.id, 1_000_000).is_err());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_metadata_requires_the_trusted_source() {
+        use axum::{Router, http::StatusCode, response::IntoResponse};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/protocol-transactions.json"))
+                .unwrap();
+        for (name, requires_trusted) in [
+            ("public-format1-height34", true),
+            ("format2-ecdsa", true),
+            ("format2-rsa-denomination", false),
+        ] {
+            let case = fixtures["transactions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap();
+            let header = case["transaction"].clone();
+            let id = header["id"].as_str().unwrap().to_owned();
+            let height = case["height"].as_u64().unwrap();
+            let available = Arc::new(AtomicBool::new(true));
+            let mut servers = Vec::new();
+            let mut urls = Vec::new();
+            for trusted in [true, false] {
+                let available = Arc::clone(&available);
+                let header = header.clone();
+                let router = Router::new().fallback(move || {
+                    let header = header.clone();
+                    let available = Arc::clone(&available);
+                    async move {
+                        if trusted && !available.load(Ordering::SeqCst) {
+                            StatusCode::NOT_FOUND.into_response()
+                        } else {
+                            header.to_string().into_response()
+                        }
+                    }
+                });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                urls.push(format!("http://{}", listener.local_addr().unwrap()));
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, router).await.unwrap();
+                }));
+            }
+            let gateway = Gateway::new(
+                Config::new(
+                    &urls[0],
+                    &urls[1],
+                    vec![urls[1].clone()],
+                    Duration::from_secs(2),
+                    1,
+                    1024 * 1024,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let verified = gateway
+                .verified_transaction_metadata(&id, height)
+                .await
+                .unwrap();
+            assert_eq!(
+                URL_SAFE_NO_PAD.encode(verified.owner_address),
+                case["owner_address"]
+            );
+            available.store(false, Ordering::SeqCst);
+            let fallback = gateway.verified_transaction_metadata(&id, height).await;
+            assert_eq!(fallback.is_err(), requires_trusted, "{name}");
+            for server in servers {
+                server.abort();
+            }
+        }
+    }
+
     fn note(value: u128) -> [u8; 32] {
         let mut note = [0; 32];
         note[16..].copy_from_slice(&value.to_be_bytes());
@@ -2994,18 +3173,24 @@ mod tests {
             ..BlockHeader::default()
         };
         block.indep_hash = URL_SAFE_NO_PAD.encode(block_indep_hash(&block).unwrap());
-        let entry = BlockIndexEntry {
+        let mut entry = BlockIndexEntry {
             tx_root,
             weave_size: "1".to_owned(),
             hash: block.indep_hash.clone(),
         };
 
-        verify_block_header(&block, &entry, block.height, &transaction_id).unwrap();
+        verify_block_header(&block, &entry, block.height, Some(&transaction_id)).unwrap();
         let absent_id = URL_SAFE_NO_PAD.encode([4u8; 32]);
-        assert!(verify_block_header(&block, &entry, block.height, &absent_id).is_err());
+        assert!(verify_block_header(&block, &entry, block.height, Some(&absent_id)).is_err());
+
+        block.tx_root.clear();
+        entry.tx_root.clear();
+        block.indep_hash = URL_SAFE_NO_PAD.encode(block_indep_hash(&block).unwrap());
+        entry.hash = block.indep_hash.clone();
+        verify_block_header(&block, &entry, block.height, Some(&transaction_id)).unwrap();
 
         block.txs[0] = absent_id;
-        assert!(verify_block_header(&block, &entry, block.height, &transaction_id).is_err());
+        assert!(verify_block_header(&block, &entry, block.height, Some(&transaction_id)).is_err());
     }
 
     #[test]

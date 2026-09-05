@@ -19,6 +19,14 @@ pub struct ImportSummary {
     pub checkpoint_hash: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct MetadataSummary {
+    pub start_height: u64,
+    pub end_height: u64,
+    pub imported_blocks: u64,
+    pub imported_transactions: u64,
+}
+
 pub async fn import_range(
     gateway: &Gateway,
     store: &mut BlockStore,
@@ -150,6 +158,115 @@ pub async fn import_range(
         imported_through,
         checkpoint_height: state.checkpoint.height,
         checkpoint_hash: URL_SAFE_NO_PAD.encode(&state.checkpoint.hash),
+    })
+}
+
+pub async fn import_metadata(
+    gateway: &Gateway,
+    store: &mut BlockStore,
+    start: u64,
+    end: u64,
+) -> Result<MetadataSummary> {
+    ensure!(start <= end, "invalid metadata import range");
+    let deadline = gateway.config.request_timeout;
+    let state = timeout(deadline, store.state())
+        .await
+        .context("metadata import initialization timed out")??
+        .context("block index is not initialized")?;
+    ensure!(
+        state.source == gateway.config.trusted_node_url,
+        "trusted node source does not match stored import"
+    );
+    let imported_through = state
+        .imported_through
+        .context("block index has no imported canonical coverage")?;
+    ensure!(
+        start >= state.start_height && end <= imported_through,
+        "metadata range {start}..={end} is outside imported block-index coverage {}..={imported_through}",
+        state.start_height
+    );
+
+    let mut imported_blocks = 0;
+    loop {
+        let blocks = timeout(deadline, store.pending_metadata_blocks(start, end, 32))
+            .await
+            .context("pending block metadata query timed out")??;
+        if blocks.is_empty() {
+            break;
+        }
+        for block in blocks {
+            timeout(deadline, async {
+                let header = gateway.verified_block(&block).await?;
+                let transaction_ids = header
+                    .txs
+                    .iter()
+                    .map(|id| {
+                        let id = decode_b64(id, "block transaction ID")?;
+                        ensure!(id.len() == 32, "invalid block transaction ID length");
+                        Ok(id)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                store
+                    .record_block_metadata(&block, header.timestamp, &transaction_ids)
+                    .await
+            })
+            .await
+            .with_context(|| format!("block metadata at height {} timed out", block.height))?
+            .with_context(|| format!("importing block metadata at height {}", block.height))?;
+            imported_blocks += 1;
+        }
+    }
+
+    let mut imported_transactions = 0;
+    loop {
+        let pending = timeout(deadline, store.pending_transactions(start, end, 4))
+            .await
+            .context("pending transaction metadata query timed out")??;
+        if pending.is_empty() {
+            break;
+        }
+        let batch_count = pending.len() as u64;
+        timeout(deadline, async {
+            let mut pending = pending.into_iter();
+            let fetch = |transaction: Option<(Vec<u8>, u64)>| async move {
+                let Some((id, height)) = transaction else {
+                    return Ok(None);
+                };
+                let id = URL_SAFE_NO_PAD.encode(id);
+                gateway
+                    .verified_transaction_metadata(&id, height)
+                    .await
+                    .with_context(|| format!("importing transaction metadata {id}"))
+                    .map(Some)
+            };
+            // Inline futures are dropped together on errors, timeout, or cancellation.
+            let (first, second, third, fourth) = tokio::try_join!(
+                fetch(pending.next()),
+                fetch(pending.next()),
+                fetch(pending.next()),
+                fetch(pending.next()),
+            )?;
+            let objects = [first, second, third, fourth]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            store.record_objects(&objects).await
+        })
+        .await
+        .context("transaction metadata batch timed out")??;
+        imported_transactions += batch_count;
+    }
+
+    if imported_blocks > 0 || imported_transactions > 0 {
+        timeout(deadline, store.analyze_metadata())
+            .await
+            .context("metadata statistics refresh timed out")??;
+    }
+    Ok(MetadataSummary {
+        start_height: start,
+        end_height: end,
+        imported_blocks,
+        imported_transactions,
     })
 }
 
