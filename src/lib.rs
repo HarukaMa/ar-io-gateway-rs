@@ -122,6 +122,7 @@ pub struct VerifiedData {
     pub id: String,
     pub block_height: u64,
     pub content_type: String,
+    pub content_encoding: Option<String>,
     pub content_length: usize,
     pub etag: String,
     pub sha256: String,
@@ -142,7 +143,24 @@ pub struct VerifiedChunk {
     pub source_host: String,
 }
 
-type RetrievalResult = Option<std::result::Result<VerifiedData, String>>;
+#[derive(Debug)]
+pub(crate) struct ContentNotFound;
+
+impl std::fmt::Display for ContentNotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("content not found")
+    }
+}
+
+impl std::error::Error for ContentNotFound {}
+
+#[derive(Clone)]
+enum RetrievalFailure {
+    NotFound,
+    Other(String),
+}
+
+type RetrievalResult = Option<std::result::Result<VerifiedData, RetrievalFailure>>;
 
 #[derive(Default)]
 struct ContentCache {
@@ -198,7 +216,9 @@ impl Drop for RetrievalLeader<'_> {
             return;
         }
         if let Some(sender) = self.cache.lock().unwrap().inflight.remove(self.id) {
-            sender.send_replace(Some(Err("verified retrieval canceled".to_owned())));
+            sender.send_replace(Some(Err(RetrievalFailure::Other(
+                "verified retrieval canceled".to_owned(),
+            ))));
         }
     }
 }
@@ -311,7 +331,10 @@ impl Gateway {
                 if let Some(sender) = cache.inflight.remove(id) {
                     sender.send_replace(Some(match &result {
                         Ok(data) => Ok(data.clone()),
-                        Err(error) => Err(format!("{error:#}")),
+                        Err(error) if error.is::<ContentNotFound>() => {
+                            Err(RetrievalFailure::NotFound)
+                        }
+                        Err(error) => Err(RetrievalFailure::Other(format!("{error:#}"))),
                     }));
                 }
                 leader.completed = true;
@@ -328,7 +351,10 @@ impl Gateway {
                 .as_ref()
                 .context("coalesced retrieval returned no result")?
                 .clone()
-                .map_err(anyhow::Error::msg)
+                .map_err(|error| match error {
+                    RetrievalFailure::NotFound => anyhow::Error::new(ContentNotFound),
+                    RetrievalFailure::Other(message) => anyhow::Error::msg(message),
+                })
         }
     }
 
@@ -598,7 +624,16 @@ impl Gateway {
             ),
         };
         let hinted_size = checked_data_size(size, self.config.max_data_size)?;
-        let (parent, parent_tags) = self.retrieve_direct_with_tags(&parent_id).await?;
+        let (parent, parent_tags) =
+            self.retrieve_direct_with_tags(&parent_id)
+                .await
+                .map_err(|error| {
+                    if error.is::<ContentNotFound>() {
+                        anyhow::anyhow!("bundle parent transaction {parent_id} was not found")
+                    } else {
+                        error
+                    }
+                })?;
         require_bundle_tags(&parent_tags)?;
         let item = match &hint {
             BundleHint::Indexed(indexed) => {
@@ -615,6 +650,7 @@ impl Gateway {
             "discovered data item size does not match verified payload"
         );
 
+        let content_encoding = response_content_encoding(item.text_tag(b"Content-Encoding"))?;
         let bytes = item.data;
         let body_hash = item.body_hash;
         Ok(VerifiedData {
@@ -624,6 +660,7 @@ impl Gateway {
             id: id.to_owned(),
             block_height: parent.block_height,
             content_type: item_content_type(&item.tags)?,
+            content_encoding,
             etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
             sha256: hex(&body_hash),
         })
@@ -648,6 +685,9 @@ impl Gateway {
             .await
             .context("failed to discover data location")?;
         let mut edges = response.data.transactions.edges;
+        if edges.is_empty() {
+            return Ok(None);
+        }
         ensure!(
             edges.len() == 1,
             "discovery did not return exactly one data item"
@@ -670,10 +710,24 @@ impl Gateway {
     async fn retrieve_direct_with_tags(&self, id: &str) -> Result<(VerifiedData, Vec<Tag>)> {
         decode_fixed::<32>(id, "transaction ID")?;
 
-        let status: TxStatus = self
-            .get_json(&self.config.archive_url, &format!("tx/{id}/status"))
+        let status_url = endpoint(&self.config.archive_url, &format!("tx/{id}/status"));
+        let response = self
+            .client
+            .get(&status_url)
+            .send()
             .await
             .context("failed to fetch transaction status")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND
+            && response.url().as_str() == status_url
+        {
+            return Err(ContentNotFound.into());
+        }
+        let status: TxStatus = read_json_response(
+            response
+                .error_for_status()
+                .context("transaction status source rejected request")?,
+        )
+        .await?;
         decode_fixed::<48>(&status.block_indep_hash, "status block hash")?;
 
         let indexed = match &self.block_store {
@@ -726,10 +780,12 @@ impl Gateway {
             .await?;
 
         let mut remaining = usize::MAX;
-        let (transaction, verified) = self
+        let (transaction, mut verified) = self
             .fetch_transaction(id, status.block_height, &mut remaining)
             .await?;
         let data_size = verified.metadata.data_size;
+        let content_encoding =
+            response_content_encoding(verified.metadata.content_encoding.take())?;
         if transaction.format == 1 && transaction.denomination == 0 {
             let previous_size = previous_block
                 .map(|previous| parse_u128(&previous.weave_size, "previous block weave size"))
@@ -761,6 +817,7 @@ impl Gateway {
                     id: id.to_owned(),
                     block_height: status.block_height,
                     content_type: content_type(&transaction.tags)?,
+                    content_encoding,
                     content_length,
                     etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
                     sha256: hex(&body_hash),
@@ -854,6 +911,7 @@ impl Gateway {
                 id: id.to_owned(),
                 block_height: status.block_height,
                 content_type,
+                content_encoding,
                 content_length: expected_len,
                 etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
                 sha256: hex(&body_hash),
@@ -2118,6 +2176,16 @@ fn response_content_type(value: String) -> String {
     }
 }
 
+fn response_content_encoding(value: Option<String>) -> Result<Option<String>> {
+    if let Some(value) = &value {
+        HeaderValue::from_bytes(value.as_bytes())
+            .context("invalid Content-Encoding tag")?
+            .to_str()
+            .context("non-ASCII Content-Encoding tag")?;
+    }
+    Ok(value)
+}
+
 fn require_bundle_tags(tags: &[Tag]) -> Result<()> {
     let mut format = false;
     let mut version = false;
@@ -2145,6 +2213,15 @@ struct VerifiedItem {
 }
 
 impl VerifiedItem {
+    fn text_tag(&self, name: &[u8]) -> Option<String> {
+        transactions::optional_text_tag(
+            self.tags
+                .iter()
+                .map(|tag| (tag.name.as_ref(), tag.value.as_ref())),
+            name,
+        )
+    }
+
     fn is_bundle(&self) -> bool {
         self.tags
             .iter()
@@ -2170,8 +2247,8 @@ impl VerifiedItem {
             owner_public_key: self.owner.to_vec(),
             target: self.target.to_vec(),
             data_size: self.data.len() as u128,
-            content_type: transactions::optional_text_tag(&tags, b"Content-Type"),
-            content_encoding: transactions::optional_text_tag(&tags, b"Content-Encoding"),
+            content_type: self.text_tag(b"Content-Type"),
+            content_encoding: self.text_tag(b"Content-Encoding"),
             signature_type: self.signature_type as i16,
             format: None,
             quantity: None,
@@ -3371,6 +3448,349 @@ mod tests {
         writer.finish().await.unwrap().0
     }
 
+    async fn retrieval_fixture(
+        data: &[u8],
+        tags: &[(&[u8], &[u8])],
+        bundled_item: Option<(&str, usize)>,
+    ) -> (
+        Gateway,
+        String,
+        Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Router, http::StatusCode, response::IntoResponse};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let height = FORK_2_9_HEIGHT + 1;
+        let end = note(data.len() as u128);
+        let data_hash = sha256(&[data]);
+        let data_root = if data.is_empty() {
+            Vec::new()
+        } else {
+            hash_leaf(&data_hash, &end).to_vec()
+        };
+        let tag_hashes = tags
+            .iter()
+            .map(|(name, value)| deep_hash_list(&[deep_hash_blob(name), deep_hash_blob(value)]))
+            .collect::<Vec<_>>();
+        let digest = sha256(&[&deep_hash_list(&[
+            deep_hash_blob(b"2"),
+            deep_hash_blob(b""),
+            deep_hash_blob(b"0"),
+            deep_hash_blob(b"0"),
+            deep_hash_blob(b""),
+            deep_hash_list(&tag_hashes),
+            deep_hash_blob(data.len().to_string().as_bytes()),
+            deep_hash_blob(&data_root),
+        ])]);
+        let key = Secp256k1SigningKey::from_slice(&[3; 32]).unwrap();
+        let (signature, recovery_id) = key.sign_prehash_recoverable(&digest);
+        let mut signature = signature.to_bytes().to_vec();
+        signature.push(recovery_id.to_byte());
+        let id = URL_SAFE_NO_PAD.encode(sha256(&[&signature]));
+        let transaction = serde_json::json!({
+            "format": 2, "id": id, "last_tx": "", "owner": "", "target": "",
+            "quantity": "0", "reward": "0", "data": "", "data_size": data.len().to_string(),
+            "data_root": URL_SAFE_NO_PAD.encode(&data_root),
+            "signature": URL_SAFE_NO_PAD.encode(signature),
+            "tags": tags.iter().map(|(name, value)| serde_json::json!({
+                "name": URL_SAFE_NO_PAD.encode(name), "value": URL_SAFE_NO_PAD.encode(value),
+            })).collect::<Vec<_>>(),
+        });
+        let zero32 = URL_SAFE_NO_PAD.encode([0; 32]);
+        let zero48 = URL_SAFE_NO_PAD.encode([0; 48]);
+        let tx_root = if data.is_empty() {
+            String::new()
+        } else {
+            URL_SAFE_NO_PAD.encode(hash_leaf(&data_root, &end))
+        };
+        let mut block = serde_json::json!({
+            "height": height, "timestamp": 0, "last_retarget": 0, "nonce": "AA",
+            "previous_block": zero48, "reward_addr": zero32, "tx_root": tx_root,
+            "tags": [], "txs": [id], "block_size": data.len().to_string(),
+            "weave_size": data.len().to_string(), "usd_to_ar_rate": ["1", "1"],
+            "scheduled_usd_to_ar_rate": ["1", "1"], "poa": {},
+            "reward_history_hash": zero32, "block_time_history_hash": zero32,
+            "chunk_hash": zero32,
+            "nonce_limiter_info": {
+                "output": zero32, "seed": zero48, "next_seed": zero48,
+                "vdf_difficulty": "0", "next_vdf_difficulty": "0",
+            },
+        });
+        for field in ["indep_hash", "wallet_list", "hash_list_merkle", "hash"] {
+            block[field] = serde_json::json!("");
+        }
+        for field in [
+            "diff",
+            "cumulative_diff",
+            "reward_pool",
+            "packing_2_5_threshold",
+            "strict_data_split_threshold",
+            "reward",
+            "recall_byte",
+            "price_per_gib_minute",
+            "scheduled_price_per_gib_minute",
+            "debt_supply",
+            "kryder_plus_rate_multiplier",
+            "kryder_plus_rate_multiplier_latch",
+            "denomination",
+            "previous_cumulative_diff",
+            "merkle_rebase_support_threshold",
+        ] {
+            block[field] = serde_json::json!("0");
+        }
+        let hash = URL_SAFE_NO_PAD
+            .encode(block_indep_hash(&historical::decode_header(block.clone()).unwrap()).unwrap());
+        block["indep_hash"] = serde_json::json!(hash);
+        let edges = match bundled_item {
+            Some((item_id, size)) => serde_json::json!([{
+                "node": {"id": item_id, "bundledIn": {"id": id}, "data": {"size": size.to_string()}},
+            }]),
+            None => serde_json::json!([]),
+        };
+        let mut responses = HashMap::new();
+        responses.insert(
+            "/graphql".to_owned(),
+            serde_json::json!({
+                "data": {"transactions": {"edges": edges}},
+            })
+            .to_string(),
+        );
+        responses.insert(
+            "/info".to_owned(),
+            serde_json::json!({
+                "height": height + CONSENSUS_DEPTH,
+            })
+            .to_string(),
+        );
+        responses.insert(
+            format!("/tx/{id}/status"),
+            serde_json::json!({
+                "block_height": height, "block_indep_hash": hash,
+            })
+            .to_string(),
+        );
+        responses.insert(
+            format!("/block_index/{}/{}", height - 1, height),
+            serde_json::json!([
+                {"hash": hash, "tx_root": tx_root, "weave_size": data.len().to_string()},
+                {"hash": zero48, "tx_root": "", "weave_size": "0"},
+            ])
+            .to_string(),
+        );
+        responses.insert(format!("/block/hash/{hash}"), block.to_string());
+        responses.insert(format!("/tx/{id}"), transaction.to_string());
+        responses.insert(
+            format!("/tx/{id}/offset"),
+            serde_json::json!({
+                "size": data.len().to_string(), "offset": data.len().to_string(),
+            })
+            .to_string(),
+        );
+        responses.insert(
+            "/chunk/1".to_owned(),
+            serde_json::json!({
+                "chunk": URL_SAFE_NO_PAD.encode(data),
+                "data_path": URL_SAFE_NO_PAD.encode([data_hash.as_slice(), &end].concat()),
+                "tx_path": URL_SAFE_NO_PAD.encode([data_root.as_slice(), &end].concat()),
+            })
+            .to_string(),
+        );
+        let corrupt_chunk = Arc::new(AtomicBool::new(false));
+        let corrupt = corrupt_chunk.clone();
+        let app = Router::new().fallback(move |uri: axum::http::Uri| {
+            let response = responses.get(uri.path()).cloned();
+            let corrupt = uri.path() == "/chunk/1" && corrupt.load(Ordering::SeqCst);
+            async move {
+                match response {
+                    Some(body) if corrupt => {
+                        let mut chunk: serde_json::Value = serde_json::from_str(&body).unwrap();
+                        chunk["chunk"] = serde_json::json!(URL_SAFE_NO_PAD.encode(b"corrupt"));
+                        chunk.to_string().into_response()
+                    }
+                    Some(body) => body.into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let gateway = Gateway::new(
+            Config::new(
+                &url,
+                &url,
+                vec![url.clone()],
+                Duration::from_secs(5),
+                1,
+                16 * 1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let requested = bundled_item.map_or(id, |(id, _)| id.to_owned());
+        (gateway, requested, corrupt_chunk, server)
+    }
+
+    #[tokio::test]
+    async fn preserves_verified_encoding_and_wire_bytes_through_retrieval() {
+        use std::sync::atomic::Ordering;
+
+        // gzip("encoded wire bytes"), including its unchanged trailer.
+        const ENCODED: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 75, 205, 75, 206, 79, 73, 77, 81, 40, 207, 44, 74,
+            85, 72, 170, 44, 73, 45, 6, 0, 226, 42, 8, 216, 18, 0, 0, 0,
+        ];
+        let tags: &[(&[u8], &[u8])] = &[
+            (b"Content-Encoding", b"\xff"),
+            (b"content-encoding", b"gzip"),
+            (b"Content-Encoding", b"br"),
+        ];
+        for bundled in [false, true] {
+            let (item, item_id) = signed_data_item(ENCODED, tags);
+            let item_id = URL_SAFE_NO_PAD.encode(item_id);
+            let bundle = encode_bundle(&[&item]);
+            let parent_tags: &[(&[u8], &[u8])] =
+                &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+            let (gateway, id, corrupt_chunk, server) = if bundled {
+                retrieval_fixture(&bundle, parent_tags, Some((&item_id, ENCODED.len()))).await
+            } else {
+                retrieval_fixture(ENCODED, tags, None).await
+            };
+            for cache_hit in [false, true] {
+                let verified = gateway.retrieve(&id).await.unwrap();
+                assert_eq!(verified.content_encoding.as_deref(), Some("gzip"));
+                assert_eq!(
+                    verified
+                        .bytes
+                        .read_all(ENCODED.len())
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    ENCODED
+                );
+                assert_eq!(verified.content_length, ENCODED.len());
+                assert_eq!(verified.sha256, hex(&sha256(&[ENCODED])));
+                assert_eq!(
+                    verified.etag,
+                    format!("\"{}\"", URL_SAFE_NO_PAD.encode(sha256(&[ENCODED])))
+                );
+                assert_eq!(verified.cache_hit, cache_hit);
+            }
+            corrupt_chunk.store(true, Ordering::SeqCst);
+            let uncached = Gateway::new(gateway.config.clone()).unwrap();
+            let (leader, follower) = tokio::join!(uncached.retrieve(&id), uncached.retrieve(&id));
+            assert!(!leader.unwrap_err().is::<ContentNotFound>());
+            assert!(!follower.unwrap_err().is::<ContentNotFound>());
+            server.abort();
+        }
+        let (gateway, id, _, server) = retrieval_fixture(b"", tags, None).await;
+        let verified = gateway.retrieve(&id).await.unwrap();
+        assert_eq!(verified.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(verified.content_length, 0);
+        assert_eq!(verified.sha256, hex(&sha256(&[b""])));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_signed_encoding_that_cannot_be_an_http_header() {
+        let tags: &[(&[u8], &[u8])] = &[(b"Content-Encoding", b"gzip\r\nX-Injected: true")];
+        let (gateway, id, _, server) = retrieval_fixture(b"wire bytes", tags, None).await;
+        let error = gateway.retrieve(&id).await.unwrap_err();
+        assert!(!error.is::<ContentNotFound>());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn only_requested_transaction_absence_is_not_found_for_all_waiters() {
+        use axum::{Router, http::StatusCode, response::IntoResponse};
+
+        for failure in [
+            "requested",
+            "discovery-404",
+            "malformed-discovery",
+            "wrong-discovery",
+            "malformed-status",
+            "status-503",
+            "missing-anchor",
+            "missing-parent",
+            "redirected-status",
+        ] {
+            let id = URL_SAFE_NO_PAD.encode([1; 32]);
+            let parent = URL_SAFE_NO_PAD.encode([2; 32]);
+            let edges = match failure {
+                "missing-parent" => serde_json::json!([{
+                    "node": {"id": id, "bundledIn": {"id": parent}, "data": {"size": "1"}},
+                }]),
+                "wrong-discovery" => serde_json::json!([{
+                    "node": {"id": parent, "bundledIn": null, "data": {"size": "1"}},
+                }]),
+                _ => serde_json::json!([]),
+            };
+            let discovery = serde_json::json!({
+                "data": {"transactions": {"edges": edges}},
+            })
+            .to_string();
+            let status = serde_json::json!({
+                "block_height": 1_000_000,
+                "block_indep_hash": URL_SAFE_NO_PAD.encode([0; 48]),
+            })
+            .to_string();
+            let app = Router::new().fallback(move |uri: axum::http::Uri| {
+                let discovery = discovery.clone();
+                let status = status.clone();
+                async move {
+                    if uri.path() == "/graphql" {
+                        match failure {
+                            "discovery-404" => StatusCode::NOT_FOUND.into_response(),
+                            "malformed-discovery" => "{}".into_response(),
+                            _ => discovery.into_response(),
+                        }
+                    } else if uri.path().starts_with("/tx/") && uri.path().ends_with("/status") {
+                        match failure {
+                            "requested" | "missing-parent" => StatusCode::NOT_FOUND.into_response(),
+                            "malformed-status" => "{}".into_response(),
+                            "status-503" => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                            "redirected-status" => (
+                                StatusCode::FOUND,
+                                [(axum::http::header::LOCATION, "/dependency")],
+                            )
+                                .into_response(),
+                            _ => status.into_response(),
+                        }
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let gateway = Gateway::new(
+                Config::new(
+                    &url,
+                    &url,
+                    vec![url.clone()],
+                    Duration::from_secs(2),
+                    1,
+                    1024,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let (leader, follower) = tokio::join!(gateway.retrieve(&id), gateway.retrieve(&id));
+            for result in [leader, follower] {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.is::<ContentNotFound>(),
+                    failure == "requested",
+                    "{failure}: {error:#}",
+                );
+            }
+            server.abort();
+        }
+    }
+
     async fn check_data_item(signature_type: u16, owner: &[u8], signature: &[u8], data: &[u8]) {
         let item = encode_data_item(signature_type, signature, owner, data, &[0], 0);
         let expected_id = sha256(&[signature]);
@@ -3907,6 +4327,7 @@ mod cache_tests {
             id: id.to_owned(),
             block_height: 1,
             content_type: "text/plain".to_owned(),
+            content_encoding: None,
             content_length: 5,
             etag: String::new(),
             sha256: String::new(),

@@ -597,6 +597,7 @@ mod bundle_tests {
         let indexed = || IndexedBundle {
             root_id: root_id.to_vec(),
             data_size: data.len() as u128,
+            content_type: None,
             locations: vec![locations[3].clone(), locations[5].clone()],
         };
         for content in [root.clone().into(), root_content] {

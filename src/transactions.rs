@@ -250,8 +250,16 @@ pub(super) fn verify_transaction(
     } else {
         sha256(&[&owner]).to_vec()
     };
-    let content_type = optional_text_tag(&tags, b"Content-Type");
-    let content_encoding = optional_text_tag(&tags, b"Content-Encoding");
+    let content_type = optional_text_tag(
+        tags.iter()
+            .map(|(name, value)| (name.as_slice(), value.as_slice())),
+        b"Content-Type",
+    );
+    let content_encoding = optional_text_tag(
+        tags.iter()
+            .map(|(name, value)| (name.as_slice(), value.as_slice())),
+        b"Content-Encoding",
+    );
     Ok(VerifiedTransaction {
         metadata: ObjectMetadata {
             id: id.to_vec(),
@@ -341,9 +349,11 @@ pub(super) fn verify_block_data_root(
     Ok(())
 }
 
-pub(super) fn optional_text_tag(tags: &[(Vec<u8>, Vec<u8>)], expected: &[u8]) -> Option<String> {
-    tags.iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case(expected))
+pub(super) fn optional_text_tag<'a>(
+    tags: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+    expected: &[u8],
+) -> Option<String> {
+    tags.filter(|(name, _)| name.eq_ignore_ascii_case(expected))
         .find_map(|(_, value)| {
             std::str::from_utf8(value)
                 .ok()

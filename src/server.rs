@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    future::Future,
     io,
     net::SocketAddr,
     pin::Pin,
@@ -58,6 +59,9 @@ const MANIFEST_CONTENT_TYPE: &str = "application/x.arweave-manifest+json";
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
 const MAX_MANIFEST_PATH_BYTES: usize = 4096;
 const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
+// ponytail: cap Range parsing and multipart bookkeeping; raise only for a measured client need.
+const MAX_RANGE_HEADER_BYTES: usize = 8 * 1024;
+const MAX_BYTE_RANGES: usize = 16;
 
 pub struct ServerConfig {
     listen_addr: SocketAddr,
@@ -297,6 +301,8 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .route("/ar-io/info", get(serve_info))
         .route("/ar-io/healthcheck", get(serve_healthcheck))
         .route("/ar-io/peers", get(serve_peers))
+        .route("/ar-io/resolver/{name}", get(serve_resolver))
+        .route("/ar-io/offsets/{id}", get(serve_offsets))
         .route("/", get(serve_arns))
         .route("/chunk/{offset}", get(serve_chunk))
         .route("/chunk/{offset}/data", get(serve_chunk_data))
@@ -304,12 +310,46 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .route("/raw/{id}/", get(serve_raw))
         .route("/{*path}", get(serve_path))
         .layer(middleware::from_fn_with_state(state.clone(), sign_response))
+        .layer(middleware::from_fn(cors_response))
         .with_state(state);
     let result = axum::serve(listener, app)
         .await
         .context("HTTP server failed");
     refresh_tasks.shutdown().await;
     result
+}
+
+async fn cors_response(request: Request<Body>, next: Next) -> Response {
+    let mut response = if request.method() == Method::OPTIONS {
+        let mut response = Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header("content-length", "0")
+            .header(
+                "access-control-allow-methods",
+                "GET,HEAD,PUT,PATCH,POST,DELETE",
+            )
+            .header("vary", "Access-Control-Request-Headers")
+            .body(Body::empty())
+            .unwrap();
+        for value in request.headers().get_all("access-control-request-headers") {
+            if !value.is_empty() {
+                response
+                    .headers_mut()
+                    .append("access-control-allow-headers", value.clone());
+            }
+        }
+        response
+    } else {
+        next.run(request).await
+    };
+    response
+        .headers_mut()
+        .insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    response.headers_mut().insert(
+        "access-control-expose-headers",
+        HeaderValue::from_static("*"),
+    );
+    response
 }
 struct HttpSigner {
     key: SigningKey,
@@ -452,6 +492,113 @@ async fn serve_info(State(state): State<Arc<AppState>>) -> Response {
     json_response(&info)
 }
 
+async fn serve_resolver(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    if split_arns_name(&name).is_err() {
+        return error_response(StatusCode::NOT_FOUND, "Not Found");
+    }
+    let _permit = match request_permit(&state.request_permits) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let resolution = match tokio::time::timeout(
+        state.gateway.config.retrieval_timeout,
+        resolve_arns(&state, name),
+    )
+    .await
+    {
+        Ok(Ok(Some(resolution))) => resolution,
+        Ok(Ok(None)) => return error_response(StatusCode::NOT_FOUND, "Not Found"),
+        Ok(Err(error)) => {
+            eprintln!("ArNS resolution failed: {error:#}");
+            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
+        }
+        Err(_) => return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+    };
+    let mut response = json_response(&serde_json::json!({
+        "txId": resolution.resolved_id,
+        "ttlSeconds": resolution.ttl,
+        "antId": resolution.ant_id,
+        "resolvedAt": resolution.resolved_at,
+        "index": resolution.index,
+        "limit": resolution.limit,
+    }));
+    for (name, value) in [
+        ("x-arns-resolved-id", resolution.resolved_id),
+        ("x-arns-ttl-seconds", resolution.ttl.to_string()),
+        ("x-arns-ant-program-id", state.config.ant_program_id.clone()),
+        ("x-arns-ant-id", resolution.ant_id),
+        ("x-arns-resolved-at", resolution.resolved_at.to_string()),
+        ("x-arns-record-index", resolution.index.to_string()),
+        ("x-arns-undername-limit", resolution.limit.to_string()),
+    ] {
+        response.headers_mut().insert(
+            name,
+            HeaderValue::from_str(&value).expect("validated resolution header"),
+        );
+    }
+    response
+}
+
+async fn serve_offsets(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let Ok(id) = decode_fixed::<32>(&id, "data ID") else {
+        return error_response(StatusCode::BAD_REQUEST, "Must provide a valid data ID");
+    };
+    let _permit = match request_permit(&state.request_permits) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let lookup = async {
+        let Some(store) = &state.gateway.block_store else {
+            return Ok(None);
+        };
+        let Some(indexed) = store.bundle_location(&id).await? else {
+            return Ok(None);
+        };
+        let target = indexed.locations.last().context("missing indexed target")?;
+        let data_offset = target
+            .root_offset
+            .checked_add(target.data_offset)
+            .context("indexed data offset overflow")?;
+        let root_id = URL_SAFE_NO_PAD.encode(&indexed.root_id);
+        let mut offsets = serde_json::json!({
+            "rootTxId": root_id,
+            "rootOffset": target.root_offset,
+            "rootDataOffset": data_offset,
+            "size": target.item_size,
+            "dataSize": indexed.data_size,
+        });
+        if indexed.locations.len() == 1 {
+            offsets["path"] = serde_json::json!([root_id]);
+        }
+        if let Some(content_type) = indexed.content_type {
+            offsets["contentType"] = serde_json::json!(content_type);
+        }
+        Ok::<_, anyhow::Error>(Some(offsets))
+    };
+    match tokio::time::timeout(state.gateway.config.retrieval_timeout, lookup).await {
+        Ok(Ok(Some(offsets))) => json_response(&offsets),
+        Ok(Ok(None)) => {
+            let mut response = error_response(StatusCode::NOT_FOUND, "Offsets not found");
+            response.headers_mut().insert(
+                CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=60, must-revalidate"),
+            );
+            response
+        }
+        result => {
+            eprintln!("indexed offset lookup failed: {result:?}");
+            let mut response = error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to resolve offsets",
+            );
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+    }
+}
+
 async fn serve_healthcheck(State(state): State<Arc<AppState>>) -> Response {
     let now = SystemTime::now();
     let date = match iso_utc_date(now) {
@@ -520,8 +667,6 @@ fn json_response(value: &serde_json::Value) -> Response {
         .header("content-type", "application/json; charset=utf-8")
         .header("content-length", body.len().to_string())
         .header("cache-control", "public, max-age=30")
-        .header("access-control-allow-origin", "*")
-        .header("access-control-expose-headers", "*")
         .body(Body::from(body))
         .unwrap()
 }
@@ -581,6 +726,9 @@ async fn serve_chunk_response(
 }
 
 async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if arns_name(&headers, &state.config.arns_root_host).is_none() {
+        return serve_info(State(state)).await;
+    }
     let permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
         Err(response) => return response,
@@ -597,8 +745,11 @@ async fn serve_raw(
         Ok(permit) => permit,
         Err(response) => return response,
     };
-    if decode_fixed::<32>(&id, "data ID").is_err() {
+    if !is_data_id_shape(&id) {
         return error_response(StatusCode::NOT_FOUND, "Not Found");
+    }
+    if decode_fixed::<32>(&id, "data ID").is_err() {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid ID");
     }
     match state.gateway.retrieve(&id).await {
         Ok(verified) => verified_response(
@@ -614,10 +765,7 @@ async fn serve_raw(
             eprintln!("response construction failed: {error:#}");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
         }),
-        Err(error) => {
-            eprintln!("verified retrieval failed: {error:#}");
-            error_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
-        }
+        Err(error) => retrieval_error_response(error),
     }
 }
 
@@ -654,6 +802,9 @@ async fn serve_path(
             permit,
         )
         .await;
+    }
+    if is_data_id_shape(id) {
+        return error_response(StatusCode::BAD_REQUEST, "Invalid ID");
     }
     serve_arns_path(&state, &headers, &path, permit).await
 }
@@ -703,10 +854,7 @@ async fn retrieve_response(
 ) -> Response {
     let verified = match state.gateway.retrieve(id).await {
         Ok(verified) => verified,
-        Err(error) => {
-            eprintln!("verified retrieval failed: {error:#}");
-            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
-        }
+        Err(error) => return retrieval_error_response(error),
     };
     if !is_manifest_content_type(&verified.content_type) {
         return verified_response(
@@ -754,10 +902,7 @@ async fn retrieve_response(
     let fallback = target.fallback;
     let verified_target = match state.gateway.retrieve(&target.id).await {
         Ok(verified) => verified,
-        Err(error) => {
-            eprintln!("verified manifest target retrieval failed: {error:#}");
-            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
-        }
+        Err(error) => return retrieval_error_response(error),
     };
     let mut response = verified_response(
         verified_target,
@@ -893,8 +1038,6 @@ fn redirect_response(status: StatusCode, location: String) -> Response {
     Response::builder()
         .status(status)
         .header("location", location)
-        .header("access-control-allow-origin", "*")
-        .header("access-control-expose-headers", "*")
         .body(Body::empty())
         .unwrap()
 }
@@ -1285,16 +1428,37 @@ enum ByteRangeError {
     Unsatisfiable,
 }
 
+fn parse_byte_ranges(
+    value: &str,
+    total: usize,
+) -> std::result::Result<Vec<(usize, usize)>, ByteRangeError> {
+    if value.len() > MAX_RANGE_HEADER_BYTES {
+        return Err(ByteRangeError::Malformed);
+    }
+    let value = value
+        .strip_prefix("bytes=")
+        .ok_or(ByteRangeError::Malformed)?;
+    let mut ranges = Vec::new();
+    for (index, value) in value.split(',').enumerate() {
+        if index == MAX_BYTE_RANGES {
+            return Err(ByteRangeError::Unsatisfiable);
+        }
+        match parse_byte_range(value.trim(), total) {
+            Ok(range) => ranges.push(range),
+            Err(ByteRangeError::Unsatisfiable) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if ranges.is_empty() {
+        return Err(ByteRangeError::Unsatisfiable);
+    }
+    Ok(ranges)
+}
+
 fn parse_byte_range(
     value: &str,
     total: usize,
 ) -> std::result::Result<(usize, usize), ByteRangeError> {
-    let Some(value) = value.strip_prefix("bytes=") else {
-        return Err(ByteRangeError::Malformed);
-    };
-    if value.contains(',') {
-        return Err(ByteRangeError::Malformed);
-    }
     let Some((start, end)) = value.split_once('-') else {
         return Err(ByteRangeError::Malformed);
     };
@@ -1324,8 +1488,93 @@ fn parse_byte_range(
     Ok((start, end.min(total - 1)))
 }
 
+fn multipart_content(
+    content: &Content,
+    ranges: &[(usize, usize)],
+    content_type: &str,
+    content_encoding: Option<&str>,
+    boundary: &str,
+) -> Result<(Vec<Content>, usize)> {
+    HeaderValue::from_str(content_type).context("invalid multipart content type")?;
+    let encoding_header = match content_encoding {
+        Some(encoding) => {
+            HeaderValue::from_str(encoding).context("invalid multipart content encoding")?;
+            format!("Content-Encoding: {encoding}\r\n")
+        }
+        None => String::new(),
+    };
+    let mut parts = Vec::with_capacity(ranges.len() * 2 + 1);
+    let mut length = 0_usize;
+    let total = content.len();
+    for (index, &(start, end)) in ranges.iter().enumerate() {
+        let separator = if index == 0 { "" } else { "\r\n" };
+        let header = format!(
+            "{separator}--{boundary}\r\nContent-Type: {content_type}\r\n{encoding_header}Content-Range: bytes {start}-{end}/{total}\r\n\r\n"
+        );
+        let range = content.slice(start..end + 1)?;
+        length = length
+            .checked_add(header.len())
+            .and_then(|length| length.checked_add(range.len()))
+            .context("multipart response length overflow")?;
+        parts.push(header.into_bytes().into());
+        parts.push(range);
+    }
+    let closing = format!("\r\n--{boundary}--\r\n");
+    length = length
+        .checked_add(closing.len())
+        .context("multipart response length overflow")?;
+    parts.push(closing.into_bytes().into());
+    Ok((parts, length))
+}
+
+struct SequentialReader {
+    reader: Option<ContentReader>,
+    remaining: std::vec::IntoIter<Content>,
+    opening: Option<Pin<Box<dyn Future<Output = Result<ContentReader>> + Send>>>,
+}
+
+impl AsyncRead for SequentialReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if output.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            if let Some(opening) = &mut this.opening {
+                let reader = match opening.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(reader) => reader,
+                };
+                this.opening = None;
+                match reader {
+                    Ok(reader) => this.reader = Some(reader),
+                    Err(error) => return Poll::Ready(Err(io::Error::other(error))),
+                }
+            }
+            if let Some(reader) = &mut this.reader {
+                let filled = output.filled().len();
+                match Pin::new(reader).poll_read(cx, output) {
+                    Poll::Ready(Ok(())) if output.filled().len() == filled => {
+                        this.reader = None;
+                    }
+                    result => return result,
+                }
+            }
+            let Some(content) = this.remaining.next() else {
+                return Poll::Ready(Ok(()));
+            };
+            // Open one verified slice at a time; dropping the reader also drops unopened slices.
+            this.opening = Some(Box::pin(async move { content.reader().await }));
+        }
+    }
+}
+
 struct ResponseStreamState {
-    resources: Option<(ContentReader, OwnedSemaphorePermit)>,
+    resources: Option<(SequentialReader, OwnedSemaphorePermit)>,
     expires_at: StreamInstant,
     total_deadline: StreamInstant,
     waker: Option<Waker>,
@@ -1389,6 +1638,15 @@ async fn content_body(
     if content.is_empty() {
         return Ok(Body::empty());
     }
+    response_body(content, Vec::new().into_iter(), limits, permit).await
+}
+
+async fn response_body(
+    content: Content,
+    remaining: std::vec::IntoIter<Content>,
+    limits: &Config,
+    permit: OwnedSemaphorePermit,
+) -> Result<Body> {
     let now = StreamInstant::now();
     let total_deadline = now
         .checked_add(limits.stream_timeout)
@@ -1401,7 +1659,14 @@ async fn content_body(
         .await
         .context("opening verified content timed out")??;
     let state = Arc::new(Mutex::new(ResponseStreamState {
-        resources: Some((reader, permit)),
+        resources: Some((
+            SequentialReader {
+                reader: Some(reader),
+                remaining,
+                opening: None,
+            },
+            permit,
+        )),
         expires_at,
         total_deadline,
         waker: None,
@@ -1475,9 +1740,7 @@ async fn verified_response(
         .header("x-ar-io-verified", "true")
         .header("x-ar-io-trusted", "true")
         .header("x-cache", if verified.cache_hit { "HIT" } else { "MISS" })
-        .header("x-ar-io-hops", "1")
-        .header("access-control-allow-origin", "*")
-        .header("access-control-expose-headers", "*");
+        .header("x-ar-io-hops", "1");
     if let Some(resolution) = resolution {
         builder = builder
             .header(
@@ -1494,6 +1757,15 @@ async fn verified_response(
             .header("x-arns-resolved-at", resolution.resolved_at.to_string())
             .header("x-arns-undername-limit", resolution.limit.to_string())
             .header("x-arns-record-index", resolution.index.to_string());
+    } else {
+        builder = builder.header(
+            "cache-control",
+            if verified.content_length > 100 * 1024 * 1024 {
+                "private, max-age=2592000, immutable"
+            } else {
+                "public, max-age=2592000, immutable"
+            },
+        );
     }
 
     let range = request_headers
@@ -1502,7 +1774,7 @@ async fn verified_response(
             value
                 .to_str()
                 .map_err(|_| ByteRangeError::Malformed)
-                .and_then(|value| parse_byte_range(value, verified.content_length))
+                .and_then(|value| parse_byte_ranges(value, verified.content_length))
         })
         .transpose();
     let range = match range {
@@ -1536,9 +1808,37 @@ async fn verified_response(
             .body(Body::empty())
             .context("failed to construct not-modified response");
     }
+    if let Some(ranges) = &range
+        && ranges.len() > 1
+    {
+        let boundary = format!("ar-io-{digest}");
+        let (parts, content_length) = multipart_content(
+            &verified.bytes,
+            ranges,
+            &verified.content_type,
+            verified.content_encoding.as_deref(),
+            &boundary,
+        )?;
+        let mut parts = parts.into_iter();
+        let first = parts.next().context("multipart response has no parts")?;
+        // The envelope is not content-encoded; each part describes the encoded representation.
+        return builder
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(
+                "content-type",
+                format!("multipart/byteranges; boundary={boundary}"),
+            )
+            .header("content-length", content_length.to_string())
+            .body(response_body(first, parts, limits, permit).await?)
+            .context("failed to construct multipart response");
+    }
+    if let Some(encoding) = &verified.content_encoding {
+        builder = builder.header("content-encoding", encoding.as_str());
+    }
 
     match range {
-        Some((start, end)) => {
+        Some(ranges) => {
+            let (start, end) = ranges[0];
             let content_length = end - start + 1;
             builder
                 .status(StatusCode::PARTIAL_CONTENT)
@@ -1600,8 +1900,6 @@ async fn chunk_response(
         "application/json; charset=utf-8"
     };
     let mut builder = Response::builder()
-        .header("content-type", content_type)
-        .header("content-length", body.len().to_string())
         .header("etag", etag.as_str())
         .header(
             "content-digest",
@@ -1609,9 +1907,7 @@ async fn chunk_response(
         )
         .header("x-ar-io-chunk-source-type", "arweave-network")
         .header("x-ar-io-chunk-host", source_host)
-        .header("x-cache", "MISS")
-        .header("access-control-allow-origin", "*")
-        .header("access-control-expose-headers", "*");
+        .header("x-cache", "MISS");
     if raw {
         builder = builder
             .header("x-arweave-chunk-data-path", data_path)
@@ -1640,16 +1936,33 @@ async fn chunk_response(
     }
     builder
         .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .header("content-length", body.len().to_string())
+        .header("cache-control", "public, max-age=30")
         .body(content_body(body.into(), limits, permit).await?)
         .context("failed to construct chunk response")
+}
+
+fn is_data_id_shape(id: &str) -> bool {
+    id.len() == 43
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn retrieval_error_response(error: anyhow::Error) -> Response {
+    if error.is::<crate::ContentNotFound>() {
+        error_response(StatusCode::NOT_FOUND, "Not Found")
+    } else {
+        eprintln!("verified retrieval failed: {error:#}");
+        error_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
+    }
 }
 
 fn empty_error_response(status: StatusCode) -> Response {
     Response::builder()
         .status(status)
         .header("content-length", "0")
-        .header("access-control-allow-origin", "*")
-        .header("access-control-expose-headers", "*")
         .body(Body::empty())
         .unwrap()
 }
@@ -1659,8 +1972,6 @@ fn error_response(status: StatusCode, message: &'static str) -> Response {
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")
         .header("content-length", message.len().to_string())
-        .header("access-control-allow-origin", "*")
-        .header("access-control-expose-headers", "*")
         .body(Body::from(message))
         .unwrap()
 }
@@ -2211,6 +2522,7 @@ mod tests {
                 id: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
                 block_height: 1,
                 content_type: "text/plain".to_owned(),
+                content_encoding: None,
                 etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
                 sha256: super::super::hex(&digest),
             },
@@ -2315,6 +2627,276 @@ mod tests {
         .unwrap()
     }
 
+    // gzip-compressed "hello", including its CRC32 and uncompressed length.
+    const GZIP_HELLO: &[u8] = &[
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 203, 72, 205, 201, 201, 7, 0, 134, 166, 16, 54, 5, 0, 0, 0,
+    ];
+
+    fn response_fixture(bytes: &[u8]) -> VerifiedData {
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        VerifiedData {
+            bytes: bytes.to_vec().into(),
+            cache_hit: false,
+            id: "fqheRv90pWZYwxcsNyVafsoT9tOipnSa_8tVMMX9b3s".to_owned(),
+            block_height: 1_993_814,
+            content_type: "text/plain; charset=utf-8".to_owned(),
+            content_encoding: None,
+            content_length: bytes.len(),
+            etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
+            sha256: super::super::hex(&digest),
+        }
+    }
+
+    #[tokio::test]
+    async fn public_cors_encoding_head_and_invalid_ids() {
+        let gateway = Gateway::new(stream_limits()).unwrap();
+        let mut verified = response_fixture(GZIP_HELLO);
+        verified.content_encoding = Some("gzip".to_owned());
+        let id = verified.id.clone();
+        let etag = verified.etag.clone();
+        gateway.cache.lock().unwrap().insert(
+            verified,
+            gateway.config.cache_max_entries,
+            gateway.config.cache_max_bytes,
+        );
+        let state = Arc::new(AppState {
+            gateway,
+            config: ServerConfig::new(
+                "127.0.0.1:0",
+                "example.com",
+                "http://127.0.0.1:1",
+                ARNS_PROGRAM,
+                ANT_PROGRAM,
+                1,
+            )
+            .unwrap(),
+            request_permits: Arc::new(Semaphore::new(1)),
+            started_at: Instant::now(),
+        });
+        let app = Router::new()
+            .route("/raw/{id}", get(serve_raw))
+            .route("/{*path}", get(serve_path))
+            .layer(middleware::from_fn(cors_response))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let preflight = client
+            .request(Method::OPTIONS, format!("{base}/unknown"))
+            .header("origin", "https://example.test")
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-headers", "Range, If-None-Match")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(preflight.headers()["access-control-allow-origin"], "*");
+        assert_eq!(preflight.headers()["access-control-expose-headers"], "*");
+        assert_eq!(
+            preflight.headers()["access-control-allow-methods"],
+            "GET,HEAD,PUT,PATCH,POST,DELETE"
+        );
+        assert_eq!(
+            preflight.headers()["access-control-allow-headers"],
+            "Range, If-None-Match"
+        );
+        assert_eq!(
+            preflight.headers()["vary"],
+            "Access-Control-Request-Headers"
+        );
+        assert!(preflight.bytes().await.unwrap().is_empty());
+
+        let invalid = format!("{}B", "A".repeat(42));
+        for (method, path, status) in [
+            (
+                Method::POST,
+                format!("/raw/{id}"),
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (Method::GET, "/unknown".to_owned(), StatusCode::NOT_FOUND),
+            (Method::GET, "/raw/short".to_owned(), StatusCode::NOT_FOUND),
+            (
+                Method::GET,
+                format!("/raw/{invalid}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                format!("/{invalid}/path"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = client
+                .request(method, format!("{base}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{path}");
+            assert_eq!(response.headers()["access-control-allow-origin"], "*");
+            assert_eq!(response.headers()["access-control-expose-headers"], "*");
+        }
+        let response = client.get(format!("{base}/raw/{id}")).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-encoding"], "gzip");
+        assert_eq!(
+            response.headers()["content-length"],
+            GZIP_HELLO.len().to_string()
+        );
+        assert_eq!(
+            response.headers()["cache-control"],
+            "public, max-age=2592000, immutable"
+        );
+        assert_eq!(
+            response.headers()["content-digest"],
+            format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(GZIP_HELLO)))
+        );
+        assert_eq!(response.bytes().await.unwrap().as_ref(), GZIP_HELLO);
+        let head = client
+            .head(format!("{base}/raw/{id}"))
+            .header("range", "bytes=0-1,2-3")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(
+            head.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("multipart/byteranges; boundary=")
+        );
+        assert!(!head.headers().contains_key("content-encoding"));
+        assert!(head.bytes().await.unwrap().is_empty());
+        let conditional = client
+            .get(format!("{base}/raw/{id}"))
+            .header("if-none-match", etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+        for header in [
+            "content-type",
+            "content-encoding",
+            "content-range",
+            "content-length",
+        ] {
+            assert!(!conditional.headers().contains_key(header), "{header}");
+        }
+        assert!(conditional.bytes().await.unwrap().is_empty());
+        let _permit = request_permit(&state.request_permits).unwrap();
+        server.abort();
+    }
+
+    #[test]
+    fn keeps_verification_failures_distinct_from_missing_content() {
+        let missing =
+            anyhow::Error::new(crate::ContentNotFound).context("retrieving manifest target");
+        assert_eq!(
+            retrieval_error_response(missing).status(),
+            StatusCode::NOT_FOUND
+        );
+        let invalid = anyhow::anyhow!("invalid chunk proof");
+        assert_eq!(
+            retrieval_error_response(invalid).status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_encoded_multipart_and_releases_spool() {
+        let mut limits = stream_limits();
+        limits.stream_idle_timeout = Duration::from_secs(5);
+        limits.stream_timeout = Duration::from_secs(30);
+        let config = ServerConfig::new(
+            "127.0.0.1:0",
+            "example.com",
+            "http://127.0.0.1:1",
+            ARNS_PROGRAM,
+            ANT_PROGRAM,
+            1,
+        )
+        .unwrap();
+        let permits = Arc::new(Semaphore::new(1));
+        let budget = Arc::new(SpoolBudget::new(GZIP_HELLO.len()));
+        for (consume, expire) in [(true, false), (false, false), (false, true)] {
+            let mut writer = ContentWriter::new(GZIP_HELLO.len(), 1, budget.clone())
+                .await
+                .unwrap();
+            writer.write(GZIP_HELLO).await.unwrap();
+            let (content, _) = writer.finish().await.unwrap();
+            let mut verified = response_fixture(GZIP_HELLO);
+            verified.bytes = content;
+            verified.content_encoding = Some("gzip".to_owned());
+            let mut headers = HeaderMap::new();
+            headers.insert("range", "bytes=23-24, 99-,0-1,1-2".parse().unwrap());
+            let response = verified_response(
+                verified,
+                None,
+                &config,
+                &headers,
+                &limits,
+                request_permit(&permits).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert!(!response.headers().contains_key("content-range"));
+            assert!(!response.headers().contains_key("content-encoding"));
+            let boundary = response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .strip_prefix("multipart/byteranges; boundary=")
+                .unwrap();
+            let mut expected = Vec::new();
+            for (start, end) in [(23, 24), (0, 1), (1, 2)] {
+                expected.extend_from_slice(format!(
+                    "--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Encoding: gzip\r\nContent-Range: bytes {start}-{end}/25\r\n\r\n"
+                ).as_bytes());
+                expected.extend_from_slice(&GZIP_HELLO[start..=end]);
+                expected.extend_from_slice(b"\r\n");
+            }
+            expected.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            assert_eq!(
+                response.headers()["content-length"],
+                expected.len().to_string()
+            );
+            assert!(request_permit(&permits).is_err());
+            assert!(
+                ContentWriter::new(GZIP_HELLO.len(), 1, budget.clone())
+                    .await
+                    .is_err()
+            );
+            if consume {
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), expected.len())
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    expected
+                );
+            } else if expire {
+                tokio::time::pause();
+                tokio::task::yield_now().await;
+                tokio::time::advance(limits.stream_idle_timeout).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    axum::body::to_bytes(response.into_body(), expected.len())
+                        .await
+                        .is_err()
+                );
+                tokio::time::resume();
+            } else {
+                drop(response);
+            }
+            let _permit = request_permit(&permits).unwrap();
+            drop(
+                ContentWriter::new(GZIP_HELLO.len(), 1, budget.clone())
+                    .await
+                    .unwrap(),
+            );
+        }
+    }
+
     #[tokio::test]
     async fn builds_verified_arns_response_headers() {
         let bytes = b"hello".to_vec();
@@ -2326,6 +2908,7 @@ mod tests {
             id: "3F_yldqW_zt6Ci_47w-7O76lPpegpu1rs7H2iyultVY".to_owned(),
             block_height: 1_118_819,
             content_type: "text/html; charset=utf-8".to_owned(),
+            content_encoding: None,
             content_length: 5,
             etag: format!("\"{digest_url}\""),
             sha256: super::super::hex(&digest),
@@ -2456,20 +3039,7 @@ mod tests {
         .unwrap();
         let limits = stream_limits();
         let permits = Arc::new(Semaphore::new(1));
-        let verified = || {
-            let bytes = b"hello".to_vec();
-            let digest: [u8; 32] = Sha256::digest(&bytes).into();
-            VerifiedData {
-                content_length: bytes.len(),
-                bytes: bytes.into(),
-                cache_hit: false,
-                id: "fqheRv90pWZYwxcsNyVafsoT9tOipnSa_8tVMMX9b3s".to_owned(),
-                block_height: 1_993_814,
-                content_type: "text/plain; charset=utf-8".to_owned(),
-                etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
-                sha256: super::super::hex(&digest),
-            }
-        };
+        let verified = || response_fixture(b"hello");
 
         let mut headers = HeaderMap::new();
         headers.insert("range", "bytes=1-3".parse().unwrap());
@@ -2487,6 +3057,10 @@ mod tests {
         assert_eq!(response.headers()["accept-ranges"], "bytes");
         assert_eq!(response.headers()["content-range"], "bytes 1-3/5");
         assert_eq!(response.headers()["content-length"], "3");
+        assert_eq!(
+            response.headers()["cache-control"],
+            "public, max-age=2592000, immutable"
+        );
         assert_eq!(
             &axum::body::to_bytes(response.into_body(), 3).await.unwrap()[..],
             b"ell"
@@ -2528,16 +3102,23 @@ mod tests {
         .unwrap();
         assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(response.headers()["content-range"], "bytes */5");
-        assert_eq!(
-            &axum::body::to_bytes(response.into_body(), 21)
-                .await
-                .unwrap()[..],
-            b"Range not satisfiable"
-        );
 
-        assert_eq!(parse_byte_range("bytes=-2", 5), Ok((3, 4)));
+        assert_eq!(parse_byte_ranges("bytes=-2", 5), Ok(vec![(3, 4)]));
         assert_eq!(
-            parse_byte_range("bytes=1-2,4-5", 5),
+            parse_byte_ranges("bytes=1-2,4-5", 5),
+            Ok(vec![(1, 2), (4, 4)])
+        );
+        let maximum = format!("bytes={}", vec!["0-0"; MAX_BYTE_RANGES].join(","));
+        assert_eq!(
+            parse_byte_ranges(&maximum, 1).unwrap(),
+            vec![(0, 0); MAX_BYTE_RANGES]
+        );
+        assert_eq!(
+            parse_byte_ranges(&format!("{maximum},0-0"), 1),
+            Err(ByteRangeError::Unsatisfiable)
+        );
+        assert_eq!(
+            parse_byte_ranges(&" ".repeat(MAX_RANGE_HEADER_BYTES + 1), 1),
             Err(ByteRangeError::Malformed)
         );
     }
@@ -2570,6 +3151,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "public, max-age=30");
         assert_eq!(
             response.headers()["content-type"],
             "application/json; charset=utf-8"
@@ -2626,6 +3208,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        for header in [
+            "content-type",
+            "content-encoding",
+            "content-range",
+            "content-length",
+        ] {
+            assert!(!response.headers().contains_key(header), "{header}");
+        }
+        assert!(!response.headers().contains_key("cache-control"));
         assert!(
             axum::body::to_bytes(response.into_body(), 0)
                 .await

@@ -11,10 +11,12 @@
 ## Architecture
 
 - Build an independent Rust gateway. Keep the implementation in one Cargo package with separate serving and indexing binaries. Avoid a generic SDK, provider framework, or database abstraction.
+- Target feature parity, strong content verification, and usable baseline performance. Defer performance optimization until measurements demonstrate a problem.
 - Keep the existing Node gateway unchanged as the production behavioral oracle and rollback deployment. Run Rust on a separate port with separate storage during development.
 - Every Rust-owned request path runs end to end in Rust. Do not call legacy Node services or read live legacy SQLite databases.
 - Separate serving from indexing, unbundling, repair, and maintenance. Bound work, concurrency, memory, queues, and request duration. Preserve cancellation and backpressure.
 - Resolve ArNS and ANT state directly through the configured trusted Solana RPC. Validate account ownership, canonical PDAs, layouts, linkage, and name lifecycle rules. Permit per-ANT `getProgramAccounts` reads filtered by mint and record discriminator, with bounded response size, concurrency, and deadlines. Add ANT indexing only when measured resolution performance requires it.
+- Keep resolver-side ArNS and ANT lookups uncached so each request queries current finalized state.
 
 ## Verification and trust
 

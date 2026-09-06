@@ -78,6 +78,7 @@ pub(crate) struct BundleLocation {
 pub(crate) struct IndexedBundle {
     pub(crate) root_id: Vec<u8>,
     pub(crate) data_size: u128,
+    pub(crate) content_type: Option<String>,
     pub(crate) locations: Vec<BundleLocation>,
 }
 
@@ -955,7 +956,7 @@ impl BlockStore {
              )
              SELECT o.id, parent.id, path.parent_offset::text, path.item_offset::text,
                 path.item_size::text, path.data_offset::text, path.root_offset::text,
-                path.root_id, path.root_size::text, path.target_size::text
+                path.root_id, path.root_size::text, path.target_size::text, o.content_type
              FROM path
              JOIN public.objects o ON o.key=path.object_key AND o.kind=1 AND o.metadata_complete
              JOIN public.objects parent ON parent.key=path.parent_key AND parent.metadata_complete
@@ -968,6 +969,10 @@ impl BlockStore {
         let root_id: Vec<u8> = first.try_get(7)?;
         let root_size: u128 = first.try_get::<_, String>(8)?.parse()?;
         let data_size: u128 = first.try_get::<_, String>(9)?.parse()?;
+        let content_type = rows
+            .last()
+            .context("missing stored bundle target")?
+            .try_get(10)?;
         let mut locations: Vec<BundleLocation> = Vec::with_capacity(rows.len());
         for row in rows {
             let location = BundleLocation {
@@ -1018,6 +1023,7 @@ impl BlockStore {
         Ok(Some(IndexedBundle {
             root_id,
             data_size,
+            content_type,
             locations,
         }))
     }
