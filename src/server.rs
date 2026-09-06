@@ -1365,10 +1365,7 @@ fn decode_ant_record(bytes: &[u8], expected_mint: &[u8; 32]) -> Result<AntRecord
         take(bytes, &mut cursor, 3, "ANT schema version")? == [1, 0, 0],
         "unsupported ANT schema version"
     );
-    ensure!(
-        bytes[cursor..].iter().all(|byte| *byte == 0),
-        "ANT account contains trailing data"
-    );
+    // Anchor updates leave unused bytes from the previous serialization intact.
     Ok(AntRecord {
         undername,
         target,
@@ -1784,6 +1781,11 @@ async fn verified_response(
 
     let range = request_headers
         .get("range")
+        .filter(|_| {
+            request_headers
+                .get("if-range")
+                .is_none_or(|value| value.as_bytes() == verified.etag.as_bytes())
+        })
         .map(|value| {
             value
                 .to_str()
@@ -2310,6 +2312,33 @@ mod tests {
     }
 
     #[test]
+    fn resolves_ant_after_owner_is_cleared_in_place() {
+        let mint = [9; 32];
+        let mut account = ant_program_account(&mint, "@", Some(0));
+        let cleared = STANDARD.decode(&account.account.data[0]).unwrap();
+        let owner_offset = cleared.len() - 37;
+        let mut stored = cleared.clone();
+        stored[owner_offset] = 1;
+        stored.splice(owner_offset + 1..owner_offset + 1, [7; 32]);
+        stored.resize(512, 0);
+        account.account.space = stored.len();
+        for clear_owner in [false, true] {
+            if clear_owner {
+                stored[..cleared.len()].copy_from_slice(&cleared);
+            }
+            account.account.data[0] = STANDARD.encode(&stored);
+            let record = decode_ant_record(&stored, &mint).unwrap();
+            assert_eq!(record.priority, Some(0));
+            assert_eq!(record.target, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        }
+        let (index, record) = select_ant_record(vec![account], ANT_PROGRAM, &mint, "@")
+            .unwrap()
+            .unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(record.target, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    }
+
+    #[test]
     fn selects_ant_records_in_deterministic_order() {
         let mint = [9; 32];
         let mut names = [
@@ -2417,12 +2446,10 @@ mod tests {
             bad.account.data[0] = STANDARD.encode(corrupted);
             reject(bad);
         }
-        for corrupted in [data[..39].to_vec(), [data, vec![1]].concat()] {
-            let mut bad = other();
-            bad.account.space = corrupted.len();
-            bad.account.data[0] = STANDARD.encode(corrupted);
-            reject(bad);
-        }
+        let mut bad = other();
+        bad.account.space = 39;
+        bad.account.data[0] = STANDARD.encode(&data[..39]);
+        reject(bad);
         assert!(
             select_ant_record(
                 vec![ant_program_account(&mint, "valid", None)],
@@ -2768,9 +2795,20 @@ mod tests {
             format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(GZIP_HELLO)))
         );
         assert_eq!(response.bytes().await.unwrap().as_ref(), GZIP_HELLO);
+        let resumed = client
+            .get(format!("{base}/raw/{id}"))
+            .header("range", "bytes=0-1,2-3")
+            .header("if-range", "\"old\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resumed.status(), StatusCode::OK);
+        assert!(!resumed.headers().contains_key("content-range"));
+        assert_eq!(resumed.bytes().await.unwrap().as_ref(), GZIP_HELLO);
         let head = client
             .head(format!("{base}/raw/{id}"))
             .header("range", "bytes=0-1,2-3")
+            .header("if-range", &etag)
             .send()
             .await
             .unwrap();
@@ -3042,6 +3080,63 @@ mod tests {
             sandbox_name(&id),
             "jqo3ajzcvm7hsac3x5bqgckjmmfga5dsvgfdcckza7omc7xv4qva"
         );
+    }
+
+    #[tokio::test]
+    async fn if_range_requires_a_matching_strong_validator() {
+        let config = ServerConfig::new(
+            "127.0.0.1:0",
+            "example.org",
+            "http://127.0.0.1:1",
+            ARNS_PROGRAM,
+            ANT_PROGRAM,
+            8,
+        )
+        .unwrap();
+        let limits = stream_limits();
+        let permits = Arc::new(Semaphore::new(1));
+        let etag = response_fixture(b"hello").etag;
+        let weak = format!("W/{etag}");
+        for (range, validator, partial) in [
+            ("bytes=1-3", etag.as_str(), true),
+            ("bytes=1-3", "\"old\"", false),
+            ("bytes=1-3", weak.as_str(), false),
+            ("bytes=99-", "\"old\"", false),
+            ("bytes=1-3", "Wed, 01 Jan 2020 00:00:00 GMT", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("range", range.parse().unwrap());
+            headers.insert("if-range", validator.parse().unwrap());
+            let response = verified_response(
+                response_fixture(b"hello"),
+                None,
+                &config,
+                &headers,
+                &limits,
+                request_permit(&permits).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response.status(),
+                if partial {
+                    StatusCode::PARTIAL_CONTENT
+                } else {
+                    StatusCode::OK
+                },
+                "{range} / {validator}"
+            );
+            assert_eq!(response.headers().contains_key("content-range"), partial);
+            let bytes = axum::body::to_bytes(response.into_body(), 5).await.unwrap();
+            assert_eq!(
+                bytes.as_ref(),
+                if partial {
+                    b"ell".as_slice()
+                } else {
+                    b"hello".as_slice()
+                }
+            );
+        }
     }
     #[tokio::test]
     async fn serves_single_ranges_and_etag_conditionals() {
