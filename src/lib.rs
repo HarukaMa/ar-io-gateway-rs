@@ -2347,8 +2347,17 @@ fn data_item_signature_payload(
 }
 
 fn verify_data_item<'a>(item: &'a [u8], expected_id: &[u8; 32]) -> Result<VerifiedItem<'a>> {
+    // Early binary items omit the type prefix. The signature hash selects
+    // their layout even when the first signature bytes resemble a modern type.
+    let legacy = item
+        .get(..512)
+        .is_some_and(|signature| sha256(&[signature]) == *expected_id);
     let mut cursor = 0;
-    let signature_type = read_le_u16(item, &mut cursor, "data item signature type")?;
+    let signature_type = if legacy {
+        1
+    } else {
+        read_le_u16(item, &mut cursor, "data item signature type")?
+    };
     let (signature_size, owner_size) = data_item_signature_sizes(signature_type)?;
     let signature = take(item, &mut cursor, signature_size, "data item signature")?;
     let owner = take(item, &mut cursor, owner_size, "data item owner")?;
@@ -2375,8 +2384,19 @@ fn verify_data_item<'a>(item: &'a [u8], expected_id: &[u8; 32]) -> Result<Verifi
         sha256(&[signature]) == *expected_id,
         "data item ID is not the signature hash"
     );
-    let payload =
-        data_item_signature_payload(signature_type, owner, target, anchor, raw_tags, data);
+    let payload = if legacy {
+        deep_hash_list(&[
+            deep_hash_blob(b"dataitem"),
+            deep_hash_blob(b"1"),
+            deep_hash_blob(owner),
+            deep_hash_blob(target),
+            deep_hash_blob(anchor),
+            deep_hash_blob(raw_tags),
+            deep_hash_blob(data),
+        ])
+    } else {
+        data_item_signature_payload(signature_type, owner, target, anchor, raw_tags, data)
+    };
     verify_data_item_signature(signature_type, owner, signature, &payload)?;
 
     Ok(VerifiedItem {
@@ -3579,6 +3599,55 @@ mod tests {
         check_data_item(7, &typed_owner, &signature, DATA);
 
         assert!(data_item_signature_sizes(8).is_err());
+    }
+
+    #[test]
+    fn verifies_legacy_binary_item_and_rejects_mutations() {
+        let bundle = include_bytes!("../tests/fixtures/legacy-bundle-752520.bin");
+        let id = decode_fixed::<32>(
+            "eATXzsBk9otMqBAxps_afQpjWd0C7rbPV8sB85S2Uvg",
+            "data item ID",
+        )
+        .unwrap();
+        let item = &bundle[96..];
+        assert_eq!(verify_data_item(item, &id).unwrap().data, b"test");
+        for offset in [0, 512, 1024, 1042] {
+            let mut corrupt = item.to_vec();
+            corrupt[offset] ^= 1;
+            let corrupt_id = sha256(&[&corrupt[..512]]);
+            assert!(verify_data_item(&corrupt, &corrupt_id).is_err());
+        }
+        assert!(verify_data_item(&item[..1042], &id).is_err());
+        let mut prefixed = vec![1, 0];
+        prefixed.extend_from_slice(item);
+        assert!(verify_data_item(&prefixed, &id).is_err());
+        let modern = include_bytes!("../tests/fixtures/lolcchekc-item.bin");
+        let modern_id = sha256(&[&modern[2..514]]);
+        assert!(verify_data_item(&modern[2..], &modern_id).is_err());
+    }
+
+    #[test]
+    fn legacy_binary_item_authenticates_tag_bytes() {
+        let item = include_bytes!("../tests/fixtures/legacy-tagged-item-752923.bin");
+        let id = decode_fixed::<32>(
+            "-tlWxtdMmgp9B2MIY1AkBjmRkdVHERzVkbiVG5I370s",
+            "data item ID",
+        )
+        .unwrap();
+        let verified = verify_data_item(item, &id).unwrap();
+        assert_eq!(verified.tags[0].name, b"Content-Type");
+        assert_eq!(verified.tags[0].value, b"text/plain");
+        assert_eq!(
+            hex(&sha256(&[verified.data])),
+            "e963887bc1aff36d4066c783226da5a23757d7d5f288c90f6d0a38a0ba13bc97"
+        );
+        let mut corrupt = item.to_vec();
+        let tag = corrupt
+            .windows(b"text/plain".len())
+            .position(|bytes| bytes == b"text/plain")
+            .unwrap();
+        corrupt[tag] = b'n';
+        assert!(verify_data_item(&corrupt, &id).is_err());
     }
 
     #[tokio::test]
