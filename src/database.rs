@@ -15,6 +15,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("../migrations/002_metadata.sql"),
     ),
     ("003_bundles", include_str!("../migrations/003_bundles.sql")),
+    (
+        "004_content_cache",
+        include_str!("../migrations/004_content_cache.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -163,6 +167,90 @@ impl BlockStore {
         }
         transaction.commit().await?;
         Ok(())
+    }
+
+    pub(crate) async fn require_content_cache(&self) -> Result<()> {
+        let installed: bool = self
+            .client
+            .query_one(
+                "SELECT to_regclass('public.content_cache') IS NOT NULL
+                    AND to_regclass('public.ar_io_schema_migrations') IS NOT NULL",
+                &[],
+            )
+            .await?
+            .try_get(0)?;
+        let instruction = "disk cache requires schema migration 004_content_cache; apply \
+            migrations/004_content_cache.sql through the approved migration workflow \
+            before enabling disk cache";
+        ensure!(installed, "{instruction}");
+        let version: bool = self
+            .client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
+                 WHERE version = 4 AND name = '004_content_cache')",
+                &[],
+            )
+            .await?
+            .try_get(0)?;
+        ensure!(version, "{instruction}");
+        Ok(())
+    }
+
+    pub(crate) async fn cached_content(&self, id: &[u8; 32]) -> Result<Option<String>> {
+        self.client
+            .query_opt(
+                "SELECT cached.metadata FROM public.content_cache cached
+                 JOIN public.canonical_blocks c
+                   ON c.height = cached.block_height AND c.block_hash = cached.block_hash
+                 JOIN public.block_index_state s
+                   ON s.singleton AND c.height > s.start_height
+                   AND c.height <= s.imported_through
+                 WHERE cached.id = $1 AND octet_length(cached.metadata) <= 1048576",
+                &[&id.as_slice()],
+            )
+            .await?
+            .map(|row| row.try_get(0).map_err(Into::into))
+            .transpose()
+    }
+
+    pub(crate) async fn cache_content(
+        &self,
+        id: &[u8; 32],
+        height: u64,
+        block_hash: &[u8],
+        metadata: &str,
+    ) -> Result<bool> {
+        ensure!(block_hash.len() == 48, "cache block hash must be 48 bytes");
+        ensure!(metadata.len() <= 1_048_576, "cache metadata exceeds 1 MiB");
+        let row = self
+            .client
+            .query_one(
+                "WITH anchor AS MATERIALIZED (
+                    SELECT c.height, c.block_hash FROM public.canonical_blocks c
+                    JOIN public.block_index_state s
+                      ON s.singleton AND c.height > s.start_height
+                      AND c.height <= s.imported_through
+                    WHERE c.height = $2 AND c.block_hash = $3
+                 ), admitted AS (
+                    INSERT INTO public.content_cache AS stored
+                        (id, block_height, block_hash, metadata)
+                    SELECT $1, height, block_hash, $4 FROM anchor WHERE true
+                    ON CONFLICT (id) DO UPDATE SET id = stored.id
+                    WHERE ROW(stored.block_height, stored.block_hash, stored.metadata)
+                        = ROW(EXCLUDED.block_height, EXCLUDED.block_hash, EXCLUDED.metadata)
+                    RETURNING id
+                 )
+                 SELECT EXISTS (SELECT 1 FROM anchor), EXISTS (SELECT 1 FROM admitted)",
+                &[&id.as_slice(), &sql_height(height)?, &block_hash, &metadata],
+            )
+            .await?;
+        let anchored: bool = row.try_get(0)?;
+        let admitted: bool = row.try_get(1)?;
+        ensure!(
+            !anchored || admitted,
+            "conflicting immutable cached content descriptor"
+        );
+        Ok(admitted)
     }
 
     pub async fn state(&self) -> Result<Option<ImportState>> {
@@ -1624,6 +1712,86 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires migration 004 and imported blocks in ar_io_rust_test"]
+    async fn content_cache_rejects_stale_anchors_and_conflicting_descriptors() -> Result<()> {
+        use sha2::Digest;
+
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .try_get(0)?;
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store.require_content_cache().await?;
+        store.client.batch_execute("BEGIN").await?;
+        let result = async {
+            let row = store
+                .client
+                .query_one(
+                    "SELECT c.height, c.block_hash FROM public.canonical_blocks c
+                     JOIN public.block_index_state s
+                       ON s.singleton AND c.height > s.start_height
+                       AND c.height <= s.imported_through
+                     ORDER BY c.height LIMIT 1 FOR UPDATE OF s",
+                    &[],
+                )
+                .await?;
+            let height = u64::try_from(row.try_get::<_, i64>(0)?)?;
+            let hash: Vec<u8> = row.try_get(1)?;
+            let id: [u8; 32] =
+                sha2::Sha256::digest([b"content-cache-regression".as_slice(), &hash].concat())
+                    .into();
+            ensure!(
+                store.cached_content(&id).await?.is_none(),
+                "cache regression fixture already exists"
+            );
+            let metadata = r#"{"verified":"original"}"#;
+            let mut wrong_hash = hash.clone();
+            wrong_hash[0] ^= 1;
+            ensure!(
+                !store
+                    .cache_content(&id, height, &wrong_hash, metadata)
+                    .await?,
+                "mismatched block anchor was admitted"
+            );
+            ensure!(store.cached_content(&id).await?.is_none());
+            ensure!(store.cache_content(&id, height, &hash, metadata).await?);
+            ensure!(store.cache_content(&id, height, &hash, metadata).await?);
+            ensure!(
+                store
+                    .cache_content(&id, height, &hash, r#"{"verified":"conflict"}"#)
+                    .await
+                    .is_err(),
+                "conflicting immutable descriptor was accepted"
+            );
+            ensure!(store.cached_content(&id).await?.as_deref() == Some(metadata));
+            store
+                .client
+                .execute(
+                    "UPDATE public.block_index_state SET start_height = $1 WHERE singleton",
+                    &[&sql_height(height)?],
+                )
+                .await?;
+            ensure!(
+                store.cached_content(&id).await?.is_none(),
+                "cache hit survived loss of imported coverage"
+            );
+            ensure!(
+                !store.cache_content(&id, height, &hash, metadata).await?,
+                "uncovered block anchor was admitted"
+            );
+            Ok(())
+        }
+        .await;
+        store.client.batch_execute("ROLLBACK").await?;
+        result
+    }
 
     #[tokio::test]
     #[ignore = "requires indexed bundles in ar_io_rust_test"]

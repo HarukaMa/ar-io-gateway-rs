@@ -84,6 +84,13 @@ async fn main() -> Result<()> {
     if let Ok(url) = env::var("DATABASE_URL") {
         gateway = gateway.with_database(&url).await?;
     }
+    if let Some(path) = env::var_os("AR_IO_DISK_CACHE_DIR") {
+        let min_free_bytes = env::var("AR_IO_DISK_CACHE_MIN_FREE_BYTES")
+            .unwrap_or_else(|_| (50_u64 * 1024 * 1024 * 1024).to_string())
+            .parse()
+            .context("invalid AR_IO_DISK_CACHE_MIN_FREE_BYTES")?;
+        gateway = gateway.with_disk_cache(path.into(), min_free_bytes).await?;
+    }
 
     if command == "serve" {
         if args.next().is_some() {

@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| config.cache_max_bytes.to_string())
         .parse()
         .context("invalid AR_IO_CACHE_MAX_BYTES")?;
-    let gateway = Gateway::new(config)?;
+    let mut gateway = Gateway::new(config)?;
     let mut store = tokio::time::timeout(timeout, async {
         let mut store = BlockStore::connect(&database_url).await?;
         store.migrate().await?;
@@ -105,6 +105,19 @@ async fn main() -> Result<()> {
     })
     .await
     .context("database initialization timed out")??;
+    if command == "bundles" {
+        if let Some(path) = env::var_os("AR_IO_DISK_CACHE_DIR") {
+            let min_free_bytes = env::var("AR_IO_DISK_CACHE_MIN_FREE_BYTES")
+                .unwrap_or_else(|_| (50_u64 * 1024 * 1024 * 1024).to_string())
+                .parse()
+                .context("invalid AR_IO_DISK_CACHE_MIN_FREE_BYTES")?;
+            gateway = gateway
+                .with_database(&database_url)
+                .await?
+                .with_disk_cache(path.into(), min_free_bytes)
+                .await?;
+        }
+    }
     let summary = match command.as_str() {
         "blocks" => serde_json::to_string(&import_range(&gateway, &mut store, start, end).await?)?,
         "transactions" => {

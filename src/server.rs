@@ -3275,8 +3275,13 @@ mod tests {
         tokio::time::pause();
         tokio::task::yield_now().await;
         tokio::time::advance(limits.stream_idle_timeout).await;
-        tokio::task::yield_now().await;
-        let _permit = request_permit(&permits).unwrap();
+        let _permit = tokio::time::timeout(
+            Duration::from_millis(1),
+            Arc::clone(&permits).acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         drop(ContentWriter::new(5, 1, budget).await.unwrap());
         assert!(axum::body::to_bytes(body, 3).await.is_err());
     }

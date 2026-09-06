@@ -1,5 +1,6 @@
 pub mod content;
 pub mod database;
+mod disk_cache;
 mod historical;
 pub mod indexer;
 mod peers;
@@ -9,7 +10,8 @@ mod transactions;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
-    sync::{Arc, Mutex},
+    path::PathBuf,
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -128,6 +130,20 @@ pub struct VerifiedData {
     pub sha256: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct CachedContent {
+    id: String,
+    block_height: u64,
+    content_type: String,
+    content_encoding: Option<String>,
+    blob_hash: [u8; 32],
+    blob_size: usize,
+    offset: usize,
+    length: usize,
+    digest: [u8; 32],
+    tags: Option<Vec<Tag>>,
+}
+
 #[derive(Debug)]
 pub struct VerifiedChunk {
     pub bytes: Vec<u8>,
@@ -230,6 +246,8 @@ pub struct Gateway {
     peers: peers::PeerState,
     block_store: Option<database::BlockStore>,
     spool_budget: Arc<SpoolBudget>,
+    disk_cache: Option<disk_cache::DiskCache>,
+    direct_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl Gateway {
@@ -260,6 +278,8 @@ impl Gateway {
             cache: Mutex::new(ContentCache::default()),
             peers,
             block_store: None,
+            disk_cache: None,
+            direct_locks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -276,10 +296,123 @@ impl Gateway {
         self.block_store = Some(store);
         Ok(self)
     }
+    pub async fn with_disk_cache(mut self, path: PathBuf, min_free_bytes: u64) -> Result<Self> {
+        let store = self
+            .block_store
+            .as_ref()
+            .context("persistent caching requires DATABASE_URL and an initialized block index")?;
+        store.require_content_cache().await?;
+        self.disk_cache = Some(
+            disk_cache::DiskCache::new(path, min_free_bytes, self.config.max_spool_bytes).await?,
+        );
+        Ok(self)
+    }
+
+    async fn load_content_cache(
+        &self,
+        id: &str,
+    ) -> Result<Option<(VerifiedData, Option<Vec<Tag>>)>> {
+        let (Some(cache), Some(store)) = (&self.disk_cache, &self.block_store) else {
+            return Ok(None);
+        };
+        let key = decode_fixed::<32>(id, "data ID")?;
+        let Some(metadata) = store.cached_content(&key).await? else {
+            return Ok(None);
+        };
+        let entry: CachedContent =
+            serde_json::from_str(&metadata).context("invalid authenticated cache metadata")?;
+        ensure!(entry.id == id, "cached content identity mismatch");
+        ensure!(
+            entry.length <= self.config.max_data_size,
+            "cached content exceeds size limit"
+        );
+        let end = entry
+            .offset
+            .checked_add(entry.length)
+            .context("cached content offset overflow")?;
+        ensure!(end <= entry.blob_size, "cached content exceeds parent file");
+        let Some(blob) = cache.load(entry.blob_hash, entry.blob_size).await? else {
+            return Ok(None);
+        };
+        let bytes = blob.slice(entry.offset..end)?;
+        let digest = if entry.offset == 0 && entry.length == entry.blob_size {
+            entry.blob_hash
+        } else {
+            bytes.hashes().await?.0
+        };
+        ensure!(digest == entry.digest, "cached content digest mismatch");
+        Ok(Some((
+            VerifiedData {
+                bytes,
+                id: entry.id,
+                block_height: entry.block_height,
+                content_type: entry.content_type,
+                content_encoding: entry.content_encoding,
+                content_length: entry.length,
+                etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
+                sha256: hex(&digest),
+                cache_hit: true,
+            },
+            entry.tags,
+        )))
+    }
+
+    async fn save_content_cache(
+        &self,
+        data: &mut VerifiedData,
+        tags: Option<Vec<Tag>>,
+    ) -> Result<()> {
+        let (Some(cache), Some(store)) = (&self.disk_cache, &self.block_store) else {
+            return Ok(());
+        };
+        let Some((_, block)) = store.block_pair(data.block_height).await? else {
+            return Ok(());
+        };
+        let digest = decode_fixed::<32>(data.etag.trim_matches('"'), "verified content digest")?;
+        let bytes = if data.bytes.persistent_blob().is_some() {
+            data.bytes.clone()
+        } else {
+            let Some(bytes) = cache.store(&data.bytes, digest).await? else {
+                return Ok(());
+            };
+            bytes
+        };
+        let (blob_hash, blob_size, offset) = bytes
+            .persistent_blob()
+            .context("cache publication did not return persistent content")?;
+        let entry = CachedContent {
+            id: data.id.clone(),
+            block_height: data.block_height,
+            content_type: data.content_type.clone(),
+            content_encoding: data.content_encoding.clone(),
+            blob_hash,
+            blob_size,
+            offset,
+            length: data.content_length,
+            digest,
+            tags,
+        };
+        let metadata = serde_json::to_string(&entry)?;
+        if store
+            .cache_content(
+                &decode_fixed::<32>(&data.id, "data ID")?,
+                data.block_height,
+                &block.hash,
+                &metadata,
+            )
+            .await?
+        {
+            data.bytes = bytes;
+        }
+        Ok(())
+    }
 
     pub async fn retrieve(&self, id: &str) -> Result<VerifiedData> {
         decode_fixed::<32>(id, "data ID")?;
         self.retrieve_cached(id, async {
+            if let Some((data, _)) = self.load_content_cache(id).await? {
+                return Ok(data);
+            }
             match self.discover(id).await? {
                 Some(hint) => self.retrieve_bundled_with_hint(id, hint).await,
                 None => self.retrieve_direct(id).await,
@@ -371,6 +504,9 @@ impl Gateway {
     pub async fn retrieve_bundled(&self, id: &str) -> Result<VerifiedData> {
         tokio::time::timeout(self.config.retrieval_timeout, async {
             decode_fixed::<32>(id, "data item ID")?;
+            if let Some((data, None)) = self.load_content_cache(id).await? {
+                return Ok(data);
+            }
             let hint = self
                 .discover(id)
                 .await?
@@ -653,17 +789,21 @@ impl Gateway {
         let content_encoding = response_content_encoding(item.text_tag(b"Content-Encoding"))?;
         let bytes = item.data;
         let body_hash = item.body_hash;
-        Ok(VerifiedData {
+        let mut data = VerifiedData {
             content_length: bytes.len(),
             bytes,
-            cache_hit: false,
+            cache_hit: parent.cache_hit,
             id: id.to_owned(),
             block_height: parent.block_height,
             content_type: item_content_type(&item.tags)?,
             content_encoding,
             etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
             sha256: hex(&body_hash),
-        })
+        };
+        if let Err(error) = self.save_content_cache(&mut data, None).await {
+            eprintln!("content cache admission failed: {error:#}");
+        }
+        Ok(data)
     }
 
     async fn discover(&self, id: &str) -> Result<Option<BundleHint>> {
@@ -708,6 +848,33 @@ impl Gateway {
     }
 
     async fn retrieve_direct_with_tags(&self, id: &str) -> Result<(VerifiedData, Vec<Tag>)> {
+        if self.disk_cache.is_none() {
+            return self.fetch_direct_with_tags(id).await;
+        }
+        let lock = {
+            let mut locks = self.direct_locks.lock().unwrap();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(id).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(id.to_owned(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _guard = lock.lock().await;
+        if let Some((data, Some(tags))) = self.load_content_cache(id).await? {
+            return Ok((data, tags));
+        }
+        let (mut data, tags) = self.fetch_direct_with_tags(id).await?;
+        if let Err(error) = self.save_content_cache(&mut data, Some(tags.clone())).await {
+            eprintln!("content cache admission failed: {error:#}");
+        }
+        Ok((data, tags))
+    }
+
+    async fn fetch_direct_with_tags(&self, id: &str) -> Result<(VerifiedData, Vec<Tag>)> {
         decode_fixed::<32>(id, "transaction ID")?;
 
         let status_url = endpoint(&self.config.archive_url, &format!("tx/{id}/status"));
@@ -1936,7 +2103,7 @@ struct Transaction {
     denomination: u32,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Tag {
     name: String,
     value: String,

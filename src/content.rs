@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    io::{self, Read as _, Seek as _, SeekFrom, Write as _},
+    io::{self, Write as _},
     ops::Range,
     path::Path,
     pin::Pin,
@@ -71,6 +71,42 @@ struct SpoolFile {
     _reservation: Reservation,
 }
 
+#[derive(Debug)]
+enum ContentFile {
+    Temporary(SpoolFile),
+    Persistent {
+        file: std::fs::File,
+        hash: [u8; 32],
+        len: usize,
+    },
+}
+
+impl ContentFile {
+    fn read_exact_at(&self, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
+        let file = match self {
+            Self::Temporary(file) => file.temp.as_file(),
+            Self::Persistent { file, .. } => file,
+        };
+        while !bytes.is_empty() {
+            // Never mix shared-handle cursor reads with positional reads on Windows.
+            #[cfg(unix)]
+            let read = std::os::unix::fs::FileExt::read_at(file, bytes, offset);
+            #[cfg(windows)]
+            let read = std::os::windows::fs::FileExt::seek_read(file, bytes, offset);
+            match read {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(len) => {
+                    offset += len as u64;
+                    bytes = &mut bytes[len..];
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Content(Storage);
 
@@ -81,7 +117,7 @@ enum Storage {
         resident_len: usize,
     },
     File {
-        file: Arc<SpoolFile>,
+        file: Arc<ContentFile>,
         offset: usize,
         len: usize,
     },
@@ -104,6 +140,63 @@ impl From<Bytes> for Content {
 }
 
 impl Content {
+    // The caller must verify the entire file and provide a read-only handle.
+    pub(crate) fn persistent(file: std::fs::File, hash: [u8; 32], len: usize) -> Self {
+        Self(Storage::File {
+            file: Arc::new(ContentFile::Persistent { file, hash, len }),
+            offset: 0,
+            len,
+        })
+    }
+
+    pub(crate) fn persistent_blob(&self) -> Option<([u8; 32], usize, usize)> {
+        let Storage::File { file, offset, .. } = &self.0 else {
+            return None;
+        };
+        match file.as_ref() {
+            ContentFile::Persistent { hash, len, .. } => Some((*hash, *len, *offset)),
+            ContentFile::Temporary(_) => None,
+        }
+    }
+
+    // Called only by the disk cache's blocking worker. Views copy only their own bytes.
+    pub(crate) fn copy_verified_to(
+        &self,
+        output: &mut std::fs::File,
+        expected_hash: [u8; 32],
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<()> {
+        let mut sha256 = Sha256::new();
+        let mut buffer = Vec::new();
+        if !self.is_memory() {
+            buffer.resize(IO_CHUNK_SIZE.min(self.len()), 0);
+        }
+        for start in (0..self.len()).step_by(IO_CHUNK_SIZE) {
+            ensure!(!cancelled.load(Ordering::Relaxed), "cache write cancelled");
+            let end = self.len().min(start.saturating_add(IO_CHUNK_SIZE));
+            let bytes = match &self.0 {
+                Storage::Memory { bytes, .. } => &bytes[start..end],
+                Storage::File { file, offset, .. } => {
+                    let position = offset
+                        .checked_add(start)
+                        .context("content offset overflow")?;
+                    file.read_exact_at(
+                        &mut buffer[..end - start],
+                        u64::try_from(position).context("content offset exceeds file limits")?,
+                    )?;
+                    &buffer[..end - start]
+                }
+            };
+            sha256.update(bytes);
+            output.write_all(bytes)?;
+        }
+        ensure!(
+            <[u8; 32]>::from(sha256.finalize()) == expected_hash,
+            "content does not match cache hash"
+        );
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         match &self.0 {
             Storage::Memory { bytes, .. } => bytes.len(),
@@ -211,25 +304,12 @@ impl Content {
     pub async fn reader(&self) -> Result<ContentReader> {
         let state = match &self.0 {
             Storage::Memory { bytes, .. } => ReadState::Memory(bytes.clone()),
-            Storage::File { file, offset, .. } => {
-                let storage = Arc::clone(file);
-                let offset =
-                    u64::try_from(*offset).context("content offset exceeds file limits")?;
-                let file = spawn_blocking(move || -> io::Result<ReaderFile> {
-                    // try_clone shares the cursor; reopen also checks the file's identity.
-                    let mut file = storage.temp.reopen()?;
-                    file.seek(SeekFrom::Start(offset))?;
-                    Ok(ReaderFile {
-                        file,
-                        _storage: storage,
-                        buffer: Vec::new(),
-                        consumed: 0,
-                    })
-                })
-                .await
-                .context("opening content reader task")??;
-                ReadState::File(file)
-            }
+            Storage::File { file, offset, .. } => ReadState::File(ReaderFile {
+                storage: Arc::clone(file),
+                offset: u64::try_from(*offset).context("content offset exceeds file limits")?,
+                buffer: Vec::new(),
+                consumed: 0,
+            }),
         };
         Ok(ContentReader {
             state,
@@ -263,9 +343,8 @@ enum ReadState {
 
 #[derive(Debug)]
 struct ReaderFile {
-    // Close this independent handle before dropping the last storage owner on Windows.
-    file: std::fs::File,
-    _storage: Arc<SpoolFile>,
+    storage: Arc<ContentFile>,
+    offset: u64,
     buffer: Vec<u8>,
     consumed: usize,
 }
@@ -307,7 +386,8 @@ impl AsyncRead for ContentReader {
                     this.state = ReadState::Reading(spawn_blocking(move || {
                         file.buffer.resize(length, 0);
                         file.consumed = 0;
-                        file.file.read_exact(&mut file.buffer)?;
+                        file.storage.read_exact_at(&mut file.buffer, file.offset)?;
+                        file.offset += length as u64;
                         Ok(file)
                     }));
                 }
@@ -418,7 +498,9 @@ impl ContentWriter {
         let content = match self.storage {
             WriteStorage::Memory(bytes) => Content::from(bytes),
             WriteStorage::File(file) => Content(Storage::File {
-                file: Arc::new(file.context("content writer unavailable")?.file),
+                file: Arc::new(ContentFile::Temporary(
+                    file.context("content writer unavailable")?.file,
+                )),
                 offset: 0,
                 len: self.expected_len,
             }),
