@@ -415,45 +415,48 @@ pub async fn import_bundles(
             break;
         };
         let encoded_id = URL_SAFE_NO_PAD.encode(&root_id);
-        let (root, tags) = timeout(deadline, gateway.retrieve_direct_with_tags(&encoded_id))
-            .await
-            .with_context(|| format!("retrieving bundle {encoded_id} timed out"))??;
-        ensure!(
-            root.block_height == height,
-            "bundle root canonical height changed"
-        );
-        require_bundle_tags(&tags)?;
-        let root_id = root_id
-            .as_slice()
-            .try_into()
-            .context("invalid bundle root ID")?;
-        let mut traversal = BundleTraversal::new(&root.bytes, root_id)?;
-        loop {
-            let (count, complete) = timeout(deadline, async {
-                let mut objects = Vec::with_capacity(256);
-                let mut locations = Vec::with_capacity(256);
-                let mut complete = false;
-                while locations.len() < 256 {
-                    let Some((object, location)) = traversal.next().await? else {
-                        complete = true;
-                        break;
-                    };
-                    objects.push(object);
-                    locations.push(location);
+        timeout(gateway.config.retrieval_timeout, async {
+            let (root, tags) = gateway.retrieve_direct_with_tags(&encoded_id).await?;
+            ensure!(
+                root.block_height == height,
+                "bundle root canonical height changed"
+            );
+            require_bundle_tags(&tags)?;
+            let root_id = root_id
+                .as_slice()
+                .try_into()
+                .context("invalid bundle root ID")?;
+            let mut traversal = BundleTraversal::new(root.bytes, root_id).await?;
+            loop {
+                let (count, complete) = timeout(deadline, async {
+                    let mut objects = Vec::with_capacity(256);
+                    let mut locations = Vec::with_capacity(256);
+                    let mut complete = false;
+                    while locations.len() < 256 {
+                        let Some((object, location)) = traversal.next().await? else {
+                            complete = true;
+                            break;
+                        };
+                        objects.push(object);
+                        locations.push(location);
+                    }
+                    store
+                        .commit_bundle_batch(root_id, &objects, &locations, complete)
+                        .await?;
+                    Ok::<_, anyhow::Error>((locations.len() as u64, complete))
+                })
+                .await
+                .with_context(|| format!("indexing bundle {encoded_id} batch timed out"))?
+                .with_context(|| format!("indexing bundle {encoded_id}"))?;
+                summary.imported_occurrences += count;
+                if complete {
+                    break;
                 }
-                store
-                    .commit_bundle_batch(root_id, &objects, &locations, complete)
-                    .await?;
-                Ok::<_, anyhow::Error>((locations.len() as u64, complete))
-            })
-            .await
-            .with_context(|| format!("indexing bundle {encoded_id} batch timed out"))?
-            .with_context(|| format!("indexing bundle {encoded_id}"))?;
-            summary.imported_occurrences += count;
-            if complete {
-                break;
             }
-        }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .with_context(|| format!("retrieving and indexing bundle {encoded_id} timed out"))??;
         summary.imported_roots += 1;
     }
     if summary.imported_roots > 0 {
@@ -464,23 +467,23 @@ pub async fn import_bundles(
     Ok(summary)
 }
 
-struct BundleFrame<'a> {
-    items: BundleItems<'a>,
+struct BundleFrame {
+    items: BundleItems,
     id: [u8; 32],
     item_offset: Option<u128>,
     payload_offset: u128,
     framing_checked: bool,
 }
 
-struct BundleTraversal<'a> {
-    stack: Vec<BundleFrame<'a>>,
+struct BundleTraversal {
+    stack: Vec<BundleFrame>,
 }
 
-impl<'a> BundleTraversal<'a> {
-    fn new(root: &'a [u8], root_id: &[u8; 32]) -> Result<Self> {
+impl BundleTraversal {
+    async fn new(root: crate::content::Content, root_id: &[u8; 32]) -> Result<Self> {
         Ok(Self {
             stack: vec![BundleFrame {
-                items: BundleItems::new(root)?,
+                items: BundleItems::new(root).await?,
                 id: *root_id,
                 item_offset: None,
                 payload_offset: 0,
@@ -492,9 +495,9 @@ impl<'a> BundleTraversal<'a> {
     async fn next(&mut self) -> Result<Option<(ObjectMetadata, BundleLocation)>> {
         while let Some(parent) = self.stack.last_mut() {
             if !parent.framing_checked {
-                let mut table = BundleItems::new(parent.items.bundle)?;
+                let mut table = BundleItems::new(parent.items.bundle.clone()).await?;
                 let mut checked = 0;
-                while table.next()?.is_some() {
+                while table.next().await?.is_some() {
                     checked += 1;
                     if checked % 256 == 0 {
                         tokio::task::yield_now().await;
@@ -503,11 +506,12 @@ impl<'a> BundleTraversal<'a> {
                 parent.framing_checked = true;
             }
             tokio::task::yield_now().await;
-            let Some(entry) = parent.items.next()? else {
+            let Some(entry) = parent.items.next().await? else {
                 self.stack.pop();
                 continue;
             };
-            let item = verify_data_item(entry.bytes, entry.id)?;
+            let item_size = entry.bytes.len() as u128;
+            let item = verify_data_item(entry.bytes, &entry.id).await?;
             let root_offset = parent
                 .payload_offset
                 .checked_add(entry.offset as u128)
@@ -517,12 +521,13 @@ impl<'a> BundleTraversal<'a> {
                 parent_id: parent.id.to_vec(),
                 parent_offset: parent.item_offset,
                 item_offset: entry.offset as u128,
-                item_size: entry.bytes.len() as u128,
+                item_size,
                 data_offset: item.data_offset as u128,
                 root_offset,
             };
+            let metadata = item.metadata(&entry.id);
             if item.is_bundle() {
-                let items = BundleItems::new(item.data)?;
+                let items = BundleItems::new(item.data).await?;
                 if items.remaining > 0 {
                     ensure!(
                         self.stack.len() < MAX_BUNDLE_DEPTH,
@@ -530,7 +535,7 @@ impl<'a> BundleTraversal<'a> {
                     );
                     self.stack.push(BundleFrame {
                         items,
-                        id: *entry.id,
+                        id: entry.id,
                         item_offset: Some(root_offset),
                         payload_offset: root_offset
                             .checked_add(item.data_offset as u128)
@@ -539,7 +544,7 @@ impl<'a> BundleTraversal<'a> {
                     });
                 }
             }
-            return Ok(Some((item.metadata(entry.id), location)));
+            return Ok(Some((metadata, location)));
         }
         Ok(None)
     }
@@ -560,12 +565,16 @@ mod bundle_tests {
     #[tokio::test]
     async fn nested_repeated_occurrences_authenticate_exact_stored_paths() {
         let root_id = [9; 32];
-        let data = b"nested repeated payload";
+        let payload = vec![0xa5; 128 * 1024 + 17];
+        let data = payload.as_slice();
         let (leaf, leaf_id) = signed_data_item(data, &[]);
         let nested_data = encode_bundle(&[&leaf, &leaf]);
         let (nested, nested_id) = signed_data_item(&nested_data, BUNDLE_TAGS);
         let root = encode_bundle(&[&nested, &nested]);
-        let mut traversal = BundleTraversal::new(&root, &root_id).unwrap();
+        let root_content = crate::tests::spooled_content(&root).await;
+        let mut traversal = BundleTraversal::new(root_content.clone(), &root_id)
+            .await
+            .unwrap();
         let mut locations = Vec::new();
         while let Some((_, location)) = traversal.next().await.unwrap() {
             locations.push(location);
@@ -590,13 +599,16 @@ mod bundle_tests {
             data_size: data.len() as u128,
             locations: vec![locations[3].clone(), locations[5].clone()],
         };
-        assert_eq!(
-            verify_indexed_bundle(&root, &leaf_id, &indexed())
+        for content in [root.clone().into(), root_content] {
+            let verified = verify_indexed_bundle(content, &leaf_id, &indexed())
                 .await
-                .unwrap()
-                .data,
-            data
-        );
+                .unwrap();
+            assert_eq!(
+                verified.data.read_all(data.len()).await.unwrap().as_ref(),
+                data
+            );
+            assert_eq!(verified.body_hash, crate::sha256(&[data]));
+        }
         for field in 0..8 {
             let mut hint = indexed();
             let location = &mut hint.locations[1];
@@ -611,26 +623,30 @@ mod bundle_tests {
                 7 => hint.data_size += 1,
                 _ => unreachable!(),
             }
-            assert!(verify_indexed_bundle(&root, &leaf_id, &hint).await.is_err());
+            assert!(
+                verify_indexed_bundle(root.clone().into(), &leaf_id, &hint)
+                    .await
+                    .is_err()
+            );
         }
         let mut missing_ancestor = indexed();
         missing_ancestor.locations.remove(0);
         assert!(
-            verify_indexed_bundle(&root, &leaf_id, &missing_ancestor)
+            verify_indexed_bundle(root.clone().into(), &leaf_id, &missing_ancestor)
                 .await
                 .is_err()
         );
         let mut corrupt_parent = root.clone();
         corrupt_parent[second_parent + 2] ^= 1;
         assert!(
-            verify_indexed_bundle(&corrupt_parent, &leaf_id, &indexed())
+            verify_indexed_bundle(corrupt_parent.into(), &leaf_id, &indexed())
                 .await
                 .is_err()
         );
         let mut corrupt_table = root.clone();
         corrupt_table[96] ^= 1;
         assert!(
-            verify_indexed_bundle(&corrupt_table, &leaf_id, &indexed())
+            verify_indexed_bundle(corrupt_table.into(), &leaf_id, &indexed())
                 .await
                 .is_err()
         );
@@ -639,14 +655,26 @@ mod bundle_tests {
         *corrupt_leaf.last_mut().unwrap() ^= 1;
         let repeated = encode_bundle(&[&corrupt_leaf, &leaf]);
         assert_eq!(
-            verify_bundle_item(&repeated, &leaf_id, Some((160 + leaf.len()) as u128))
-                .await
-                .unwrap()
-                .0
-                .data,
+            verify_bundle_item(
+                repeated.clone().into(),
+                &leaf_id,
+                Some((160 + leaf.len()) as u128)
+            )
+            .await
+            .unwrap()
+            .0
+            .data
+            .read_all(data.len())
+            .await
+            .unwrap()
+            .as_ref(),
             data
         );
-        assert!(verify_bundle_item(&repeated, &leaf_id, None).await.is_err());
+        assert!(
+            verify_bundle_item(repeated.into(), &leaf_id, None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -657,8 +685,12 @@ mod bundle_tests {
         let mut items = vec![leaf.as_slice(); 256];
         items.push(&corrupt);
         let root = encode_bundle(&items);
-        let mut first = BundleTraversal::new(&root, &[9; 32]).unwrap();
-        let mut replay = BundleTraversal::new(&root, &[9; 32]).unwrap();
+        let mut first = BundleTraversal::new(root.clone().into(), &[9; 32])
+            .await
+            .unwrap();
+        let mut replay = BundleTraversal::new(crate::tests::spooled_content(&root).await, &[9; 32])
+            .await
+            .unwrap();
         for index in 0..256 {
             let original = first.next().await.unwrap().unwrap();
             assert_eq!(original, replay.next().await.unwrap().unwrap());
@@ -676,15 +708,21 @@ mod bundle_tests {
         let (leaf, _) = signed_data_item(b"framing", &[]);
         let mut root = encode_bundle(&vec![leaf.as_slice(); 257]);
         root.push(0);
-        let mut traversal = BundleTraversal::new(&root, &[9; 32]).unwrap();
-        assert!(traversal.next().await.is_err());
+        for content in [
+            root.clone().into(),
+            crate::tests::spooled_content(&root).await,
+        ] {
+            let mut traversal = BundleTraversal::new(content, &[9; 32]).await.unwrap();
+            assert!(traversal.next().await.is_err());
+        }
     }
 
     #[tokio::test]
     async fn traversal_accepts_empty_bundles_and_enforces_table_and_depth_bounds() {
         let empty = encode_bundle(&[]);
         assert!(
-            BundleTraversal::new(&empty, &[9; 32])
+            BundleTraversal::new(empty.clone().into(), &[9; 32])
+                .await
                 .unwrap()
                 .next()
                 .await
@@ -693,10 +731,18 @@ mod bundle_tests {
         );
         let mut trailing = empty.clone();
         trailing.push(0);
-        assert!(BundleTraversal::new(&trailing, &[9; 32]).is_err());
+        assert!(
+            BundleTraversal::new(trailing.into(), &[9; 32])
+                .await
+                .is_err()
+        );
         let mut oversized = empty;
         oversized[31] = 1;
-        assert!(BundleTraversal::new(&oversized, &[9; 32]).is_err());
+        assert!(
+            BundleTraversal::new(oversized.into(), &[9; 32])
+                .await
+                .is_err()
+        );
 
         let (leaf, _) = signed_data_item(b"deep", &[]);
         let mut root = encode_bundle(&[&leaf]);
@@ -704,14 +750,18 @@ mod bundle_tests {
             let (parent, _) = signed_data_item(&root, BUNDLE_TAGS);
             root = encode_bundle(&[&parent]);
         }
-        let mut traversal = BundleTraversal::new(&root, &[9; 32]).unwrap();
+        let mut traversal = BundleTraversal::new(root.clone().into(), &[9; 32])
+            .await
+            .unwrap();
         for _ in 0..MAX_BUNDLE_DEPTH {
             assert!(traversal.next().await.unwrap().is_some());
         }
         assert!(traversal.next().await.unwrap().is_none());
         let (parent, _) = signed_data_item(&root, BUNDLE_TAGS);
         let too_deep = encode_bundle(&[&parent]);
-        let mut traversal = BundleTraversal::new(&too_deep, &[9; 32]).unwrap();
+        let mut traversal = BundleTraversal::new(too_deep.into(), &[9; 32])
+            .await
+            .unwrap();
         for _ in 1..MAX_BUNDLE_DEPTH {
             traversal.next().await.unwrap().unwrap();
         }

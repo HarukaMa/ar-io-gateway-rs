@@ -1,3 +1,4 @@
+pub mod content;
 pub mod database;
 mod historical;
 pub mod indexer;
@@ -14,6 +15,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use content::{Content, ContentWriter, SpoolBudget};
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
 use k256::ecdsa::{
     RecoveryId, Signature as Secp256k1Signature, VerifyingKey as Secp256k1VerifyingKey,
@@ -57,6 +59,11 @@ pub struct Config {
     pub request_timeout: Duration,
     pub max_peer_attempts: usize,
     pub max_data_size: usize,
+    pub max_memory_data_size: usize,
+    pub max_spool_bytes: usize,
+    pub retrieval_timeout: Duration,
+    pub stream_idle_timeout: Duration,
+    pub stream_timeout: Duration,
     pub cache_max_entries: usize,
     pub cache_max_bytes: usize,
 }
@@ -95,6 +102,11 @@ impl Config {
             request_timeout,
             max_peer_attempts,
             max_data_size,
+            max_memory_data_size: max_data_size.min(64 * 1024 * 1024),
+            max_spool_bytes: 4 * 1024 * 1024 * 1024,
+            retrieval_timeout: Duration::from_secs(30 * 60),
+            stream_idle_timeout: Duration::from_secs(30),
+            stream_timeout: Duration::from_secs(30 * 60),
             cache_max_entries: 1024,
             cache_max_bytes: 512 * 1024 * 1024,
         })
@@ -104,7 +116,7 @@ impl Config {
 #[derive(Clone, Debug, Serialize)]
 pub struct VerifiedData {
     #[serde(skip_serializing)]
-    pub bytes: Arc<[u8]>,
+    pub bytes: Content,
     #[serde(skip_serializing)]
     pub cache_hit: bool,
     pub id: String,
@@ -151,12 +163,12 @@ impl ContentCache {
     }
 
     fn insert(&mut self, data: VerifiedData, max_entries: usize, max_bytes: usize) {
-        let size = data.bytes.len();
-        if max_entries == 0 || size > max_bytes || max_bytes == 0 {
+        let size = data.bytes.resident_len();
+        if !data.bytes.is_memory() || max_entries == 0 || size > max_bytes || max_bytes == 0 {
             return;
         }
         if let Some((old, _)) = self.entries.remove(&data.id) {
-            self.bytes -= old.bytes.len();
+            self.bytes -= old.bytes.resident_len();
         }
         // ponytail: bounded O(n) eviction, use an ordered LRU if insertion throughput demands it.
         while self.entries.len() >= max_entries || self.bytes > max_bytes - size {
@@ -166,7 +178,7 @@ impl ContentCache {
                 .min_by_key(|(_, (_, accessed))| *accessed)
                 .map(|(id, _)| id.clone())
                 .unwrap();
-            self.bytes -= self.entries.remove(&victim).unwrap().0.bytes.len();
+            self.bytes -= self.entries.remove(&victim).unwrap().0.bytes.resident_len();
         }
         self.clock += 1;
         self.bytes += size;
@@ -197,16 +209,32 @@ pub struct Gateway {
     cache: Mutex<ContentCache>,
     peers: peers::PeerState,
     block_store: Option<database::BlockStore>,
+    spool_budget: Arc<SpoolBudget>,
 }
 
 impl Gateway {
     pub fn new(config: Config) -> Result<Self> {
+        ensure!(
+            config.max_data_size > 0,
+            "maximum data size must be positive"
+        );
+        ensure!(
+            config.max_memory_data_size > 0 && config.max_spool_bytes > 0,
+            "memory and temporary storage limits must be positive"
+        );
+        ensure!(
+            !config.retrieval_timeout.is_zero()
+                && !config.stream_idle_timeout.is_zero()
+                && !config.stream_timeout.is_zero(),
+            "retrieval and stream timeouts must be positive"
+        );
         let client = Client::builder()
             .timeout(config.request_timeout)
             .build()
             .context("failed to build HTTP client")?;
         let peers = peers::PeerState::new(&config.trusted_node_url)?;
         Ok(Self {
+            spool_budget: Arc::new(SpoolBudget::new(config.max_spool_bytes)),
             config,
             client,
             cache: Mutex::new(ContentCache::default()),
@@ -267,7 +295,7 @@ impl Gateway {
             }
         };
         if let Some(mut leader) = leader {
-            let result = tokio::time::timeout(self.config.request_timeout, retrieve)
+            let result = tokio::time::timeout(self.config.retrieval_timeout, retrieve)
                 .await
                 .context("verified retrieval timed out")
                 .and_then(|result| result);
@@ -291,7 +319,7 @@ impl Gateway {
             drop(leader);
             result
         } else {
-            tokio::time::timeout(self.config.request_timeout, receiver.changed())
+            tokio::time::timeout(self.config.retrieval_timeout, receiver.changed())
                 .await
                 .context("coalesced retrieval timed out")?
                 .context("coalesced retrieval canceled")?;
@@ -306,7 +334,7 @@ impl Gateway {
 
     pub async fn retrieve_direct(&self, id: &str) -> Result<VerifiedData> {
         let (verified, _) = tokio::time::timeout(
-            self.config.request_timeout,
+            self.config.retrieval_timeout,
             self.retrieve_direct_with_tags(id),
         )
         .await
@@ -315,7 +343,7 @@ impl Gateway {
     }
 
     pub async fn retrieve_bundled(&self, id: &str) -> Result<VerifiedData> {
-        tokio::time::timeout(self.config.request_timeout, async {
+        tokio::time::timeout(self.config.retrieval_timeout, async {
             decode_fixed::<32>(id, "data item ID")?;
             let hint = self
                 .discover(id)
@@ -574,10 +602,10 @@ impl Gateway {
         require_bundle_tags(&parent_tags)?;
         let item = match &hint {
             BundleHint::Indexed(indexed) => {
-                verify_indexed_bundle(&parent.bytes, &expected_id, indexed).await?
+                verify_indexed_bundle(parent.bytes, &expected_id, indexed).await?
             }
             BundleHint::External { .. } => {
-                verify_bundle_item(&parent.bytes, &expected_id, None)
+                verify_bundle_item(parent.bytes, &expected_id, None)
                     .await?
                     .0
             }
@@ -587,11 +615,11 @@ impl Gateway {
             "discovered data item size does not match verified payload"
         );
 
-        let bytes = item.data.to_vec();
-        let body_hash = sha256(&[&bytes]);
+        let bytes = item.data;
+        let body_hash = item.body_hash;
         Ok(VerifiedData {
             content_length: bytes.len(),
-            bytes: bytes.into(),
+            bytes,
             cache_hit: false,
             id: id.to_owned(),
             block_height: parent.block_height,
@@ -784,19 +812,22 @@ impl Gateway {
         };
 
         let expected_len = checked_data_size(data_size, self.config.max_data_size)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(expected_len)
-            .context("unable to reserve transaction buffer")?;
+        let mut writer = ContentWriter::new(
+            expected_len,
+            self.config.max_memory_data_size,
+            self.spool_budget.clone(),
+        )
+        .await?;
+        let mut received = 0usize;
         let max_chunks = data_size.div_ceil(MAX_CHUNK_SIZE) + 1;
         let mut chunks = 0u128;
 
-        while bytes.len() < expected_len {
+        while received < expected_len {
             ensure!(
                 chunks < max_chunks,
                 "chunk count exceeded transaction bound"
             );
-            let relative_offset = bytes.len() as u128;
+            let relative_offset = received as u128;
             let absolute_offset = first_offset
                 .checked_add(relative_offset)
                 .context("chunk offset overflow")?;
@@ -805,23 +836,20 @@ impl Gateway {
                 .await?;
             ensure!(!chunk.is_empty(), "verified chunk made no forward progress");
             ensure!(
-                chunk.len() <= expected_len - bytes.len(),
+                chunk.len() <= expected_len - received,
                 "verified chunk exceeds transaction size"
             );
-            bytes.extend_from_slice(&chunk);
+            writer.write(&chunk).await?;
+            received += chunk.len();
             chunks += 1;
         }
 
-        ensure!(
-            bytes.len() == expected_len,
-            "assembled transaction is incomplete"
-        );
-        let body_hash = sha256(&[&bytes]);
+        let (bytes, body_hash) = writer.finish().await?;
         let content_type = content_type(&transaction.tags)?;
 
         Ok((
             VerifiedData {
-                bytes: bytes.into(),
+                bytes,
                 cache_hit: false,
                 id: id.to_owned(),
                 block_height: status.block_height,
@@ -860,6 +888,7 @@ impl Gateway {
         let limit = self
             .config
             .max_data_size
+            .min(self.config.max_memory_data_size)
             .checked_mul(4)
             .and_then(|size| size.checked_div(3))
             .and_then(|size| size.checked_add(MAX_JSON_BYTES))
@@ -2103,26 +2132,27 @@ fn require_bundle_tags(tags: &[Tag]) -> Result<()> {
     Ok(())
 }
 
-struct VerifiedItem<'a> {
-    data: &'a [u8],
+struct VerifiedItem {
+    data: content::Content,
     data_offset: usize,
+    body_hash: [u8; 32],
     signature_type: u16,
-    signature: &'a [u8],
-    owner: &'a [u8],
-    target: &'a [u8],
-    anchor: &'a [u8],
-    tags: Vec<ItemTag<'a>>,
+    signature: axum::body::Bytes,
+    owner: axum::body::Bytes,
+    target: axum::body::Bytes,
+    anchor: axum::body::Bytes,
+    tags: Vec<ItemTag>,
 }
 
-impl VerifiedItem<'_> {
+impl VerifiedItem {
     fn is_bundle(&self) -> bool {
         self.tags
             .iter()
-            .any(|tag| tag.name == b"Bundle-Format" && tag.value == b"binary")
+            .any(|tag| tag.name.as_ref() == b"Bundle-Format" && tag.value.as_ref() == b"binary")
             && self
                 .tags
                 .iter()
-                .any(|tag| tag.name == b"Bundle-Version" && tag.value == b"2.0.0")
+                .any(|tag| tag.name.as_ref() == b"Bundle-Version" && tag.value.as_ref() == b"2.0.0")
     }
 
     fn metadata(&self, id: &[u8; 32]) -> database::ObjectMetadata {
@@ -2136,7 +2166,7 @@ impl VerifiedItem<'_> {
             kind: 1,
             signature: self.signature.to_vec(),
             anchor: self.anchor.to_vec(),
-            owner_address: sha256(&[self.owner]).to_vec(),
+            owner_address: sha256(&[&self.owner]).to_vec(),
             owner_public_key: self.owner.to_vec(),
             target: self.target.to_vec(),
             data_size: self.data.len() as u128,
@@ -2153,31 +2183,33 @@ impl VerifiedItem<'_> {
     }
 }
 
-struct ItemTag<'a> {
-    name: &'a [u8],
-    value: &'a [u8],
+struct ItemTag {
+    name: axum::body::Bytes,
+    value: axum::body::Bytes,
 }
 
-struct BundleEntry<'a> {
-    id: &'a [u8; 32],
-    bytes: &'a [u8],
+struct BundleEntry {
+    id: [u8; 32],
+    bytes: content::Content,
     offset: usize,
 }
 
-struct BundleItems<'a> {
-    bundle: &'a [u8],
+struct BundleItems {
+    bundle: content::Content,
     remaining: usize,
     cursor: usize,
     item_start: usize,
+    table: axum::body::Bytes,
 }
 
-impl<'a> BundleItems<'a> {
-    fn new(bundle: &'a [u8]) -> Result<Self> {
-        let mut cursor = 0;
-        let count = read_u256_usize(
-            take(bundle, &mut cursor, 32, "bundle item count")?,
-            "bundle item count",
-        )?;
+impl BundleItems {
+    async fn new(bundle: content::Content) -> Result<Self> {
+        let header = bundle
+            .read_at(0, 32)
+            .await
+            .context("bundle item count is truncated")?;
+        let count = read_u256_usize(&header, "bundle item count")?;
+        let cursor = 32;
         ensure!(
             count <= (bundle.len() - cursor) / BUNDLE_ENTRY_SIZE,
             "bundle item table exceeds parent bounds"
@@ -2192,19 +2224,25 @@ impl<'a> BundleItems<'a> {
             remaining: count,
             cursor,
             item_start,
+            table: axum::body::Bytes::new(),
         })
     }
 
-    fn next(&mut self) -> Result<Option<BundleEntry<'a>>> {
+    async fn next(&mut self) -> Result<Option<BundleEntry>> {
         if self.remaining == 0 {
             return Ok(None);
         }
-        let size = read_u256_usize(
-            take(self.bundle, &mut self.cursor, 32, "bundle item size")?,
-            "bundle item size",
-        )?;
+        if self.table.is_empty() {
+            self.table = self
+                .bundle
+                .read_at(self.cursor, self.remaining.min(256) * BUNDLE_ENTRY_SIZE)
+                .await?;
+        }
+        let header = self.table.split_to(BUNDLE_ENTRY_SIZE);
+        self.cursor += BUNDLE_ENTRY_SIZE;
+        let size = read_u256_usize(&header[..32], "bundle item size")?;
         ensure!(size > 0, "bundle contains an empty item");
-        let id = take(self.bundle, &mut self.cursor, 32, "bundle item ID")?
+        let id = header[32..]
             .try_into()
             .context("invalid bundle item ID length")?;
         let end = self
@@ -2224,7 +2262,7 @@ impl<'a> BundleItems<'a> {
         }
         let entry = BundleEntry {
             id,
-            bytes: &self.bundle[self.item_start..end],
+            bytes: self.bundle.slice(self.item_start..end)?,
             offset: self.item_start,
         };
         self.item_start = end;
@@ -2232,16 +2270,16 @@ impl<'a> BundleItems<'a> {
     }
 }
 
-async fn verify_bundle_item<'a>(
-    bundle: &'a [u8],
+async fn verify_bundle_item(
+    bundle: content::Content,
     expected_id: &[u8; 32],
     expected_offset: Option<u128>,
-) -> Result<(VerifiedItem<'a>, usize)> {
-    let mut entries = BundleItems::new(bundle)?;
+) -> Result<(VerifiedItem, usize)> {
+    let mut entries = BundleItems::new(bundle).await?;
     let mut found = None;
     let mut scanned = 0;
-    while let Some(entry) = entries.next()? {
-        if entry.id == expected_id
+    while let Some(entry) = entries.next().await? {
+        if &entry.id == expected_id
             && expected_offset.is_none_or(|offset| offset == entry.offset as u128)
             && found.is_none()
         {
@@ -2254,14 +2292,17 @@ async fn verify_bundle_item<'a>(
         }
     }
     let entry = found.context("data item is absent from verified parent at the expected offset")?;
-    Ok((verify_data_item(entry.bytes, expected_id)?, entry.offset))
+    Ok((
+        verify_data_item(entry.bytes, expected_id).await?,
+        entry.offset,
+    ))
 }
 
-async fn verify_indexed_bundle<'a>(
-    root: &'a [u8],
+async fn verify_indexed_bundle(
+    root: content::Content,
     expected_id: &[u8; 32],
     indexed: &database::IndexedBundle,
-) -> Result<VerifiedItem<'a>> {
+) -> Result<VerifiedItem> {
     ensure!(
         indexed.root_id.len() == 32 && (1..=MAX_BUNDLE_DEPTH).contains(&indexed.locations.len()),
         "invalid indexed bundle path"
@@ -2331,7 +2372,7 @@ fn data_item_signature_payload(
     target: &[u8],
     anchor: &[u8],
     raw_tags: &[u8],
-    data: &[u8],
+    data_hash: [u8; 48],
 ) -> [u8; 48] {
     let signature_type = signature_type.to_string();
     deep_hash_list(&[
@@ -2342,48 +2383,59 @@ fn data_item_signature_payload(
         deep_hash_blob(target),
         deep_hash_blob(anchor),
         deep_hash_blob(raw_tags),
-        deep_hash_blob(data),
+        data_hash,
     ])
 }
 
-fn verify_data_item<'a>(item: &'a [u8], expected_id: &[u8; 32]) -> Result<VerifiedItem<'a>> {
+async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Result<VerifiedItem> {
+    // Type 6 has the largest signature/owner; flags, lengths and tags are bounded.
+    const MAX_HEADER_SIZE: usize = 2 + 2_052 + 1_025 + 2 * 33 + 16 + MAX_DATA_ITEM_TAG_BYTES;
+    let header = item.read_at(0, item.len().min(MAX_HEADER_SIZE)).await?;
     // Early binary items omit the type prefix. The signature hash selects
     // their layout even when the first signature bytes resemble a modern type.
-    let legacy = item
+    let legacy = header
         .get(..512)
         .is_some_and(|signature| sha256(&[signature]) == *expected_id);
     let mut cursor = 0;
     let signature_type = if legacy {
         1
     } else {
-        read_le_u16(item, &mut cursor, "data item signature type")?
+        read_le_u16(&header, &mut cursor, "data item signature type")?
     };
     let (signature_size, owner_size) = data_item_signature_sizes(signature_type)?;
-    let signature = take(item, &mut cursor, signature_size, "data item signature")?;
-    let owner = take(item, &mut cursor, owner_size, "data item owner")?;
-    let target = read_optional_32(item, &mut cursor, "data item target")?;
-    let anchor = read_optional_32(item, &mut cursor, "data item anchor")?;
-    let tag_count = usize::try_from(read_le_u64(item, &mut cursor, "data item tag count")?)
+    let signature = take(&header, &mut cursor, signature_size, "data item signature")?;
+    let owner = take(&header, &mut cursor, owner_size, "data item owner")?;
+    let target = read_optional_32(&header, &mut cursor, "data item target")?;
+    let anchor = read_optional_32(&header, &mut cursor, "data item anchor")?;
+    let tag_count = usize::try_from(read_le_u64(&header, &mut cursor, "data item tag count")?)
         .context("data item tag count is too large")?;
     ensure!(
         tag_count <= MAX_DATA_ITEM_TAGS,
         "data item tag count exceeds limit"
     );
-    let tag_bytes_len =
-        usize::try_from(read_le_u64(item, &mut cursor, "data item tag byte length")?)
-            .context("data item tag byte length is too large")?;
+    let tag_bytes_len = usize::try_from(read_le_u64(
+        &header,
+        &mut cursor,
+        "data item tag byte length",
+    )?)
+    .context("data item tag byte length is too large")?;
     ensure!(
         tag_bytes_len <= MAX_DATA_ITEM_TAG_BYTES,
         "data item tag bytes exceed limit"
     );
-    let raw_tags = take(item, &mut cursor, tag_bytes_len, "data item tags")?;
-    let tags = parse_avro_tags(raw_tags, tag_count)?;
-    let data = &item[cursor..];
+    let raw_tags = take(&header, &mut cursor, tag_bytes_len, "data item tags")?;
+    let tags = parse_avro_tags(&header.slice_ref(raw_tags), tag_count)?;
+    let data = item.slice(cursor..item.len())?;
 
     ensure!(
         sha256(&[signature]) == *expected_id,
         "data item ID is not the signature hash"
     );
+    let (body_hash, body_sha384) = data.hashes().await?;
+    let data_hash = sha384(&[
+        &sha384(&[format!("blob{}", data.len()).as_bytes()]),
+        &body_sha384,
+    ]);
     let payload = if legacy {
         deep_hash_list(&[
             deep_hash_blob(b"dataitem"),
@@ -2392,29 +2444,30 @@ fn verify_data_item<'a>(item: &'a [u8], expected_id: &[u8; 32]) -> Result<Verifi
             deep_hash_blob(target),
             deep_hash_blob(anchor),
             deep_hash_blob(raw_tags),
-            deep_hash_blob(data),
+            data_hash,
         ])
     } else {
-        data_item_signature_payload(signature_type, owner, target, anchor, raw_tags, data)
+        data_item_signature_payload(signature_type, owner, target, anchor, raw_tags, data_hash)
     };
     verify_data_item_signature(signature_type, owner, signature, &payload)?;
 
     Ok(VerifiedItem {
         data,
         data_offset: cursor,
+        body_hash,
         signature_type,
-        signature,
-        owner,
-        target,
-        anchor,
+        signature: header.slice_ref(signature),
+        owner: header.slice_ref(owner),
+        target: header.slice_ref(target),
+        anchor: header.slice_ref(anchor),
         tags,
     })
 }
 
-fn item_content_type(tags: &[ItemTag<'_>]) -> Result<String> {
+fn item_content_type(tags: &[ItemTag]) -> Result<String> {
     for tag in tags {
-        if tag.name == b"Content-Type" {
-            let value = HeaderValue::from_bytes(tag.value)
+        if tag.name.as_ref() == b"Content-Type" {
+            let value = HeaderValue::from_bytes(&tag.value)
                 .context("invalid Content-Type tag")?
                 .to_str()
                 .context("non-ASCII Content-Type tag")?
@@ -2425,7 +2478,7 @@ fn item_content_type(tags: &[ItemTag<'_>]) -> Result<String> {
     Ok("application/octet-stream".to_owned())
 }
 
-fn parse_avro_tags(bytes: &[u8], expected_count: usize) -> Result<Vec<ItemTag<'_>>> {
+fn parse_avro_tags(bytes: &axum::body::Bytes, expected_count: usize) -> Result<Vec<ItemTag>> {
     if bytes.is_empty() && expected_count == 0 {
         return Ok(Vec::new());
     }
@@ -2463,7 +2516,10 @@ fn parse_avro_tags(bytes: &[u8], expected_count: usize) -> Result<Vec<ItemTag<'_
             let name = take(bytes, &mut cursor, name_len, "Avro tag name")?;
             let value_len = read_avro_length(bytes, &mut cursor, "Avro tag value")?;
             let value = take(bytes, &mut cursor, value_len, "Avro tag value")?;
-            tags.push(ItemTag { name, value });
+            tags.push(ItemTag {
+                name: bytes.slice_ref(name),
+                value: bytes.slice_ref(value),
+            });
         }
         if let Some(block_end) = block_end {
             ensure!(cursor == block_end, "Avro tag block size mismatch");
@@ -3278,7 +3334,8 @@ mod tests {
         raw_tags.push(0);
         let key = Ed25519SigningKey::from_bytes(&[2; 32]);
         let owner = key.verifying_key().to_bytes();
-        let payload = data_item_signature_payload(2, &owner, &[], &[], &raw_tags, data);
+        let payload =
+            data_item_signature_payload(2, &owner, &[], &[], &raw_tags, deep_hash_blob(data));
         let signature = key.sign(&payload).to_bytes();
         (
             encode_data_item(2, &signature, &owner, data, &raw_tags, tags.len() as u64),
@@ -3303,50 +3360,74 @@ mod tests {
         bundle
     }
 
-    fn check_data_item(
-        signature_type: u16,
-        owner: &[u8],
-        signature: &[u8],
-        data: &[u8],
-    ) -> Vec<u8> {
+    pub(super) async fn spooled_content(bytes: &[u8]) -> content::Content {
+        let budget = Arc::new(content::SpoolBudget::new(bytes.len()));
+        let mut writer = content::ContentWriter::new(bytes.len(), 1, budget)
+            .await
+            .unwrap();
+        for chunk in bytes.chunks(64 * 1024) {
+            writer.write(chunk).await.unwrap();
+        }
+        writer.finish().await.unwrap().0
+    }
+
+    async fn check_data_item(signature_type: u16, owner: &[u8], signature: &[u8], data: &[u8]) {
         let item = encode_data_item(signature_type, signature, owner, data, &[0], 0);
         let expected_id = sha256(&[signature]);
-        assert_eq!(verify_data_item(&item, &expected_id).unwrap().data, data);
+        for bytes in [item.clone().into(), spooled_content(&item).await] {
+            let verified = verify_data_item(bytes, &expected_id).await.unwrap();
+            assert_eq!(
+                verified.data.read_all(data.len()).await.unwrap().as_ref(),
+                data
+            );
+            assert_eq!(verified.body_hash, sha256(&[data]));
+        }
 
         let (signature_size, _) = data_item_signature_sizes(signature_type).unwrap();
         let mut wrong_signature = item.clone();
         wrong_signature[2] ^= 1;
         let wrong_id = sha256(&[&wrong_signature[2..2 + signature_size]]);
-        assert!(verify_data_item(&wrong_signature, &wrong_id).is_err());
+        assert!(
+            verify_data_item(wrong_signature.into(), &wrong_id)
+                .await
+                .is_err()
+        );
 
         let mut wrong_owner = item.clone();
         wrong_owner[2 + signature_size] ^= 1;
-        assert!(verify_data_item(&wrong_owner, &expected_id).is_err());
+        assert!(
+            verify_data_item(wrong_owner.into(), &expected_id)
+                .await
+                .is_err()
+        );
 
-        let mut wrong_data = item.clone();
+        let mut wrong_data = item;
         *wrong_data.last_mut().unwrap() ^= 1;
-        assert!(verify_data_item(&wrong_data, &expected_id).is_err());
-        item
+        assert!(
+            verify_data_item(wrong_data.into(), &expected_id)
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn verifies_items_with_zero_tag_bytes() {
+    #[tokio::test]
+    async fn verifies_items_with_zero_tag_bytes() {
         let data = b"untagged";
         let key = Ed25519SigningKey::from_bytes(&[2; 32]);
         let owner = key.verifying_key().to_bytes();
-        let payload = data_item_signature_payload(2, &owner, &[], &[], &[], data);
+        let payload = data_item_signature_payload(2, &owner, &[], &[], &[], deep_hash_blob(data));
         let signature = key.sign(&payload).to_bytes();
         let id = sha256(&[&signature]);
         let bytes = encode_data_item(2, &signature, &owner, data, &[], 0);
-        let item = verify_data_item(&bytes, &id).unwrap();
-        assert_eq!(item.data, data);
+        let item = verify_data_item(bytes.into(), &id).await.unwrap();
+        assert_eq!(item.data.read_all(data.len()).await.unwrap().as_ref(), data);
         assert!(item.metadata(&id).tags.is_empty());
         let inconsistent = encode_data_item(2, &signature, &owner, data, &[], 1);
-        assert!(verify_data_item(&inconsistent, &id).is_err());
+        assert!(verify_data_item(inconsistent.into(), &id).await.is_err());
     }
 
-    #[test]
-    fn verified_item_metadata_preserves_raw_tags_and_derives_only_valid_text() {
+    #[tokio::test]
+    async fn verified_item_metadata_preserves_raw_tags_and_derives_only_valid_text() {
         let tags: &[(&[u8], &[u8])] = &[
             (b"Content-Type", b"\xff"),
             (b"content-type", b"text/plain"),
@@ -3355,7 +3436,7 @@ mod tests {
             (b"\0\xff", b"\xff\0"),
         ];
         let (encoded, id) = signed_data_item(b"raw tag payload", tags);
-        let verified = verify_data_item(&encoded, &id).unwrap();
+        let verified = verify_data_item(encoded.into(), &id).await.unwrap();
         let metadata = verified.metadata(&id);
         assert_eq!(
             metadata.tags,
@@ -3365,7 +3446,7 @@ mod tests {
         );
         assert_eq!(metadata.content_type.as_deref(), Some("text/plain"));
         assert_eq!(metadata.content_encoding.as_deref(), Some("gzip"));
-        assert_eq!(metadata.owner_address, sha256(&[verified.owner]));
+        assert_eq!(metadata.owner_address, sha256(&[&verified.owner]));
     }
 
     fn recoverable_signature(key: &Secp256k1SigningKey, digest: &[u8; 32]) -> Vec<u8> {
@@ -3541,16 +3622,23 @@ mod tests {
         assert!(verify_block_header(&block, &entry, block.height, Some(&transaction_id)).is_err());
     }
 
-    #[test]
-    fn verifies_all_supported_ans104_signature_types() {
+    #[tokio::test]
+    async fn verifies_all_supported_ans104_signature_types() {
         const DATA: &[u8] = b"ANS-104 signature parity";
         const RAW_TAGS: &[u8] = &[0];
 
         let ed25519 = Ed25519SigningKey::from_bytes(&[2; 32]);
         let ed25519_owner = ed25519.verifying_key().to_bytes();
-        let payload = data_item_signature_payload(2, &ed25519_owner, &[], &[], RAW_TAGS, DATA);
+        let payload = data_item_signature_payload(
+            2,
+            &ed25519_owner,
+            &[],
+            &[],
+            RAW_TAGS,
+            deep_hash_blob(DATA),
+        );
         let signature = ed25519.sign(&payload).to_bytes();
-        check_data_item(2, &ed25519_owner, &signature, DATA);
+        check_data_item(2, &ed25519_owner, &signature, DATA).await;
 
         let secp256k1 = Secp256k1SigningKey::from_slice(&[3; 32]).unwrap();
         let ethereum_owner = secp256k1
@@ -3558,34 +3646,64 @@ mod tests {
             .to_sec1_point(false)
             .as_bytes()
             .to_vec();
-        let payload = data_item_signature_payload(3, &ethereum_owner, &[], &[], RAW_TAGS, DATA);
+        let payload = data_item_signature_payload(
+            3,
+            &ethereum_owner,
+            &[],
+            &[],
+            RAW_TAGS,
+            deep_hash_blob(DATA),
+        );
         let signature = recoverable_signature(&secp256k1, &ethereum_message_hash(&payload));
-        check_data_item(3, &ethereum_owner, &signature, DATA);
+        check_data_item(3, &ethereum_owner, &signature, DATA).await;
 
-        let payload = data_item_signature_payload(4, &ed25519_owner, &[], &[], RAW_TAGS, DATA);
+        let payload = data_item_signature_payload(
+            4,
+            &ed25519_owner,
+            &[],
+            &[],
+            RAW_TAGS,
+            deep_hash_blob(DATA),
+        );
         let signature = ed25519.sign(hex(&payload).as_bytes()).to_bytes();
-        check_data_item(4, &ed25519_owner, &signature, DATA);
+        check_data_item(4, &ed25519_owner, &signature, DATA).await;
 
-        let payload = data_item_signature_payload(5, &ed25519_owner, &[], &[], RAW_TAGS, DATA);
+        let payload = data_item_signature_payload(
+            5,
+            &ed25519_owner,
+            &[],
+            &[],
+            RAW_TAGS,
+            deep_hash_blob(DATA),
+        );
         let message = format!("APTOS\nmessage: {}\nnonce: bundlr", hex(&payload));
         let signature = ed25519.sign(message.as_bytes()).to_bytes();
-        check_data_item(5, &ed25519_owner, &signature, DATA);
+        check_data_item(5, &ed25519_owner, &signature, DATA).await;
 
         let second_ed25519 = Ed25519SigningKey::from_bytes(&[4; 32]);
         let mut multisig_owner = vec![0; 1_025];
         multisig_owner[..32].copy_from_slice(&ed25519_owner);
         multisig_owner[32..64].copy_from_slice(&second_ed25519.verifying_key().to_bytes());
         multisig_owner[1_024] = 2;
-        let payload = data_item_signature_payload(6, &multisig_owner, &[], &[], RAW_TAGS, DATA);
+        let payload = data_item_signature_payload(
+            6,
+            &multisig_owner,
+            &[],
+            &[],
+            RAW_TAGS,
+            deep_hash_blob(DATA),
+        );
         let mut multisignature = vec![0; 2_052];
         multisignature[..64].copy_from_slice(&ed25519.sign(&payload).to_bytes());
         multisignature[64..128].copy_from_slice(&second_ed25519.sign(&payload).to_bytes());
         multisignature[2_048] = 0b1100_0000;
-        check_data_item(6, &multisig_owner, &multisignature, DATA);
+        check_data_item(6, &multisig_owner, &multisignature, DATA).await;
         multisignature[2_048] = 0b1000_0000;
         let insufficient = encode_data_item(6, &multisignature, &multisig_owner, DATA, &[0], 0);
         assert!(
-            verify_data_item(&insufficient, &sha256(&[&multisignature])).is_err(),
+            verify_data_item(insufficient.into(), &sha256(&[&multisignature]))
+                .await
+                .is_err(),
             "Aptos multisignature must meet its owner threshold"
         );
 
@@ -3593,16 +3711,17 @@ mod tests {
         let public_key_hash = keccak256(&[&public_key.as_bytes()[1..]]);
         let address: [u8; 20] = public_key_hash[12..].try_into().unwrap();
         let typed_owner = format!("0x{}", hex(&address)).into_bytes();
-        let payload = data_item_signature_payload(7, &typed_owner, &[], &[], RAW_TAGS, DATA);
+        let payload =
+            data_item_signature_payload(7, &typed_owner, &[], &[], RAW_TAGS, deep_hash_blob(DATA));
         let signature =
             recoverable_signature(&secp256k1, &typed_ethereum_message_hash(&payload, &address));
-        check_data_item(7, &typed_owner, &signature, DATA);
+        check_data_item(7, &typed_owner, &signature, DATA).await;
 
         assert!(data_item_signature_sizes(8).is_err());
     }
 
-    #[test]
-    fn verifies_legacy_binary_item_and_rejects_mutations() {
+    #[tokio::test]
+    async fn verifies_legacy_binary_item_and_rejects_mutations() {
         let bundle = include_bytes!("../tests/fixtures/legacy-bundle-752520.bin");
         let id = decode_fixed::<32>(
             "eATXzsBk9otMqBAxps_afQpjWd0C7rbPV8sB85S2Uvg",
@@ -3610,35 +3729,49 @@ mod tests {
         )
         .unwrap();
         let item = &bundle[96..];
-        assert_eq!(verify_data_item(item, &id).unwrap().data, b"test");
+        for bytes in [item.to_vec().into(), spooled_content(item).await] {
+            let verified = verify_data_item(bytes, &id).await.unwrap();
+            assert_eq!(verified.data.read_all(4).await.unwrap().as_ref(), b"test");
+            assert_eq!(verified.body_hash, sha256(&[b"test"]));
+        }
         for offset in [0, 512, 1024, 1042] {
             let mut corrupt = item.to_vec();
             corrupt[offset] ^= 1;
             let corrupt_id = sha256(&[&corrupt[..512]]);
-            assert!(verify_data_item(&corrupt, &corrupt_id).is_err());
+            assert!(verify_data_item(corrupt.into(), &corrupt_id).await.is_err());
         }
-        assert!(verify_data_item(&item[..1042], &id).is_err());
+        assert!(
+            verify_data_item(item[..1042].to_vec().into(), &id)
+                .await
+                .is_err()
+        );
         let mut prefixed = vec![1, 0];
         prefixed.extend_from_slice(item);
-        assert!(verify_data_item(&prefixed, &id).is_err());
+        assert!(verify_data_item(prefixed.into(), &id).await.is_err());
         let modern = include_bytes!("../tests/fixtures/lolcchekc-item.bin");
         let modern_id = sha256(&[&modern[2..514]]);
-        assert!(verify_data_item(&modern[2..], &modern_id).is_err());
+        assert!(
+            verify_data_item(modern[2..].to_vec().into(), &modern_id)
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn legacy_binary_item_authenticates_tag_bytes() {
+    #[tokio::test]
+    async fn legacy_binary_item_authenticates_tag_bytes() {
         let item = include_bytes!("../tests/fixtures/legacy-tagged-item-752923.bin");
         let id = decode_fixed::<32>(
             "-tlWxtdMmgp9B2MIY1AkBjmRkdVHERzVkbiVG5I370s",
             "data item ID",
         )
         .unwrap();
-        let verified = verify_data_item(item, &id).unwrap();
-        assert_eq!(verified.tags[0].name, b"Content-Type");
-        assert_eq!(verified.tags[0].value, b"text/plain");
+        let verified = verify_data_item(spooled_content(item).await, &id)
+            .await
+            .unwrap();
+        assert_eq!(verified.tags[0].name.as_ref(), b"Content-Type");
+        assert_eq!(verified.tags[0].value.as_ref(), b"text/plain");
         assert_eq!(
-            hex(&sha256(&[verified.data])),
+            hex(&verified.body_hash),
             "e963887bc1aff36d4066c783226da5a23757d7d5f288c90f6d0a38a0ba13bc97"
         );
         let mut corrupt = item.to_vec();
@@ -3647,7 +3780,7 @@ mod tests {
             .position(|bytes| bytes == b"text/plain")
             .unwrap();
         corrupt[tag] = b'n';
-        assert!(verify_data_item(&corrupt, &id).is_err());
+        assert!(verify_data_item(corrupt.into(), &id).await.is_err());
     }
 
     #[tokio::test]
@@ -3655,10 +3788,12 @@ mod tests {
         const ID: &str = "3F_yldqW_zt6Ci_47w-7O76lPpegpu1rs7H2iyultVY";
         let item = include_bytes!("../tests/fixtures/lolcchekc-item.bin");
         let expected_id = decode_fixed::<32>(ID, "data item ID").unwrap();
-        let verified = verify_data_item(item, &expected_id).unwrap();
+        let verified = verify_data_item(spooled_content(item).await, &expected_id)
+            .await
+            .unwrap();
         assert_eq!(verified.data.len(), 2_982);
         assert_eq!(
-            hex(&sha256(&[verified.data])),
+            hex(&verified.body_hash),
             "4d02c735657b171d1a3d3bc9ddd7ee396cdf5232e11d6adb06826637c3b9070c"
         );
         assert_eq!(
@@ -3674,18 +3809,21 @@ mod tests {
         bundle.extend_from_slice(&expected_id);
         bundle.extend_from_slice(item);
         assert_eq!(
-            verify_bundle_item(&bundle, &expected_id, None)
+            verify_bundle_item(bundle.clone().into(), &expected_id, None)
                 .await
                 .unwrap()
                 .0
-                .data,
-            verified.data
+                .data
+                .read_all(2_982)
+                .await
+                .unwrap(),
+            verified.data.read_all(2_982).await.unwrap()
         );
 
         let mut wrong_id = bundle.clone();
         wrong_id[64] ^= 1;
         assert!(
-            verify_bundle_item(&wrong_id, &expected_id, None)
+            verify_bundle_item(wrong_id.into(), &expected_id, None)
                 .await
                 .is_err()
         );
@@ -3693,7 +3831,7 @@ mod tests {
         let mut wrong_size = bundle.clone();
         wrong_size[32] ^= 1;
         assert!(
-            verify_bundle_item(&wrong_size, &expected_id, None)
+            verify_bundle_item(wrong_size.into(), &expected_id, None)
                 .await
                 .is_err()
         );
@@ -3701,7 +3839,7 @@ mod tests {
         let mut truncated = bundle;
         truncated.pop();
         assert!(
-            verify_bundle_item(&truncated, &expected_id, None)
+            verify_bundle_item(truncated.into(), &expected_id, None)
                 .await
                 .is_err()
         );
@@ -3710,18 +3848,34 @@ mod tests {
         let mut wrong_signature = item.to_vec();
         wrong_signature[2] ^= 1;
         let wrong_signature_id = sha256(&[&wrong_signature[2..2 + signature_size]]);
-        assert!(verify_data_item(&wrong_signature, &wrong_signature_id).is_err());
+        assert!(
+            verify_data_item(wrong_signature.into(), &wrong_signature_id)
+                .await
+                .is_err()
+        );
 
         let mut wrong_owner = item.to_vec();
         wrong_owner[2 + signature_size] ^= 1;
-        assert!(verify_data_item(&wrong_owner, &expected_id).is_err());
+        assert!(
+            verify_data_item(wrong_owner.into(), &expected_id)
+                .await
+                .is_err()
+        );
 
         let mut wrong_payload = item.to_vec();
         let payload_start = item.len() - verified.data.len();
         wrong_payload[payload_start] ^= 1;
-        assert!(verify_data_item(&wrong_payload, &expected_id).is_err());
+        assert!(
+            verify_data_item(wrong_payload.into(), &expected_id)
+                .await
+                .is_err()
+        );
 
-        assert!(verify_data_item(&item[..2 + signature_size], &expected_id).is_err());
+        assert!(
+            verify_data_item(item[..2 + signature_size].to_vec().into(), &expected_id)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -3748,7 +3902,7 @@ mod cache_tests {
 
     fn data(id: &str) -> VerifiedData {
         VerifiedData {
-            bytes: Arc::from(&b"hello"[..]),
+            bytes: b"hello".to_vec().into(),
             cache_hit: false,
             id: id.to_owned(),
             block_height: 1,
@@ -3760,18 +3914,17 @@ mod cache_tests {
     }
 
     fn gateway() -> Gateway {
-        Gateway::new(
-            Config::new(
-                "http://127.0.0.1:1",
-                "http://127.0.0.1:1",
-                vec!["http://127.0.0.1:1".to_owned()],
-                Duration::from_millis(50),
-                1,
-                1024,
-            )
-            .unwrap(),
+        let mut config = Config::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            vec!["http://127.0.0.1:1".to_owned()],
+            Duration::from_millis(50),
+            1,
+            1024,
         )
-        .unwrap()
+        .unwrap();
+        config.retrieval_timeout = Duration::from_millis(50);
+        Gateway::new(config).unwrap()
     }
 
     #[test]
@@ -3788,6 +3941,12 @@ mod cache_tests {
             cache.insert(data("oversized"), entries, 4);
             assert!(cache.get("oversized").is_none());
         }
+        let mut cache = ContentCache::default();
+        let mut small_view = data("slice");
+        small_view.bytes = Content::from(vec![0; 32]).slice(0..1).unwrap();
+        small_view.content_length = 1;
+        cache.insert(small_view, 2, 8);
+        assert!(cache.get("slice").is_none());
     }
 
     #[tokio::test]
@@ -3806,7 +3965,6 @@ mod cache_tests {
             let leader = leader.unwrap();
             let follower = follower.unwrap();
             assert!(!leader.cache_hit && !follower.cache_hit);
-            assert!(Arc::ptr_eq(&leader.bytes, &follower.bytes));
             let next = gateway
                 .retrieve_cached(&id, async { Ok(data(&id)) })
                 .await

@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
         .parse()
         .context("invalid ARWEAVE_MAX_PEER_ATTEMPTS")?;
     let max_data_size = env::var("ARWEAVE_MAX_DATA_SIZE_BYTES")
-        .unwrap_or_else(|_| (64 * 1024 * 1024).to_string())
+        .unwrap_or_else(|_| (1024 * 1024 * 1024).to_string())
         .parse()
         .context("invalid ARWEAVE_MAX_DATA_SIZE_BYTES")?;
     let mut config = Config::new(
@@ -46,6 +46,32 @@ async fn main() -> Result<()> {
         max_attempts,
         max_data_size,
     )?;
+    config.max_memory_data_size = env::var("ARWEAVE_MAX_MEMORY_DATA_SIZE_BYTES")
+        .unwrap_or_else(|_| config.max_memory_data_size.to_string())
+        .parse()
+        .context("invalid ARWEAVE_MAX_MEMORY_DATA_SIZE_BYTES")?;
+    config.max_spool_bytes = env::var("ARWEAVE_MAX_SPOOL_BYTES")
+        .unwrap_or_else(|_| config.max_spool_bytes.to_string())
+        .parse()
+        .context("invalid ARWEAVE_MAX_SPOOL_BYTES")?;
+    config.retrieval_timeout = Duration::from_secs(
+        env::var("ARWEAVE_RETRIEVAL_TIMEOUT_SECS")
+            .unwrap_or_else(|_| config.retrieval_timeout.as_secs().to_string())
+            .parse()
+            .context("invalid ARWEAVE_RETRIEVAL_TIMEOUT_SECS")?,
+    );
+    config.stream_idle_timeout = Duration::from_secs(
+        env::var("AR_IO_STREAM_IDLE_TIMEOUT_SECS")
+            .unwrap_or_else(|_| config.stream_idle_timeout.as_secs().to_string())
+            .parse()
+            .context("invalid AR_IO_STREAM_IDLE_TIMEOUT_SECS")?,
+    );
+    config.stream_timeout = Duration::from_secs(
+        env::var("AR_IO_STREAM_TIMEOUT_SECS")
+            .unwrap_or_else(|_| config.stream_timeout.as_secs().to_string())
+            .parse()
+            .context("invalid AR_IO_STREAM_TIMEOUT_SECS")?,
+    );
     config.cache_max_entries = env::var("AR_IO_CACHE_MAX_ENTRIES")
         .unwrap_or_else(|_| config.cache_max_entries.to_string())
         .parse()
@@ -164,7 +190,10 @@ async fn main() -> Result<()> {
         "fetch-bundled" => gateway.retrieve_bundled(&id).await?,
         _ => unreachable!(),
     };
-    fs::write(&output, verified.bytes.as_ref())
+    verified
+        .bytes
+        .write_to(&output)
+        .await
         .with_context(|| format!("failed to write verified data to {output}"))?;
     println!("{}", serde_json::to_string(&verified)?);
     Ok(())

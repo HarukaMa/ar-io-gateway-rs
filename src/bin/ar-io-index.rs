@@ -52,17 +52,52 @@ async fn main() -> Result<()> {
         .parse()
         .context("invalid ARWEAVE_MAX_PEER_ATTEMPTS")?;
     let max_data_size = env::var("ARWEAVE_MAX_DATA_SIZE_BYTES")
-        .unwrap_or_else(|_| (64 * 1024 * 1024).to_string())
+        .unwrap_or_else(|_| (1024 * 1024 * 1024).to_string())
         .parse()
         .context("invalid ARWEAVE_MAX_DATA_SIZE_BYTES")?;
-    let gateway = Gateway::new(Config::new(
+    let mut config = Config::new(
         trusted_node,
         archive,
         sources,
         timeout,
         max_attempts,
         max_data_size,
-    )?)?;
+    )?;
+    config.max_memory_data_size = env::var("ARWEAVE_MAX_MEMORY_DATA_SIZE_BYTES")
+        .unwrap_or_else(|_| config.max_memory_data_size.to_string())
+        .parse()
+        .context("invalid ARWEAVE_MAX_MEMORY_DATA_SIZE_BYTES")?;
+    config.max_spool_bytes = env::var("ARWEAVE_MAX_SPOOL_BYTES")
+        .unwrap_or_else(|_| config.max_spool_bytes.to_string())
+        .parse()
+        .context("invalid ARWEAVE_MAX_SPOOL_BYTES")?;
+    config.retrieval_timeout = Duration::from_secs(
+        env::var("ARWEAVE_RETRIEVAL_TIMEOUT_SECS")
+            .unwrap_or_else(|_| config.retrieval_timeout.as_secs().to_string())
+            .parse()
+            .context("invalid ARWEAVE_RETRIEVAL_TIMEOUT_SECS")?,
+    );
+    config.stream_idle_timeout = Duration::from_secs(
+        env::var("AR_IO_STREAM_IDLE_TIMEOUT_SECS")
+            .unwrap_or_else(|_| config.stream_idle_timeout.as_secs().to_string())
+            .parse()
+            .context("invalid AR_IO_STREAM_IDLE_TIMEOUT_SECS")?,
+    );
+    config.stream_timeout = Duration::from_secs(
+        env::var("AR_IO_STREAM_TIMEOUT_SECS")
+            .unwrap_or_else(|_| config.stream_timeout.as_secs().to_string())
+            .parse()
+            .context("invalid AR_IO_STREAM_TIMEOUT_SECS")?,
+    );
+    config.cache_max_entries = env::var("AR_IO_CACHE_MAX_ENTRIES")
+        .unwrap_or_else(|_| config.cache_max_entries.to_string())
+        .parse()
+        .context("invalid AR_IO_CACHE_MAX_ENTRIES")?;
+    config.cache_max_bytes = env::var("AR_IO_CACHE_MAX_BYTES")
+        .unwrap_or_else(|_| config.cache_max_bytes.to_string())
+        .parse()
+        .context("invalid AR_IO_CACHE_MAX_BYTES")?;
+    let gateway = Gateway::new(config)?;
     let mut store = tokio::time::timeout(timeout, async {
         let mut store = BlockStore::connect(&database_url).await?;
         store.migrate().await?;

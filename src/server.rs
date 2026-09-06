@@ -1,13 +1,16 @@
 use std::{
+    io,
     net::SocketAddr,
+    pin::Pin,
     sync::Arc,
+    task::{Context as TaskContext, Poll, Waker},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Router,
-    body::{Body, Bytes},
+    body::Body,
     extract::{Path, State},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode, Uri,
@@ -23,17 +26,24 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use ed25519_dalek::{Signer, SigningKey};
+use parking_lot::Mutex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
 use tokio::{
-    sync::{Semaphore, SemaphorePermit},
-    task::JoinSet,
-    time::{MissedTickBehavior, interval},
+    io::{AsyncRead, ReadBuf},
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::{JoinHandle, JoinSet},
+    time::{Instant as StreamInstant, MissedTickBehavior, interval, sleep_until},
 };
+use tokio_util::io::ReaderStream;
 
-use super::{Gateway, VerifiedChunk, VerifiedData, decode_fixed};
+use super::{
+    Config, Gateway, VerifiedChunk, VerifiedData,
+    content::{Content, ContentReader},
+    decode_fixed,
+};
 
 const ARNS_CONFIG_DISCRIMINATOR: [u8; 8] = [117, 20, 158, 16, 49, 85, 82, 24];
 const ARNS_RECORD_DISCRIMINATOR: [u8; 8] = [53, 158, 42, 125, 7, 132, 104, 188];
@@ -45,6 +55,7 @@ const MAX_SOLANA_ACCOUNT_BYTES: usize = 4096;
 const MANIFEST_CONTENT_TYPE: &str = "application/x.arweave-manifest+json";
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
 const MAX_MANIFEST_PATH_BYTES: usize = 4096;
+const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
 
 pub struct ServerConfig {
     listen_addr: SocketAddr,
@@ -179,7 +190,7 @@ impl ServerConfig {
 struct AppState {
     gateway: Gateway,
     config: ServerConfig,
-    request_permits: Semaphore,
+    request_permits: Arc<Semaphore>,
     started_at: Instant,
 }
 
@@ -241,7 +252,7 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .context("failed to bind HTTP listener")?;
     println!("listening on http://{}", listener.local_addr()?);
     let state = Arc::new(AppState {
-        request_permits: Semaphore::new(config.max_concurrent_requests),
+        request_permits: Arc::new(Semaphore::new(config.max_concurrent_requests)),
         started_at: Instant::now(),
         gateway,
         config,
@@ -511,9 +522,10 @@ fn json_response(value: &serde_json::Value) -> Response {
         .unwrap()
 }
 
-fn request_permit(permits: &Semaphore) -> Result<SemaphorePermit<'_>, Response> {
+fn request_permit(permits: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Response> {
     permits
-        .try_acquire()
+        .clone()
+        .try_acquire_owned()
         .map_err(|_| error_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"))
 }
 
@@ -539,7 +551,7 @@ async fn serve_chunk_response(
     headers: &HeaderMap,
     raw: bool,
 ) -> Response {
-    let _permit = match request_permit(&state.request_permits) {
+    let permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
         Err(response) => return response,
     };
@@ -550,10 +562,12 @@ async fn serve_chunk_response(
         return error_response(StatusCode::BAD_REQUEST, "Invalid offset");
     };
     match state.gateway.retrieve_chunk(offset).await {
-        Ok(Some(chunk)) => chunk_response(chunk, raw, headers).unwrap_or_else(|error| {
-            eprintln!("chunk response construction failed: {error:#}");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-        }),
+        Ok(Some(chunk)) => chunk_response(chunk, raw, headers, &state.gateway.config, permit)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("chunk response construction failed: {error:#}");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            }),
         Ok(None) => error_response(StatusCode::NOT_FOUND, "Not Found"),
         Err(error) => {
             eprintln!("verified chunk retrieval failed: {error:#}");
@@ -563,11 +577,11 @@ async fn serve_chunk_response(
 }
 
 async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let _permit = match request_permit(&state.request_permits) {
+    let permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
         Err(response) => return response,
     };
-    serve_arns_path(&state, &headers, "").await
+    serve_arns_path(&state, &headers, "", permit).await
 }
 
 async fn serve_raw(
@@ -575,7 +589,7 @@ async fn serve_raw(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let _permit = match request_permit(&state.request_permits) {
+    let permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
         Err(response) => return response,
     };
@@ -583,12 +597,19 @@ async fn serve_raw(
         return error_response(StatusCode::NOT_FOUND, "Not Found");
     }
     match state.gateway.retrieve(&id).await {
-        Ok(verified) => {
-            verified_response(verified, None, &state.config, &headers).unwrap_or_else(|error| {
-                eprintln!("response construction failed: {error:#}");
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-            })
-        }
+        Ok(verified) => verified_response(
+            verified,
+            None,
+            &state.config,
+            &headers,
+            &state.gateway.config,
+            permit,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("response construction failed: {error:#}");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+        }),
         Err(error) => {
             eprintln!("verified retrieval failed: {error:#}");
             error_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
@@ -602,7 +623,7 @@ async fn serve_path(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    let _permit = match request_permit(&state.request_permits) {
+    let permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
         Err(response) => return response,
     };
@@ -626,13 +647,19 @@ async fn serve_path(
             uri.query(),
             None,
             &headers,
+            permit,
         )
         .await;
     }
-    serve_arns_path(&state, &headers, &path).await
+    serve_arns_path(&state, &headers, &path, permit).await
 }
 
-async fn serve_arns_path(state: &AppState, headers: &HeaderMap, path: &str) -> Response {
+async fn serve_arns_path(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    permit: OwnedSemaphorePermit,
+) -> Response {
     let Some(name) = arns_name(headers, &state.config.arns_root_host) else {
         return error_response(StatusCode::NOT_FOUND, "Not Found");
     };
@@ -655,6 +682,7 @@ async fn serve_arns_path(state: &AppState, headers: &HeaderMap, path: &str) -> R
         None,
         Some(&resolution),
         headers,
+        permit,
     )
     .await
 }
@@ -667,6 +695,7 @@ async fn retrieve_response(
     query: Option<&str>,
     resolution: Option<&Resolution>,
     headers: &HeaderMap,
+    permit: OwnedSemaphorePermit,
 ) -> Response {
     let verified = match state.gateway.retrieve(id).await {
         Ok(verified) => verified,
@@ -676,15 +705,31 @@ async fn retrieve_response(
         }
     };
     if !is_manifest_content_type(&verified.content_type) {
-        return verified_response(verified, resolution, &state.config, headers).unwrap_or_else(
-            |error| {
-                eprintln!("response construction failed: {error:#}");
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-            },
-        );
+        return verified_response(
+            verified,
+            resolution,
+            &state.config,
+            headers,
+            &state.gateway.config,
+            permit,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("response construction failed: {error:#}");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+        });
     }
 
-    let target = match resolve_manifest(&verified.bytes, manifest_path) {
+    let target = async {
+        ensure!(
+            verified.bytes.len() <= MAX_MANIFEST_BYTES,
+            "manifest exceeds size limit"
+        );
+        let bytes = verified.bytes.read_all(MAX_MANIFEST_BYTES).await?;
+        resolve_manifest(&bytes, manifest_path)
+    }
+    .await;
+    let target = match target {
         Ok(Some(target)) => target,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not Found"),
         Err(error) => {
@@ -700,6 +745,7 @@ async fn retrieve_response(
         }
         return redirect_response(StatusCode::MOVED_PERMANENTLY, location);
     }
+    drop(verified);
 
     let fallback = target.fallback;
     let verified_target = match state.gateway.retrieve(&target.id).await {
@@ -709,11 +755,19 @@ async fn retrieve_response(
             return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
         }
     };
-    let mut response = verified_response(verified_target, resolution, &state.config, headers)
-        .unwrap_or_else(|error| {
-            eprintln!("response construction failed: {error:#}");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-        });
+    let mut response = verified_response(
+        verified_target,
+        resolution,
+        &state.config,
+        headers,
+        &state.gateway.config,
+        permit,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        eprintln!("response construction failed: {error:#}");
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+    });
     if fallback {
         response.headers_mut().insert(
             CACHE_CONTROL,
@@ -1160,11 +1214,129 @@ fn parse_byte_range(
     Ok((start, end.min(total - 1)))
 }
 
-fn verified_response(
+struct ResponseStreamState {
+    resources: Option<(ContentReader, OwnedSemaphorePermit)>,
+    expires_at: StreamInstant,
+    total_deadline: StreamInstant,
+    waker: Option<Waker>,
+}
+
+struct ResponseReader {
+    state: Arc<Mutex<ResponseStreamState>>,
+    idle_timeout: Duration,
+    watchdog: JoinHandle<()>,
+}
+
+impl AsyncRead for ResponseReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let mut state = self.state.lock();
+        let now = StreamInstant::now();
+        if now >= state.expires_at {
+            state.resources.take();
+        }
+        let Some((reader, _permit)) = &mut state.resources else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "verified response stream timed out",
+            )));
+        };
+        let filled = buf.filled().len();
+        let result = Pin::new(reader).poll_read(cx, buf);
+        if result.is_pending() {
+            state.waker = Some(cx.waker().clone());
+        } else {
+            state.waker = None;
+            if buf.filled().len() > filled {
+                // Idle measures body-read progress under backpressure, not remote acknowledgements.
+                state.expires_at = now
+                    .checked_add(self.idle_timeout)
+                    .unwrap_or(state.total_deadline)
+                    .min(state.total_deadline);
+            }
+        }
+        result
+    }
+}
+
+impl Drop for ResponseReader {
+    fn drop(&mut self) {
+        self.watchdog.abort();
+    }
+}
+
+async fn content_body(
+    content: Content,
+    limits: &Config,
+    permit: OwnedSemaphorePermit,
+) -> Result<Body> {
+    if content.is_empty() {
+        return Ok(Body::empty());
+    }
+    let now = StreamInstant::now();
+    let total_deadline = now
+        .checked_add(limits.stream_timeout)
+        .context("stream timeout exceeds clock range")?;
+    let expires_at = now
+        .checked_add(limits.stream_idle_timeout)
+        .unwrap_or(total_deadline)
+        .min(total_deadline);
+    let reader = tokio::time::timeout_at(expires_at, content.reader())
+        .await
+        .context("opening verified content timed out")??;
+    let state = Arc::new(Mutex::new(ResponseStreamState {
+        resources: Some((reader, permit)),
+        expires_at,
+        total_deadline,
+        waker: None,
+    }));
+    let weak = Arc::downgrade(&state);
+    // ponytail: a watchdog is necessary because a stalled client may stop polling the body.
+    let watchdog = tokio::spawn(async move {
+        let mut expires_at = expires_at;
+        loop {
+            sleep_until(expires_at).await;
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let waker = {
+                let mut state = state.lock();
+                if StreamInstant::now() < state.expires_at {
+                    expires_at = state.expires_at;
+                    continue;
+                }
+                state.resources.take();
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+            return;
+        }
+    });
+    Ok(Body::from_stream(ReaderStream::with_capacity(
+        ResponseReader {
+            state,
+            idle_timeout: limits.stream_idle_timeout,
+            watchdog,
+        },
+        RESPONSE_CHUNK_BYTES,
+    )))
+}
+
+async fn verified_response(
     verified: VerifiedData,
     resolution: Option<&Resolution>,
     config: &ServerConfig,
     request_headers: &HeaderMap,
+    limits: &Config,
+    permit: OwnedSemaphorePermit,
 ) -> Result<Response> {
     ensure!(
         verified.bytes.len() == verified.content_length,
@@ -1258,7 +1430,6 @@ fn verified_response(
     match range {
         Some((start, end)) => {
             let content_length = end - start + 1;
-            let bytes = Bytes::from_owner(verified.bytes);
             builder
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header("content-type", verified.content_type.as_str())
@@ -1267,22 +1438,24 @@ fn verified_response(
                     "content-range",
                     format!("bytes {start}-{end}/{}", verified.content_length),
                 )
-                .body(Body::from(bytes.slice(start..end + 1)))
+                .body(content_body(verified.bytes.slice(start..end + 1)?, limits, permit).await?)
                 .context("failed to construct partial response")
         }
         None => builder
             .status(StatusCode::OK)
             .header("content-type", verified.content_type.as_str())
             .header("content-length", verified.content_length.to_string())
-            .body(Body::from(Bytes::from_owner(verified.bytes)))
+            .body(content_body(verified.bytes, limits, permit).await?)
             .context("failed to construct HTTP response"),
     }
 }
 
-fn chunk_response(
+async fn chunk_response(
     chunk: VerifiedChunk,
     raw: bool,
     request_headers: &HeaderMap,
+    limits: &Config,
+    permit: OwnedSemaphorePermit,
 ) -> Result<Response> {
     let VerifiedChunk {
         bytes,
@@ -1357,7 +1530,7 @@ fn chunk_response(
     }
     builder
         .status(StatusCode::OK)
-        .body(Body::from(body))
+        .body(content_body(body.into(), limits, permit).await?)
         .context("failed to construct chunk response")
 }
 
@@ -1567,6 +1740,8 @@ struct SolanaAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::{ContentWriter, SpoolBudget};
+    use axum::body::HttpBody as _;
 
     const ARNS_ACCOUNT: &str = "NZ4qfQeEaLwF6jmlT8XLNtBIvGDG/foSDuHpVUuCqaQ+a2p0ioe5aC2+lbeF1KeVB3WX89Ksp18jfWPgMFBF9tJsgtCTCP9M76AI6Wt+7PHPwtgIPrVmlgBd2KoBvC2lEcnNDTc0HywBgHC2ZwAAAAAAZAAAAAAAAAAAAP4JAAAAbG9sY2NoZWtjAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const ANT_ACCOUNT: &str = "4V5G8FIth1HvoAjpa37s8c/C2Ag+tWaWAF3YqgG8LaURyc0NNzQfLAEAAABAKwAAADNGX3lsZHFXX3p0NkNpXzQ3dy03Tzc2bFBwZWdwdTFyczdIMml5dWx0VlkAEA4AAAEAAAAAAC2+lbeF1KeVB3WX89Ksp18jfWPgMFBF9tJsgtCTCP9M/wEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
@@ -1666,7 +1841,7 @@ mod tests {
 
     #[test]
     fn rejects_saturated_requests_and_releases_permits() {
-        let permits = Semaphore::new(1);
+        let permits = Arc::new(Semaphore::new(1));
         let held = request_permit(&permits).unwrap();
         let response = request_permit(&permits).unwrap_err();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1685,8 +1860,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn builds_verified_arns_response_headers() {
+    fn stream_limits() -> Config {
+        Config::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            vec!["http://127.0.0.1:1".to_owned()],
+            Duration::from_secs(1),
+            1,
+            RESPONSE_CHUNK_BYTES * 4,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn builds_verified_arns_response_headers() {
         let bytes = b"hello".to_vec();
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         let digest_url = URL_SAFE_NO_PAD.encode(digest);
@@ -1720,8 +1907,16 @@ mod tests {
             8,
         )
         .unwrap();
-        let response =
-            verified_response(verified, Some(&resolution), &config, &HeaderMap::new()).unwrap();
+        let response = verified_response(
+            verified,
+            Some(&resolution),
+            &config,
+            &HeaderMap::new(),
+            &stream_limits(),
+            request_permit(&Arc::new(Semaphore::new(1))).unwrap(),
+        )
+        .await
+        .unwrap();
         let headers = response.headers();
         assert_eq!(headers["content-type"], "text/html; charset=utf-8");
         assert_eq!(headers["content-length"], "5");
@@ -1816,6 +2011,8 @@ mod tests {
             8,
         )
         .unwrap();
+        let limits = stream_limits();
+        let permits = Arc::new(Semaphore::new(1));
         let verified = || {
             let bytes = b"hello".to_vec();
             let digest: [u8; 32] = Sha256::digest(&bytes).into();
@@ -1833,7 +2030,16 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("range", "bytes=1-3".parse().unwrap());
-        let response = verified_response(verified(), None, &config, &headers).unwrap();
+        let response = verified_response(
+            verified(),
+            None,
+            &config,
+            &headers,
+            &limits,
+            request_permit(&permits).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.headers()["accept-ranges"], "bytes");
         assert_eq!(response.headers()["content-range"], "bytes 1-3/5");
@@ -1845,7 +2051,16 @@ mod tests {
 
         headers.clear();
         headers.insert("if-none-match", verified().etag.parse().unwrap());
-        let response = verified_response(verified(), None, &config, &headers).unwrap();
+        let response = verified_response(
+            verified(),
+            None,
+            &config,
+            &headers,
+            &limits,
+            request_permit(&permits).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert!(!response.headers().contains_key("content-length"));
         assert!(!response.headers().contains_key("content-type"));
@@ -1858,7 +2073,16 @@ mod tests {
 
         headers.clear();
         headers.insert("range", "bytes=5-".parse().unwrap());
-        let response = verified_response(verified(), None, &config, &headers).unwrap();
+        let response = verified_response(
+            verified(),
+            None,
+            &config,
+            &headers,
+            &limits,
+            request_permit(&permits).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(response.headers()["content-range"], "bytes */5");
         assert_eq!(
@@ -1877,6 +2101,8 @@ mod tests {
 
     #[tokio::test]
     async fn builds_chunk_json_raw_and_conditional_responses() {
+        let limits = stream_limits();
+        let permits = Arc::new(Semaphore::new(1));
         let verified = || VerifiedChunk {
             bytes: b"hello".to_vec(),
             chunk: "aGVsbG8".to_owned(),
@@ -1891,7 +2117,15 @@ mod tests {
             source_host: "arweave.net".to_owned(),
         };
 
-        let response = chunk_response(verified(), false, &HeaderMap::new()).unwrap();
+        let response = chunk_response(
+            verified(),
+            false,
+            &HeaderMap::new(),
+            &limits,
+            request_permit(&permits).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers()["content-type"],
@@ -1907,7 +2141,15 @@ mod tests {
             br#"{"chunk":"aGVsbG8","data_path":"data-path","tx_path":"tx-path","packing":"unpacked"}"#
         );
 
-        let response = chunk_response(verified(), true, &HeaderMap::new()).unwrap();
+        let response = chunk_response(
+            verified(),
+            true,
+            &HeaderMap::new(),
+            &limits,
+            request_permit(&permits).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers()["content-type"],
@@ -1931,13 +2173,113 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("if-none-match", etag);
-        let response = chunk_response(verified(), false, &headers).unwrap();
+        let response = chunk_response(
+            verified(),
+            false,
+            &headers,
+            &limits,
+            request_permit(&permits).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert!(
             axum::body::to_bytes(response.into_body(), 0)
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    async fn spooled_body(
+        limits: &Config,
+        permits: &Arc<Semaphore>,
+        budget: Arc<SpoolBudget>,
+    ) -> Body {
+        let mut writer = ContentWriter::new(5, 1, budget).await.unwrap();
+        writer.write(b"hello").await.unwrap();
+        let (content, _) = writer.finish().await.unwrap();
+        content_body(
+            content.slice(1..4).unwrap(),
+            limits,
+            request_permit(permits).unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn spooled_response_releases_resources_on_drop_and_completion() {
+        let limits = stream_limits();
+        let permits = Arc::new(Semaphore::new(1));
+        let budget = Arc::new(SpoolBudget::new(5));
+        for cancel in [true, false] {
+            let body = spooled_body(&limits, &permits, budget.clone()).await;
+            assert_eq!(
+                request_permit(&permits).unwrap_err().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(ContentWriter::new(5, 1, budget.clone()).await.is_err());
+            if cancel {
+                drop(body);
+            } else {
+                assert_eq!(&axum::body::to_bytes(body, 3).await.unwrap()[..], b"ell");
+            }
+            let _permit = request_permit(&permits).unwrap();
+            drop(ContentWriter::new(5, 1, budget.clone()).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_deadline_reclaims_unpolled_spooled_response() {
+        let mut limits = stream_limits();
+        limits.stream_idle_timeout = Duration::from_secs(5);
+        limits.stream_timeout = Duration::from_secs(30);
+        let permits = Arc::new(Semaphore::new(1));
+        let budget = Arc::new(SpoolBudget::new(5));
+        let body = spooled_body(&limits, &permits, budget.clone()).await;
+        tokio::time::pause();
+        tokio::task::yield_now().await;
+        tokio::time::advance(limits.stream_idle_timeout).await;
+        tokio::task::yield_now().await;
+        let _permit = request_permit(&permits).unwrap();
+        drop(ContentWriter::new(5, 1, budget).await.unwrap());
+        assert!(axum::body::to_bytes(body, 3).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_body_reads_reset_idle_but_not_total_deadline() {
+        let mut limits = stream_limits();
+        limits.stream_idle_timeout = Duration::from_secs(5);
+        limits.stream_timeout = Duration::from_secs(7);
+        let permits = Arc::new(Semaphore::new(1));
+        let mut body = content_body(
+            vec![42; RESPONSE_CHUNK_BYTES * 3].into(),
+            &limits,
+            request_permit(&permits).unwrap(),
+        )
+        .await
+        .unwrap();
+        for elapsed in [0, 4] {
+            tokio::time::advance(Duration::from_secs(elapsed)).await;
+            let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx))
+                .await
+                .unwrap()
+                .unwrap();
+            let chunk = frame.into_data().unwrap();
+            assert!(chunk.len() <= RESPONSE_CHUNK_BYTES);
+            assert!(chunk.iter().all(|byte| *byte == 42));
+        }
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(request_permit(&permits).is_err());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let _permit = request_permit(&permits).unwrap();
+        assert!(
+            axum::body::to_bytes(body, RESPONSE_CHUNK_BYTES)
+                .await
+                .is_err()
         );
     }
 }
