@@ -40,6 +40,8 @@ const MAX_CHUNK_SIZE: u128 = 256 * 1024;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
 const MAX_PROOF_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_INDEX_BYTES: usize = 256 * 99;
+const MAX_BLOCK_TRANSACTIONS: usize = 1000;
+const MAX_BLOCK_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 const BUNDLE_ENTRY_SIZE: usize = 64;
 const MAX_DATA_ITEM_TAGS: usize = 128;
 const MAX_DATA_ITEM_TAG_BYTES: usize = 4096;
@@ -303,17 +305,26 @@ impl Gateway {
     }
 
     pub async fn retrieve_direct(&self, id: &str) -> Result<VerifiedData> {
-        let (verified, _) = self.retrieve_direct_with_tags(id).await?;
+        let (verified, _) = tokio::time::timeout(
+            self.config.request_timeout,
+            self.retrieve_direct_with_tags(id),
+        )
+        .await
+        .context("verified retrieval timed out")??;
         Ok(verified)
     }
 
     pub async fn retrieve_bundled(&self, id: &str) -> Result<VerifiedData> {
-        decode_fixed::<32>(id, "data item ID")?;
-        let hint = self
-            .discover(id)
-            .await?
-            .context("discovery returned an unbundled transaction")?;
-        self.retrieve_bundled_with_hint(id, hint).await
+        tokio::time::timeout(self.config.request_timeout, async {
+            decode_fixed::<32>(id, "data item ID")?;
+            let hint = self
+                .discover(id)
+                .await?
+                .context("discovery returned an unbundled transaction")?;
+            self.retrieve_bundled_with_hint(id, hint).await
+        })
+        .await
+        .context("verified bundle retrieval timed out")?
     }
 
     pub async fn retrieve_chunk(&self, offset: u128) -> Result<Option<VerifiedChunk>> {
@@ -682,11 +693,36 @@ impl Gateway {
             block.hash == status.block_indep_hash,
             "archival status does not match the trusted block index"
         );
-        self.authenticate_block(block, status.block_height, Some(id))
+        let header = self
+            .authenticate_block(block, status.block_height, Some(id))
             .await?;
 
-        let (transaction, verified) = self.verified_transaction(id, status.block_height).await?;
+        let mut remaining = usize::MAX;
+        let (transaction, verified) = self
+            .fetch_transaction(id, status.block_height, &mut remaining)
+            .await?;
         let data_size = verified.metadata.data_size;
+        if transaction.format == 1 && transaction.denomination == 0 {
+            let previous_size = previous_block
+                .map(|previous| parse_u128(&previous.weave_size, "previous block weave size"))
+                .transpose()?
+                .unwrap_or(0);
+            ensure!(
+                parse_u128(&block.weave_size, "block weave size")?.checked_sub(previous_size)
+                    == Some(parse_u128(&header.block_size, "block size")?),
+                "block size does not match trusted weave geometry"
+            );
+            if let Some(previous) = previous_block {
+                ensure!(
+                    header.previous_block == previous.hash,
+                    "block predecessor does not match trusted index"
+                );
+            }
+            // Legacy signatures bind concatenated fields, not the data boundary.
+            // Authenticate the ID-to-payload association before returning inline bytes.
+            self.verify_block_transactions(&header, verified.metadata, usize::MAX - remaining)
+                .await?;
+        }
         if let Some(bytes) = verified.inline_data {
             let body_hash = sha256(&[&bytes]);
             let content_length = bytes.len();
@@ -814,10 +850,11 @@ impl Gateway {
         Ok(header)
     }
 
-    async fn verified_transaction(
+    async fn fetch_transaction(
         &self,
         id: &str,
         height: u64,
+        remaining_bytes: &mut usize,
     ) -> Result<(Transaction, transactions::VerifiedTransaction)> {
         decode_fixed::<32>(id, "transaction ID")?;
         let limit = self
@@ -848,13 +885,11 @@ impl Gateway {
                         "trusted transaction source redirected outside its origin"
                     );
                 }
-                let value = read_json_response_with_limit(response, limit).await?;
+                let value = read_json_response_with_limit(response, limit, remaining_bytes).await?;
                 let mut transaction = transactions::decode_transaction(value)?;
                 ensure!(
-                    trusted
-                        || (!transaction.owner.is_empty()
-                            && (transaction.format != 1 || transaction.denomination != 0)),
-                    "this transaction format requires trusted-node metadata"
+                    trusted || !transaction.owner.is_empty(),
+                    "ECDSA transactions require trusted-node metadata"
                 );
                 let verified = verify_transaction(&transaction, id, height)?;
                 ensure!(
@@ -876,12 +911,38 @@ impl Gateway {
         bail!("transaction metadata unavailable: {}", failures.join("; "))
     }
 
-    async fn verified_transaction_metadata(
+    async fn verify_block_transactions(
         &self,
-        id: &str,
-        height: u64,
-    ) -> Result<database::ObjectMetadata> {
-        Ok(self.verified_transaction(id, height).await?.1.metadata)
+        block: &BlockHeader,
+        first: database::ObjectMetadata,
+        fetched_bytes: usize,
+    ) -> Result<Vec<database::ObjectMetadata>> {
+        ensure!(
+            block.txs.len() <= MAX_BLOCK_TRANSACTIONS,
+            "block transaction count exceeds verification limit"
+        );
+        let mut remaining = MAX_BLOCK_TRANSACTION_BYTES
+            .checked_sub(fetched_bytes)
+            .context("block transactions exceed aggregate response limit")?;
+        let mut objects = Vec::with_capacity(block.txs.len());
+        let first_id = URL_SAFE_NO_PAD.encode(&first.id);
+        ensure!(
+            block.txs.iter().any(|id| id == &first_id),
+            "transaction ID is absent from authenticated block"
+        );
+        objects.push(first);
+        for id in &block.txs {
+            if id != &first_id {
+                let (_, verified) = self
+                    .fetch_transaction(id, block.height, &mut remaining)
+                    .await?;
+                // Only the requested transaction's inline bytes survive this loop.
+                objects.push(verified.metadata);
+            }
+            tokio::task::yield_now().await;
+        }
+        transactions::verify_block_data_root(block, &mut objects)?;
+        Ok(objects)
     }
 
     async fn authenticate_block(
@@ -897,7 +958,6 @@ impl Gateway {
             .fetch_and_authenticate_block(
                 self.client
                     .get(endpoint(&self.config.trusted_node_url, &path)),
-                &self.config.trusted_node_url,
                 entry,
                 height,
                 transaction_id,
@@ -935,7 +995,6 @@ impl Gateway {
             match self
                 .fetch_and_authenticate_block(
                     self.source_request(source, &path, &discovered),
-                    source,
                     entry,
                     height,
                     transaction_id,
@@ -962,7 +1021,6 @@ impl Gateway {
     async fn fetch_and_authenticate_block(
         &self,
         request: RequestBuilder,
-        source: &str,
         entry: &BlockIndexEntry,
         height: u64,
         transaction_id: Option<&str>,
@@ -973,30 +1031,17 @@ impl Gateway {
             block.height == height && block.indep_hash == entry.hash,
             "block header identifier mismatch"
         );
-        if height < 422_250 && block.legacy_wallets.is_none() {
-            let path = format!("block/hash/{}/wallet_list", entry.hash);
-            let response = self
-                .client
-                .get(endpoint(source, &path))
-                .send()
-                .await?
-                .error_for_status()?;
-            let wallets =
-                read_json_response_with_limit(response, self.config.max_data_size).await?;
-            block.legacy_wallets = Some(historical::decode_wallets(wallets)?);
+        if height < 422_250 {
+            historical::verify_legacy_header(&mut block, entry, &self.client).await?;
+            if let Some(transaction_id) = transaction_id {
+                ensure!(
+                    block.txs.iter().any(|id| id == transaction_id),
+                    "transaction ID is absent from authenticated block"
+                );
+            }
+        } else {
+            verify_block_header(&block, entry, height, transaction_id)?;
         }
-        if height < 95_000 && block.hash_list.len() as u64 != height {
-            let path = format!("block/hash/{}/hash_list", entry.hash);
-            let response = self
-                .client
-                .get(endpoint(source, &path))
-                .send()
-                .await?
-                .error_for_status()?;
-            block.hash_list =
-                read_json_response_with_limit(response, self.config.max_data_size).await?;
-        }
-        verify_block_header(&block, entry, height, transaction_id)?;
         Ok(block)
     }
 
@@ -1083,21 +1128,28 @@ impl Gateway {
 }
 
 async fn read_json_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
-    read_json_response_with_limit(response, MAX_JSON_BYTES).await
+    let mut remaining = MAX_JSON_BYTES;
+    read_json_response_with_limit(response, MAX_JSON_BYTES, &mut remaining).await
 }
 
 async fn read_json_response_with_limit<T: DeserializeOwned>(
     mut response: reqwest::Response,
     limit: usize,
+    remaining_bytes: &mut usize,
 ) -> Result<T> {
     if let Some(length) = response.content_length() {
-        ensure!(length <= limit as u64, "JSON response exceeds size limit");
+        ensure!(
+            length <= limit.min(*remaining_bytes) as u64,
+            "JSON response exceeds size limit"
+        );
     }
 
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.context("failed to read HTTP body")? {
+        let remaining = *remaining_bytes;
+        *remaining_bytes = remaining.saturating_sub(chunk.len());
         ensure!(
-            body.len().saturating_add(chunk.len()) <= limit,
+            chunk.len() <= remaining && body.len().saturating_add(chunk.len()) <= limit,
             "JSON response exceeds size limit"
         );
         body.extend_from_slice(&chunk);
@@ -2986,7 +3038,7 @@ fn hash_branch(left: &[u8; 32], right: &[u8; 32], note: &[u8]) -> [u8; 32] {
     sha256(&[&left, &right, &note])
 }
 
-fn hash_leaf(data_hash: &[u8; 32], note: &[u8]) -> [u8; 32] {
+fn hash_leaf(data_hash: &[u8], note: &[u8]) -> [u8; 32] {
     let data_hash = sha256(&[data_hash]);
     let note = sha256(&[note]);
     sha256(&[&data_hash, &note])
@@ -3085,14 +3137,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_metadata_requires_the_trusted_source() {
+    async fn only_ecdsa_metadata_requires_the_trusted_source() {
         use axum::{Router, http::StatusCode, response::IntoResponse};
         use std::sync::atomic::{AtomicBool, Ordering};
         let fixtures: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/protocol-transactions.json"))
                 .unwrap();
         for (name, requires_trusted) in [
-            ("public-format1-height34", true),
+            ("public-format1-height34", false),
             ("format2-ecdsa", true),
             ("format2-rsa-denomination", false),
         ] {
@@ -3140,16 +3192,17 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
+            let mut remaining = usize::MAX;
             let verified = gateway
-                .verified_transaction_metadata(&id, height)
+                .fetch_transaction(&id, height, &mut remaining)
                 .await
                 .unwrap();
             assert_eq!(
-                URL_SAFE_NO_PAD.encode(verified.owner_address),
+                URL_SAFE_NO_PAD.encode(verified.1.metadata.owner_address),
                 case["owner_address"]
             );
             available.store(false, Ordering::SeqCst);
-            let fallback = gateway.verified_transaction_metadata(&id, height).await;
+            let fallback = gateway.fetch_transaction(&id, height, &mut remaining).await;
             assert_eq!(fallback.is_err(), requires_trusted, "{name}");
             for server in servers {
                 server.abort();

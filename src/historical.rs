@@ -1,20 +1,147 @@
-use std::io;
+use std::{io, time::Duration};
 
 use anyhow::{Context, Result, ensure};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{
     Number, Value,
     ser::{CharEscape, CompactFormatter, Formatter},
 };
+use tokio::sync::OnceCell;
 
 use super::{
-    BlockHeader, FORK_2_5_HEIGHT, decode_b64, decode_fixed, deep_hash_b64_list, deep_hash_blob,
-    deep_hash_decimal, deep_hash_list, parse_biguint, reward_address, sha384,
+    BlockHeader, BlockIndexEntry, FORK_2_5_HEIGHT, decode_b64, decode_fixed, deep_hash_b64_list,
+    deep_hash_blob, deep_hash_decimal, deep_hash_list, parse_biguint, parse_u128, reward_address,
+    sha256, sha384,
 };
 
 pub(super) const FORK_1_6_HEIGHT: u64 = 95_000;
 pub(super) const FORK_2_0_HEIGHT: u64 = 422_250;
 const FORK_2_4_HEIGHT: u64 = 633_720;
+
+// Official client-verification auxiliary, not the original block-index hashes.
+const LEGACY_HASH_LIST_URL: &str = "https://raw.githubusercontent.com/ArweaveTeam/arweave/50e47de6d054afefdee112fa124695eb8d0176fc/genesis_data/hash_list_1_0";
+const LEGACY_HASH_LIST_BYTES: usize = 28_290_751;
+const LEGACY_HASH_LIST_SHA256: [u8; 32] = [
+    0xd1, 0x61, 0x50, 0x2a, 0x13, 0xe6, 0x4f, 0xa4, 0x9b, 0xcb, 0x24, 0x25, 0x42, 0x0b, 0xcd, 0xcd,
+    0x6a, 0x44, 0x07, 0xe4, 0x88, 0xac, 0xa3, 0xe1, 0x4b, 0xa2, 0x54, 0xf1, 0x64, 0x18, 0xca, 0x6f,
+];
+static LEGACY_HASHES: OnceCell<Vec<[u8; 48]>> = OnceCell::const_new();
+
+pub(super) async fn verify_legacy_header(
+    block: &mut BlockHeader,
+    entry: &BlockIndexEntry,
+    client: &reqwest::Client,
+) -> Result<()> {
+    let index = legacy_hash_index(block.height)?;
+    let hashes = LEGACY_HASHES
+        .get_or_try_init(|| download_legacy_hashes(client))
+        .await?;
+    verify_legacy_header_hash(block, entry, &hashes[index])
+}
+
+fn legacy_hash_index(height: u64) -> Result<usize> {
+    (FORK_2_0_HEIGHT - 1)
+        .checked_sub(height)
+        .map(|index| index as usize)
+        .context("not a pre-2.0 block")
+}
+
+async fn download_legacy_hashes(client: &reqwest::Client) -> Result<Vec<[u8; 48]>> {
+    let mut response = client
+        .get(LEGACY_HASH_LIST_URL)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .context("failed to download historical H2 table")?
+        .error_for_status()
+        .context("historical H2 table request failed")?;
+    if let Some(length) = response.content_length() {
+        ensure!(
+            length == LEGACY_HASH_LIST_BYTES as u64,
+            "historical H2 table length mismatch"
+        );
+    }
+    let mut body = Vec::with_capacity(LEGACY_HASH_LIST_BYTES);
+    while let Some(chunk) = response.chunk().await.context("failed to read H2 table")? {
+        ensure!(
+            body.len().saturating_add(chunk.len()) <= LEGACY_HASH_LIST_BYTES,
+            "historical H2 table exceeds size limit"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    decode_legacy_hashes(&body).await
+}
+
+async fn decode_legacy_hashes(body: &[u8]) -> Result<Vec<[u8; 48]>> {
+    ensure!(
+        body.len() == LEGACY_HASH_LIST_BYTES,
+        "historical H2 table length mismatch"
+    );
+    ensure!(
+        sha256(&[body]) == LEGACY_HASH_LIST_SHA256,
+        "historical H2 table checksum mismatch"
+    );
+    let encoded: Vec<&str> =
+        serde_json::from_slice(body).context("invalid historical H2 table JSON")?;
+    ensure!(
+        encoded.len() == FORK_2_0_HEIGHT as usize,
+        "historical H2 table entry count mismatch"
+    );
+    let mut hashes = Vec::with_capacity(encoded.len());
+    for chunk in encoded.chunks(4096) {
+        tokio::task::yield_now().await;
+        for value in chunk {
+            ensure!(value.len() == 64, "invalid historical H2 hash length");
+            let mut hash = [0_u8; 48];
+            URL_SAFE_NO_PAD
+                .decode_slice(value, &mut hash)
+                .context("invalid historical H2 hash")?;
+            hashes.push(hash);
+        }
+    }
+    Ok(hashes)
+}
+
+// ar_header_sync replaces the old tx_root and sorts decoded IDs before hashing.
+// The caller separately checks the requested height and transaction membership.
+fn verify_legacy_header_hash(
+    block: &mut BlockHeader,
+    entry: &BlockIndexEntry,
+    expected_h2: &[u8; 48],
+) -> Result<()> {
+    legacy_hash_index(block.height)?;
+    ensure!(
+        decode_fixed::<48>(&block.indep_hash, "block indep_hash")?
+            == decode_fixed::<48>(&entry.hash, "trusted block hash")?,
+        "block header identifier mismatch"
+    );
+    ensure!(
+        parse_u128(&block.weave_size, "block weave size")?
+            == parse_u128(&entry.weave_size, "trusted block weave size")?,
+        "block weave size does not match trusted index"
+    );
+    ensure!(
+        matches!(
+            decode_b64(&entry.tx_root, "trusted block tx_root")?.len(),
+            0 | 32
+        ),
+        "invalid trusted block tx_root length"
+    );
+    block.tx_root.clone_from(&entry.tx_root);
+    let mut transactions = block
+        .txs
+        .iter()
+        .map(|id| decode_fixed::<32>(id, "block transaction ID"))
+        .collect::<Result<Vec<_>>>()?;
+    transactions.sort_unstable();
+    let transaction_hashes: Vec<_> = transactions.iter().map(|id| deep_hash_blob(id)).collect();
+    ensure!(
+        modern_indep_hash(block, deep_hash_list(&transaction_hashes))? == *expected_h2,
+        "historical block H2 verification failed"
+    );
+    Ok(())
+}
 
 // The order and JSON field names here are the pre-1.6 consensus preimage,
 // not the modern wallet-list endpoint's address/balance field names.
@@ -71,14 +198,10 @@ pub(super) fn decode_header(mut value: Value) -> Result<BlockHeader> {
         return serde_json::from_value(value).context("invalid block header");
     }
 
-    // These fields were absent and are not hash inputs before their forks.
+    // The official parser ignores these fields entirely before fork 1.6.
     if height < FORK_1_6_HEIGHT {
-        fields
-            .entry("cumulative_diff")
-            .or_insert(Value::String("0".into()));
-        fields
-            .entry("hash_list_merkle")
-            .or_insert(Value::String(String::new()));
+        fields.insert("cumulative_diff".into(), Value::String("0".into()));
+        fields.insert("hash_list_merkle".into(), Value::String(String::new()));
     }
     if height < FORK_2_0_HEIGHT {
         fields
@@ -167,7 +290,7 @@ pub(super) fn decode_header(mut value: Value) -> Result<BlockHeader> {
 // Historical source (includes the complete pre-1.6 ordered JSON object):
 // https://github.com/ArweaveTeam/arweave/blob/de995bf9aec003ccf5f48ee47998a34c1ec36668/src/ar_weave.erl#L243-L327
 // Fork-2.0/2.4 BDS and PoA placement:
-// https://github.com/ArweaveTeam/arweave/blob/master/apps/arweave/src/ar_block.erl#L474-L621
+// https://github.com/ArweaveTeam/arweave/blob/50e47de6d054afefdee112fa124695eb8d0176fc/apps/arweave/src/ar_block.erl#L474-L621
 pub(super) fn indep_hash(block: &BlockHeader) -> Result<[u8; 48]> {
     ensure!(block.height < FORK_2_5_HEIGHT, "not a pre-2.5 block");
     if block.height < FORK_1_6_HEIGHT {
@@ -181,7 +304,6 @@ pub(super) fn indep_hash(block: &BlockHeader) -> Result<[u8; 48]> {
     // In particular, interpreting [name, value] as a tuple would change the ID.
     // https://github.com/ArweaveTeam/arweave/blob/master/apps/arweave/src/ar_serialize.erl#L1368-L1376
     // https://github.com/ArweaveTeam/arweave/blob/master/apps/arweave/src/ar_tx.erl#L137-L138
-    let tags = deep_hash_list(&[]);
     if block.height < FORK_2_0_HEIGHT {
         let wallets = required_wallets(block)?;
         let wallet_hashes = wallets
@@ -207,13 +329,20 @@ pub(super) fn indep_hash(block: &BlockHeader) -> Result<[u8; 48]> {
             deep_hash_b64_list(&block.txs, "block transaction ID")?,
             deep_hash_list(&wallet_hashes),
             deep_hash_blob(&reward_address(&block.reward_addr, false)?),
-            tags,
+            deep_hash_list(&[]),
             deep_hash_decimal(&block.reward_pool, "reward pool")?,
             deep_hash_decimal(&block.weave_size, "block weave size")?,
             deep_hash_decimal(&block.block_size, "block size")?,
         ]));
     }
 
+    modern_indep_hash(
+        block,
+        deep_hash_b64_list(&block.txs, "block transaction ID")?,
+    )
+}
+
+fn modern_indep_hash(block: &BlockHeader, transaction_hash: [u8; 48]) -> Result<[u8; 48]> {
     let poa = deep_hash_list(&[
         deep_hash_decimal(&block.poa.option, "proof option")?,
         deep_hash_blob(&decode_b64(&block.poa.tx_path, "block tx_path")?),
@@ -224,11 +353,11 @@ pub(super) fn indep_hash(block: &BlockHeader) -> Result<[u8; 48]> {
         deep_hash_blob(block.height.to_string().as_bytes()),
         deep_hash_blob(&decode_b64(&block.previous_block, "previous block")?),
         deep_hash_blob(&decode_b64(&block.tx_root, "block tx_root")?),
-        deep_hash_b64_list(&block.txs, "block transaction ID")?,
+        transaction_hash,
         deep_hash_decimal(&block.block_size, "block size")?,
         deep_hash_decimal(&block.weave_size, "block weave size")?,
         deep_hash_blob(&reward_address(&block.reward_addr, false)?),
-        tags,
+        deep_hash_list(&[]),
         poa,
     ];
     let base_hash = deep_hash_list(if block.height < FORK_2_4_HEIGHT {
@@ -468,7 +597,81 @@ impl Formatter for JiffyFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[test]
+    fn normalized_legacy_header_authenticates_real_300000_and_rejects_tampering() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/historical-block-300000.json"
+        ))
+        .unwrap();
+        let expected_h2 = decode_fixed::<48>(fixture["h2"].as_str().unwrap(), "H2").unwrap();
+        let entry: BlockIndexEntry = serde_json::from_value(fixture["index"].clone()).unwrap();
+        let mut block = decode_header(fixture["block"].clone()).unwrap();
+        verify_legacy_header_hash(&mut block, &entry, &expected_h2).unwrap();
+        block.txs.reverse();
+        verify_legacy_header_hash(&mut block, &entry, &expected_h2).unwrap();
+
+        block.wallet_list = URL_SAFE_NO_PAD.encode([0_u8; 32]);
+        assert!(verify_legacy_header_hash(&mut block, &entry, &expected_h2).is_err());
+        block = decode_header(fixture["block"].clone()).unwrap();
+        block.txs[0] = URL_SAFE_NO_PAD.encode([0_u8; 32]);
+        assert!(verify_legacy_header_hash(&mut block, &entry, &expected_h2).is_err());
+        block = decode_header(fixture["block"].clone()).unwrap();
+        block.indep_hash = URL_SAFE_NO_PAD.encode([0_u8; 48]);
+        assert!(verify_legacy_header_hash(&mut block, &entry, &expected_h2).is_err());
+        block = decode_header(fixture["block"].clone()).unwrap();
+        block.weave_size = "0".into();
+        assert!(verify_legacy_header_hash(&mut block, &entry, &expected_h2).is_err());
+        block = decode_header(fixture["block"].clone()).unwrap();
+        let altered_entry = BlockIndexEntry {
+            tx_root: URL_SAFE_NO_PAD.encode([0_u8; 32]),
+            ..entry
+        };
+        assert!(verify_legacy_header_hash(&mut block, &altered_entry, &expected_h2).is_err());
+    }
+
+    #[test]
+    fn pre_1_6_h2_ignores_fields_absent_before_the_fork() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/historical-block-300000.json"
+        ))
+        .unwrap();
+        let mut header = fixture["block"].clone();
+        header["height"] = Value::from(FORK_1_6_HEIGHT - 1);
+        let fields = header.as_object_mut().unwrap();
+        fields.remove("cumulative_diff");
+        fields.remove("hash_list_merkle");
+        fields.remove("poa");
+        let block = decode_header(header.clone()).unwrap();
+        let transactions = deep_hash_b64_list(&block.txs, "transaction ID").unwrap();
+        let expected = modern_indep_hash(&block, transactions).unwrap();
+
+        header["cumulative_diff"] = serde_json::json!({"ignored": true});
+        header["hash_list_merkle"] = Value::String("not base64".into());
+        let block = decode_header(header.clone()).unwrap();
+        assert_eq!(modern_indep_hash(&block, transactions).unwrap(), expected);
+        header["height"] = Value::from(FORK_1_6_HEIGHT);
+        assert!(decode_header(header).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_table_rejects_truncation_overflow_and_checksum_changes() {
+        let mut corrupt = vec![0; LEGACY_HASH_LIST_BYTES - 1];
+        assert!(decode_legacy_hashes(&corrupt).await.is_err());
+        corrupt.push(0);
+        assert!(decode_legacy_hashes(&corrupt).await.is_err());
+        corrupt.push(0);
+        assert!(decode_legacy_hashes(&corrupt).await.is_err());
+    }
+
+    #[test]
+    fn legacy_table_height_mapping_covers_both_boundaries() {
+        assert_eq!(legacy_hash_index(0).unwrap(), 422_249);
+        assert_eq!(legacy_hash_index(300_000).unwrap(), 122_249);
+        assert_eq!(legacy_hash_index(422_249).unwrap(), 0);
+        assert!(legacy_hash_index(FORK_2_0_HEIGHT).is_err());
+        assert!(legacy_hash_index(u64::MAX).is_err());
+    }
 
     #[test]
     fn jiffy_preimage_preserves_order_integers_and_raw_tags() {

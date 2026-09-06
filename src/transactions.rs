@@ -4,9 +4,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    FORK_2_6_HEIGHT, FORK_2_9_HEIGHT, RecoveryId, Secp256k1Signature, Secp256k1VerifyingKey,
-    Transaction, database::ObjectMetadata, decode_b64, decode_fixed, deep_hash_blob,
-    deep_hash_list, hash_branch, hash_leaf, sha256,
+    BlockHeader, FORK_2_5_HEIGHT, FORK_2_6_HEIGHT, FORK_2_9_HEIGHT, MAX_BLOCK_TRANSACTIONS,
+    MAX_CHUNK_SIZE, RecoveryId, Secp256k1Signature, Secp256k1VerifyingKey, Transaction,
+    database::ObjectMetadata, decode_b64, decode_fixed, deep_hash_blob, deep_hash_list,
+    hash_branch, hash_leaf, parse_u128, sha256,
 };
 
 const FORK_2_0_HEIGHT: u64 = 422_250;
@@ -279,6 +280,67 @@ pub(super) fn verify_transaction(
     })
 }
 
+pub(super) fn verify_block_data_root(
+    block: &BlockHeader,
+    objects: &mut [ObjectMetadata],
+) -> Result<()> {
+    ensure!(
+        objects.len() == block.txs.len() && objects.len() <= MAX_BLOCK_TRANSACTIONS,
+        "incomplete block transaction data"
+    );
+    let mut expected_ids = block
+        .txs
+        .iter()
+        .map(|id| decode_fixed::<32>(id, "block transaction ID"))
+        .collect::<Result<std::collections::HashSet<_>>>()?;
+    ensure!(
+        expected_ids.len() == block.txs.len(),
+        "duplicate block transaction ID"
+    );
+    // Erlang sorts full #tx{} records: format precedes the raw ID in the tuple.
+    objects.sort_unstable_by(|left, right| (left.format, &left.id).cmp(&(right.format, &right.id)));
+    let mut row = Vec::with_capacity(objects.len() * 2);
+    let mut end = 0u128;
+    for object in objects {
+        let id: [u8; 32] = object
+            .id
+            .as_slice()
+            .try_into()
+            .context("invalid transaction ID")?;
+        ensure!(
+            expected_ids.remove(&id),
+            "transaction does not match authenticated block membership"
+        );
+        let root = object
+            .data_root
+            .as_deref()
+            .context("missing transaction data root")?;
+        end = end
+            .checked_add(object.data_size)
+            .context("block data size overflow")?;
+        // Empty roots/sizes still produce leaves; padding has an empty data root.
+        row.push((hash_leaf(root, &note(end)), end));
+        if block.height >= FORK_2_5_HEIGHT {
+            let padding = (MAX_CHUNK_SIZE - object.data_size % MAX_CHUNK_SIZE) % MAX_CHUNK_SIZE;
+            if padding > 0 {
+                end = end.checked_add(padding).context("block padding overflow")?;
+                row.push((hash_leaf(&[], &note(end)), end));
+            }
+        }
+    }
+    ensure!(
+        end == parse_u128(&block.block_size, "block size")?,
+        "transaction data does not match authenticated block size"
+    );
+    let root = merkle_root(row);
+    ensure!(
+        root.as_ref().map_or(&[][..], |root| root.as_slice())
+            == decode_b64(&block.tx_root, "block tx_root")?,
+        "transaction data does not match authenticated block tx_root"
+    );
+    Ok(())
+}
+
 pub(super) fn optional_text_tag(tags: &[(Vec<u8>, Vec<u8>)], expected: &[u8]) -> Option<String> {
     tags.iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case(expected))
@@ -302,6 +364,10 @@ fn inline_data_root(data: &[u8]) -> [u8; 32] {
             end as u128,
         ));
     }
+    merkle_root(row).expect("inline data always has a leaf")
+}
+
+fn merkle_root(mut row: Vec<([u8; 32], u128)>) -> Option<[u8; 32]> {
     while row.len() > 1 {
         let count = row.len();
         for index in 0..count.div_ceil(2) {
@@ -315,7 +381,7 @@ fn inline_data_root(data: &[u8]) -> [u8; 32] {
         }
         row.truncate(count.div_ceil(2));
     }
-    row[0].0
+    row.first().map(|(root, _)| *root)
 }
 
 fn note(value: u128) -> [u8; 32] {
@@ -559,6 +625,116 @@ mod tests {
                 URL_SAFE_NO_PAD.encode(inline_data_root(&data)),
                 case["root"]
             );
+        }
+    }
+
+    #[test]
+    fn legacy_field_interpretation_cannot_change_authenticated_payload() {
+        let fixtures = fixtures();
+        let case = fixtures["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "format1-raw-variable-salt")
+            .unwrap();
+        let height = case["height"].as_u64().unwrap();
+        let mut transaction = decode_transaction(case["transaction"].clone()).unwrap();
+        let original = verify_transaction(&transaction, &transaction.id, height).unwrap();
+        let mut block = BlockHeader {
+            height,
+            txs: vec![transaction.id.clone()],
+            block_size: original.metadata.data_size.to_string(),
+            tx_root: URL_SAFE_NO_PAD.encode(hash_leaf(
+                original.metadata.data_root.as_deref().unwrap(),
+                &note(original.metadata.data_size),
+            )),
+            ..BlockHeader::default()
+        };
+        let mut objects = [original.metadata];
+        verify_block_data_root(&block, &mut objects).unwrap();
+
+        // Re-split a tag name/value without changing the concatenated preimage.
+        let tag = &mut transaction.tags[2];
+        let mut name = decode_b64(&tag.name, "tag name").unwrap();
+        let mut value = decode_b64(&tag.value, "tag value").unwrap();
+        value.insert(0, name.pop().unwrap());
+        tag.name = URL_SAFE_NO_PAD.encode(&name);
+        tag.value = URL_SAFE_NO_PAD.encode(&value);
+        let interpreted = verify_transaction(&transaction, &transaction.id, height).unwrap();
+        assert_ne!(interpreted.metadata.tags, objects[0].tags);
+        objects[0] = interpreted.metadata;
+        verify_block_data_root(&block, &mut objects).unwrap();
+
+        // Move "900" out of the canonical quantity into data. Signature and ID
+        // still verify, but the payload boundary is no longer the block's.
+        let mut data = decode_b64(&transaction.data, "data").unwrap();
+        data.extend_from_slice(&transaction.quantity.as_bytes()[..3]);
+        transaction.data = URL_SAFE_NO_PAD.encode(data);
+        transaction.quantity = transaction.quantity[3..].to_owned();
+        let substituted = verify_transaction(&transaction, &transaction.id, height).unwrap();
+        assert_ne!(substituted.metadata.data_root, objects[0].data_root);
+        objects[0] = substituted.metadata;
+        assert!(verify_block_data_root(&block, &mut objects).is_err());
+        // Matching the attacker's size is insufficient: the trusted root differs.
+        block.block_size = objects[0].data_size.to_string();
+        assert!(verify_block_data_root(&block, &mut objects).is_err());
+    }
+
+    #[test]
+    fn block_roots_preserve_record_order_empty_leaves_and_fork_padding() {
+        let fixtures = fixtures();
+        let legacy = fixtures["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == "format1-modern-width-boundary")
+            .unwrap();
+        let legacy = decode_transaction(legacy["transaction"].clone()).unwrap();
+        let empty = decode_transaction(
+            serde_json::from_str(include_str!("../tests/fixtures/empty-transaction.json")).unwrap(),
+        )
+        .unwrap();
+        for height in [FORK_2_5_HEIGHT - 1, FORK_2_5_HEIGHT] {
+            let legacy = verify_transaction(&legacy, &legacy.id, height)
+                .unwrap()
+                .metadata;
+            let empty = verify_transaction(&empty, &empty.id, height)
+                .unwrap()
+                .metadata;
+            assert!(legacy.id > empty.id);
+            let size = legacy.data_size;
+            let leaf = hash_leaf(legacy.data_root.as_deref().unwrap(), &note(size));
+            let (root, block_size) = if height < FORK_2_5_HEIGHT {
+                (
+                    hash_branch(&leaf, &hash_leaf(&[], &note(size)), &note(size)),
+                    size,
+                )
+            } else {
+                let padding = hash_leaf(&[], &note(MAX_CHUNK_SIZE));
+                let left = hash_branch(&leaf, &padding, &note(size));
+                (
+                    hash_branch(&left, &padding, &note(MAX_CHUNK_SIZE)),
+                    MAX_CHUNK_SIZE,
+                )
+            };
+            let block = BlockHeader {
+                height,
+                txs: vec![
+                    URL_SAFE_NO_PAD.encode(&empty.id),
+                    URL_SAFE_NO_PAD.encode(&legacy.id),
+                ],
+                block_size: block_size.to_string(),
+                tx_root: URL_SAFE_NO_PAD.encode(root),
+                ..BlockHeader::default()
+            };
+            let mut objects = [empty, legacy];
+            verify_block_data_root(&block, &mut objects).unwrap();
+            // Membership and the set of roots are unchanged, but their ID
+            // associations are swapped. A root-set-only check would miss this.
+            let (left, right) = objects.split_at_mut(1);
+            std::mem::swap(&mut left[0].data_root, &mut right[0].data_root);
+            std::mem::swap(&mut left[0].data_size, &mut right[0].data_size);
+            assert!(verify_block_data_root(&block, &mut objects).is_err());
         }
     }
 

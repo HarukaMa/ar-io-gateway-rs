@@ -20,7 +20,9 @@
 
 - Anchor chain history to the trusted Arweave node's consensus-validated stable block index. Pin synchronization to a stable checkpoint outside the node's consensus window.
 - Treat archival providers and external location hints as untrusted. Authenticate block hashes and membership, transaction signatures and roots, chunk proofs, bundle offsets, and item signatures before serving or caching bytes.
-- ECDSA transactions and format-1 transactions without denomination require the trusted node's canonical metadata because their signature encodings leave metadata ambiguity. Never accept archival-only metadata for these formats. Still verify signatures, canonical membership, and content proofs, and fail closed when the trusted header is unavailable.
+- Legacy format-1 transactions without denomination may use archival field interpretations. Their signatures do not uniquely bind field boundaries. Verify signatures and canonical membership, then reconstruct the complete block transaction root and check block geometry before serving inline content or recording legacy metadata.
+- ECDSA transactions still require metadata from the trusted node and its trusted transport. Fail closed when that header is unavailable.
+- Pre-2.0 block shadows use the checksum-pinned official H2 auxiliary with the trusted block index. Treat that table as an additional client-verification anchor.
 - Fail closed when required anchors or proofs are unavailable or invalid. Provider agreement does not establish authenticity.
 - Preserve protocol compatibility. Identify unsupported formats and related compatibility gaps explicitly before claiming a request path or indexing range is complete.
 

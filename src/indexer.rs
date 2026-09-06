@@ -1,12 +1,13 @@
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Serialize;
+use std::collections::HashMap;
 use tokio::time::timeout;
 
 use crate::{
     BundleItems, CONSENSUS_DEPTH, Gateway, MAX_BUNDLE_DEPTH, NodeInfo,
     database::{BlockStore, BundleLocation, Checkpoint, IndexBlock, ObjectMetadata},
-    decode_b64, endpoint, require_bundle_tags, verify_data_item,
+    decode_b64, endpoint, parse_u128, require_bundle_tags, verify_data_item,
 };
 
 #[derive(Debug, Serialize)]
@@ -226,6 +227,10 @@ pub async fn import_metadata(
     }
 
     let mut imported_transactions = 0;
+    // Keep only one fully authenticated block, without inline payloads, across
+    // resumable four-object commits. Partial root reconstructions never enter it.
+    let mut authenticated_height = None;
+    let mut authenticated_objects = HashMap::<Vec<u8>, ObjectMetadata>::new();
     loop {
         let pending = timeout(deadline, store.pending_transactions(start, end, 4))
             .await
@@ -236,16 +241,29 @@ pub async fn import_metadata(
         let batch_count = pending.len() as u64;
         timeout(deadline, async {
             let mut pending = pending.into_iter();
-            let fetch = |transaction: Option<(Vec<u8>, u64)>| async move {
-                let Some((id, height)) = transaction else {
-                    return Ok(None);
-                };
-                let id = URL_SAFE_NO_PAD.encode(id);
-                gateway
-                    .verified_transaction_metadata(&id, height)
-                    .await
-                    .with_context(|| format!("importing transaction metadata {id}"))
-                    .map(Some)
+            let fetch = |transaction: Option<(Vec<u8>, u64)>| {
+                let cached = transaction.as_ref().is_some_and(|(id, height)| {
+                    authenticated_height == Some(*height) && authenticated_objects.contains_key(id)
+                });
+                async move {
+                    let Some((id, height)) = transaction else {
+                        return Ok(None);
+                    };
+                    if cached {
+                        return Ok(Some((id, height, None)));
+                    }
+                    let encoded_id = URL_SAFE_NO_PAD.encode(&id);
+                    let mut remaining = usize::MAX;
+                    let (_, verified) = gateway
+                        .fetch_transaction(&encoded_id, height, &mut remaining)
+                        .await
+                        .with_context(|| format!("importing transaction metadata {encoded_id}"))?;
+                    Ok::<_, anyhow::Error>(Some((
+                        id,
+                        height,
+                        Some((verified.metadata, usize::MAX - remaining)),
+                    )))
+                }
             };
             // Inline futures are dropped together on errors, timeout, or cancellation.
             let (first, second, third, fourth) = tokio::try_join!(
@@ -254,10 +272,78 @@ pub async fn import_metadata(
                 fetch(pending.next()),
                 fetch(pending.next()),
             )?;
-            let objects = [first, second, third, fourth]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+            let mut objects = Vec::with_capacity(4);
+            for (id, height, fetched) in [first, second, third, fourth].into_iter().flatten() {
+                if authenticated_height == Some(height)
+                    && let Some(object) = authenticated_objects.remove(&id)
+                {
+                    objects.push(object);
+                    continue;
+                }
+                let (object, fetched_bytes) =
+                    fetched.context("verified block metadata is missing")?;
+                if object.format != Some(1) || object.denomination != Some(0) {
+                    objects.push(object);
+                    continue;
+                }
+                let header = if let Some((previous, block)) = store.block_pair(height).await? {
+                    let header = gateway.verified_block(&block).await?;
+                    ensure!(
+                        block.weave_size.checked_sub(previous.weave_size)
+                            == Some(parse_u128(&header.block_size, "block size")?),
+                        "block size does not match trusted weave geometry"
+                    );
+                    header
+                } else {
+                    // The coverage boundary/genesis may have no stored predecessor.
+                    let entries = gateway
+                        .trusted_block_index(height.saturating_sub(1), height)
+                        .await?
+                        .context("trusted transaction block index is unavailable")?;
+                    let block = entries
+                        .last()
+                        .context("missing trusted transaction block")?;
+                    let entry = crate::BlockIndexEntry {
+                        hash: block.hash.clone(),
+                        tx_root: block.tx_root.clone(),
+                        weave_size: block.weave_size.to_string(),
+                    };
+                    let encoded_id = URL_SAFE_NO_PAD.encode(&id);
+                    let header = gateway
+                        .authenticate_block(&entry, height, Some(&encoded_id))
+                        .await?;
+                    let previous_size = if height == 0 {
+                        0
+                    } else {
+                        entries[0].weave_size
+                    };
+                    ensure!(
+                        block.weave_size.checked_sub(previous_size)
+                            == Some(parse_u128(&header.block_size, "block size")?),
+                        "block size does not match trusted weave geometry"
+                    );
+                    if height > 0 {
+                        ensure!(
+                            header.previous_block == entries[0].hash,
+                            "block predecessor does not match trusted index"
+                        );
+                    }
+                    header
+                };
+                let verified = gateway
+                    .verify_block_transactions(&header, object, fetched_bytes)
+                    .await?;
+                authenticated_objects = verified
+                    .into_iter()
+                    .map(|object| (object.id.clone(), object))
+                    .collect();
+                authenticated_height = Some(height);
+                objects.push(
+                    authenticated_objects
+                        .remove(&id)
+                        .context("verified transaction is missing")?,
+                );
+            }
             store.record_objects(&objects).await
         })
         .await
