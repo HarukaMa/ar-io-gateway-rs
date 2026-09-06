@@ -23,6 +23,30 @@ const MIGRATIONS: &[(&str, &str)] = &[
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
 
+const CANONICAL_BUNDLES: &str = "
+    SELECT o.id, p.block_height, o.data_size::text, coalesce(progress.complete, false)
+    FROM public.canonical_placements p
+    JOIN public.objects o ON o.key=p.object_key
+    LEFT JOIN public.bundle_progress progress ON progress.root_key=o.key
+    WHERE o.kind=0 AND o.metadata_complete AND EXISTS (
+        SELECT 1 FROM public.block_index_state s
+        JOIN public.canonical_blocks c
+          ON c.height > s.start_height AND c.height <= s.imported_through
+        JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
+        JOIN public.blocks b ON b.hash=c.block_hash
+        WHERE s.singleton AND c.height=p.block_height AND bt.position=p.position
+          AND bt.object_key=o.key AND b.timestamp IS NOT NULL)
+    AND EXISTS (
+        SELECT 1 FROM public.object_tags t
+        JOIN public.tag_names n ON n.key=t.name_key
+        JOIN public.tag_values v ON v.key=t.value_key
+        WHERE t.object_key=o.key AND n.value='Bundle-Format'::bytea AND v.value='binary'::bytea)
+    AND EXISTS (
+        SELECT 1 FROM public.object_tags t
+        JOIN public.tag_names n ON n.key=t.name_key
+        JOIN public.tag_values v ON v.key=t.value_key
+        WHERE t.object_key=o.key AND n.value='Bundle-Version'::bytea AND v.value='2.0.0'::bytea)";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
     pub height: u64,
@@ -46,7 +70,7 @@ pub struct ImportState {
     pub source: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ObjectMetadata {
     pub(crate) id: Vec<u8>,
     pub(crate) kind: i16,
@@ -488,12 +512,28 @@ impl BlockStore {
         timestamp: u64,
         transaction_ids: &[Vec<u8>],
     ) -> Result<()> {
-        let height = sql_height(block.height)?;
-        let timestamp = i64::try_from(timestamp).context("timestamp exceeds PostgreSQL bigint")?;
-        let count = i32::try_from(transaction_ids.len()).context("too many block transactions")?;
+        let transaction = self
+            .client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
+        Self::write_block_metadata(&transaction, block, timestamp, transaction_ids).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn record_bundle_root(
+        &mut self,
+        block: &IndexBlock,
+        timestamp: u64,
+        transaction_ids: &[Vec<u8>],
+        object: &ObjectMetadata,
+        source: &str,
+    ) -> Result<()> {
         ensure!(
-            transaction_ids.iter().all(|id| id.len() == 32),
-            "transaction ID must be 32 bytes"
+            object.kind == 0 && transaction_ids.contains(&object.id),
+            "bundle root is absent from authenticated block membership"
         );
         let transaction = self
             .client
@@ -501,6 +541,37 @@ impl BlockStore {
             .isolation_level(IsolationLevel::ReadCommitted)
             .start()
             .await?;
+        let stored_source: String = transaction
+            .query_opt(
+                "SELECT source FROM public.block_index_state WHERE singleton FOR SHARE",
+                &[],
+            )
+            .await?
+            .context("block index is not initialized")?
+            .try_get(0)?;
+        ensure!(
+            stored_source == source,
+            "trusted node source does not match stored import"
+        );
+        Self::write_block_metadata(&transaction, block, timestamp, transaction_ids).await?;
+        Self::write_objects(&transaction, std::slice::from_ref(object)).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn write_block_metadata(
+        transaction: &Transaction<'_>,
+        block: &IndexBlock,
+        timestamp: u64,
+        transaction_ids: &[Vec<u8>],
+    ) -> Result<()> {
+        let height = sql_height(block.height)?;
+        let timestamp = i64::try_from(timestamp).context("timestamp exceeds PostgreSQL bigint")?;
+        let count = i32::try_from(transaction_ids.len()).context("too many block transactions")?;
+        ensure!(
+            transaction_ids.iter().all(|id| id.len() == 32),
+            "transaction ID must be 32 bytes"
+        );
         let row = transaction
             .query_opt(
                 "SELECT b.height, b.hash, b.previous_hash, b.tx_root, b.weave_size::text, b.timestamp
@@ -527,7 +598,7 @@ impl BlockStore {
         identities.dedup();
         if stored_timestamp.is_none() {
             for ids in identities.chunks(ROW_BATCH_SIZE) {
-                Self::lock_bundle_roots(&transaction, ids).await?;
+                Self::lock_bundle_roots(transaction, ids).await?;
             }
         }
         if stored_timestamp.is_none() {
@@ -628,11 +699,10 @@ impl BlockStore {
                 let Some(&last) = keys.last() else {
                     break;
                 };
-                Self::refresh_item_placements(&transaction, &keys).await?;
+                Self::refresh_item_placements(transaction, &keys).await?;
                 after = last;
             }
         }
-        transaction.commit().await?;
         Ok(())
     }
 
@@ -683,34 +753,75 @@ impl BlockStore {
             (1..=METADATA_BATCH_SIZE).contains(&limit),
             "bundle query limit must be between 1 and 256"
         );
-        self.client.query(
-            "SELECT o.id, p.block_height
-             FROM public.canonical_placements p
-             JOIN public.objects o ON o.key=p.object_key
-             LEFT JOIN public.bundle_progress progress ON progress.root_key=o.key
-             WHERE o.kind=0 AND o.metadata_complete AND NOT coalesce(progress.complete, false)
-               AND p.block_height BETWEEN $1 AND $2
-               AND EXISTS (
-                   SELECT 1 FROM public.block_index_state s
-                   JOIN public.canonical_blocks cb
-                     ON cb.height > s.start_height AND cb.height <= s.imported_through
-                   JOIN public.blocks b ON b.hash=cb.block_hash
-                   JOIN public.block_transactions bt ON bt.block_hash=cb.block_hash
-                   WHERE s.singleton AND cb.height=p.block_height AND bt.position=p.position
-                     AND bt.object_key=o.key AND b.timestamp IS NOT NULL)
-               AND EXISTS (
-                   SELECT 1 FROM public.object_tags t
-                   JOIN public.tag_names n ON n.key=t.name_key
-                   JOIN public.tag_values v ON v.key=t.value_key
-                   WHERE t.object_key=o.key AND n.value='Bundle-Format'::bytea AND v.value='binary'::bytea)
-               AND EXISTS (
-                   SELECT 1 FROM public.object_tags t
-                   JOIN public.tag_names n ON n.key=t.name_key
-                   JOIN public.tag_values v ON v.key=t.value_key
-                   WHERE t.object_key=o.key AND n.value='Bundle-Version'::bytea AND v.value='2.0.0'::bytea)
-             ORDER BY p.block_height, p.position, p.id LIMIT $3",
-            &[&sql_height(start)?, &sql_height(end)?, &i64::try_from(limit)?],
-        ).await?.iter().map(|row| Ok((row.try_get(0)?, u64::try_from(row.try_get::<_, i64>(1)?)?))).collect()
+        self.client
+            .query(
+                &format!(
+                    "{CANONICAL_BUNDLES}
+                    AND NOT coalesce(progress.complete, false)
+                    AND p.block_height BETWEEN $1 AND $2
+                    ORDER BY p.block_height, p.position, p.id LIMIT $3"
+                ),
+                &[
+                    &sql_height(start)?,
+                    &sql_height(end)?,
+                    &i64::try_from(limit)?,
+                ],
+            )
+            .await?
+            .iter()
+            .map(|row| Ok((row.try_get(0)?, u64::try_from(row.try_get::<_, i64>(1)?)?)))
+            .collect()
+    }
+
+    pub(crate) async fn pending_bundle_after(
+        &self,
+        after: Option<&[u8]>,
+    ) -> Result<Option<(Vec<u8>, u64, u128)>> {
+        ensure!(
+            after.is_none_or(|id| id.len() == 32),
+            "bundle cursor ID must be 32 bytes"
+        );
+        self.client
+            .query_opt(
+                &format!(
+                    "{CANONICAL_BUNDLES}
+                    AND NOT coalesce(progress.complete, false)
+                    AND ($1::bytea IS NULL OR o.id > $1)
+                    ORDER BY o.id LIMIT 1"
+                ),
+                &[&after],
+            )
+            .await?
+            .map(|row| {
+                Ok((
+                    row.try_get(0)?,
+                    u64::try_from(row.try_get::<_, i64>(1)?)?,
+                    row.try_get::<_, String>(2)?.parse()?,
+                ))
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn bundle_status(&self, id: &[u8]) -> Result<Option<(u64, u128, bool)>> {
+        ensure!(id.len() == 32, "bundle root ID must be 32 bytes");
+        self.client
+            .query_opt(&format!("{CANONICAL_BUNDLES} AND o.id=$1"), &[&id])
+            .await?
+            .map(|row| {
+                Ok((
+                    u64::try_from(row.try_get::<_, i64>(1)?)?,
+                    row.try_get::<_, String>(2)?.parse()?,
+                    row.try_get(3)?,
+                ))
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn bundle_complete(&self, id: &[u8]) -> Result<bool> {
+        Ok(self
+            .bundle_status(id)
+            .await?
+            .is_some_and(|(_, _, complete)| complete))
     }
 
     pub(crate) async fn commit_bundle_batch(
@@ -1712,6 +1823,82 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires a canonical bundle root in ar_io_rust_test"]
+    async fn scheduled_bundles_advance_past_pending_roots_and_recheck_coverage() -> Result<()> {
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .try_get(0)?;
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store.client.batch_execute("BEGIN").await?;
+        let result = async {
+            let roots = store
+                .client
+                .query(&format!("{CANONICAL_BUNDLES} ORDER BY o.id LIMIT 1"), &[])
+                .await?
+                .iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get::<_, Vec<u8>>(0)?,
+                        u64::try_from(row.try_get::<_, i64>(1)?)?,
+                        row.try_get::<_, String>(2)?.parse::<u128>()?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(roots.len() == 1, "requires a canonical bundle root");
+            let ids: Vec<_> = roots.iter().map(|(id, _, _)| id.as_slice()).collect();
+            store
+                .client
+                .execute(
+                    "INSERT INTO public.bundle_progress (root_key, complete)
+                     SELECT key, false FROM public.objects WHERE id=ANY($1::bytea[])
+                     ON CONFLICT (root_key) DO UPDATE SET complete=false",
+                    &[&ids],
+                )
+                .await?;
+            ensure!(store.pending_bundle_after(None).await? == Some(roots[0].clone()));
+            ensure!(
+                store.pending_bundle_after(Some(&roots[0].0)).await? != Some(roots[0].clone()),
+                "scheduled discovery repeated its cursor root"
+            );
+            store
+                .client
+                .execute(
+                    "UPDATE public.bundle_progress SET complete=true
+                     WHERE root_key=(SELECT key FROM public.objects WHERE id=$1)",
+                    &[&roots[0].0],
+                )
+                .await?;
+            ensure!(
+                store.bundle_complete(&roots[0].0).await?
+                    && store.pending_bundle_after(None).await? != Some(roots[0].clone()),
+                "a completed root remained eligible for scheduled retrieval"
+            );
+            store
+                .client
+                .execute(
+                    "UPDATE public.block_index_state SET imported_through=NULL WHERE singleton",
+                    &[],
+                )
+                .await?;
+            ensure!(
+                !store.bundle_complete(&roots[0].0).await?
+                    && store.pending_bundle_after(None).await?.is_none(),
+                "bundle completion or discovery survived loss of canonical coverage"
+            );
+            Ok(())
+        }
+        .await;
+        store.client.batch_execute("ROLLBACK").await?;
+        result
+    }
 
     #[tokio::test]
     #[ignore = "requires migration 004 and imported blocks in ar_io_rust_test"]

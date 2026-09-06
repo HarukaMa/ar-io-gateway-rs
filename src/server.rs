@@ -464,6 +464,11 @@ async fn sign_response(
 }
 
 async fn serve_info(State(state): State<Arc<AppState>>) -> Response {
+    let filter = if state.gateway.bundle_indexer.is_some() {
+        serde_json::json!({"always": true})
+    } else {
+        serde_json::json!({"never": true})
+    };
     let mut info = serde_json::json!({
         "programIds": {
             "core": state.config.core_program_id,
@@ -471,8 +476,8 @@ async fn serve_info(State(state): State<Arc<AppState>>) -> Response {
             "arns": state.config.arns_program_id,
             "ant": state.config.ant_program_id,
         },
-        "ans104UnbundleFilter": {"never": true},
-        "ans104IndexFilter": {"never": true},
+        "ans104UnbundleFilter": filter,
+        "ans104IndexFilter": filter,
         "supportedManifestVersions": ["0.1.0", "0.2.0"],
         "release": env!("CARGO_PKG_VERSION"),
         "services": {
@@ -613,12 +618,21 @@ async fn serve_healthcheck(State(state): State<Arc<AppState>>) -> Response {
         "uptime": state.started_at.elapsed().as_secs_f64(),
         "date": date,
     });
+    let last_indexed_at = state
+        .gateway
+        .bundle_indexer
+        .as_ref()
+        .map_or(0, |indexer| indexer.last_indexed_at());
     if let Some(seconds) = state
         .config
         .max_expected_data_item_indexing_interval_seconds
-        && now.duration_since(UNIX_EPOCH).unwrap().as_secs() > seconds
+        && now
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(last_indexed_at)
+            > seconds
     {
-        // No data item has been indexed, so the last-indexed timestamp is zero.
         health["status"] = serde_json::json!("unhealthy");
         health["reasons"] = serde_json::json!([format!(
             "Last data item indexed more than {seconds} seconds ago."
@@ -2525,6 +2539,7 @@ mod tests {
                 content_encoding: None,
                 etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
                 sha256: super::super::hex(&digest),
+                indexing_root: None,
             },
             1,
             1024,
@@ -2644,6 +2659,7 @@ mod tests {
             content_length: bytes.len(),
             etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
             sha256: super::super::hex(&digest),
+            indexing_root: None,
         }
     }
 
@@ -2912,6 +2928,7 @@ mod tests {
             content_length: 5,
             etag: format!("\"{digest_url}\""),
             sha256: super::super::hex(&digest),
+            indexing_root: None,
         };
         let resolution = Resolution {
             name: "lolcchekc".to_owned(),

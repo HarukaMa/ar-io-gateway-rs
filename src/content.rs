@@ -277,28 +277,35 @@ impl Content {
     }
 
     pub async fn hashes(&self) -> Result<([u8; 32], [u8; 48])> {
-        let mut sha256 = Sha256::new();
-        let mut sha384 = Sha384::new();
-        if let Some(bytes) = self.memory_bytes() {
-            for chunk in bytes.chunks(IO_CHUNK_SIZE) {
-                sha256.update(chunk);
-                sha384.update(chunk);
-                tokio::task::coop::consume_budget().await;
-            }
-        } else {
-            let mut reader = self.reader().await?;
-            // An inline array inflates every enclosing retrieval future on Windows.
-            let mut buffer = vec![0; IO_CHUNK_SIZE];
-            loop {
-                let length = reader.read(&mut buffer).await?;
-                if length == 0 {
-                    break;
+        let content = self.clone();
+        crate::cpu_work(move || {
+            let mut sha256 = Sha256::new();
+            let mut sha384 = Sha384::new();
+            match &content.0 {
+                Storage::Memory { bytes, .. } => {
+                    sha256.update(bytes);
+                    sha384.update(bytes);
                 }
-                sha256.update(&buffer[..length]);
-                sha384.update(&buffer[..length]);
+                Storage::File { file, offset, len } => {
+                    let mut buffer = vec![0; IO_CHUNK_SIZE.min(*len)];
+                    for start in (0..*len).step_by(IO_CHUNK_SIZE) {
+                        let length = IO_CHUNK_SIZE.min(len - start);
+                        let position = offset
+                            .checked_add(start)
+                            .context("content offset overflow")?;
+                        file.read_exact_at(
+                            &mut buffer[..length],
+                            u64::try_from(position)
+                                .context("content offset exceeds file limits")?,
+                        )?;
+                        sha256.update(&buffer[..length]);
+                        sha384.update(&buffer[..length]);
+                    }
+                }
             }
-        }
-        Ok((sha256.finalize().into(), sha384.finalize().into()))
+            Ok((sha256.finalize().into(), sha384.finalize().into()))
+        })
+        .await
     }
 
     pub async fn reader(&self) -> Result<ContentReader> {

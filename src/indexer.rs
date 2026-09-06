@@ -1,7 +1,10 @@
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 use tokio::time::timeout;
 
 use crate::{
@@ -34,6 +37,66 @@ pub struct BundleSummary {
     pub end_height: u64,
     pub imported_roots: u64,
     pub imported_occurrences: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct RootFacts {
+    pub(crate) block_hash: [u8; 48],
+    pub(crate) timestamp: u64,
+    pub(crate) transaction_ids: Vec<Vec<u8>>,
+    pub(crate) object: ObjectMetadata,
+}
+
+impl RootFacts {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let ObjectMetadata {
+            id,
+            kind: _,
+            signature,
+            anchor,
+            owner_address,
+            owner_public_key,
+            target,
+            data_size: _,
+            content_type,
+            content_encoding,
+            signature_type: _,
+            format: _,
+            quantity,
+            reward,
+            denomination: _,
+            data_root,
+            tags,
+        } = &self.object;
+        let mut bytes = self.transaction_ids.capacity() * std::mem::size_of::<Vec<u8>>();
+        for id in &self.transaction_ids {
+            bytes = bytes.saturating_add(id.capacity());
+        }
+        for value in [
+            id,
+            signature,
+            anchor,
+            owner_address,
+            owner_public_key,
+            target,
+        ] {
+            bytes = bytes.saturating_add(value.capacity());
+        }
+        for value in [content_type, content_encoding, quantity, reward]
+            .into_iter()
+            .flatten()
+        {
+            bytes = bytes.saturating_add(value.capacity());
+        }
+        bytes = bytes.saturating_add(data_root.as_ref().map_or(0, Vec::capacity));
+        bytes = bytes.saturating_add(tags.capacity() * std::mem::size_of::<(Vec<u8>, Vec<u8>)>());
+        for (name, value) in tags {
+            bytes = bytes
+                .saturating_add(name.capacity())
+                .saturating_add(value.capacity());
+        }
+        bytes
+    }
 }
 
 pub async fn import_range(
@@ -330,8 +393,8 @@ pub async fn import_metadata(
                     }
                     header
                 };
-                let verified = gateway
-                    .verify_block_transactions(&header, object, fetched_bytes)
+                let (_, verified) = gateway
+                    .verify_block_transactions(header, object, fetched_bytes)
                     .await?;
                 authenticated_objects = verified
                     .into_iter()
@@ -415,45 +478,13 @@ pub async fn import_bundles(
             break;
         };
         let encoded_id = URL_SAFE_NO_PAD.encode(&root_id);
-        timeout(gateway.config.retrieval_timeout, async {
-            let (root, tags) = gateway.retrieve_direct_with_tags(&encoded_id).await?;
+        summary.imported_occurrences += timeout(gateway.config.retrieval_timeout, async {
+            let root = gateway.retrieve_direct_with_tags(&encoded_id).await?;
             ensure!(
-                root.block_height == height,
+                root.data.block_height == height,
                 "bundle root canonical height changed"
             );
-            require_bundle_tags(&tags)?;
-            let root_id = root_id
-                .as_slice()
-                .try_into()
-                .context("invalid bundle root ID")?;
-            let mut traversal = BundleTraversal::new(root.bytes, root_id).await?;
-            loop {
-                let (count, complete) = timeout(deadline, async {
-                    let mut objects = Vec::with_capacity(256);
-                    let mut locations = Vec::with_capacity(256);
-                    let mut complete = false;
-                    while locations.len() < 256 {
-                        let Some((object, location)) = traversal.next().await? else {
-                            complete = true;
-                            break;
-                        };
-                        objects.push(object);
-                        locations.push(location);
-                    }
-                    store
-                        .commit_bundle_batch(root_id, &objects, &locations, complete)
-                        .await?;
-                    Ok::<_, anyhow::Error>((locations.len() as u64, complete))
-                })
-                .await
-                .with_context(|| format!("indexing bundle {encoded_id} batch timed out"))?
-                .with_context(|| format!("indexing bundle {encoded_id}"))?;
-                summary.imported_occurrences += count;
-                if complete {
-                    break;
-                }
-            }
-            Ok::<_, anyhow::Error>(())
+            index_bundle_content(gateway, store, root).await
         })
         .await
         .with_context(|| format!("retrieving and indexing bundle {encoded_id} timed out"))??;
@@ -465,6 +496,145 @@ pub async fn import_bundles(
             .context("bundle statistics refresh timed out")??;
     }
     Ok(summary)
+}
+
+pub(crate) async fn index_bundle_content(
+    gateway: &Gateway,
+    store: &mut BlockStore,
+    bundle: std::sync::Arc<crate::VerifiedRoot>,
+) -> Result<u64> {
+    let crate::VerifiedRoot {
+        data: root,
+        tags,
+        facts,
+    } = bundle.as_ref();
+    let encoded_id = &root.id;
+    let reused_facts = facts.is_some();
+    timeout(gateway.config.retrieval_timeout, async {
+        let root_id = crate::decode_fixed::<32>(encoded_id, "bundle root ID")?;
+        require_bundle_tags(tags)?;
+        let deadline = gateway.config.request_timeout;
+        let status = timeout(deadline, async {
+            let state = store
+                .state()
+                .await?
+                .context("block index is not initialized")?;
+            ensure!(
+                state.source == gateway.config.trusted_node_url,
+                "trusted node source does not match stored import"
+            );
+            ensure!(
+                root.block_height >= state.start_height
+                    && state
+                        .imported_through
+                        .is_some_and(|through| root.block_height <= through),
+                "bundle root is outside imported block-index coverage"
+            );
+            store.bundle_status(&root_id).await
+        })
+        .await
+        .context("bundle metadata lookup timed out")??;
+        if status.is_some_and(|(_, _, complete)| complete) {
+            return Ok(0);
+        }
+
+        if let Some(facts) = facts {
+            ensure!(
+                facts.object.id.as_slice() == root_id
+                    && facts.object.kind == 0
+                    && facts.object.data_size == root.bytes.len() as u128,
+                "authenticated bundle root metadata does not match verified content"
+            );
+            ensure!(
+                facts.object.tags.len() == tags.len(),
+                "authenticated bundle root tags differ"
+            );
+            for (tag, (name, value)) in tags.iter().zip(&facts.object.tags) {
+                ensure!(
+                    decode_b64(&tag.name, "tag name")? == *name
+                        && decode_b64(&tag.value, "tag value")? == *value,
+                    "authenticated bundle root tags differ"
+                );
+            }
+            timeout(deadline, async {
+                let (_, block) = store
+                    .block_pair(root.block_height)
+                    .await?
+                    .context("bundle root has no imported canonical block pair")?;
+                ensure!(
+                    block.hash.as_slice() == facts.block_hash,
+                    "authenticated bundle root block changed"
+                );
+                store
+                    .record_bundle_root(
+                        &block,
+                        facts.timestamp,
+                        &facts.transaction_ids,
+                        &facts.object,
+                        &gateway.config.trusted_node_url,
+                    )
+                    .await
+            })
+            .await
+            .context("recording authenticated bundle root timed out")??;
+        } else if status.is_none() {
+            import_metadata(gateway, store, root.block_height, root.block_height).await?;
+        }
+        let (height, size, complete) = match status {
+            Some(status) => status,
+            None => timeout(deadline, store.bundle_status(&root_id))
+                .await
+                .context("bundle metadata lookup timed out")??
+                .context("bundle root lacks completed canonical ANS-104 metadata")?,
+        };
+        ensure!(
+            height == root.block_height && size == root.bytes.len() as u128,
+            "canonical bundle root metadata does not match verified content"
+        );
+        if complete {
+            return Ok(0);
+        }
+
+        let mut traversal = BundleTraversal::new(root.bytes.clone(), &root_id).await?;
+        let mut occurrences = 0;
+        let mut verification_time = Duration::ZERO;
+        let mut persistence_time = Duration::ZERO;
+        loop {
+            let (count, complete) = timeout(deadline, async {
+                let started = Instant::now();
+                let mut objects = Vec::with_capacity(256);
+                let mut locations = Vec::with_capacity(256);
+                let mut complete = false;
+                while locations.len() < 256 {
+                    let Some((object, location)) = traversal.next().await? else {
+                        complete = true;
+                        break;
+                    };
+                    objects.push(object);
+                    locations.push(location);
+                }
+                verification_time += started.elapsed();
+                let started = Instant::now();
+                store
+                    .commit_bundle_batch(&root_id, &objects, &locations, complete)
+                    .await?;
+                persistence_time += started.elapsed();
+                Ok::<_, anyhow::Error>((locations.len() as u64, complete))
+            })
+            .await
+            .with_context(|| format!("indexing bundle {encoded_id} batch timed out"))??;
+            occurrences += count;
+            if complete {
+                eprintln!(
+                    "indexed bundle {encoded_id}: occurrences={occurrences} cache_hit={} reused_root_facts={reused_facts} item_verification_ms={} persistence_ms={}",
+                    root.cache_hit, verification_time.as_millis(), persistence_time.as_millis(),
+                );
+                return Ok(occurrences);
+            }
+        }
+    })
+    .await
+    .with_context(|| format!("indexing bundle {encoded_id} timed out"))?
 }
 
 struct BundleFrame {

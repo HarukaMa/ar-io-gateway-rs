@@ -1,3 +1,4 @@
+pub mod background;
 pub mod content;
 pub mod database;
 mod disk_cache;
@@ -11,8 +12,8 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
     path::PathBuf,
-    sync::{Arc, Mutex, Weak},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -128,6 +129,87 @@ pub struct VerifiedData {
     pub content_length: usize,
     pub etag: String,
     pub sha256: String,
+    #[serde(skip_serializing)]
+    indexing_root: Option<Arc<VerifiedRoot>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct VerifiedRoot {
+    data: VerifiedData,
+    tags: Vec<Tag>,
+    facts: Option<indexer::RootFacts>,
+}
+
+impl VerifiedRoot {
+    fn verified(self: &Arc<Self>) -> VerifiedData {
+        let mut data = self.data.clone();
+        data.indexing_root = Some(Arc::clone(self));
+        data
+    }
+
+    fn metadata_bytes(&self) -> usize {
+        self.tags.iter().fold(
+            std::mem::size_of::<Self>()
+                .saturating_add(self.data.string_bytes())
+                .saturating_add(self.tags.capacity() * std::mem::size_of::<Tag>())
+                .saturating_add(self.facts.as_ref().map_or(0, |facts| facts.heap_bytes())),
+            |bytes, tag| {
+                bytes
+                    .saturating_add(tag.name.capacity())
+                    .saturating_add(tag.value.capacity())
+            },
+        )
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.metadata_bytes()
+            .saturating_add(self.data.bytes.persistent_blob().map_or_else(
+                || self.data.bytes.len().max(self.data.bytes.resident_len()),
+                |(_, size, _)| size,
+            ))
+    }
+}
+
+impl VerifiedData {
+    fn string_bytes(&self) -> usize {
+        self.id
+            .capacity()
+            .saturating_add(self.content_type.capacity())
+            .saturating_add(self.content_encoding.as_ref().map_or(0, String::capacity))
+            .saturating_add(self.etag.capacity())
+            .saturating_add(self.sha256.capacity())
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.string_bytes().saturating_add(
+            self.indexing_root
+                .as_ref()
+                .map_or_else(|| self.bytes.resident_len(), |root| root.retained_bytes()),
+        )
+    }
+}
+
+tokio::task_local! {
+    static BACKGROUND_CPU: ();
+}
+
+async fn cpu_work<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    static HTTP_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    static BACKGROUND_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let jobs = if BACKGROUND_CPU.try_with(|()| ()).is_ok() {
+        &BACKGROUND_JOBS
+    } else {
+        &HTTP_JOBS
+    };
+    let permit = jobs.acquire().await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .context("CPU verification task failed")?
 }
 
 #[derive(Serialize, Deserialize)]
@@ -197,12 +279,12 @@ impl ContentCache {
     }
 
     fn insert(&mut self, data: VerifiedData, max_entries: usize, max_bytes: usize) {
-        let size = data.bytes.resident_len();
+        let size = data.cache_bytes();
         if !data.bytes.is_memory() || max_entries == 0 || size > max_bytes || max_bytes == 0 {
             return;
         }
         if let Some((old, _)) = self.entries.remove(&data.id) {
-            self.bytes -= old.bytes.resident_len();
+            self.bytes -= old.cache_bytes();
         }
         // ponytail: bounded O(n) eviction, use an ordered LRU if insertion throughput demands it.
         while self.entries.len() >= max_entries || self.bytes > max_bytes - size {
@@ -212,7 +294,7 @@ impl ContentCache {
                 .min_by_key(|(_, (_, accessed))| *accessed)
                 .map(|(id, _)| id.clone())
                 .unwrap();
-            self.bytes -= self.entries.remove(&victim).unwrap().0.bytes.resident_len();
+            self.bytes -= self.entries.remove(&victim).unwrap().0.cache_bytes();
         }
         self.clock += 1;
         self.bytes += size;
@@ -247,7 +329,8 @@ pub struct Gateway {
     block_store: Option<database::BlockStore>,
     spool_budget: Arc<SpoolBudget>,
     disk_cache: Option<disk_cache::DiskCache>,
-    direct_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    direct_cache: Arc<Mutex<ContentCache>>,
+    bundle_indexer: Option<background::BundleSubmitter>,
 }
 
 impl Gateway {
@@ -279,7 +362,8 @@ impl Gateway {
             peers,
             block_store: None,
             disk_cache: None,
-            direct_locks: Mutex::new(HashMap::new()),
+            direct_cache: Arc::new(Mutex::new(ContentCache::default())),
+            bundle_indexer: None,
         })
     }
 
@@ -306,6 +390,25 @@ impl Gateway {
             disk_cache::DiskCache::new(path, min_free_bytes, self.config.max_spool_bytes).await?,
         );
         Ok(self)
+    }
+
+    pub async fn with_bundle_indexing(
+        mut self,
+        database_url: &str,
+    ) -> Result<(Self, background::BundleWorker)> {
+        ensure!(
+            self.block_store.is_some(),
+            "bundle indexing requires an initialized database"
+        );
+        let (submitter, worker) = background::start(
+            self.config.clone(),
+            self.disk_cache.clone(),
+            database_url.to_owned(),
+            Arc::clone(&self.direct_cache),
+        )
+        .await?;
+        self.bundle_indexer = Some(submitter);
+        Ok((self, worker))
     }
 
     async fn load_content_cache(
@@ -352,6 +455,7 @@ impl Gateway {
                 etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
                 sha256: hex(&digest),
                 cache_hit: true,
+                indexing_root: None,
             },
             entry.tags,
         )))
@@ -409,37 +513,52 @@ impl Gateway {
 
     pub async fn retrieve(&self, id: &str) -> Result<VerifiedData> {
         decode_fixed::<32>(id, "data ID")?;
-        self.retrieve_cached(id, async {
-            if let Some((data, _)) = self.load_content_cache(id).await? {
-                return Ok(data);
-            }
-            match self.discover(id).await? {
-                Some(hint) => self.retrieve_bundled_with_hint(id, hint).await,
-                None => self.retrieve_direct(id).await,
-            }
-        })
-        .await
+        let data = self
+            .retrieve_cached(&self.cache, id, true, async {
+                if let Some((mut data, tags)) = self.load_content_cache(id).await? {
+                    if let Some(tags) = tags {
+                        data = Arc::new(VerifiedRoot {
+                            data,
+                            tags,
+                            facts: None,
+                        })
+                        .verified();
+                    }
+                    return Ok(data);
+                }
+                match self.discover(id).await? {
+                    Some(hint) => self.retrieve_bundled_with_hint(id, hint).await,
+                    None => self.retrieve_direct(id).await,
+                }
+            })
+            .await?;
+        if let (Some(indexer), Some(root)) = (&self.bundle_indexer, &data.indexing_root) {
+            indexer.submit(root);
+        }
+        Ok(data)
     }
 
     async fn retrieve_cached(
         &self,
+        cache: &Mutex<ContentCache>,
         id: &str,
+        cache_result: bool,
         retrieve: impl Future<Output = Result<VerifiedData>>,
     ) -> Result<VerifiedData> {
         let (mut receiver, leader) = {
-            let mut cache = self.cache.lock().unwrap();
-            if let Some(data) = cache.get(id) {
+            let mut state = cache.lock().unwrap();
+            if let Some(data) = state.get(id) {
                 return Ok(data);
             }
-            match cache.inflight.get(id) {
+            match state.inflight.get(id) {
                 Some(sender) => (sender.subscribe(), None),
                 None => {
                     let (sender, receiver) = tokio::sync::watch::channel(None);
-                    cache.inflight.insert(id.to_owned(), sender);
+                    state.inflight.insert(id.to_owned(), sender);
                     (
                         receiver,
                         Some(RetrievalLeader {
-                            cache: &self.cache,
+                            cache,
                             id,
                             completed: false,
                         }),
@@ -453,8 +572,8 @@ impl Gateway {
                 .context("verified retrieval timed out")
                 .and_then(|result| result);
             {
-                let mut cache = self.cache.lock().unwrap();
-                if let Ok(data) = &result {
+                let mut cache = cache.lock().unwrap();
+                if cache_result && let Ok(data) = &result {
                     cache.insert(
                         data.clone(),
                         self.config.cache_max_entries,
@@ -492,13 +611,13 @@ impl Gateway {
     }
 
     pub async fn retrieve_direct(&self, id: &str) -> Result<VerifiedData> {
-        let (verified, _) = tokio::time::timeout(
+        let root = tokio::time::timeout(
             self.config.retrieval_timeout,
             self.retrieve_direct_with_tags(id),
         )
         .await
         .context("verified retrieval timed out")??;
-        Ok(verified)
+        Ok(root.verified())
     }
 
     pub async fn retrieve_bundled(&self, id: &str) -> Result<VerifiedData> {
@@ -567,14 +686,15 @@ impl Gateway {
                 self.peers.record_result(source, false);
                 continue;
             };
-            let proof = match verify_chunk_proof(candidate, offset, &geometry) {
-                Ok(proof) => proof,
-                Err(error) => {
-                    self.peers.record_result(source, false);
-                    invalid.push(format!("{source}: {error:#}"));
-                    continue;
-                }
-            };
+            let proof =
+                match cpu_work(move || verify_chunk_proof(candidate, offset, &geometry)).await {
+                    Ok(proof) => proof,
+                    Err(error) => {
+                        self.peers.record_result(source, false);
+                        invalid.push(format!("{source}: {error:#}"));
+                        continue;
+                    }
+                };
             let start_offset = proof
                 .first_offset
                 .checked_add(proof.data.start)
@@ -760,23 +880,24 @@ impl Gateway {
             ),
         };
         let hinted_size = checked_data_size(size, self.config.max_data_size)?;
-        let (parent, parent_tags) =
-            self.retrieve_direct_with_tags(&parent_id)
-                .await
-                .map_err(|error| {
-                    if error.is::<ContentNotFound>() {
-                        anyhow::anyhow!("bundle parent transaction {parent_id} was not found")
-                    } else {
-                        error
-                    }
-                })?;
-        require_bundle_tags(&parent_tags)?;
+        let parent_root = self
+            .retrieve_direct_with_tags(&parent_id)
+            .await
+            .map_err(|error| {
+                if error.is::<ContentNotFound>() {
+                    anyhow::anyhow!("bundle parent transaction {parent_id} was not found")
+                } else {
+                    error
+                }
+            })?;
+        let parent = &parent_root.data;
+        require_bundle_tags(&parent_root.tags)?;
         let item = match &hint {
             BundleHint::Indexed(indexed) => {
-                verify_indexed_bundle(parent.bytes, &expected_id, indexed).await?
+                verify_indexed_bundle(parent.bytes.clone(), &expected_id, indexed).await?
             }
             BundleHint::External { .. } => {
-                verify_bundle_item(parent.bytes, &expected_id, None)
+                verify_bundle_item(parent.bytes.clone(), &expected_id, None)
                     .await?
                     .0
             }
@@ -799,6 +920,7 @@ impl Gateway {
             content_encoding,
             etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
             sha256: hex(&body_hash),
+            indexing_root: Some(Arc::clone(&parent_root)),
         };
         if let Err(error) = self.save_content_cache(&mut data, None).await {
             eprintln!("content cache admission failed: {error:#}");
@@ -847,34 +969,50 @@ impl Gateway {
         }))
     }
 
-    async fn retrieve_direct_with_tags(&self, id: &str) -> Result<(VerifiedData, Vec<Tag>)> {
-        if self.disk_cache.is_none() {
-            return self.fetch_direct_with_tags(id).await;
+    async fn retrieve_direct_with_tags(&self, id: &str) -> Result<Arc<VerifiedRoot>> {
+        let data = self
+            .retrieve_cached(&self.direct_cache, id, false, async {
+                let root = if let Some((data, Some(tags))) = self.load_content_cache(id).await? {
+                    VerifiedRoot {
+                        data,
+                        tags,
+                        facts: None,
+                    }
+                } else {
+                    let started = Instant::now();
+                    let (mut data, tags, facts) = self.fetch_direct_with_tags(id).await?;
+                    if facts.is_some() {
+                        eprintln!(
+                            "verified bundle root {id}: retrieval_ms={}",
+                            started.elapsed().as_millis()
+                        );
+                    }
+                    if let Err(error) = self.save_content_cache(&mut data, Some(tags.clone())).await
+                    {
+                        eprintln!("content cache admission failed: {error:#}");
+                    }
+                    VerifiedRoot { data, tags, facts }
+                };
+                Ok(Arc::new(root).verified())
+            })
+            .await?;
+        let root = data
+            .indexing_root
+            .context("direct retrieval lacks root metadata")?;
+        ensure!(
+            root.data.bytes.len() <= self.config.max_data_size,
+            "shared root exceeds size limit"
+        );
+        if let Some(indexer) = &self.bundle_indexer {
+            indexer.submit(&root);
         }
-        let lock = {
-            let mut locks = self.direct_locks.lock().unwrap();
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(id).and_then(Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(id.to_owned(), Arc::downgrade(&lock));
-                    lock
-                }
-            }
-        };
-        let _guard = lock.lock().await;
-        if let Some((data, Some(tags))) = self.load_content_cache(id).await? {
-            return Ok((data, tags));
-        }
-        let (mut data, tags) = self.fetch_direct_with_tags(id).await?;
-        if let Err(error) = self.save_content_cache(&mut data, Some(tags.clone())).await {
-            eprintln!("content cache admission failed: {error:#}");
-        }
-        Ok((data, tags))
+        Ok(root)
     }
 
-    async fn fetch_direct_with_tags(&self, id: &str) -> Result<(VerifiedData, Vec<Tag>)> {
+    async fn fetch_direct_with_tags(
+        &self,
+        id: &str,
+    ) -> Result<(VerifiedData, Vec<Tag>, Option<indexer::RootFacts>)> {
         decode_fixed::<32>(id, "transaction ID")?;
 
         let status_url = endpoint(&self.config.archive_url, &format!("tx/{id}/status"));
@@ -942,7 +1080,7 @@ impl Gateway {
             block.hash == status.block_indep_hash,
             "archival status does not match the trusted block index"
         );
-        let header = self
+        let mut header = self
             .authenticate_block(block, status.block_height, Some(id))
             .await?;
 
@@ -950,6 +1088,9 @@ impl Gateway {
         let (transaction, mut verified) = self
             .fetch_transaction(id, status.block_height, &mut remaining)
             .await?;
+        let root_metadata = (self.bundle_indexer.is_some()
+            && require_bundle_tags(&transaction.tags).is_ok())
+        .then(|| verified.metadata.clone());
         let data_size = verified.metadata.data_size;
         let content_encoding =
             response_content_encoding(verified.metadata.content_encoding.take())?;
@@ -971,11 +1112,32 @@ impl Gateway {
             }
             // Legacy signatures bind concatenated fields, not the data boundary.
             // Authenticate the ID-to-payload association before returning inline bytes.
-            self.verify_block_transactions(&header, verified.metadata, usize::MAX - remaining)
+            (header, _) = self
+                .verify_block_transactions(header, verified.metadata, usize::MAX - remaining)
                 .await?;
         }
+        let facts = root_metadata
+            .map(|object| {
+                Ok::<_, anyhow::Error>(indexer::RootFacts {
+                    block_hash: decode_fixed::<48>(&block.hash, "bundle block hash")?,
+                    timestamp: header.timestamp,
+                    transaction_ids: header
+                        .txs
+                        .iter()
+                        .map(|id| {
+                            decode_fixed::<32>(id, "block transaction ID").map(|id| id.to_vec())
+                        })
+                        .collect::<Result<_>>()?,
+                    object,
+                })
+            })
+            .transpose()?;
         if let Some(bytes) = verified.inline_data {
-            let body_hash = sha256(&[&bytes]);
+            let (bytes, body_hash) = cpu_work(move || {
+                let body_hash = sha256(&[&bytes]);
+                Ok((bytes, body_hash))
+            })
+            .await?;
             let content_length = bytes.len();
             return Ok((
                 VerifiedData {
@@ -988,8 +1150,10 @@ impl Gateway {
                     content_length,
                     etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
                     sha256: hex(&body_hash),
+                    indexing_root: None,
                 },
                 transaction.tags,
+                facts,
             ));
         }
 
@@ -1082,8 +1246,10 @@ impl Gateway {
                 content_length: expected_len,
                 etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
                 sha256: hex(&body_hash),
+                indexing_root: None,
             },
             transaction.tags,
+            facts,
         ))
     }
 
@@ -1140,12 +1306,17 @@ impl Gateway {
                     );
                 }
                 let value = read_json_response_with_limit(response, limit, remaining_bytes).await?;
-                let mut transaction = transactions::decode_transaction(value)?;
+                let transaction = transactions::decode_transaction(value)?;
                 ensure!(
                     trusted || !transaction.owner.is_empty(),
-                    "ECDSA transactions require trusted-node metadata"
+                    "ECDSA transactions require trusted node metadata"
                 );
-                let verified = verify_transaction(&transaction, id, height)?;
+                let expected_id = id.to_owned();
+                let (mut transaction, verified) = cpu_work(move || {
+                    let verified = verify_transaction(&transaction, &expected_id, height)?;
+                    Ok((transaction, verified))
+                })
+                .await?;
                 ensure!(
                     verified
                         .inline_data
@@ -1167,10 +1338,10 @@ impl Gateway {
 
     async fn verify_block_transactions(
         &self,
-        block: &BlockHeader,
+        block: BlockHeader,
         first: database::ObjectMetadata,
         fetched_bytes: usize,
-    ) -> Result<Vec<database::ObjectMetadata>> {
+    ) -> Result<(BlockHeader, Vec<database::ObjectMetadata>)> {
         ensure!(
             block.txs.len() <= MAX_BLOCK_TRANSACTIONS,
             "block transaction count exceeds verification limit"
@@ -1195,8 +1366,11 @@ impl Gateway {
             }
             tokio::task::yield_now().await;
         }
-        transactions::verify_block_data_root(block, &mut objects)?;
-        Ok(objects)
+        cpu_work(move || {
+            transactions::verify_block_data_root(&block, &mut objects)?;
+            Ok((block, objects))
+        })
+        .await
     }
 
     async fn authenticate_block(
@@ -1286,7 +1460,7 @@ impl Gateway {
             "block header identifier mismatch"
         );
         if height < 422_250 {
-            historical::verify_legacy_header(&mut block, entry, &self.client).await?;
+            block = historical::verify_legacy_header(block, entry.clone(), &self.client).await?;
             if let Some(transaction_id) = transaction_id {
                 ensure!(
                     block.txs.iter().any(|id| id == transaction_id),
@@ -1294,7 +1468,13 @@ impl Gateway {
                 );
             }
         } else {
-            verify_block_header(&block, entry, height, transaction_id)?;
+            let entry = entry.clone();
+            let transaction_id = transaction_id.map(str::to_owned);
+            block = cpu_work(move || {
+                verify_block_header(&block, &entry, height, transaction_id.as_deref())?;
+                Ok(block)
+            })
+            .await?;
         }
         Ok(block)
     }
@@ -1337,7 +1517,9 @@ impl Gateway {
                         &discovered,
                     ))
                     .await?;
-                verify_chunk(chunk, absolute_offset, relative_offset, geometry)
+                let geometry = *geometry;
+                cpu_work(move || verify_chunk(chunk, absolute_offset, relative_offset, &geometry))
+                    .await
             }
             .await;
 
@@ -1457,7 +1639,7 @@ struct TrustedBlockIndexEntry {
     weave_size: u128,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct BlockIndexEntry {
     tx_root: String,
     weave_size: String,
@@ -2103,7 +2285,7 @@ struct Transaction {
     denomination: u32,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Tag {
     name: String,
     value: String,
@@ -2162,6 +2344,7 @@ struct JsonChunk {
     tx_path: String,
 }
 
+#[derive(Clone, Copy)]
 struct Geometry {
     tx_root: [u8; 32],
     data_root: [u8; 32],
@@ -2172,6 +2355,7 @@ struct Geometry {
     data_size: u128,
 }
 
+#[derive(Clone, Copy)]
 struct BlockGeometry {
     tx_root: [u8; 32],
     block_weave_size: u128,
@@ -2693,17 +2877,25 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
     } else {
         data_item_signature_payload(signature_type, owner, target, anchor, raw_tags, data_hash)
     };
-    verify_data_item_signature(signature_type, owner, signature, &payload)?;
+    let signature_bytes = header.slice_ref(signature);
+    let owner_bytes = header.slice_ref(owner);
+    let target_bytes = header.slice_ref(target);
+    let anchor_bytes = header.slice_ref(anchor);
+    let (signature_bytes, owner_bytes) = cpu_work(move || {
+        verify_data_item_signature(signature_type, &owner_bytes, &signature_bytes, &payload)?;
+        Ok((signature_bytes, owner_bytes))
+    })
+    .await?;
 
     Ok(VerifiedItem {
         data,
         data_offset: cursor,
         body_hash,
         signature_type,
-        signature: header.slice_ref(signature),
-        owner: header.slice_ref(owner),
-        target: header.slice_ref(target),
-        anchor: header.slice_ref(anchor),
+        signature: signature_bytes,
+        owner: owner_bytes,
+        target: target_bytes,
+        anchor: anchor_bytes,
         tags,
     })
 }
@@ -3624,6 +3816,7 @@ mod tests {
         String,
         Arc<std::sync::atomic::AtomicBool>,
         tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
     ) {
         use axum::{Router, http::StatusCode, response::IntoResponse};
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -3765,7 +3958,12 @@ mod tests {
         );
         let corrupt_chunk = Arc::new(AtomicBool::new(false));
         let corrupt = corrupt_chunk.clone();
+        let chunk_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&chunk_requests);
         let app = Router::new().fallback(move |uri: axum::http::Uri| {
+            if uri.path() == "/chunk/1" {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
             let response = responses.get(uri.path()).cloned();
             let corrupt = uri.path() == "/chunk/1" && corrupt.load(Ordering::SeqCst);
             async move {
@@ -3796,7 +3994,29 @@ mod tests {
         )
         .unwrap();
         let requested = bundled_item.map_or(id, |(id, _)| id.to_owned());
-        (gateway, requested, corrupt_chunk, server)
+        (gateway, requested, corrupt_chunk, server, chunk_requests)
+    }
+
+    #[tokio::test]
+    async fn concurrent_gateways_share_verified_root_without_disk_cache() {
+        let (gateway, id, corrupt, server, requests) =
+            retrieval_fixture(b"shared root", &[], None).await;
+        let mut worker = Gateway::new(gateway.config.clone()).unwrap();
+        worker.direct_cache = Arc::clone(&gateway.direct_cache);
+        let (requested, scheduled) = tokio::join!(
+            gateway.retrieve_direct_with_tags(&id),
+            worker.retrieve_direct_with_tags(&id),
+        );
+        for root in [requested.unwrap(), scheduled.unwrap()] {
+            assert_eq!(
+                root.data.bytes.read_all(11).await.unwrap().as_ref(),
+                b"shared root"
+            );
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::Relaxed), 1);
+        corrupt.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(gateway.retrieve_direct_with_tags(&id).await.is_err());
+        server.abort();
     }
 
     #[tokio::test]
@@ -3819,7 +4039,7 @@ mod tests {
             let bundle = encode_bundle(&[&item]);
             let parent_tags: &[(&[u8], &[u8])] =
                 &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
-            let (gateway, id, corrupt_chunk, server) = if bundled {
+            let (gateway, id, corrupt_chunk, server, _) = if bundled {
                 retrieval_fixture(&bundle, parent_tags, Some((&item_id, ENCODED.len()))).await
             } else {
                 retrieval_fixture(ENCODED, tags, None).await
@@ -3851,7 +4071,7 @@ mod tests {
             assert!(!follower.unwrap_err().is::<ContentNotFound>());
             server.abort();
         }
-        let (gateway, id, _, server) = retrieval_fixture(b"", tags, None).await;
+        let (gateway, id, _, server, _) = retrieval_fixture(b"", tags, None).await;
         let verified = gateway.retrieve(&id).await.unwrap();
         assert_eq!(verified.content_encoding.as_deref(), Some("gzip"));
         assert_eq!(verified.content_length, 0);
@@ -3862,7 +4082,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_signed_encoding_that_cannot_be_an_http_header() {
         let tags: &[(&[u8], &[u8])] = &[(b"Content-Encoding", b"gzip\r\nX-Injected: true")];
-        let (gateway, id, _, server) = retrieval_fixture(b"wire bytes", tags, None).await;
+        let (gateway, id, _, server, _) = retrieval_fixture(b"wire bytes", tags, None).await;
         let error = gateway.retrieve(&id).await.unwrap_err();
         assert!(!error.is::<ContentNotFound>());
         server.abort();
@@ -4498,6 +4718,7 @@ mod cache_tests {
             content_length: 5,
             etag: String::new(),
             sha256: String::new(),
+            indexing_root: None,
         }
     }
 
@@ -4517,7 +4738,7 @@ mod cache_tests {
 
     #[test]
     fn bounds_cache_and_retains_recently_used_content() {
-        for (entries, bytes) in [(2, 100), (100, 10)] {
+        for (entries, bytes) in [(2, 1024), (100, data("a").cache_bytes() * 2)] {
             let mut cache = ContentCache::default();
             cache.insert(data("a"), entries, bytes);
             cache.insert(data("b"), entries, bytes);
@@ -4544,32 +4765,38 @@ mod cache_tests {
             gateway.config.cache_max_bytes = limit;
             let id = limit.to_string();
             let (leader, follower) = tokio::join!(
-                gateway.retrieve_cached(&id, async {
+                gateway.retrieve_cached(&gateway.cache, &id, true, async {
                     tokio::task::yield_now().await;
                     Ok(data(&id))
                 }),
-                gateway.retrieve_cached(&id, async { panic!("duplicate retrieval") })
+                gateway.retrieve_cached(&gateway.cache, &id, true, async {
+                    panic!("duplicate retrieval")
+                })
             );
             let leader = leader.unwrap();
             let follower = follower.unwrap();
             assert!(!leader.cache_hit && !follower.cache_hit);
             let next = gateway
-                .retrieve_cached(&id, async { Ok(data(&id)) })
+                .retrieve_cached(&gateway.cache, &id, true, async { Ok(data(&id)) })
                 .await
                 .unwrap();
             assert_eq!(next.cache_hit, limit >= 5);
         }
         let (leader, follower) = tokio::join!(
-            gateway.retrieve_cached("failure", async {
+            gateway.retrieve_cached(&gateway.cache, "failure", true, async {
                 tokio::task::yield_now().await;
                 bail!("bad proof")
             }),
-            gateway.retrieve_cached("failure", async { panic!("duplicate retrieval") })
+            gateway.retrieve_cached(&gateway.cache, "failure", true, async {
+                panic!("duplicate retrieval")
+            })
         );
         assert!(leader.is_err() && follower.is_err());
         assert!(
             !gateway
-                .retrieve_cached("failure", async { Ok(data("failure")) })
+                .retrieve_cached(&gateway.cache, "failure", true, async {
+                    Ok(data("failure"))
+                })
                 .await
                 .unwrap()
                 .cache_hit
@@ -4579,15 +4806,24 @@ mod cache_tests {
     #[tokio::test]
     async fn cancellation_and_deadlines_release_followers() {
         let gateway = gateway();
-        let mut leader = Box::pin(gateway.retrieve_cached("cancel", std::future::pending()));
+        let mut leader = Box::pin(gateway.retrieve_cached(
+            &gateway.cache,
+            "cancel",
+            true,
+            std::future::pending(),
+        ));
         assert!(
             std::future::poll_fn(|cx| {
                 std::task::Poll::Ready(leader.as_mut().poll(cx).is_pending())
             })
             .await
         );
-        let mut follower =
-            Box::pin(gateway.retrieve_cached("cancel", async { panic!("duplicate") }));
+        let mut follower = Box::pin(gateway.retrieve_cached(
+            &gateway.cache,
+            "cancel",
+            true,
+            async { panic!("duplicate") },
+        ));
         assert!(
             std::future::poll_fn(|cx| {
                 std::task::Poll::Ready(follower.as_mut().poll(cx).is_pending())
@@ -4598,29 +4834,78 @@ mod cache_tests {
         assert!(follower.await.unwrap_err().to_string().contains("canceled"));
         assert!(
             !gateway
-                .retrieve_cached("cancel", async { Ok(data("cancel")) })
+                .retrieve_cached(&gateway.cache, "cancel", true, async { Ok(data("cancel")) })
                 .await
                 .unwrap()
                 .cache_hit
         );
 
-        let mut leader = Box::pin(gateway.retrieve_cached("timeout", std::future::pending()));
+        let mut leader = Box::pin(gateway.retrieve_cached(
+            &gateway.cache,
+            "timeout",
+            true,
+            std::future::pending(),
+        ));
         std::future::poll_fn(|cx| {
             assert!(leader.as_mut().poll(cx).is_pending());
             std::task::Poll::Ready(())
         })
         .await;
         let follower = gateway
-            .retrieve_cached("timeout", async { panic!("duplicate") })
+            .retrieve_cached(&gateway.cache, "timeout", true, async {
+                panic!("duplicate")
+            })
             .await;
         assert!(follower.unwrap_err().to_string().contains("timed out"));
         assert!(leader.await.unwrap_err().to_string().contains("timed out"));
         assert!(
             !gateway
-                .retrieve_cached("timeout", async { Ok(data("timeout")) })
+                .retrieve_cached(&gateway.cache, "timeout", true, async {
+                    Ok(data("timeout"))
+                })
                 .await
                 .unwrap()
                 .cache_hit
         );
+    }
+
+    #[tokio::test]
+    async fn cpu_jobs_leave_runtime_responsive_and_keep_permits_until_completion() -> Result<()> {
+        let mut jobs = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            jobs.push(tokio::spawn(BACKGROUND_CPU.scope(
+                (),
+                cpu_work(move || {
+                    let _ = started.send(());
+                    wait.recv_timeout(Duration::from_secs(5))?;
+                    Ok(())
+                }),
+            )));
+            releases.push(release);
+            ready.await?;
+        }
+        let http_result = tokio::time::timeout(Duration::from_secs(1), cpu_work(|| Ok(7))).await;
+        let mut waiting = Box::pin(BACKGROUND_CPU.scope((), cpu_work(|| Ok(42))));
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        jobs[0].abort();
+        assert!(jobs.remove(0).await.unwrap_err().is_cancelled());
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        releases.remove(0).send(())?;
+        assert_eq!(waiting.await?, 42);
+        releases.remove(0).send(())?;
+        jobs.remove(0).await??;
+        assert_eq!(http_result??, 7);
+        Ok(())
     }
 }

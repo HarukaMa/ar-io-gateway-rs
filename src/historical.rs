@@ -29,15 +29,20 @@ const LEGACY_HASH_LIST_SHA256: [u8; 32] = [
 static LEGACY_HASHES: OnceCell<Vec<[u8; 48]>> = OnceCell::const_new();
 
 pub(super) async fn verify_legacy_header(
-    block: &mut BlockHeader,
-    entry: &BlockIndexEntry,
+    mut block: BlockHeader,
+    entry: BlockIndexEntry,
     client: &reqwest::Client,
-) -> Result<()> {
+) -> Result<BlockHeader> {
     let index = legacy_hash_index(block.height)?;
     let hashes = LEGACY_HASHES
         .get_or_try_init(|| download_legacy_hashes(client))
         .await?;
-    verify_legacy_header_hash(block, entry, &hashes[index])
+    let expected_h2 = hashes[index];
+    super::cpu_work(move || {
+        verify_legacy_header_hash(&mut block, &entry, &expected_h2)?;
+        Ok(block)
+    })
+    .await
 }
 
 fn legacy_hash_index(height: u64) -> Result<usize> {
@@ -70,10 +75,10 @@ async fn download_legacy_hashes(client: &reqwest::Client) -> Result<Vec<[u8; 48]
         );
         body.extend_from_slice(&chunk);
     }
-    decode_legacy_hashes(&body).await
+    super::cpu_work(move || decode_legacy_hashes(&body)).await
 }
 
-async fn decode_legacy_hashes(body: &[u8]) -> Result<Vec<[u8; 48]>> {
+fn decode_legacy_hashes(body: &[u8]) -> Result<Vec<[u8; 48]>> {
     ensure!(
         body.len() == LEGACY_HASH_LIST_BYTES,
         "historical H2 table length mismatch"
@@ -89,16 +94,13 @@ async fn decode_legacy_hashes(body: &[u8]) -> Result<Vec<[u8; 48]>> {
         "historical H2 table entry count mismatch"
     );
     let mut hashes = Vec::with_capacity(encoded.len());
-    for chunk in encoded.chunks(4096) {
-        tokio::task::yield_now().await;
-        for value in chunk {
-            ensure!(value.len() == 64, "invalid historical H2 hash length");
-            let mut hash = [0_u8; 48];
-            URL_SAFE_NO_PAD
-                .decode_slice(value, &mut hash)
-                .context("invalid historical H2 hash")?;
-            hashes.push(hash);
-        }
+    for value in encoded {
+        ensure!(value.len() == 64, "invalid historical H2 hash length");
+        let mut hash = [0_u8; 48];
+        URL_SAFE_NO_PAD
+            .decode_slice(value, &mut hash)
+            .context("invalid historical H2 hash")?;
+        hashes.push(hash);
     }
     Ok(hashes)
 }
@@ -654,14 +656,14 @@ mod tests {
         assert!(decode_header(header).is_err());
     }
 
-    #[tokio::test]
-    async fn legacy_table_rejects_truncation_overflow_and_checksum_changes() {
+    #[test]
+    fn legacy_table_rejects_truncation_overflow_and_checksum_changes() {
         let mut corrupt = vec![0; LEGACY_HASH_LIST_BYTES - 1];
-        assert!(decode_legacy_hashes(&corrupt).await.is_err());
+        assert!(decode_legacy_hashes(&corrupt).is_err());
         corrupt.push(0);
-        assert!(decode_legacy_hashes(&corrupt).await.is_err());
+        assert!(decode_legacy_hashes(&corrupt).is_err());
         corrupt.push(0);
-        assert!(decode_legacy_hashes(&corrupt).await.is_err());
+        assert!(decode_legacy_hashes(&corrupt).is_err());
     }
 
     #[test]

@@ -96,12 +96,23 @@ async fn main() -> Result<()> {
         if args.next().is_some() {
             bail!("{USAGE}");
         }
+        let index_bundles = env::var("AR_IO_INDEX_BUNDLES")
+            .unwrap_or_else(|_| "false".to_owned())
+            .parse::<bool>()
+            .context("invalid AR_IO_INDEX_BUNDLES")?;
         for name in ["ANS104_UNBUNDLE_FILTER", "ANS104_INDEX_FILTER"] {
             if let Ok(value) = env::var(name) {
                 let filter: serde_json::Value =
                     serde_json::from_str(&value).with_context(|| format!("invalid {name}"))?;
-                if filter != serde_json::json!({"never": true}) {
-                    bail!("{name} must be {{\"never\":true}}; indexing is not supported");
+                let expected = if index_bundles {
+                    serde_json::json!({"always": true})
+                } else {
+                    serde_json::json!({"never": true})
+                };
+                if filter != expected {
+                    bail!(
+                        "{name} must be {expected} when AR_IO_INDEX_BUNDLES={index_bundles}; selective filters are not supported"
+                    );
                 }
             }
         }
@@ -180,7 +191,21 @@ async fn main() -> Result<()> {
             keypair.fill(0);
             config = result?;
         }
-        return server::serve(gateway, config).await;
+        let worker = if index_bundles {
+            let url = env::var("DATABASE_URL")
+                .context("AR_IO_INDEX_BUNDLES=true requires DATABASE_URL")?;
+            let (indexed_gateway, worker) = gateway.with_bundle_indexing(&url).await?;
+            gateway = indexed_gateway;
+            Some(worker)
+        } else {
+            None
+        };
+        let result = server::serve(gateway, config).await;
+        let shutdown = match worker {
+            Some(worker) => worker.shutdown().await,
+            None => Ok(()),
+        };
+        return result.and(shutdown);
     }
 
     let Some(id) = args.next() else {
