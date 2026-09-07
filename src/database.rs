@@ -27,6 +27,31 @@ const MIGRATIONS: &[(&str, &str)] = &[
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
 
+const BUNDLE_OVERLAP: &str = "
+    SELECT key FROM (
+        SELECT key, item_offset,
+               lag(item_offset + item_size) OVER (
+                   PARTITION BY parent_offset ORDER BY item_offset, key
+               ) AS previous_end
+        FROM public.item_locations WHERE root_key=$1
+    ) siblings
+    WHERE item_offset < previous_end LIMIT 1";
+
+const BUNDLE_ANCESTRY: &str = "
+    WITH RECURSIVE ancestors AS (
+        SELECT root_offset AS target, parent_offset, 1 AS depth
+        FROM public.item_locations
+        WHERE root_key=$1 AND root_offset IN (SELECT unnest($2::text[])::numeric)
+          AND parent_offset IS NOT NULL
+        UNION ALL
+        SELECT a.target, p.parent_offset, a.depth+1
+        FROM ancestors a
+        JOIN public.item_locations p ON p.root_key=$1 AND p.root_offset=a.parent_offset
+        WHERE a.depth < 32 AND a.parent_offset IS NOT NULL
+    )
+    SELECT target FROM ancestors
+    GROUP BY target HAVING NOT bool_or(parent_offset IS NULL) LIMIT 1";
+
 const CANONICAL_BUNDLES: &str = "
     SELECT o.id, p.block_height, o.data_size::text, coalesce(progress.complete, false)
     FROM public.canonical_placements p
@@ -1068,31 +1093,11 @@ impl BlockStore {
             conflict.is_none(),
             "invalid nested bundle parent or offsets"
         );
-        let conflict = transaction
-            .query_opt(
-                "SELECT l.key FROM public.item_locations l
-             JOIN public.item_locations sibling ON sibling.root_key=l.root_key
-               AND sibling.parent_offset IS NOT DISTINCT FROM l.parent_offset AND sibling.key<>l.key
-               AND sibling.item_offset < l.item_offset + l.item_size
-               AND l.item_offset < sibling.item_offset + sibling.item_size
-             WHERE l.root_key=$1 AND l.root_offset IN (SELECT unnest($2::text[])::numeric) LIMIT 1",
-                &[&root_key, &root_offsets],
-            )
-            .await?;
+        let conflict = transaction.query_opt(BUNDLE_OVERLAP, &[&root_key]).await?;
         ensure!(conflict.is_none(), "overlapping bundle siblings");
-        let conflict = transaction.query_opt(
-            "WITH RECURSIVE ancestors AS (
-                SELECT root_offset AS target, parent_offset, 1 AS depth
-                FROM public.item_locations
-                WHERE root_key=$1 AND root_offset IN (SELECT unnest($2::text[])::numeric)
-                UNION ALL
-                SELECT a.target, p.parent_offset, a.depth+1
-                FROM ancestors a JOIN public.item_locations p ON p.root_key=$1 AND p.root_offset=a.parent_offset
-                WHERE a.depth < 32
-             )
-             SELECT target FROM ancestors GROUP BY target HAVING NOT bool_or(parent_offset IS NULL) LIMIT 1",
-            &[&root_key, &root_offsets],
-        ).await?;
+        let conflict = transaction
+            .query_opt(BUNDLE_ANCESTRY, &[&root_key, &root_offsets])
+            .await?;
         ensure!(
             conflict.is_none(),
             "bundle parent chain is missing or exceeds 32 levels"
@@ -1857,6 +1862,104 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; uses only a connection-local temporary table"]
+    async fn bundle_geometry_rejects_overlap_and_broken_ancestry() -> Result<()> {
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store
+            .client
+            .batch_execute(
+                "CREATE TEMP TABLE geometry (
+                key bigint PRIMARY KEY, root_key bigint, parent_offset numeric,
+                root_offset numeric, item_offset numeric, item_size numeric
+             );
+             INSERT INTO geometry VALUES
+                (1,1,NULL,96,96,100), (2,1,NULL,196,196,10),
+                (3,1,96,500,96,100), (4,2,NULL,96,96,100);",
+            )
+            .await?;
+        let overlap = BUNDLE_OVERLAP.replace("public.item_locations", "pg_temp.geometry");
+        let ancestry = BUNDLE_ANCESTRY.replace("public.item_locations", "pg_temp.geometry");
+        assert!(store.client.query_opt(&overlap, &[&1i64]).await?.is_none());
+        // Containment, identical starts, and an earlier interval crossing its successor.
+        for (start, size) in [(97, 1), (96, 1), (95, 2)] {
+            store
+                .client
+                .batch_execute(&format!(
+                    "INSERT INTO geometry VALUES (5,1,NULL,{start},{start},{size})"
+                ))
+                .await?;
+            assert!(store.client.query_opt(&overlap, &[&1i64]).await?.is_some());
+            store
+                .client
+                .batch_execute("DELETE FROM geometry WHERE key=5")
+                .await?;
+        }
+        let offsets = vec!["96".to_owned(), "500".to_owned()];
+        assert!(
+            store
+                .client
+                .query_opt(&ancestry, &[&1i64, &offsets])
+                .await?
+                .is_none()
+        );
+        store
+            .client
+            .batch_execute("UPDATE geometry SET parent_offset=999 WHERE key=3")
+            .await?;
+        assert!(
+            store
+                .client
+                .query_opt(&ancestry, &[&1i64, &offsets])
+                .await?
+                .is_some()
+        );
+        store
+            .client
+            .batch_execute(
+                "TRUNCATE geometry;
+             INSERT INTO geometry
+             SELECT n, 1, CASE WHEN n=1 THEN NULL ELSE n-1 END, n, 96, 1
+             FROM generate_series(1,33) n;",
+            )
+            .await?;
+        assert!(
+            store
+                .client
+                .query_opt(&ancestry, &[&1i64, &vec!["32".to_owned()]])
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .client
+                .query_opt(&ancestry, &[&1i64, &vec!["33".to_owned()]])
+                .await?
+                .is_some()
+        );
+        store
+            .client
+            .batch_execute("UPDATE geometry SET parent_offset=2 WHERE key=1")
+            .await?;
+        assert!(
+            store
+                .client
+                .query_opt(&ancestry, &[&1i64, &vec!["2".to_owned()]])
+                .await?
+                .is_some()
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires a canonical bundle root in ar_io_rust_test"]
