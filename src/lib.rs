@@ -388,7 +388,8 @@ impl Gateway {
         store.require_content_cache().await?;
         let mut cache =
             disk_cache::DiskCache::new(path, min_free_bytes, self.config.max_spool_bytes).await?;
-        let removed = tokio::time::timeout(self.config.retrieval_timeout, cache.cleanup(store))
+        let deadline = Instant::now() + self.config.retrieval_timeout;
+        let removed = tokio::time::timeout_at(deadline.into(), cache.cleanup(store, deadline))
             .await
             .context("content cache startup cleanup timed out")??;
         if removed > 0 {

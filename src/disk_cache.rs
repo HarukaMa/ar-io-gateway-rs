@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -169,19 +170,42 @@ impl DiskCache {
         .context("writing content cache task")?
     }
 
-    pub(crate) async fn cleanup(&mut self, store: &crate::database::BlockStore) -> Result<u64> {
+    pub(crate) async fn cleanup(
+        &mut self,
+        store: &crate::database::BlockStore,
+        deadline: Instant,
+    ) -> Result<u64> {
         ensure!(
             Arc::strong_count(&self.0) == 1 && Arc::strong_count(&self.0.lock) == 1,
             "cache cleanup requires exclusive startup ownership"
         );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelWrite(Arc::clone(&cancelled));
+        ensure!(Instant::now() < deadline, "cache cleanup timed out");
         let directory = Arc::clone(&self.0);
-        let mut entries = spawn_blocking(move || fs::read_dir(&directory.path)).await??;
+        let worker_cancelled = Arc::clone(&cancelled);
+        let mut entries = spawn_blocking(move || {
+            ensure!(
+                !worker_cancelled.load(Ordering::Relaxed),
+                "cache cleanup cancelled"
+            );
+            ensure!(Instant::now() < deadline, "cache cleanup timed out");
+            fs::read_dir(&directory.path).context("reading cache directory")
+        })
+        .await??;
         let mut removed = 0;
         loop {
+            let worker_cancelled = Arc::clone(&cancelled);
             let (next, seen, batch) = spawn_blocking(move || -> Result<_> {
                 let mut batch = Vec::with_capacity(128);
                 let mut seen = 0;
-                for entry in entries.by_ref().take(128) {
+                for _ in 0..128 {
+                    ensure!(
+                        !worker_cancelled.load(Ordering::Relaxed),
+                        "cache cleanup cancelled"
+                    );
+                    ensure!(Instant::now() < deadline, "cache cleanup timed out");
+                    let Some(entry) = entries.next() else { break };
                     seen += 1;
                     let entry = entry?;
                     if !entry.file_type()?.is_file() {
@@ -216,18 +240,17 @@ impl DiskCache {
                 return Ok(removed);
             }
             let hashes: Vec<_> = batch.iter().filter_map(|(_, hash)| *hash).collect();
+            ensure!(Instant::now() < deadline, "cache cleanup timed out");
             let referenced = store.referenced_cache_blobs(&hashes).await?;
             let directory = Arc::clone(&self.0);
+            let worker_cancelled = Arc::clone(&cancelled);
             removed += spawn_blocking(move || -> Result<u64> {
                 let _directory = directory;
-                let mut removed = 0;
-                for (path, hash) in batch {
-                    if hash.is_none_or(|hash| !referenced.contains(&hash)) {
-                        fs::remove_file(path).context("removing abandoned cache file")?;
-                        removed += 1;
-                    }
-                }
-                Ok(removed)
+                let paths = batch.into_iter().filter_map(|(path, hash)| {
+                    hash.is_none_or(|hash| !referenced.contains(&hash))
+                        .then_some(path)
+                });
+                remove_abandoned_files(paths, &worker_cancelled, deadline)
             })
             .await??;
         }
@@ -273,6 +296,25 @@ impl CacheDirectory {
             .context("creating content cache temporary file")?;
         Ok(Some(PendingWrite { temp, reservation }))
     }
+}
+
+fn remove_abandoned_files(
+    paths: impl IntoIterator<Item = PathBuf>,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+) -> Result<u64> {
+    let mut removed = 0;
+    for path in paths {
+        ensure!(
+            !cancelled.load(Ordering::Relaxed),
+            "cache cleanup cancelled"
+        );
+        ensure!(Instant::now() < deadline, "cache cleanup timed out");
+        // A filesystem call already in progress must finish before cancellation takes effect.
+        fs::remove_file(path).context("removing abandoned cache file")?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 fn verified_file(
@@ -326,6 +368,68 @@ mod tests {
     use super::*;
     use crate::content::{ContentWriter, SpoolBudget};
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn cleanup_timeout_stops_deleting_between_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        fs::write(&first, b"first")?;
+        fs::write(&second, b"second")?;
+        let paths = [first.clone(), second.clone()];
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (finished, result) = tokio::sync::oneshot::channel();
+        let mut cleanup = Box::pin(async move {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let _cancel_on_drop = CancelWrite(Arc::clone(&cancelled));
+            spawn_blocking(move || {
+                let mut started = Some(started);
+                let paths = paths.into_iter().enumerate().map(|(index, path)| {
+                    if index == 1 {
+                        started.take().unwrap().send(()).unwrap();
+                        released.recv().unwrap();
+                    }
+                    path
+                });
+                let outcome = remove_abandoned_files(
+                    paths,
+                    &cancelled,
+                    Instant::now() + std::time::Duration::from_secs(60),
+                );
+                finished.send(outcome).unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        std::future::poll_fn(|cx| {
+            assert!(cleanup.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        ready.await?;
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(1), cleanup).await;
+        release.send(())?;
+        let outcome = result.await?;
+        assert!(timed_out.is_err());
+        assert!(outcome.is_err());
+        assert!(!first.exists());
+        assert_eq!(fs::read(second)?, b"second");
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_expired_deadline_preserves_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("abandoned");
+        fs::write(&path, b"keep")?;
+        assert!(
+            remove_abandoned_files([path.clone()], &AtomicBool::new(false), Instant::now(),)
+                .is_err()
+        );
+        assert_eq!(fs::read(path)?, b"keep");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn restart_load_preserves_parent_views_and_independent_readers() -> Result<()> {

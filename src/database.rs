@@ -1856,6 +1856,7 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[tokio::test]
     #[ignore = "requires a canonical bundle root in ar_io_rust_test"]
@@ -2033,12 +2034,18 @@ mod tests {
             std::fs::write(subdirectory.join("keep.txt"), b"nested")?;
             let active = cache.load(blob_hash, 6).await?.unwrap();
             ensure!(
-                cache.cleanup(&store).await.is_err(),
+                cache
+                    .cleanup(&store, Instant::now() + Duration::from_secs(10))
+                    .await
+                    .is_err(),
                 "cleanup accepted active readers"
             );
             drop(active);
             ensure!(
-                cache.cleanup(&store).await? == 131,
+                cache
+                    .cleanup(&store, Instant::now() + Duration::from_secs(10))
+                    .await?
+                    == 131,
                 "incomplete cache cleanup"
             );
             ensure!(orphan_paths.iter().all(|path| !path.exists()) && !pending_path.exists());
