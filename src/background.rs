@@ -482,7 +482,12 @@ mod tests {
 
         let file = tempfile::tempfile()?;
         file.set_len(submitter.admission.max_bytes as u64)?;
-        let persistent = Content::persistent(file, [0; 32], submitter.admission.max_bytes);
+        let persistent = Content::persistent(
+            file,
+            [0; 32],
+            submitter.admission.max_bytes,
+            Arc::new(tempfile::tempfile()?),
+        );
         submitter.submit(&root(3, persistent.slice(0..1)?));
         assert!(receiver.try_recv().is_err());
         Ok(())

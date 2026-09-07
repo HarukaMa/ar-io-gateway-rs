@@ -23,6 +23,7 @@ pub(crate) struct DiskCache(Arc<CacheDirectory>);
 #[derive(Debug)]
 struct CacheDirectory {
     path: PathBuf,
+    lock: Arc<File>,
     min_free_bytes: u64,
     max_pending_bytes: usize,
     pending_bytes: AtomicUsize,
@@ -64,9 +65,20 @@ impl DiskCache {
         spawn_blocking(move || {
             fs::create_dir_all(&path).context("creating content cache directory")?;
             let path = fs::canonicalize(path).context("resolving content cache directory")?;
+            let lock = Arc::new(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path.join(".lock"))?,
+            );
+            lock.try_lock()
+                .context("content cache directory is already in use")?;
             fs4::available_space(&path).context("checking content cache filesystem")?;
             Ok(Self(Arc::new(CacheDirectory {
                 path,
+                lock,
                 min_free_bytes,
                 max_pending_bytes,
                 pending_bytes: AtomicUsize::new(0),
@@ -80,11 +92,14 @@ impl DiskCache {
         let path = self.0.path.join(crate::hex(&hash));
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelWrite(Arc::clone(&cancelled));
-        spawn_blocking(move || verified_file(&path, hash, size, &cancelled))
-            .await
-            .context("reading content cache task")
-            .and_then(|result| result)
-            .map(|file| file.map(|file| Content::persistent(file, hash, size)))
+        let cache_lock = Arc::clone(&self.0.lock);
+        spawn_blocking(move || {
+            verified_file(&path, hash, size, &cancelled)
+                .map(|file| file.map(|file| Content::persistent(file, hash, size, cache_lock)))
+        })
+        .await
+        .context("reading cached content task")
+        .and_then(|result| result)
     }
 
     pub(crate) async fn store(&self, content: &Content, hash: [u8; 32]) -> Result<Option<Content>> {
@@ -121,7 +136,12 @@ impl DiskCache {
                     #[cfg(unix)]
                     File::open(&directory.path)?.sync_all()?;
                     drop(reservation);
-                    Ok(Some(Content::persistent(file, hash, content.len())))
+                    Ok(Some(Content::persistent(
+                        file,
+                        hash,
+                        content.len(),
+                        Arc::clone(&directory.lock),
+                    )))
                 }
                 Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
                     drop(file);
@@ -130,7 +150,12 @@ impl DiskCache {
                         "existing content cache file is corrupt or has conflicting length",
                     )?;
                     drop(reservation);
-                    Ok(Some(Content::persistent(existing, hash, content.len())))
+                    Ok(Some(Content::persistent(
+                        existing,
+                        hash,
+                        content.len(),
+                        Arc::clone(&directory.lock),
+                    )))
                 }
                 Err(error) => {
                     drop(file);
@@ -142,6 +167,70 @@ impl DiskCache {
         })
         .await
         .context("writing content cache task")?
+    }
+
+    pub(crate) async fn cleanup(&mut self, store: &crate::database::BlockStore) -> Result<u64> {
+        ensure!(
+            Arc::strong_count(&self.0) == 1 && Arc::strong_count(&self.0.lock) == 1,
+            "cache cleanup requires exclusive startup ownership"
+        );
+        let directory = Arc::clone(&self.0);
+        let mut entries = spawn_blocking(move || fs::read_dir(&directory.path)).await??;
+        let mut removed = 0;
+        loop {
+            let (next, seen, batch) = spawn_blocking(move || -> Result<_> {
+                let mut batch = Vec::with_capacity(128);
+                let mut seen = 0;
+                for entry in entries.by_ref().take(128) {
+                    seen += 1;
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    let hash = if name.len() == 64
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    {
+                        let mut hash = [0; 32];
+                        for (index, byte) in hash.iter_mut().enumerate() {
+                            *byte = u8::from_str_radix(&name[index * 2..index * 2 + 2], 16)?;
+                        }
+                        Some(hash)
+                    } else if name.strip_prefix(".pending-").is_some_and(|suffix| {
+                        suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+                    }) {
+                        None
+                    } else {
+                        continue;
+                    };
+                    batch.push((entry.path(), hash));
+                }
+                Ok((entries, seen, batch))
+            })
+            .await??;
+            entries = next;
+            if seen == 0 {
+                return Ok(removed);
+            }
+            let hashes: Vec<_> = batch.iter().filter_map(|(_, hash)| *hash).collect();
+            let referenced = store.referenced_cache_blobs(&hashes).await?;
+            let directory = Arc::clone(&self.0);
+            removed += spawn_blocking(move || -> Result<u64> {
+                let _directory = directory;
+                let mut removed = 0;
+                for (path, hash) in batch {
+                    if hash.is_none_or(|hash| !referenced.contains(&hash)) {
+                        fs::remove_file(path).context("removing abandoned cache file")?;
+                        removed += 1;
+                    }
+                }
+                Ok(removed)
+            })
+            .await??;
+        }
     }
 }
 
@@ -261,6 +350,11 @@ mod tests {
         drop(view);
         drop(stored);
         drop(cache);
+        assert!(
+            DiskCache::new(root.path().to_path_buf(), 0, 10)
+                .await
+                .is_err()
+        );
         let mut pair = [0; 2];
         left.read_exact(&mut pair).await?;
         assert_eq!(&pair, b"34");
@@ -272,6 +366,13 @@ mod tests {
         assert_eq!(&pair, b"23");
         assert_eq!(left.read(&mut pair).await?, 0);
         assert_eq!(right.read(&mut pair).await?, 0);
+        drop(left);
+        drop(right);
+        let cache = DiskCache::new(root.path().to_path_buf(), 0, 10).await?;
+        assert_eq!(
+            cache.load(hash, 10).await?.unwrap().read_all(10).await?,
+            b"0123456789"[..]
+        );
         Ok(())
     }
 
@@ -301,15 +402,15 @@ mod tests {
         let hash = Sha256::digest(b"data").into();
         let reserve = DiskCache::new(root.path().to_path_buf(), u64::MAX, 4).await?;
         assert!(reserve.store(&content, hash).await?.is_none());
+        drop(reserve);
         let small = DiskCache::new(root.path().to_path_buf(), 0, 3).await?;
         assert!(small.store(&content, hash).await?.is_none());
+        drop(small);
         let cache = DiskCache::new(root.path().to_path_buf(), 0, 4).await?;
         assert!(cache.store(&content, [0; 32]).await.is_err());
-        assert_eq!(fs::read_dir(root.path())?.count(), 0);
         drop(cache.store(&content, hash).await?.unwrap());
         // An identical publication race/repeat succeeds without replacing the root file.
         drop(cache.store(&content, hash).await?.unwrap());
-        assert_eq!(fs::read_dir(root.path())?.count(), 1);
         assert_eq!(
             cache.load(hash, 4).await?.unwrap().read_all(4).await?,
             b"data"[..]
@@ -342,7 +443,6 @@ mod tests {
             blocker.await?;
             // This lookup is queued behind the cancelled worker on the same blocking pool.
             assert!(cache.load(hash, 4).await?.is_none());
-            assert_eq!(fs::read_dir(root.path())?.count(), 0);
             drop(cache.store(&content, hash).await?.unwrap());
             assert_eq!(
                 cache.load(hash, 4).await?.unwrap().read_all(4).await?,

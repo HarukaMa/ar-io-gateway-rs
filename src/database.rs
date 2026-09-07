@@ -1,4 +1,4 @@
-use std::{net::IpAddr, time::Duration};
+use std::{collections::HashSet, net::IpAddr, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use tokio::{task::JoinHandle, time::timeout};
@@ -18,6 +18,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "004_content_cache",
         include_str!("../migrations/004_content_cache.sql"),
+    ),
+    (
+        "005_cache_cleanup",
+        include_str!("../migrations/005_cache_cleanup.sql"),
     ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
@@ -198,26 +202,55 @@ impl BlockStore {
             .client
             .query_one(
                 "SELECT to_regclass('public.content_cache') IS NOT NULL
-                    AND to_regclass('public.ar_io_schema_migrations') IS NOT NULL",
+                    AND to_regclass('public.ar_io_schema_migrations') IS NOT NULL
+                    AND to_regclass('public.content_cache_blob_hash_idx') IS NOT NULL",
                 &[],
             )
             .await?
             .try_get(0)?;
-        let instruction = "disk cache requires schema migration 004_content_cache; apply \
-            migrations/004_content_cache.sql through the approved migration workflow \
+        let instruction = "disk cache requires schema migration 005_cache_cleanup; apply \
+            migrations/005_cache_cleanup.sql through the approved migration workflow \
             before enabling disk cache";
         ensure!(installed, "{instruction}");
         let version: bool = self
             .client
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
-                 WHERE version = 4 AND name = '004_content_cache')",
+                 WHERE version = 5 AND name = '005_cache_cleanup')",
                 &[],
             )
             .await?
             .try_get(0)?;
         ensure!(version, "{instruction}");
         Ok(())
+    }
+    pub(crate) async fn referenced_cache_blobs(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<HashSet<[u8; 32]>> {
+        ensure!(hashes.len() <= 128, "cache cleanup batch exceeds 128 blobs");
+        if hashes.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let hashes = hashes
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.client
+            .query(
+                "SELECT value FROM unnest($1::text[]) AS value
+                 WHERE EXISTS (
+                     SELECT 1 FROM public.content_cache
+                     WHERE metadata::jsonb -> 'blob_hash' = value::jsonb)",
+                &[&hashes],
+            )
+            .await?
+            .into_iter()
+            .map(|row| {
+                let hash: String = row.try_get(0)?;
+                Ok(serde_json::from_str(&hash)?)
+            })
+            .collect()
     }
 
     pub(crate) async fn cached_content(&self, id: &[u8; 32]) -> Result<Option<String>> {
@@ -1901,7 +1934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires migration 004 and imported blocks in ar_io_rust_test"]
+    #[ignore = "requires migration 005 and imported blocks in ar_io_rust_test"]
     async fn content_cache_rejects_stale_anchors_and_conflicting_descriptors() -> Result<()> {
         use sha2::Digest;
 
@@ -1938,7 +1971,11 @@ mod tests {
                 store.cached_content(&id).await?.is_none(),
                 "cache regression fixture already exists"
             );
-            let metadata = r#"{"verified":"original"}"#;
+            let blob_hash: [u8; 32] = sha2::Sha256::digest(b"cached").into();
+            let metadata_json = serde_json::to_string(&serde_json::json!({
+                "verified": "original", "blob_hash": blob_hash,
+            }))?;
+            let metadata = metadata_json.as_str();
             let mut wrong_hash = hash.clone();
             wrong_hash[0] ^= 1;
             ensure!(
@@ -1973,6 +2010,41 @@ mod tests {
                 !store.cache_content(&id, height, &hash, metadata).await?,
                 "uncovered block anchor was admitted"
             );
+            let directory = tempfile::tempdir()?;
+            let mut cache =
+                crate::disk_cache::DiskCache::new(directory.path().to_path_buf(), 0, 1024).await?;
+            let content = crate::content::Content::from(b"cached".to_vec());
+            drop(cache.store(&content, blob_hash).await?.unwrap());
+            let orphan_paths: Vec<_> = (0..130)
+                .map(|byte| directory.path().join(crate::hex(&[byte; 32])))
+                .collect();
+            for path in &orphan_paths {
+                std::fs::write(path, b"abandoned")?;
+            }
+            let (pending, pending_path) = tempfile::Builder::new()
+                .prefix(".pending-")
+                .tempfile_in(directory.path())?
+                .keep()?;
+            drop(pending);
+            let unrelated = directory.path().join("keep.txt");
+            std::fs::write(&unrelated, b"unrelated")?;
+            let subdirectory = directory.path().join(crate::hex(&[255; 32]));
+            std::fs::create_dir(&subdirectory)?;
+            std::fs::write(subdirectory.join("keep.txt"), b"nested")?;
+            let active = cache.load(blob_hash, 6).await?.unwrap();
+            ensure!(
+                cache.cleanup(&store).await.is_err(),
+                "cleanup accepted active readers"
+            );
+            drop(active);
+            ensure!(
+                cache.cleanup(&store).await? == 131,
+                "incomplete cache cleanup"
+            );
+            ensure!(orphan_paths.iter().all(|path| !path.exists()) && !pending_path.exists());
+            ensure!(std::fs::read(&unrelated)? == b"unrelated");
+            ensure!(std::fs::read(subdirectory.join("keep.txt"))? == b"nested");
+            ensure!(cache.load(blob_hash, 6).await?.unwrap().read_all(6).await? == b"cached"[..]);
             Ok(())
         }
         .await;

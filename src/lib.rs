@@ -386,9 +386,15 @@ impl Gateway {
             .as_ref()
             .context("persistent caching requires DATABASE_URL and an initialized block index")?;
         store.require_content_cache().await?;
-        self.disk_cache = Some(
-            disk_cache::DiskCache::new(path, min_free_bytes, self.config.max_spool_bytes).await?,
-        );
+        let mut cache =
+            disk_cache::DiskCache::new(path, min_free_bytes, self.config.max_spool_bytes).await?;
+        let removed = tokio::time::timeout(self.config.retrieval_timeout, cache.cleanup(store))
+            .await
+            .context("content cache startup cleanup timed out")??;
+        if removed > 0 {
+            eprintln!("removed {removed} abandoned content cache files");
+        }
+        self.disk_cache = Some(cache);
         Ok(self)
     }
 

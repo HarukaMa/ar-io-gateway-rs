@@ -14,7 +14,6 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use axum::body::Bytes;
 use sha2::{Digest, Sha256, Sha384};
-use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
     task::{JoinHandle, spawn_blocking},
@@ -66,8 +65,8 @@ impl Drop for Reservation {
 
 #[derive(Debug)]
 struct SpoolFile {
-    // Drop the file (and unlink its name) before releasing the disk reservation.
-    temp: NamedTempFile,
+    // Close the anonymous file before releasing its disk reservation.
+    temp: std::fs::File,
     _reservation: Reservation,
 }
 
@@ -78,13 +77,14 @@ enum ContentFile {
         file: std::fs::File,
         hash: [u8; 32],
         len: usize,
+        _cache_lock: Arc<std::fs::File>,
     },
 }
 
 impl ContentFile {
     fn read_exact_at(&self, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
         let file = match self {
-            Self::Temporary(file) => file.temp.as_file(),
+            Self::Temporary(file) => &file.temp,
             Self::Persistent { file, .. } => file,
         };
         while !bytes.is_empty() {
@@ -141,9 +141,19 @@ impl From<Bytes> for Content {
 
 impl Content {
     // The caller must verify the entire file and provide a read-only handle.
-    pub(crate) fn persistent(file: std::fs::File, hash: [u8; 32], len: usize) -> Self {
+    pub(crate) fn persistent(
+        file: std::fs::File,
+        hash: [u8; 32],
+        len: usize,
+        cache_lock: Arc<std::fs::File>,
+    ) -> Self {
         Self(Storage::File {
-            file: Arc::new(ContentFile::Persistent { file, hash, len }),
+            file: Arc::new(ContentFile::Persistent {
+                file,
+                hash,
+                len,
+                _cache_lock: cache_lock,
+            }),
             offset: 0,
             len,
         })
@@ -449,7 +459,7 @@ impl ContentWriter {
             let reservation = budget.reserve(expected_len)?;
             let file = spawn_blocking(move || -> io::Result<SpoolFile> {
                 Ok(SpoolFile {
-                    temp: NamedTempFile::new()?,
+                    temp: tempfile::tempfile()?,
                     _reservation: reservation,
                 })
             })
@@ -482,7 +492,7 @@ impl ContentWriter {
                     file.buffer.extend_from_slice(chunk);
                     *slot = Some(
                         spawn_blocking(move || -> io::Result<WriterFile> {
-                            file.file.temp.as_file_mut().write_all(&file.buffer)?;
+                            file.file.temp.write_all(&file.buffer)?;
                             Ok(file)
                         })
                         .await
