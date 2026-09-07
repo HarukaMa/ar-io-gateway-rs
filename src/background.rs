@@ -151,6 +151,10 @@ impl BundleSubmitter {
     pub(crate) fn last_indexed_at(&self) -> u64 {
         self.admission.last_indexed_at.load(Ordering::Relaxed)
     }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
 }
 
 fn job_bytes(root: &VerifiedRoot) -> usize {
@@ -443,6 +447,62 @@ mod tests {
                 value: URL_SAFE_NO_PAD.encode(value),
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn healthcheck_reports_worker_exit_without_indexing_age_limit() -> Result<()> {
+        let (submitter, receiver) = submitter(1024);
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = stopped.recv();
+            drop(receiver);
+        });
+        let mut gateway = Gateway::new(Config::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            vec!["http://127.0.0.1:1".to_owned()],
+            Duration::from_millis(50),
+            1,
+            1024,
+        )?)?;
+        gateway.bundle_indexer = Some(submitter);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let config = crate::server::ServerConfig::new(
+            &address.to_string(),
+            "",
+            "http://127.0.0.1:1",
+            "11111111111111111111111111111111",
+            "11111111111111111111111111111111",
+            1,
+        )?;
+        drop(listener);
+        let server = tokio::spawn(crate::server::serve(gateway, config));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()?;
+        let url = format!("http://{address}/ar-io/healthcheck");
+        let ready = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(response) = client.get(&url).send().await {
+                    break response;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert_eq!(ready.status(), reqwest::StatusCode::OK);
+        assert_eq!(ready.json::<serde_json::Value>().await?["status"], "ok");
+        stop.send(())?;
+        worker.join().expect("worker thread panicked");
+        let response = client.get(&url).send().await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.json::<serde_json::Value>().await?["status"],
+            "unhealthy"
+        );
+        server.abort();
+        Ok(())
     }
 
     #[test]

@@ -734,7 +734,15 @@ async fn serve_healthcheck(State(state): State<Arc<AppState>>) -> Response {
         .bundle_indexer
         .as_ref()
         .map_or(0, |indexer| indexer.last_indexed_at());
-    if let Some(seconds) = state
+    if state
+        .gateway
+        .bundle_indexer
+        .as_ref()
+        .is_some_and(|indexer| indexer.is_closed())
+    {
+        health["status"] = serde_json::json!("unhealthy");
+        health["reasons"] = serde_json::json!(["Bundle indexing worker stopped."]);
+    } else if let Some(seconds) = state
         .config
         .max_expected_data_item_indexing_interval_seconds
         && now
