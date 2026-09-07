@@ -21,6 +21,7 @@ use crate::{
     disk_cache::DiskCache, indexer::index_bundle_content, require_bundle_tags,
 };
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 const MAX_JOBS: usize = 8;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -28,54 +29,86 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 struct Admission {
     state: Mutex<AdmissionState>,
     max_bytes: usize,
+    max_jobs: usize,
+    max_scheduled_jobs: usize,
+    max_scheduled_bytes: usize,
+    changed: tokio::sync::Notify,
     last_indexed_at: AtomicU64,
 }
 
 struct AdmissionState {
     ids: HashSet<[u8; 32]>,
     bytes: usize,
+    scheduled_bytes: usize,
+    scheduled_jobs: usize,
     closed: bool,
 }
 
 impl Admission {
-    fn new(max_bytes: usize) -> Arc<Self> {
+    fn new(max_bytes: usize, max_jobs: usize, request_headroom: bool) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(AdmissionState {
-                ids: HashSet::with_capacity(MAX_JOBS),
+                ids: HashSet::with_capacity(max_jobs),
                 bytes: 0,
+                scheduled_bytes: 0,
                 closed: false,
+                scheduled_jobs: 0,
             }),
             max_bytes,
+            max_jobs,
+            max_scheduled_jobs: if request_headroom {
+                max_jobs - MAX_JOBS
+            } else {
+                max_jobs
+            },
+            max_scheduled_bytes: if request_headroom {
+                max_bytes / 2
+            } else {
+                max_bytes
+            },
+            changed: tokio::sync::Notify::new(),
             last_indexed_at: AtomicU64::new(0),
         })
     }
 
     fn reserve(self: &Arc<Self>, id: [u8; 32], bytes: usize) -> Option<Reservation> {
+        self.reserve_inner(id, bytes, false)
+    }
+
+    fn reserve_inner(
+        self: &Arc<Self>,
+        id: [u8; 32],
+        bytes: usize,
+        scheduled: bool,
+    ) -> Option<Reservation> {
         // Contention is backpressure too: HTTP never waits for the worker.
         let mut state = self.state.try_lock()?;
         if state.closed
-            || state.ids.len() == MAX_JOBS
+            || state.ids.len() == self.max_jobs
             || state.ids.contains(&id)
             || bytes > self.max_bytes - state.bytes
+            || (scheduled && bytes > self.max_scheduled_bytes - state.scheduled_bytes)
+            || (scheduled && state.scheduled_jobs == self.max_scheduled_jobs)
         {
             return None;
         }
         state.ids.insert(id);
         state.bytes += bytes;
+        if scheduled {
+            state.scheduled_bytes += bytes;
+            state.scheduled_jobs += 1;
+        }
         Some(Reservation {
             admission: Arc::clone(self),
             id,
             bytes,
+            scheduled,
         })
     }
 
     fn reserve_scheduled(self: &Arc<Self>, id: [u8; 32], data_size: usize) -> Option<Reservation> {
-        // Leave half the retained-byte budget available for request handoffs.
         let bytes = data_size.checked_add(MAX_JSON_BYTES)?;
-        if bytes > self.max_bytes / 2 {
-            return None;
-        }
-        self.reserve(id, bytes)
+        self.reserve_inner(id, bytes, true)
     }
 
     fn indexed(&self, count: u64) {
@@ -91,6 +124,7 @@ struct Reservation {
     admission: Arc<Admission>,
     id: [u8; 32],
     bytes: usize,
+    scheduled: bool,
 }
 
 impl Reservation {
@@ -99,8 +133,13 @@ impl Reservation {
             bytes <= self.bytes,
             "bundle exceeds retained-byte reservation"
         );
-        self.admission.state.lock().bytes -= self.bytes - bytes;
+        let mut state = self.admission.state.lock();
+        state.bytes -= self.bytes - bytes;
+        if self.scheduled {
+            state.scheduled_bytes -= self.bytes - bytes;
+        }
         self.bytes = bytes;
+        self.admission.changed.notify_one();
         Ok(())
     }
 }
@@ -110,6 +149,11 @@ impl Drop for Reservation {
         let mut state = self.admission.state.lock();
         state.ids.remove(&self.id);
         state.bytes -= self.bytes;
+        if self.scheduled {
+            state.scheduled_bytes -= self.bytes;
+            state.scheduled_jobs -= 1;
+        }
+        self.admission.changed.notify_one();
     }
 }
 
@@ -206,8 +250,13 @@ pub(crate) async fn start(
     disk_cache: Option<DiskCache>,
     database_url: String,
     direct_cache: Arc<std::sync::Mutex<ContentCache>>,
+    peers: Arc<crate::peers::PeerState>,
 ) -> Result<(BundleSubmitter, BundleWorker)> {
-    let admission = Admission::new(config.max_spool_bytes);
+    let admission = Admission::new(
+        config.index_max_bytes,
+        config.index_downloads + MAX_JOBS,
+        true,
+    );
     let (sender, receiver) = mpsc::channel(MAX_JOBS);
     let (cancel, mut cancelled) = oneshot::channel();
     let (ready, readiness) = oneshot::channel();
@@ -228,12 +277,13 @@ pub(crate) async fn start(
                         let mut gateway = Gateway::new(config)?.with_database(&database_url).await?;
                         gateway.disk_cache = disk_cache;
                         gateway.direct_cache = direct_cache;
+                        gateway.peers = peers;
                         let store = BlockStore::connect(&database_url).await?;
                         // Fail startup if the bundle schema is absent. Never migrate here.
-                        store.pending_bundle_after(None).await?;
+                        store.pending_bundle_after(None, None).await?;
                         Ok::<_, anyhow::Error>((gateway, store))
                     };
-                    let (mut gateway, mut store) = tokio::select! {
+                    let (gateway, mut store) = tokio::select! {
                         biased;
                         _ = &mut cancelled => return Ok(()),
                         result = timeout(startup_timeout, initialize) => {
@@ -246,7 +296,7 @@ pub(crate) async fn start(
                     tokio::select! {
                         biased;
                         _ = &mut cancelled => Ok(()),
-                        result = run(&mut gateway, &mut store, receiver, worker_admission) => result,
+                        result = run(&gateway, &mut store, Some(receiver), worker_admission, None) => result.map(|_| ()),
                     }
                 }));
                 // Runtime shutdown (including blocking I/O) is on its owning OS thread.
@@ -270,85 +320,177 @@ pub(crate) async fn start(
     Ok((BundleSubmitter { sender, admission }, worker))
 }
 
-enum Next {
-    Request(Option<Job>),
-    Scheduled(Result<Option<Arc<VerifiedRoot>>>),
+pub(crate) async fn import(
+    gateway: &Gateway,
+    store: &mut BlockStore,
+    start: u64,
+    end: u64,
+) -> Result<(u64, u64)> {
+    let admission = Admission::new(
+        gateway.config.index_max_bytes,
+        gateway.config.index_downloads,
+        false,
+    );
+    crate::BACKGROUND_CPU
+        .scope((), run(gateway, store, None, admission, Some((start, end))))
+        .await
 }
 
 async fn run(
-    gateway: &mut Gateway,
+    gateway: &Gateway,
     store: &mut BlockStore,
-    mut receiver: mpsc::Receiver<Job>,
+    mut requests: Option<mpsc::Receiver<Job>>,
     admission: Arc<Admission>,
-) -> Result<()> {
-    let mut cursor: Option<Vec<u8>> = None;
-    let mut next_poll = Instant::now();
-    let max_data_size = gateway.config.max_data_size;
-    loop {
-        tokio::select! {
-            biased;
-            job = receiver.recv() => {
-                let Some(job) = job else { return Ok(()); };
-                process_request(gateway, store, job).await;
+    range: Option<(u64, u64)>,
+) -> Result<(u64, u64)> {
+    let (sender, mut ready) = mpsc::channel(gateway.config.index_downloads);
+    let produce = download_pending(gateway, sender, &admission, range);
+    let consume = async {
+        let mut roots = 0;
+        let mut occurrences = 0;
+        loop {
+            let job = tokio::select! {
+                job = async { requests.as_mut().unwrap().recv().await }, if requests.is_some() => {
+                    match job {
+                        Some(job) => job,
+                        None => { requests = None; continue; }
+                    }
+                }
+                job = ready.recv() => {
+                    let Some(job) = job else { break; };
+                    job
+                }
+            };
+            let id = job.root.data.id.clone();
+            match process_job(gateway, store, job).await {
+                Ok(count) => {
+                    roots += 1;
+                    occurrences += count;
+                }
+                Err(error) if range.is_some() => return Err(error),
+                Err(error) => eprintln!("indexing bundle {id} failed: {error:#}"),
             }
-            _ = sleep_until(next_poll) => {
-                next_poll = Instant::now() + POLL_INTERVAL;
-                let pending = timeout(
-                    gateway.config.request_timeout,
-                    store.pending_bundle_after(cursor.as_deref()),
-                ).await.context("discovering pending bundle timed out");
-                let (root_id, height, data_size) = match pending.and_then(|result| result) {
-                    Ok(Some(pending)) => pending,
+        }
+        Ok((roots, occurrences))
+    };
+    let (_, summary) = tokio::try_join!(produce, consume)?;
+    Ok(summary)
+}
+
+async fn download_pending(
+    gateway: &Gateway,
+    sender: mpsc::Sender<Job>,
+    admission: &Arc<Admission>,
+    range: Option<(u64, u64)>,
+) -> Result<()> {
+    let store = gateway
+        .block_store
+        .as_ref()
+        .context("bundle downloads require a database")?;
+    let mut downloads = FuturesUnordered::new();
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut pending: Option<(Vec<u8>, u64, u128)> = None;
+    let mut exhausted = false;
+    let mut next_poll = Instant::now();
+    loop {
+        if let Some((root_id, height, data_size)) = pending.take() {
+            let id: [u8; 32] = root_id
+                .as_slice()
+                .try_into()
+                .context("invalid pending bundle ID")?;
+            let size = usize::try_from(data_size).ok().filter(|size| {
+                *size <= gateway.config.max_data_size
+                    && (*size <= gateway.config.max_memory_data_size
+                        || *size <= gateway.config.max_spool_bytes)
+                    && size
+                        .checked_add(MAX_JSON_BYTES)
+                        .is_some_and(|bytes| bytes <= admission.max_scheduled_bytes)
+            });
+            if size.is_none() {
+                let error = anyhow::anyhow!(
+                    "bundle {} exceeds indexing byte limits",
+                    URL_SAFE_NO_PAD.encode(id)
+                );
+                if range.is_some() {
+                    return Err(error);
+                }
+                eprintln!("{error:#}");
+                cursor = Some(root_id);
+            } else if admission.state.lock().ids.contains(&id) {
+                cursor = Some(root_id);
+            } else {
+                let size = size.unwrap();
+                let spool = if size <= gateway.config.max_memory_data_size {
+                    Ok(None)
+                } else {
+                    gateway.spool_budget.reserve(size).map(Some)
+                };
+                let reserved = spool.ok().and_then(|spool| {
+                    admission
+                        .reserve_scheduled(id, size)
+                        .map(|reservation| (reservation, spool))
+                });
+                if let Some((mut reservation, spool)) = reserved {
+                    cursor = Some(root_id);
+                    downloads.push(async move {
+                        let encoded = URL_SAFE_NO_PAD.encode(id);
+                        let result = crate::content::DOWNLOAD_SPOOL
+                            .scope(std::cell::RefCell::new(spool), async {
+                                let Some(root) =
+                                    fetch_scheduled(gateway, store, &id, &encoded, height).await?
+                                else {
+                                    return Ok(None);
+                                };
+                                ensure!(
+                                    root.data.bytes.len() == size,
+                                    "bundle size changed after admission"
+                                );
+                                reservation.shrink(job_bytes(&root))?;
+                                Ok::<_, anyhow::Error>(Some(Job { root, reservation }))
+                            })
+                            .await;
+                        (encoded, result)
+                    });
+                } else {
+                    pending = Some((root_id, height, data_size));
+                }
+            }
+        }
+        if exhausted && downloads.is_empty() && range.is_some() {
+            return Ok(());
+        }
+        tokio::select! {
+            result = downloads.next(), if !downloads.is_empty() => {
+                let (id, result) = result.expect("nonempty downloads");
+                match result {
+                    Ok(Some(job)) => sender.send(job).await.map_err(|_| anyhow::anyhow!("bundle writer stopped"))?,
+                    Ok(None) => {}
+                    Err(error) if range.is_some() => return Err(error),
+                    Err(error) => eprintln!("retrieving scheduled bundle {id} failed: {error:#}"),
+                }
+            }
+            _ = admission.changed.notified() => {}
+            _ = gateway.spool_budget.released.notified(), if pending.is_some() => {}
+            result = async {
+                sleep_until(next_poll).await;
+                timeout(gateway.config.request_timeout, store.pending_bundle_after(cursor.as_deref(), range))
+                    .await.context("discovering pending bundle timed out")?
+            }, if pending.is_none() && downloads.len() < gateway.config.index_downloads && (!exhausted || range.is_none()) => {
+                match result {
+                    Ok(Some(root)) => { pending = Some(root); exhausted = false; next_poll = Instant::now(); }
                     Ok(None) => {
+                        exhausted = true;
                         cursor = None;
                         next_poll = Instant::now() + RETRY_INTERVAL;
-                        continue;
                     }
+                    Err(error) if range.is_some() => return Err(error),
                     Err(error) => {
                         eprintln!("discovering pending bundles failed: {error:#}");
                         next_poll = Instant::now() + RETRY_INTERVAL;
-                        continue;
-                    }
-                };
-                // A request arriving during discovery takes priority over a new root.
-                if !receiver.is_empty() {
-                    continue;
-                }
-                let id: [u8; 32] = root_id.as_slice().try_into().context("invalid pending bundle ID")?;
-                // Advance on failure too; a broken root cannot starve later IDs.
-                cursor = Some(root_id);
-                let Ok(data_size) = usize::try_from(data_size) else { continue; };
-                if data_size > max_data_size { continue; }
-                let Some(mut reservation) = admission.reserve_scheduled(id, data_size) else {
-                    continue;
-                };
-                let encoded = URL_SAFE_NO_PAD.encode(id);
-                let next = tokio::select! {
-                    biased;
-                    job = receiver.recv() => Next::Request(job),
-                    result = fetch_scheduled(gateway, store, &id, &encoded, height) => Next::Scheduled(result),
-                };
-                match next {
-                    Next::Request(job) => {
-                        // The retrieval future has been dropped before releasing its room.
-                        drop(reservation);
-                        let Some(job) = job else { return Ok(()); };
-                        process_request(gateway, store, job).await;
-                    }
-                    Next::Scheduled(result) => {
-                        let result = async {
-                            let Some(root) = result? else { return Ok(()); };
-                            reservation.shrink(job_bytes(&root))?;
-                            let count = index_bundle_content(gateway, store, root).await?;
-                            reservation.admission.indexed(count);
-                            Ok::<_, anyhow::Error>(())
-                        }.await;
-                        if let Err(error) = result {
-                            eprintln!("indexing scheduled bundle {encoded} failed: {error:#}");
-                        }
                     }
                 }
             }
+            _ = tokio::time::sleep(POLL_INTERVAL), if pending.is_some() => {}
         }
     }
 }
@@ -378,10 +520,9 @@ async fn fetch_scheduled(
     .context("retrieving scheduled bundle timed out")?
 }
 
-async fn process_request(gateway: &Gateway, store: &mut BlockStore, job: Job) {
+async fn process_job(gateway: &Gateway, store: &mut BlockStore, job: Job) -> Result<u64> {
     let Job { root, reservation } = job;
-    let id = root.data.id.clone();
-    let result = timeout(gateway.config.retrieval_timeout, async {
+    timeout(gateway.config.retrieval_timeout, async {
         if timeout(
             gateway.config.request_timeout,
             store.bundle_complete(&reservation.id),
@@ -389,18 +530,14 @@ async fn process_request(gateway: &Gateway, store: &mut BlockStore, job: Job) {
         .await
         .context("checking bundle completion timed out")??
         {
-            return Ok(());
+            return Ok(0);
         }
         let count = index_bundle_content(gateway, store, root).await?;
         reservation.admission.indexed(count);
-        Ok::<_, anyhow::Error>(())
+        Ok(count)
     })
     .await
-    .context("indexing requested bundle timed out")
-    .and_then(|result| result);
-    if let Err(error) = result {
-        eprintln!("indexing requested bundle {id} failed: {error:#}");
-    }
+    .context("indexing bundle timed out")?
 }
 
 #[cfg(test)]
@@ -409,12 +546,52 @@ mod tests {
     use crate::content::{ContentWriter, SpoolBudget};
     use crate::{Tag, VerifiedData, content::Content};
 
+    #[test]
+    fn scheduled_roots_keep_request_slots_free_until_they_are_released() {
+        let admission = Admission::new(128 * MAX_JSON_BYTES, 40, true);
+        let mut scheduled: Vec<_> = (0..32)
+            .map(|id| admission.reserve_scheduled([id; 32], 0).unwrap())
+            .collect();
+        for reservation in &mut scheduled {
+            reservation.shrink(0).unwrap();
+        }
+        assert!(admission.reserve_scheduled([32; 32], 0).is_none());
+        let requests: Vec<_> = (32..40)
+            .map(|id| admission.reserve([id; 32], 1).unwrap())
+            .collect();
+        assert!(admission.reserve([40; 32], 1).is_none());
+        drop(scheduled.pop());
+        assert!(admission.reserve_scheduled([40; 32], 0).is_some());
+        drop(requests);
+    }
+
+    #[test]
+    fn scheduled_bytes_preserve_aggregate_request_headroom() {
+        let admission = Admission::new(8 * MAX_JSON_BYTES, 40, true);
+        let first = admission
+            .reserve_scheduled([1; 32], MAX_JSON_BYTES)
+            .unwrap();
+        let second = admission
+            .reserve_scheduled([2; 32], MAX_JSON_BYTES)
+            .unwrap();
+        assert!(admission.reserve_scheduled([3; 32], 0).is_none());
+        let request = admission.reserve([4; 32], 4 * MAX_JSON_BYTES).unwrap();
+        assert!(admission.reserve([5; 32], 1).is_none());
+        drop(first);
+        let next = admission
+            .reserve_scheduled([3; 32], MAX_JSON_BYTES)
+            .unwrap();
+        assert!(admission.reserve_scheduled([6; 32], 0).is_none());
+        drop((second, request, next));
+        assert!(admission.reserve([7; 32], 8 * MAX_JSON_BYTES).is_some());
+    }
+
     fn submitter(bytes: usize) -> (BundleSubmitter, mpsc::Receiver<Job>) {
         let (sender, receiver) = mpsc::channel(MAX_JOBS);
         (
             BundleSubmitter {
                 sender,
-                admission: Admission::new(bytes),
+                admission: Admission::new(bytes, MAX_JOBS, false),
             },
             receiver,
         )

@@ -64,6 +64,11 @@ pub struct Config {
     pub max_data_size: usize,
     pub max_memory_data_size: usize,
     pub max_spool_bytes: usize,
+    /// Concurrent bundle downloads, configured by AR_IO_INDEX_DOWNLOADS.
+    pub index_downloads: usize,
+    /// Active and queued bundle bytes, configured by AR_IO_INDEX_MAX_BYTES.
+    /// The serving worker reserves half for HTTP-discovered bundle handoffs.
+    pub index_max_bytes: usize,
     pub retrieval_timeout: Duration,
     pub stream_idle_timeout: Duration,
     pub stream_timeout: Duration,
@@ -107,6 +112,8 @@ impl Config {
             max_data_size,
             max_memory_data_size: max_data_size.min(64 * 1024 * 1024),
             max_spool_bytes: 4 * 1024 * 1024 * 1024,
+            index_downloads: 32,
+            index_max_bytes: 8 * 1024 * 1024 * 1024,
             retrieval_timeout: Duration::from_secs(30 * 60),
             stream_idle_timeout: Duration::from_secs(30),
             stream_timeout: Duration::from_secs(30 * 60),
@@ -325,7 +332,7 @@ pub struct Gateway {
     config: Config,
     client: Client,
     cache: Mutex<ContentCache>,
-    peers: peers::PeerState,
+    peers: Arc<peers::PeerState>,
     block_store: Option<database::BlockStore>,
     spool_budget: Arc<SpoolBudget>,
     disk_cache: Option<disk_cache::DiskCache>,
@@ -344,6 +351,10 @@ impl Gateway {
             "memory and temporary storage limits must be positive"
         );
         ensure!(
+            (1..=256).contains(&config.index_downloads) && config.index_max_bytes > 0,
+            "index downloads must be between 1 and 256 and the byte budget must be positive"
+        );
+        ensure!(
             !config.retrieval_timeout.is_zero()
                 && !config.stream_idle_timeout.is_zero()
                 && !config.stream_timeout.is_zero(),
@@ -353,7 +364,7 @@ impl Gateway {
             .timeout(config.request_timeout)
             .build()
             .context("failed to build HTTP client")?;
-        let peers = peers::PeerState::new(&config.trusted_node_url)?;
+        let peers = Arc::new(peers::PeerState::new(&config.trusted_node_url)?);
         Ok(Self {
             spool_budget: Arc::new(SpoolBudget::new(config.max_spool_bytes)),
             config,
@@ -412,6 +423,7 @@ impl Gateway {
             self.disk_cache.clone(),
             database_url.to_owned(),
             Arc::clone(&self.direct_cache),
+            Arc::clone(&self.peers),
         )
         .await?;
         self.bundle_indexer = Some(submitter);
@@ -660,44 +672,31 @@ impl Gateway {
             return Ok(None);
         };
         let mut invalid = Vec::new();
-        let discovered = self.peers.candidates(
-            Some(offset),
+        let sources = self.peers.chunk_candidates(
+            offset,
             self.config.max_peer_attempts,
             &self.config.chunk_sources,
         );
 
-        for source in self
-            .config
-            .chunk_sources
-            .iter()
-            .take(self.config.max_peer_attempts - usize::from(!discovered.is_empty()))
-            .chain(discovered.iter())
-            .take(self.config.max_peer_attempts)
-        {
-            let candidate: Option<JsonChunk> = match self
-                .request_optional_json(self.source_request(
-                    source,
-                    &format!("chunk/{offset}"),
-                    &discovered,
-                ))
-                .await
-            {
+        for source in &sources {
+            let (candidate, headers, body) = match self.fetch_chunk(source, offset).await {
                 Ok(candidate) => candidate,
                 Err(error) => {
-                    self.peers.record_result(source, false);
-                    invalid.push(format!("{source}: {error:#}"));
+                    self.peers.record_chunk_result(source, None);
+                    if error
+                        .downcast_ref::<reqwest::Error>()
+                        .is_none_or(|error| error.is_body() || error.is_decode())
+                    {
+                        invalid.push(format!("{source}: {error:#}"));
+                    }
                     continue;
                 }
-            };
-            let Some(candidate) = candidate else {
-                self.peers.record_result(source, false);
-                continue;
             };
             let proof =
                 match cpu_work(move || verify_chunk_proof(candidate, offset, &geometry)).await {
                     Ok(proof) => proof,
                     Err(error) => {
-                        self.peers.record_result(source, false);
+                        self.peers.record_chunk_result(source, None);
                         invalid.push(format!("{source}: {error:#}"));
                         continue;
                     }
@@ -715,7 +714,8 @@ impl Gateway {
                 .context("chunk source has no host")?
                 .to_owned();
 
-            self.peers.record_result(source, true);
+            self.peers
+                .record_chunk_result(source, Some((headers, body, proof.bytes.len())));
             return Ok(Some(VerifiedChunk {
                 data_root: URL_SAFE_NO_PAD.encode(proof.transaction.data_root),
                 data_size: proof.transaction.size,
@@ -974,6 +974,10 @@ impl Gateway {
             parent_id,
             data_size: node.data.size,
         }))
+    }
+
+    pub async fn refresh_peers(&self) -> Result<()> {
+        self.peers.refresh_arweave().await
     }
 
     async fn retrieve_direct_with_tags(&self, id: &str) -> Result<Arc<VerifiedRoot>> {
@@ -1502,35 +1506,27 @@ impl Gateway {
         geometry: &Geometry,
     ) -> Result<Vec<u8>> {
         let mut failures = Vec::new();
-        let discovered = self.peers.candidates(
-            Some(absolute_offset),
+        let sources = self.peers.chunk_candidates(
+            absolute_offset,
             self.config.max_peer_attempts,
             &self.config.chunk_sources,
         );
-        let sources = self
-            .config
-            .chunk_sources
-            .iter()
-            .take(self.config.max_peer_attempts - usize::from(!discovered.is_empty()))
-            .chain(discovered.iter())
-            .take(self.config.max_peer_attempts);
 
-        for source in sources {
+        for source in &sources {
+            let mut sample = None;
             let result = async {
-                let chunk: JsonChunk = self
-                    .request_json(self.source_request(
-                        source,
-                        &format!("chunk/{absolute_offset}"),
-                        &discovered,
-                    ))
-                    .await?;
+                let (chunk, headers, body) = self.fetch_chunk(source, absolute_offset).await?;
                 let geometry = *geometry;
-                cpu_work(move || verify_chunk(chunk, absolute_offset, relative_offset, &geometry))
-                    .await
+                let bytes = cpu_work(move || {
+                    verify_chunk(chunk, absolute_offset, relative_offset, &geometry)
+                })
+                .await?;
+                sample = Some((headers, body, bytes.len()));
+                Ok::<_, anyhow::Error>(bytes)
             }
             .await;
 
-            self.peers.record_result(source, result.is_ok());
+            self.peers.record_chunk_result(source, sample);
             match result {
                 Ok(chunk) => return Ok(chunk),
                 Err(error) => failures.push(format!("{source}: {error:#}")),
@@ -1538,6 +1534,30 @@ impl Gateway {
         }
 
         bail!("all bounded chunk attempts failed: {}", failures.join("; "))
+    }
+
+    async fn fetch_chunk(
+        &self,
+        source: &str,
+        offset: u128,
+    ) -> Result<(JsonChunk, Duration, Duration)> {
+        let url = endpoint(source, &format!("chunk/{offset}"));
+        let request = if self
+            .config
+            .chunk_sources
+            .iter()
+            .any(|configured| configured.trim_end_matches('/') == source.trim_end_matches('/'))
+        {
+            self.client.get(url)
+        } else {
+            self.peers.get(url)
+        };
+        let started = Instant::now();
+        let response = request.send().await?.error_for_status()?;
+        let headers = started.elapsed();
+        let started = Instant::now();
+        let chunk = read_json_response(response).await?;
+        Ok((chunk, headers, started.elapsed()))
     }
 
     async fn get_json<T: DeserializeOwned>(&self, base: &str, path: &str) -> Result<T> {

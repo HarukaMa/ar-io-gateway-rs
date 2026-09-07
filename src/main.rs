@@ -54,6 +54,14 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| config.max_spool_bytes.to_string())
         .parse()
         .context("invalid ARWEAVE_MAX_SPOOL_BYTES")?;
+    config.index_downloads = env::var("AR_IO_INDEX_DOWNLOADS")
+        .unwrap_or_else(|_| config.index_downloads.to_string())
+        .parse()
+        .context("invalid AR_IO_INDEX_DOWNLOADS")?;
+    config.index_max_bytes = env::var("AR_IO_INDEX_MAX_BYTES")
+        .unwrap_or_else(|_| config.index_max_bytes.to_string())
+        .parse()
+        .context("invalid AR_IO_INDEX_MAX_BYTES")?;
     config.retrieval_timeout = Duration::from_secs(
         env::var("ARWEAVE_RETRIEVAL_TIMEOUT_SECS")
             .unwrap_or_else(|_| config.retrieval_timeout.as_secs().to_string())

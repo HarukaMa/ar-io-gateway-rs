@@ -470,26 +470,8 @@ pub async fn import_bundles(
         imported_roots: 0,
         imported_occurrences: 0,
     };
-    loop {
-        let pending = timeout(deadline, store.pending_bundles(start, end, 1))
-            .await
-            .context("pending bundle query timed out")??;
-        let Some((root_id, height)) = pending.into_iter().next() else {
-            break;
-        };
-        let encoded_id = URL_SAFE_NO_PAD.encode(&root_id);
-        summary.imported_occurrences += timeout(gateway.config.retrieval_timeout, async {
-            let root = gateway.retrieve_direct_with_tags(&encoded_id).await?;
-            ensure!(
-                root.data.block_height == height,
-                "bundle root canonical height changed"
-            );
-            index_bundle_content(gateway, store, root).await
-        })
-        .await
-        .with_context(|| format!("retrieving and indexing bundle {encoded_id} timed out"))??;
-        summary.imported_roots += 1;
-    }
+    (summary.imported_roots, summary.imported_occurrences) =
+        crate::background::import(gateway, store, start, end).await?;
     if summary.imported_roots > 0 {
         timeout(deadline, store.analyze_metadata())
             .await

@@ -18,6 +18,7 @@ dependencies = [
  "bs58",
  "ed25519-dalek",
  "fs4",
+ "futures-util",
  "k256",
  "parking_lot",
  "reqwest",

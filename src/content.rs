@@ -21,10 +21,16 @@ use tokio::{
 
 const IO_CHUNK_SIZE: usize = 64 * 1024;
 
+tokio::task_local! {
+    // Transfer pre-admitted disk space into the writer without reserving twice.
+    pub(crate) static DOWNLOAD_SPOOL: std::cell::RefCell<Option<Reservation>>;
+}
+
 #[derive(Debug)]
 pub(crate) struct SpoolBudget {
     max_bytes: usize,
     used_bytes: AtomicUsize,
+    pub(crate) released: tokio::sync::Notify,
 }
 
 impl SpoolBudget {
@@ -32,10 +38,11 @@ impl SpoolBudget {
         Self {
             max_bytes,
             used_bytes: AtomicUsize::new(0),
+            released: tokio::sync::Notify::new(),
         }
     }
 
-    fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Reservation> {
+    pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Reservation> {
         self.used_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes)
@@ -50,7 +57,7 @@ impl SpoolBudget {
 }
 
 #[derive(Debug)]
-struct Reservation {
+pub(crate) struct Reservation {
     budget: Arc<SpoolBudget>,
     bytes: usize,
 }
@@ -60,6 +67,7 @@ impl Drop for Reservation {
         self.budget
             .used_bytes
             .fetch_sub(self.bytes, Ordering::Relaxed);
+        self.budget.released.notify_waiters();
     }
 }
 
@@ -456,7 +464,18 @@ impl ContentWriter {
             bytes.try_reserve_exact(expected_len)?;
             WriteStorage::Memory(bytes)
         } else {
-            let reservation = budget.reserve(expected_len)?;
+            let reservation = match DOWNLOAD_SPOOL.try_with(|slot| slot.borrow_mut().take()) {
+                Ok(Some(reservation)) => {
+                    ensure!(
+                        Arc::ptr_eq(&reservation.budget, &budget)
+                            && reservation.bytes == expected_len,
+                        "content does not match its spool reservation"
+                    );
+                    reservation
+                }
+                Ok(None) => anyhow::bail!("scheduled content lacks a spool reservation"),
+                Err(_) => budget.reserve(expected_len)?,
+            };
             let file = spawn_blocking(move || -> io::Result<SpoolFile> {
                 Ok(SpoolFile {
                     temp: tempfile::tempfile()?,
@@ -529,6 +548,58 @@ impl ContentWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn admitted_spool_transfers_to_content_and_cancellation_releases_it() -> Result<()> {
+        let budget = Arc::new(SpoolBudget::new(4));
+        let reservation = budget.reserve(4)?;
+        let reserved = DOWNLOAD_SPOOL.scope(
+            std::cell::RefCell::new(Some(reservation)),
+            std::future::pending::<()>(),
+        );
+        assert!(budget.reserve(1).is_err());
+        drop(reserved);
+        let reservation = budget.reserve(4)?;
+        let mut writer = DOWNLOAD_SPOOL
+            .scope(
+                std::cell::RefCell::new(Some(reservation)),
+                ContentWriter::new(4, 1, Arc::clone(&budget)),
+            )
+            .await?;
+        assert!(ContentWriter::new(1, 0, Arc::clone(&budget)).await.is_err());
+        writer.write(b"next").await?;
+        let (content, _) = writer.finish().await?;
+        assert!(budget.reserve(1).is_err());
+        assert_eq!(content.read_all(4).await?, b"next"[..]);
+        drop(content);
+        assert!(budget.reserve(4).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduled_writer_rejects_missing_or_mismatched_spool_credit() -> Result<()> {
+        let budget = Arc::new(SpoolBudget::new(4));
+        assert!(
+            DOWNLOAD_SPOOL
+                .scope(
+                    std::cell::RefCell::new(None),
+                    ContentWriter::new(4, 1, Arc::clone(&budget)),
+                )
+                .await
+                .is_err()
+        );
+        let reservation = budget.reserve(3)?;
+        assert!(
+            DOWNLOAD_SPOOL
+                .scope(
+                    std::cell::RefCell::new(Some(reservation)),
+                    ContentWriter::new(4, 1, Arc::clone(&budget)),
+                )
+                .await
+                .is_err()
+        );
+        assert!(budget.reserve(4).is_ok());
+        Ok(())
+    }
 
     #[test]
     fn bytes_input_cannot_hide_retained_parent_memory() {

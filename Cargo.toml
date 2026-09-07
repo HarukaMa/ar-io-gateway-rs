@@ -26,6 +26,7 @@ tokio = { version = "1.0", features = ["fs", "io-util", "macros", "net", "rt", "
 tokio-postgres = "0.7"
 tokio-util = { version = "0.7", features = ["io"] }
 fs4 = { version = "0.13.1", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["test-util"] }

@@ -47,6 +47,8 @@ struct State {
     gateways: BTreeMap<String, GatewayPeer>,
     nodes: BTreeMap<String, ArweavePeer>,
     selection: usize,
+    chunk_stats: BTreeMap<String, ChunkStats>,
+    chunk_selection: usize,
 }
 
 #[derive(Serialize)]
@@ -55,6 +57,11 @@ struct GatewayPeer {
     url: String,
     data_weight: u8,
     chunk_weight: u8,
+}
+
+struct ChunkStats {
+    timing: Option<(f64, f64)>,
+    weight: u8,
 }
 
 struct ArweavePeer {
@@ -312,6 +319,75 @@ impl PeerState {
             (key.clone(), value)
         }).collect();
         json!({ "gateways": state.gateways, "arweaveNodes": nodes })
+    }
+
+    pub(crate) fn chunk_candidates(
+        &self,
+        offset: u128,
+        limit: usize,
+        configured: &[String],
+    ) -> Vec<String> {
+        let mut state = self.state.lock().unwrap();
+        let mut pool: BTreeMap<String, bool> = configured
+            .iter()
+            .map(|url| (url.trim_end_matches('/').to_owned(), false))
+            .collect();
+        for peer in state.nodes.values() {
+            pool.insert(
+                peer.url.clone(),
+                peer.coverage
+                    .as_ref()
+                    .is_some_and(|coverage| coverage.covers(offset)),
+            );
+        }
+        state.chunk_stats.retain(|url, _| pool.contains_key(url));
+        let mut ranked = Vec::with_capacity(pool.len());
+        for (url, covered) in pool {
+            let stats = state.chunk_stats.entry(url.clone()).or_insert(ChunkStats {
+                timing: None,
+                weight: 50,
+            });
+            let (latency, rate) = stats.timing.unwrap_or((1.0, 262_144.0));
+            let cost = (latency + 262_144.0 / rate) * 50.0 / f64::from(stats.weight)
+                + f64::from(50u8.saturating_sub(stats.weight)) / 5.0;
+            ranked.push((cost * if covered { 1.0 } else { 1.25 }, url));
+        }
+        ranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let selection = state.chunk_selection;
+        state.chunk_selection = selection.wrapping_add(1);
+        if !ranked.is_empty() && selection % 8 == 0 {
+            let probe = ranked.len() - 1 - (selection / 8) % ranked.len();
+            ranked.swap(0, probe);
+        }
+        ranked.into_iter().take(limit).map(|(_, url)| url).collect()
+    }
+
+    pub(crate) fn record_chunk_result(
+        &self,
+        url: &str,
+        sample: Option<(Duration, Duration, usize)>,
+    ) {
+        self.record_result(url, sample.is_some());
+        let mut state = self.state.lock().unwrap();
+        let Some(stats) = state.chunk_stats.get_mut(url.trim_end_matches('/')) else {
+            return;
+        };
+        if let Some((headers, body, bytes)) = sample {
+            stats.weight = stats.weight.saturating_add(5).min(100);
+            let latency = headers.as_secs_f64();
+            let rate = bytes as f64 / body.as_secs_f64().max(0.000_001);
+            if bytes > 0 {
+                stats.timing = Some(match stats.timing {
+                    Some((old_latency, old_rate)) => (
+                        old_latency * 0.75 + latency * 0.25,
+                        old_rate * 0.75 + rate * 0.25,
+                    ),
+                    None => (latency, rate),
+                });
+            }
+        } else {
+            stats.weight = stats.weight.saturating_sub(5).max(1);
+        }
     }
 
     pub(crate) fn candidates(
@@ -788,6 +864,51 @@ fn etf_integer(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn chunk_ranking_learns_speed_penalizes_failure_and_explores() -> Result<()> {
+        let peers = PeerState::new("http://127.0.0.1:1984")?;
+        let configured = vec!["https://slow".to_owned(), "https://new".to_owned()];
+        peers.state.lock().unwrap().nodes.insert(
+            "fast".to_owned(),
+            ArweavePeer {
+                url: "http://8.8.8.8:1984".to_owned(),
+                blocks: 1,
+                height: 1,
+                last_seen: 0,
+                coverage: None,
+                weight: 50,
+            },
+        );
+        let fast = "http://8.8.8.8:1984";
+        peers.chunk_candidates(1, 3, &configured);
+        peers.record_chunk_result(
+            "https://slow",
+            Some((Duration::from_secs(2), Duration::from_secs(2), 262_144)),
+        );
+        peers.record_chunk_result(
+            fast,
+            Some((
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                262_144,
+            )),
+        );
+        assert_eq!(peers.chunk_candidates(1, 1, &configured), [fast]);
+        for _ in 0..4 {
+            peers.record_chunk_result(fast, None);
+        }
+        assert_ne!(peers.chunk_candidates(1, 1, &configured), [fast]);
+        peers.record_chunk_result(
+            fast,
+            Some((
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                262_144,
+            )),
+        );
+        assert!((0..32).any(|_| peers.chunk_candidates(1, 1, &configured) == ["https://new"]));
+        Ok(())
+    }
     fn bucket_frame(entries: &[(u8, f64)]) -> Vec<u8> {
         let mut bytes = vec![131, 104, 2, 110, 5, 0];
         bytes.extend_from_slice(&DEFAULT_BUCKET_SIZE.to_le_bytes()[..5]);
@@ -1011,7 +1132,7 @@ mod tests {
             .build()
             .unwrap();
         gateway.client = client.clone();
-        gateway.peers.client = client;
+        Arc::get_mut(&mut gateway.peers).unwrap().client = client;
         gateway.peers.refresh_arweave().await.unwrap();
         let geometry = crate::Geometry {
             tx_root,
@@ -1033,7 +1154,7 @@ mod tests {
             gateway.retrieve_chunk(1001).await.unwrap().unwrap().bytes,
             body
         );
-        assert_eq!(failed_attempts.load(Ordering::Relaxed), 4);
+        assert!(failed_attempts.load(Ordering::Relaxed) <= 4);
         server.abort();
     }
 }

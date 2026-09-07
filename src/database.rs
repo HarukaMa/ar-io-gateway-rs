@@ -800,54 +800,31 @@ impl BlockStore {
             .collect()
     }
 
-    pub(crate) async fn pending_bundles(
-        &self,
-        start: u64,
-        end: u64,
-        limit: usize,
-    ) -> Result<Vec<(Vec<u8>, u64)>> {
-        ensure!(start <= end, "bundle range is reversed");
-        ensure!(
-            (1..=METADATA_BATCH_SIZE).contains(&limit),
-            "bundle query limit must be between 1 and 256"
-        );
-        self.client
-            .query(
-                &format!(
-                    "{CANONICAL_BUNDLES}
-                    AND NOT coalesce(progress.complete, false)
-                    AND p.block_height BETWEEN $1 AND $2
-                    ORDER BY p.block_height, p.position, p.id LIMIT $3"
-                ),
-                &[
-                    &sql_height(start)?,
-                    &sql_height(end)?,
-                    &i64::try_from(limit)?,
-                ],
-            )
-            .await?
-            .iter()
-            .map(|row| Ok((row.try_get(0)?, u64::try_from(row.try_get::<_, i64>(1)?)?)))
-            .collect()
-    }
-
     pub(crate) async fn pending_bundle_after(
         &self,
         after: Option<&[u8]>,
+        range: Option<(u64, u64)>,
     ) -> Result<Option<(Vec<u8>, u64, u128)>> {
         ensure!(
             after.is_none_or(|id| id.len() == 32),
             "bundle cursor ID must be 32 bytes"
         );
+        ensure!(
+            range.is_none_or(|(start, end)| start <= end),
+            "bundle range is reversed"
+        );
+        let start = range.map(|(start, _)| sql_height(start)).transpose()?;
+        let end = range.map(|(_, end)| sql_height(end)).transpose()?;
         self.client
             .query_opt(
                 &format!(
                     "{CANONICAL_BUNDLES}
                     AND NOT coalesce(progress.complete, false)
                     AND ($1::bytea IS NULL OR o.id > $1)
+                    AND ($2::bigint IS NULL OR p.block_height BETWEEN $2 AND $3)
                     ORDER BY o.id LIMIT 1"
                 ),
-                &[&after],
+                &[&after, &start, &end],
             )
             .await?
             .map(|row| {
@@ -2000,9 +1977,10 @@ mod tests {
                     &[&ids],
                 )
                 .await?;
-            ensure!(store.pending_bundle_after(None).await? == Some(roots[0].clone()));
+            ensure!(store.pending_bundle_after(None, None).await? == Some(roots[0].clone()));
             ensure!(
-                store.pending_bundle_after(Some(&roots[0].0)).await? != Some(roots[0].clone()),
+                store.pending_bundle_after(Some(&roots[0].0), None).await?
+                    != Some(roots[0].clone()),
                 "scheduled discovery repeated its cursor root"
             );
             store
@@ -2015,7 +1993,7 @@ mod tests {
                 .await?;
             ensure!(
                 store.bundle_complete(&roots[0].0).await?
-                    && store.pending_bundle_after(None).await? != Some(roots[0].clone()),
+                    && store.pending_bundle_after(None, None).await? != Some(roots[0].clone()),
                 "a completed root remained eligible for scheduled retrieval"
             );
             store
@@ -2027,7 +2005,7 @@ mod tests {
                 .await?;
             ensure!(
                 !store.bundle_complete(&roots[0].0).await?
-                    && store.pending_bundle_after(None).await?.is_none(),
+                    && store.pending_bundle_after(None, None).await?.is_none(),
                 "bundle completion or discovery survived loss of canonical coverage"
             );
             Ok(())
