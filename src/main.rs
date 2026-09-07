@@ -1,4 +1,4 @@
-use std::{env, fs, time::Duration};
+use std::{env, fs, io::Read, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use ar_io_gateway::{
@@ -131,6 +131,32 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5".to_owned()),
             max_concurrent_requests,
         )?;
+        config = config.with_routing(
+            env::var("APEX_TX_ID")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .as_deref(),
+            env::var("APEX_ARNS_NAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .as_deref(),
+            env::var("CACHE_APEX_MAX_AGE")
+                .unwrap_or_else(|_| "3600".to_owned())
+                .parse()
+                .context("invalid CACHE_APEX_MAX_AGE")?,
+        )?;
+        if let Some(path) = env::var("AR_IO_BLOCKLIST_PATH")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            let mut bytes = Vec::new();
+            fs::File::open(path)
+                .context("cannot open AR_IO_BLOCKLIST_PATH")?
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .context("cannot read AR_IO_BLOCKLIST_PATH")?;
+            config = config.with_blocklist(&bytes)?;
+        }
         let wallet = env::var("AR_IO_WALLET")
             .ok()
             .filter(|value| !value.is_empty());

@@ -63,9 +63,31 @@ const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_RANGE_HEADER_BYTES: usize = 8 * 1024;
 const MAX_BYTE_RANGES: usize = 16;
 
+struct RootHost {
+    host: String,
+    apex_name: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Blocklist {
+    ids: HashSet<String>,
+    hashes: HashSet<String>,
+    names: HashSet<String>,
+}
+
+impl Blocklist {
+    fn blocks(&self, data: &VerifiedData) -> bool {
+        self.ids.contains(&data.id) || self.hashes.contains(data.etag.trim_matches('"'))
+    }
+}
+
 pub struct ServerConfig {
     listen_addr: SocketAddr,
-    arns_root_host: String,
+    arns_root_hosts: Vec<RootHost>,
+    apex_tx_id: Option<String>,
+    apex_max_age: u64,
+    blocklist: Blocklist,
     solana_rpc_url: Url,
     core_program_id: String,
     gar_program_id: String,
@@ -88,8 +110,19 @@ impl ServerConfig {
         max_concurrent_requests: usize,
     ) -> Result<Self> {
         let listen_addr = listen_addr.parse().context("invalid AR_IO_LISTEN_ADDR")?;
-        let arns_root_host = arns_root_host.trim_end_matches('.').to_ascii_lowercase();
-        validate_host(&arns_root_host)?;
+        let arns_root_hosts = arns_root_host
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(|host| {
+                let host = host.trim_end_matches('.').to_ascii_lowercase();
+                validate_host(&host)?;
+                Ok(RootHost {
+                    host,
+                    apex_name: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let solana_rpc_url = Url::parse(solana_rpc_url).context("invalid SOLANA_RPC_URL")?;
         ensure!(
             matches!(solana_rpc_url.scheme(), "http" | "https"),
@@ -104,7 +137,10 @@ impl ServerConfig {
 
         Ok(Self {
             listen_addr,
-            arns_root_host,
+            arns_root_hosts,
+            apex_tx_id: None,
+            apex_max_age: 3600,
+            blocklist: Blocklist::default(),
             solana_rpc_url,
             core_program_id: "73YoECm6NKXpVRoe5f1Q9BcP5DJGPFUjnFy6AxBE5Nvh".to_owned(),
             gar_program_id: "89fNiiwgpFSPHKuqfNUkgYTYjtAJAhyqHjXmgXeppGpf".to_owned(),
@@ -116,6 +152,81 @@ impl ServerConfig {
             max_expected_data_item_indexing_interval_seconds: None,
             signer: None,
         })
+    }
+
+    pub fn with_routing(
+        mut self,
+        apex_tx_id: Option<&str>,
+        apex_names: Option<&str>,
+        apex_max_age: u64,
+    ) -> Result<Self> {
+        ensure!(
+            apex_tx_id.is_none() || apex_names.is_none(),
+            "APEX_TX_ID and APEX_ARNS_NAME are mutually exclusive"
+        );
+        ensure!(apex_max_age > 0, "CACHE_APEX_MAX_AGE must be positive");
+        if let Some(id) = apex_tx_id {
+            decode_fixed::<32>(id, "APEX_TX_ID")?;
+            self.apex_tx_id = Some(id.to_owned());
+        }
+        if let Some(names) = apex_names {
+            let names: Vec<_> = names.split(',').map(str::trim).collect();
+            ensure!(
+                !self.arns_root_hosts.is_empty(),
+                "APEX_ARNS_NAME requires ARNS_ROOT_HOST"
+            );
+            ensure!(
+                names.len() == 1 || names.len() <= self.arns_root_hosts.len(),
+                "too many APEX_ARNS_NAME entries"
+            );
+            for (index, root) in self.arns_root_hosts.iter_mut().enumerate() {
+                let name = if names.len() == 1 {
+                    names.first()
+                } else {
+                    names.get(index)
+                };
+                if let Some(name) = name.filter(|name| !name.is_empty()) {
+                    let name = name.to_ascii_lowercase();
+                    split_arns_name(&name)?;
+                    root.apex_name = Some(name);
+                }
+            }
+        }
+        self.apex_max_age = apex_max_age;
+        Ok(self)
+    }
+
+    pub fn with_blocklist(mut self, bytes: &[u8]) -> Result<Self> {
+        ensure!(bytes.len() <= 1024 * 1024, "blocking policy exceeds 1 MiB");
+        let mut policy: Blocklist =
+            serde_json::from_slice(bytes).context("invalid blocking policy JSON")?;
+        for id in &policy.ids {
+            decode_fixed::<32>(id, "blocked ID")?;
+        }
+        for hash in &policy.hashes {
+            decode_fixed::<32>(hash, "blocked SHA-256")?;
+        }
+        policy.names = policy
+            .names
+            .into_iter()
+            .map(|name| {
+                let name = name.to_ascii_lowercase();
+                split_arns_name(&name)?;
+                Ok(name)
+            })
+            .collect::<Result<_>>()?;
+        self.blocklist = policy;
+        Ok(self)
+    }
+
+    fn root_host(&self, host: &str) -> Option<&RootHost> {
+        self.arns_root_hosts
+            .iter()
+            .filter(|root| {
+                host.strip_suffix(&root.host)
+                    .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
+            })
+            .max_by_key(|root| root.host.len())
     }
 
     pub fn with_info(
@@ -499,7 +610,7 @@ async fn serve_info(State(state): State<Arc<AppState>>) -> Response {
 
 async fn serve_resolver(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     if split_arns_name(&name).is_err() {
-        return error_response(StatusCode::NOT_FOUND, "Not Found");
+        return error_response(StatusCode::NOT_FOUND, "Not found");
     }
     let _permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
@@ -512,7 +623,7 @@ async fn serve_resolver(State(state): State<Arc<AppState>>, Path(name): Path<Str
     .await
     {
         Ok(Ok(Some(resolution))) => resolution,
-        Ok(Ok(None)) => return error_response(StatusCode::NOT_FOUND, "Not Found"),
+        Ok(Ok(None)) => return error_response(StatusCode::NOT_FOUND, "Not found"),
         Ok(Err(error)) => {
             eprintln!("ArNS resolution failed: {error:#}");
             return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
@@ -731,7 +842,7 @@ async fn serve_chunk_response(
                 eprintln!("chunk response construction failed: {error:#}");
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
             }),
-        Ok(None) => error_response(StatusCode::NOT_FOUND, "Not Found"),
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "Not found"),
         Err(error) => {
             eprintln!("verified chunk retrieval failed: {error:#}");
             empty_error_response(StatusCode::BAD_GATEWAY)
@@ -740,7 +851,14 @@ async fn serve_chunk_response(
 }
 
 async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    if arns_name(&headers, &state.config.arns_root_host).is_none() {
+    let apex = request_host(&headers).is_some_and(|host| {
+        state
+            .config
+            .root_host(&host)
+            .is_some_and(|root| root.host == host)
+            && state.config.apex_tx_id.is_some()
+    });
+    if !apex && arns_name(&headers, &state.config).is_none() {
         return serve_info(State(state)).await;
     }
     let permit = match request_permit(&state.request_permits) {
@@ -753,6 +871,8 @@ async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 async fn serve_raw(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Response {
     let permit = match request_permit(&state.request_permits) {
@@ -760,10 +880,13 @@ async fn serve_raw(
         Err(response) => return response,
     };
     if !is_data_id_shape(&id) {
-        return error_response(StatusCode::NOT_FOUND, "Not Found");
+        return unmatched_response(&method, &uri);
     }
     if decode_fixed::<32>(&id, "data ID").is_err() {
         return error_response(StatusCode::BAD_REQUEST, "Invalid ID");
+    }
+    if state.config.blocklist.ids.contains(&id) {
+        return blocked_response(&id);
     }
     match state.gateway.retrieve(&id).await {
         Ok(verified) => verified_response(
@@ -787,6 +910,7 @@ async fn serve_path(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
     uri: Uri,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
     let permit = match request_permit(&state.request_permits) {
@@ -795,15 +919,21 @@ async fn serve_path(
     };
     let (id, manifest_path) = path.split_once('/').unwrap_or((&path, ""));
     if let Ok(decoded_id) = decode_fixed::<32>(id, "data ID") {
-        let sandbox = sandbox_name(&decoded_id);
-        let sandbox_host = format!("{sandbox}.{}", state.config.arns_root_host);
-        if request_host(&headers).as_deref() != Some(sandbox_host.as_str()) {
-            let location = format!(
-                "https://{sandbox_host}{}?{}",
-                uri.path(),
-                uri.query().unwrap_or("")
-            );
-            return redirect_response(StatusCode::FOUND, location);
+        let host = request_host(&headers);
+        let root = host
+            .as_deref()
+            .and_then(|host| state.config.root_host(host))
+            .or_else(|| state.config.arns_root_hosts.first());
+        if let Some(root) = root {
+            let sandbox_host = format!("{}.{}", sandbox_name(&decoded_id), root.host);
+            if host.as_deref() != Some(sandbox_host.as_str()) {
+                let location = format!(
+                    "https://{sandbox_host}{}?{}",
+                    uri.path(),
+                    uri.query().unwrap_or("")
+                );
+                return redirect_response(StatusCode::FOUND, location);
+            }
         }
         return retrieve_response(
             &state,
@@ -820,6 +950,16 @@ async fn serve_path(
     if is_data_id_shape(id) {
         return error_response(StatusCode::BAD_REQUEST, "Invalid ID");
     }
+    let apex = state.config.apex_tx_id.is_some()
+        && request_host(&headers).is_some_and(|host| {
+            state
+                .config
+                .root_host(&host)
+                .is_some_and(|root| root.host == host)
+        });
+    if !apex && arns_name(&headers, &state.config).is_none() {
+        return unmatched_response(&method, &uri);
+    }
     serve_arns_path(&state, &headers, &path, permit).await
 }
 
@@ -829,12 +969,43 @@ async fn serve_arns_path(
     path: &str,
     permit: OwnedSemaphorePermit,
 ) -> Response {
-    let Some(name) = arns_name(headers, &state.config.arns_root_host) else {
-        return error_response(StatusCode::NOT_FOUND, "Not Found");
+    if let Some(id) = &state.config.apex_tx_id
+        && request_host(headers).is_some_and(|host| {
+            state
+                .config
+                .root_host(&host)
+                .is_some_and(|root| root.host == host)
+        })
+    {
+        let mut response =
+            retrieve_response(state, id, path, false, None, None, headers, permit).await;
+        if response.status().is_success()
+            || matches!(
+                response.status(),
+                StatusCode::NOT_MODIFIED | StatusCode::RANGE_NOT_SATISFIABLE
+            )
+        {
+            response.headers_mut().insert(
+                CACHE_CONTROL,
+                format!(
+                    "public, max-age={}, must-revalidate",
+                    state.config.apex_max_age
+                )
+                .parse()
+                .unwrap(),
+            );
+        }
+        return response;
+    }
+    let Some(name) = arns_name(headers, &state.config) else {
+        return error_response(StatusCode::NOT_FOUND, "Not found");
     };
+    if state.config.blocklist.names.contains(&name) {
+        return blocked_response(&name);
+    }
     let resolution = match resolve_arns(state, name).await {
         Ok(Some(resolution)) => resolution,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not Found"),
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not found"),
         Err(error) => {
             eprintln!("ArNS resolution failed: {error:#}");
             return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
@@ -866,10 +1037,16 @@ async fn retrieve_response(
     headers: &HeaderMap,
     permit: OwnedSemaphorePermit,
 ) -> Response {
+    if state.config.blocklist.ids.contains(id) {
+        return blocked_response(id);
+    }
     let verified = match state.gateway.retrieve(id).await {
         Ok(verified) => verified,
         Err(error) => return retrieval_error_response(error),
     };
+    if state.config.blocklist.blocks(&verified) {
+        return blocked_response(id);
+    }
     if !is_manifest_content_type(&verified.content_type) {
         return verified_response(
             verified,
@@ -897,7 +1074,7 @@ async fn retrieve_response(
     .await;
     let target = match target {
         Ok(Some(target)) => target,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not Found"),
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not found"),
         Err(error) => {
             eprintln!("manifest resolution failed: {error:#}");
             return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
@@ -914,6 +1091,9 @@ async fn retrieve_response(
     drop(verified);
 
     let fallback = target.fallback;
+    if state.config.blocklist.ids.contains(&target.id) {
+        return blocked_response(&target.id);
+    }
     let verified_target = match state.gateway.retrieve(&target.id).await {
         Ok(verified) => verified,
         Err(error) => return retrieval_error_response(error),
@@ -931,7 +1111,7 @@ async fn retrieve_response(
         eprintln!("response construction failed: {error:#}");
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
     });
-    if fallback {
+    if fallback && response.status() != StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS {
         response.headers_mut().insert(
             CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=60, must-revalidate"),
@@ -1503,24 +1683,16 @@ fn multipart_content(
     content: &Content,
     ranges: &[(usize, usize)],
     content_type: &str,
-    content_encoding: Option<&str>,
     boundary: &str,
 ) -> Result<(Vec<Content>, usize)> {
     HeaderValue::from_str(content_type).context("invalid multipart content type")?;
-    let encoding_header = match content_encoding {
-        Some(encoding) => {
-            HeaderValue::from_str(encoding).context("invalid multipart content encoding")?;
-            format!("Content-Encoding: {encoding}\r\n")
-        }
-        None => String::new(),
-    };
     let mut parts = Vec::with_capacity(ranges.len() * 2 + 1);
     let mut length = 0_usize;
     let total = content.len();
     for (index, &(start, end)) in ranges.iter().enumerate() {
         let separator = if index == 0 { "" } else { "\r\n" };
         let header = format!(
-            "{separator}--{boundary}\r\nContent-Type: {content_type}\r\n{encoding_header}Content-Range: bytes {start}-{end}/{total}\r\n\r\n"
+            "{separator}--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: bytes {start}-{end}/{total}\r\n\r\n"
         );
         let range = content.slice(start..end + 1)?;
         length = length
@@ -1724,6 +1896,9 @@ async fn verified_response(
     limits: &Config,
     permit: OwnedSemaphorePermit,
 ) -> Result<Response> {
+    if config.blocklist.blocks(&verified) {
+        return Ok(blocked_response(&verified.id));
+    }
     ensure!(
         verified.bytes.len() == verified.content_length,
         "verified content length mismatch"
@@ -1824,20 +1999,18 @@ async fn verified_response(
             .body(Body::empty())
             .context("failed to construct not-modified response");
     }
+    if let Some(encoding) = &verified.content_encoding {
+        builder = builder.header("content-encoding", encoding.as_str());
+    }
     if let Some(ranges) = &range
         && ranges.len() > 1
     {
         let boundary = format!("ar-io-{digest}");
-        let (parts, content_length) = multipart_content(
-            &verified.bytes,
-            ranges,
-            &verified.content_type,
-            verified.content_encoding.as_deref(),
-            &boundary,
-        )?;
+        let (parts, content_length) =
+            multipart_content(&verified.bytes, ranges, &verified.content_type, &boundary)?;
         let mut parts = parts.into_iter();
         let first = parts.next().context("multipart response has no parts")?;
-        // The envelope is not content-encoded; each part describes the encoded representation.
+        // Preserve Node's encoded multipart wire contract.
         return builder
             .status(StatusCode::PARTIAL_CONTENT)
             .header(
@@ -1848,9 +2021,7 @@ async fn verified_response(
             .body(response_body(first, parts, limits, permit).await?)
             .context("failed to construct multipart response");
     }
-    if let Some(encoding) = &verified.content_encoding {
-        builder = builder.header("content-encoding", encoding.as_str());
-    }
+    let content_type = super::response_content_type(verified.content_type);
 
     match range {
         Some(ranges) => {
@@ -1858,7 +2029,7 @@ async fn verified_response(
             let content_length = end - start + 1;
             builder
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header("content-type", verified.content_type.as_str())
+                .header("content-type", content_type.as_str())
                 .header("content-length", content_length.to_string())
                 .header(
                     "content-range",
@@ -1869,7 +2040,7 @@ async fn verified_response(
         }
         None => builder
             .status(StatusCode::OK)
-            .header("content-type", verified.content_type.as_str())
+            .header("content-type", content_type.as_str())
             .header("content-length", verified.content_length.to_string())
             .body(content_body(verified.bytes, limits, permit).await?)
             .context("failed to construct HTTP response"),
@@ -1968,11 +2139,41 @@ fn is_data_id_shape(id: &str) -> bool {
 
 fn retrieval_error_response(error: anyhow::Error) -> Response {
     if error.is::<crate::ContentNotFound>() {
-        error_response(StatusCode::NOT_FOUND, "Not Found")
+        error_response(StatusCode::NOT_FOUND, "Not found")
     } else {
         eprintln!("verified retrieval failed: {error:#}");
         error_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
     }
+}
+
+fn unmatched_response(method: &Method, uri: &Uri) -> Response {
+    let message = format!("Cannot {method} {}", uri.path())
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let body = format!(
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Error</title>\n</head>\n<body>\n<pre>{message}</pre>\n</body>\n</html>\n"
+    );
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("content-type", "text/html; charset=utf-8")
+        .header("content-length", body.len().to_string())
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn blocked_response(id: &str) -> Response {
+    let message =
+        format!("Requested content blocked by this node's content policy. Blocked ID: {id}");
+    Response::builder()
+        .status(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS)
+        .header("cache-control", "public, max-age=2592000, immutable")
+        .header("content-type", "text/html; charset=utf-8")
+        .header("content-length", message.len().to_string())
+        .body(Body::from(message))
+        .unwrap()
 }
 
 fn empty_error_response(status: StatusCode) -> Response {
@@ -1984,9 +2185,20 @@ fn empty_error_response(status: StatusCode) -> Response {
 }
 
 fn error_response(status: StatusCode, message: &'static str) -> Response {
-    Response::builder()
+    let mut builder = Response::builder();
+    if status == StatusCode::NOT_FOUND {
+        builder = builder.header(CACHE_CONTROL, "public, max-age=60, must-revalidate");
+    }
+    builder
         .status(status)
-        .header("content-type", "text/plain; charset=utf-8")
+        .header(
+            "content-type",
+            if status == StatusCode::NOT_FOUND {
+                "text/html; charset=utf-8"
+            } else {
+                "text/plain; charset=utf-8"
+            },
+        )
         .header("content-length", message.len().to_string())
         .body(Body::from(message))
         .unwrap()
@@ -2002,9 +2214,17 @@ fn request_host(headers: &HeaderMap) -> Option<String> {
     Some(authority.host().trim_end_matches('.').to_ascii_lowercase())
 }
 
-fn arns_name(headers: &HeaderMap, root_host: &str) -> Option<String> {
+fn arns_name(headers: &HeaderMap, config: &ServerConfig) -> Option<String> {
     let host = request_host(headers)?;
-    let name = host.strip_suffix(&format!(".{root_host}"))?;
+    let root = config.root_host(&host)?;
+    if host == root.host {
+        return root.apex_name.clone();
+    }
+    let prefix = host.strip_suffix(&root.host)?.strip_suffix('.')?;
+    let name = prefix.split('.').next()?;
+    if name == "www" || (name.len() > 51 && !name.contains('_')) {
+        return None;
+    }
     split_arns_name(name).ok()?;
     Some(name.to_owned())
 }
@@ -2691,6 +2911,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apex_manifest_and_blocking_policy_cover_cached_targets() {
+        let id = |byte: u8| URL_SAFE_NO_PAD.encode([byte; 32]);
+        let manifest_id = id(1);
+        let good_id = id(2);
+        let blocked_id = id(3);
+        let hashed_id = id(4);
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "manifest": "arweave/paths", "version": "0.2.0",
+            "index": {"id": good_id},
+            "paths": {"hello.txt": {"id": good_id}, "blocked": {"id": blocked_id}},
+            "fallback": {"id": hashed_id}
+        }))
+        .unwrap();
+        let gateway = Gateway::new(stream_limits()).unwrap();
+        for (id, bytes, content_type) in [
+            (&manifest_id, manifest.as_slice(), MANIFEST_CONTENT_TYPE),
+            (&good_id, b"hello".as_slice(), "text/plain"),
+            (&hashed_id, b"blocked fallback".as_slice(), "text/plain"),
+        ] {
+            let mut verified = response_fixture(bytes);
+            verified.id = id.clone();
+            verified.content_type = content_type.to_owned();
+            gateway.cache.lock().unwrap().insert(
+                verified,
+                gateway.config.cache_max_entries,
+                gateway.config.cache_max_bytes,
+            );
+        }
+        let config = ServerConfig::new(
+            "127.0.0.1:0",
+            "example.com, deep.example.com",
+            "http://127.0.0.1:1",
+            ARNS_PROGRAM,
+            ANT_PROGRAM,
+            1,
+        )
+        .unwrap()
+        .with_routing(Some(&manifest_id), None, 3600)
+        .unwrap()
+        .with_blocklist(
+            &serde_json::to_vec(&serde_json::json!({
+                "ids": [blocked_id],
+                "hashes": [URL_SAFE_NO_PAD.encode(Sha256::digest(b"blocked fallback"))],
+                "names": ["blocked-name"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            gateway,
+            config,
+            request_permits: Arc::new(Semaphore::new(1)),
+            started_at: Instant::now(),
+        });
+        let app = Router::new()
+            .route("/", get(serve_arns))
+            .route("/raw/{id}", get(serve_raw))
+            .route("/{*path}", get(serve_path))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        for path in ["/", "/hello.txt"] {
+            let response = client
+                .get(format!("{base}{path}"))
+                .header(HOST, "deep.example.com")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[CACHE_CONTROL],
+                "public, max-age=3600, must-revalidate"
+            );
+            assert_eq!(response.bytes().await.unwrap().as_ref(), b"hello");
+        }
+        for (host, path) in [
+            ("deep.example.com", "/blocked".to_owned()),
+            ("deep.example.com", "/missing".to_owned()),
+            ("example.com", format!("/raw/{blocked_id}")),
+            ("example.com", format!("/raw/{hashed_id}")),
+            ("blocked-name.deep.example.com", "/".to_owned()),
+        ] {
+            let response = client
+                .get(format!("{base}{path}"))
+                .header(HOST, host)
+                .header(
+                    "if-none-match",
+                    format!(
+                        "\"{}\"",
+                        URL_SAFE_NO_PAD.encode(Sha256::digest(b"blocked fallback"))
+                    ),
+                )
+                .header("range", "bytes=0-1")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+                "{path}"
+            );
+            assert_eq!(
+                response.headers()[CACHE_CONTROL],
+                "public, max-age=2592000, immutable"
+            );
+            assert!(response.text().await.unwrap().contains("Blocked ID: "));
+        }
+        let response = client
+            .get(format!("{base}/{good_id}"))
+            .header(HOST, "deep.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers()["location"],
+            format!(
+                "https://{}.deep.example.com/{good_id}?",
+                sandbox_name(&[2; 32])
+            )
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn resolves_longest_root_and_positional_apex_names() {
+        let config = ServerConfig::new(
+            "127.0.0.1:0",
+            "example.com, deep.example.com",
+            "http://127.0.0.1:1",
+            ARNS_PROGRAM,
+            ANT_PROGRAM,
+            1,
+        )
+        .unwrap()
+        .with_routing(None, Some("first,second"), 3600)
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        for (host, expected) in [
+            ("example.com", Some("first")),
+            ("deep.example.com", Some("second")),
+            ("page.deep.example.com", Some("page")),
+            ("www.deep.example.com", None),
+            ("badexample.com", None),
+        ] {
+            headers.insert(HOST, host.parse().unwrap());
+            assert_eq!(arns_name(&headers, &config).as_deref(), expected);
+        }
+        assert!(config.with_blocklist(br#"{"ids":["invalid"]}"#).is_err());
+    }
+
+    #[tokio::test]
     async fn public_cors_encoding_head_and_invalid_ids() {
         let gateway = Gateway::new(stream_limits()).unwrap();
         let mut verified = response_fixture(GZIP_HELLO);
@@ -2819,7 +3196,7 @@ mod tests {
                 .unwrap()
                 .starts_with("multipart/byteranges; boundary=")
         );
-        assert!(!head.headers().contains_key("content-encoding"));
+        assert_eq!(head.headers()["content-encoding"], "gzip");
         assert!(head.bytes().await.unwrap().is_empty());
         let conditional = client
             .get(format!("{base}/raw/{id}"))
@@ -2845,15 +3222,18 @@ mod tests {
     fn keeps_verification_failures_distinct_from_missing_content() {
         let missing =
             anyhow::Error::new(crate::ContentNotFound).context("retrieving manifest target");
+        let response = retrieval_error_response(missing);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            retrieval_error_response(missing).status(),
-            StatusCode::NOT_FOUND
+            response.headers()[CACHE_CONTROL],
+            "public, max-age=60, must-revalidate"
         );
         let invalid = anyhow::anyhow!("invalid chunk proof");
-        assert_eq!(
-            retrieval_error_response(invalid).status(),
-            StatusCode::BAD_GATEWAY
-        );
+        let response = retrieval_error_response(invalid);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.headers().contains_key(CACHE_CONTROL));
+        let unmatched = unmatched_response(&Method::GET, &"/unknown".parse().unwrap());
+        assert!(!unmatched.headers().contains_key(CACHE_CONTROL));
     }
 
     #[tokio::test]
@@ -2895,7 +3275,7 @@ mod tests {
             .unwrap();
             assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
             assert!(!response.headers().contains_key("content-range"));
-            assert!(!response.headers().contains_key("content-encoding"));
+            assert_eq!(response.headers()["content-encoding"], "gzip");
             let boundary = response.headers()["content-type"]
                 .to_str()
                 .unwrap()
@@ -2904,7 +3284,7 @@ mod tests {
             let mut expected = Vec::new();
             for (start, end) in [(23, 24), (0, 1), (1, 2)] {
                 expected.extend_from_slice(format!(
-                    "--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Encoding: gzip\r\nContent-Range: bytes {start}-{end}/25\r\n\r\n"
+                    "--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Range: bytes {start}-{end}/25\r\n\r\n"
                 ).as_bytes());
                 expected.extend_from_slice(&GZIP_HELLO[start..=end]);
                 expected.extend_from_slice(b"\r\n");
@@ -3009,7 +3389,7 @@ mod tests {
 
         let mut host_headers = HeaderMap::new();
         host_headers.insert(HOST, "lolcchekc.ar.mrx.im:3000".parse().unwrap());
-        assert_eq!(arns_name(&host_headers, "ar.mrx.im").unwrap(), "lolcchekc");
+        assert_eq!(arns_name(&host_headers, &config).unwrap(), "lolcchekc");
     }
 
     #[test]

@@ -513,25 +513,25 @@ impl Gateway {
 
     pub async fn retrieve(&self, id: &str) -> Result<VerifiedData> {
         decode_fixed::<32>(id, "data ID")?;
-        let data = self
-            .retrieve_cached(&self.cache, id, true, async {
-                if let Some((mut data, tags)) = self.load_content_cache(id).await? {
-                    if let Some(tags) = tags {
-                        data = Arc::new(VerifiedRoot {
-                            data,
-                            tags,
-                            facts: None,
-                        })
-                        .verified();
-                    }
-                    return Ok(data);
+        // Keep the retrieval state machine off the Windows HTTP thread's stack.
+        let data = Box::pin(self.retrieve_cached(&self.cache, id, true, async {
+            if let Some((mut data, tags)) = self.load_content_cache(id).await? {
+                if let Some(tags) = tags {
+                    data = Arc::new(VerifiedRoot {
+                        data,
+                        tags,
+                        facts: None,
+                    })
+                    .verified();
                 }
-                match self.discover(id).await? {
-                    Some(hint) => self.retrieve_bundled_with_hint(id, hint).await,
-                    None => self.retrieve_direct(id).await,
-                }
-            })
-            .await?;
+                return Ok(data);
+            }
+            match self.discover(id).await? {
+                Some(hint) => self.retrieve_bundled_with_hint(id, hint).await,
+                None => self.retrieve_direct(id).await,
+            }
+        }))
+        .await?;
         if let (Some(indexer), Some(root)) = (&self.bundle_indexer, &data.indexing_root) {
             indexer.submit(root);
         }
@@ -2501,7 +2501,7 @@ fn content_type(tags: &[Tag]) -> Result<String> {
                 .to_str()
                 .context("non-ASCII Content-Type tag")?
                 .to_owned();
-            return Ok(response_content_type(value));
+            return Ok(value);
         }
     }
     Ok("application/octet-stream".to_owned())
@@ -2908,7 +2908,7 @@ fn item_content_type(tags: &[ItemTag]) -> Result<String> {
                 .to_str()
                 .context("non-ASCII Content-Type tag")?
                 .to_owned();
-            return Ok(response_content_type(value));
+            return Ok(value);
         }
     }
     Ok("application/octet-stream".to_owned())
@@ -4603,10 +4603,7 @@ mod tests {
             hex(&verified.body_hash),
             "4d02c735657b171d1a3d3bc9ddd7ee396cdf5232e11d6adb06826637c3b9070c"
         );
-        assert_eq!(
-            item_content_type(&verified.tags).unwrap(),
-            "text/html; charset=utf-8"
-        );
+        assert_eq!(item_content_type(&verified.tags).unwrap(), "text/html");
 
         let mut bundle = Vec::with_capacity(32 + BUNDLE_ENTRY_SIZE + item.len());
         bundle.extend_from_slice(&1u64.to_le_bytes());
