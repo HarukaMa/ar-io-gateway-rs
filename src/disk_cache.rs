@@ -133,7 +133,6 @@ impl DiskCache {
             match temp.persist_noclobber(&path) {
                 Ok(writer) => {
                     drop(writer);
-                    // The completed name is published atomically; never replace or evict it.
                     #[cfg(unix)]
                     File::open(&directory.path)?.sync_all()?;
                     drop(reservation);
@@ -145,11 +144,26 @@ impl DiskCache {
                     )))
                 }
                 Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-                    drop(file);
-                    drop(error);
-                    let existing = verified_file(&path, hash, content.len(), &cancelled)?.context(
-                        "existing content cache file is corrupt or has conflicting length",
-                    )?;
+                    let existing = if let Some(existing) =
+                        verified_file(&path, hash, content.len(), &cancelled)?
+                    {
+                        existing
+                    } else {
+                        ensure!(
+                            fs::symlink_metadata(&path)?.file_type().is_file(),
+                            "cache repair requires a regular file"
+                        );
+                        ensure!(!cancelled.load(Ordering::Relaxed), "cache write cancelled");
+                        drop(
+                            error
+                                .file
+                                .persist(&path)
+                                .context("repairing cached content")?,
+                        );
+                        #[cfg(unix)]
+                        File::open(&directory.path)?.sync_all()?;
+                        file
+                    };
                     drop(reservation);
                     Ok(Some(Content::persistent(
                         existing,
@@ -481,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_truncated_and_wrong_length_files_are_misses_not_overwritten() -> Result<()> {
+    async fn verified_download_repairs_corrupt_and_truncated_cache_files() -> Result<()> {
         let root = tempfile::tempdir()?;
         let cache = DiskCache::new(root.path().to_path_buf(), 0, 4).await?;
         let content = Content::from(b"data".to_vec());
@@ -493,9 +507,39 @@ mod tests {
         for corrupt in [b"evil".as_slice(), b"dat".as_slice()] {
             fs::write(&path, corrupt)?;
             assert!(cache.load(hash, 4).await?.is_none());
-            assert!(cache.store(&content, hash).await.is_err());
-            assert_eq!(fs::read(&path)?, corrupt);
+            let mut existing_reader = File::open(&path)?;
+            #[cfg(windows)]
+            {
+                assert!(cache.store(&content, hash).await.is_err());
+                assert_eq!(fs::read(&path)?, corrupt);
+                let mut previous = Vec::new();
+                existing_reader.read_to_end(&mut previous)?;
+                assert_eq!(previous, corrupt);
+                drop(existing_reader);
+            }
+            let repaired = cache.store(&content, hash).await?.unwrap();
+            assert_eq!(repaired.read_all(4).await?.as_ref(), b"data");
+            assert_eq!(
+                cache
+                    .load(hash, 4)
+                    .await?
+                    .unwrap()
+                    .read_all(4)
+                    .await?
+                    .as_ref(),
+                b"data"
+            );
+            #[cfg(not(windows))]
+            {
+                let mut previous = Vec::new();
+                existing_reader.read_to_end(&mut previous)?;
+                assert_eq!(previous, corrupt);
+            }
         }
+        fs::remove_file(&path)?;
+        fs::create_dir(&path)?;
+        assert!(cache.store(&content, hash).await.is_err());
+        assert!(path.is_dir());
         Ok(())
     }
 
