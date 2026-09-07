@@ -20,7 +20,7 @@ use axum::{
         uri::Authority,
     },
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use base64::{
@@ -806,17 +806,21 @@ fn request_permit(permits: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Resp
 async fn serve_chunk(
     State(state): State<Arc<AppState>>,
     Path(offset): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    serve_chunk_response(&state, &offset, &headers, false).await
+    serve_chunk_response(&state, &offset, &headers, false, &method, &uri).await
 }
 
 async fn serve_chunk_data(
     State(state): State<Arc<AppState>>,
     Path(offset): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    serve_chunk_response(&state, &offset, &headers, true).await
+    serve_chunk_response(&state, &offset, &headers, true, &method, &uri).await
 }
 
 async fn serve_chunk_response(
@@ -824,13 +828,15 @@ async fn serve_chunk_response(
     offset: &str,
     headers: &HeaderMap,
     raw: bool,
+    method: &Method,
+    uri: &Uri,
 ) -> Response {
     let permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
         Err(response) => return response,
     };
     if offset.is_empty() || !offset.bytes().all(|byte| byte.is_ascii_digit()) {
-        return error_response(StatusCode::BAD_REQUEST, "Invalid offset");
+        return unmatched_response(method, uri);
     }
     let Ok(offset) = offset.parse::<u128>() else {
         return error_response(StatusCode::BAD_REQUEST, "Invalid offset");
@@ -883,7 +889,7 @@ async fn serve_raw(
         return unmatched_response(&method, &uri);
     }
     if decode_fixed::<32>(&id, "data ID").is_err() {
-        return error_response(StatusCode::BAD_REQUEST, "Invalid ID");
+        return invalid_id_response(&id);
     }
     if state.config.blocklist.ids.contains(&id) {
         return blocked_response(&id);
@@ -932,7 +938,7 @@ async fn serve_path(
                     uri.path(),
                     uri.query().unwrap_or("")
                 );
-                return redirect_response(StatusCode::FOUND, location);
+                return redirect_response(StatusCode::FOUND, location, &headers);
             }
         }
         return retrieve_response(
@@ -948,7 +954,7 @@ async fn serve_path(
         .await;
     }
     if is_data_id_shape(id) {
-        return error_response(StatusCode::BAD_REQUEST, "Invalid ID");
+        return invalid_id_response(id);
     }
     let apex = state.config.apex_tx_id.is_some()
         && request_host(&headers).is_some_and(|host| {
@@ -982,7 +988,9 @@ async fn serve_arns_path(
         if response.status().is_success()
             || matches!(
                 response.status(),
-                StatusCode::NOT_MODIFIED | StatusCode::RANGE_NOT_SATISFIABLE
+                StatusCode::NOT_MODIFIED
+                    | StatusCode::BAD_REQUEST
+                    | StatusCode::RANGE_NOT_SATISFIABLE
             )
         {
             response.headers_mut().insert(
@@ -1086,7 +1094,7 @@ async fn retrieve_response(
             location.push('?');
             location.push_str(query);
         }
-        return redirect_response(StatusCode::MOVED_PERMANENTLY, location);
+        return redirect_response(StatusCode::MOVED_PERMANENTLY, location, headers);
     }
     drop(verified);
 
@@ -1228,12 +1236,84 @@ fn sandbox_name(id: &[u8; 32]) -> String {
     encoded
 }
 
-fn redirect_response(status: StatusCode, location: String) -> Response {
-    Response::builder()
+fn redirect_response(status: StatusCode, location: String, headers: &HeaderMap) -> Response {
+    let content_type = redirect_content_type(headers);
+    let reason = status.canonical_reason().unwrap_or_default();
+    let body = match content_type {
+        Some("text/plain") => format!("{reason}. Redirecting to {location}"),
+        Some("text/html") => format!("<p>{reason}. Redirecting to {}</p>", escape_html(&location)),
+        _ => String::new(),
+    };
+    let mut builder = Response::builder()
         .status(status)
         .header("location", location)
-        .body(Body::empty())
-        .unwrap()
+        .header("vary", "Accept")
+        .header("content-length", body.len().to_string());
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", format!("{content_type}; charset=utf-8"));
+    }
+    builder.body(Body::from(body)).unwrap()
+}
+
+fn redirect_content_type(headers: &HeaderMap) -> Option<&'static str> {
+    use std::cmp::Reverse;
+    if !headers.contains_key("accept") {
+        return Some("text/plain");
+    }
+    let mut selected = None;
+    for (offer_index, offer) in ["text/plain", "text/html"].into_iter().enumerate() {
+        let mut priority = None;
+        for (index, range) in headers
+            .get_all("accept")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .enumerate()
+        {
+            let mut parts = range.split(';');
+            let media_type = parts.next().unwrap_or_default().trim();
+            let specificity = if media_type.eq_ignore_ascii_case(offer) {
+                2
+            } else if media_type.eq_ignore_ascii_case("text/*") {
+                1
+            } else if media_type == "*/*" {
+                0
+            } else {
+                continue;
+            };
+            let mut quality = 1.0_f32;
+            let mut supported = true;
+            if let Some(parameter) = parts.next() {
+                if let Some((name, value)) = parameter.split_once('=')
+                    && name.trim().eq_ignore_ascii_case("q")
+                {
+                    quality = value
+                        .trim()
+                        .parse()
+                        .ok()
+                        .filter(|q| (0.0..=1.0).contains(q))
+                        .unwrap_or(0.0);
+                } else {
+                    supported = false;
+                }
+            }
+            if supported {
+                let rank = (specificity, quality, Reverse(index));
+                if priority.is_none_or(|current| rank > current) {
+                    priority = Some(rank);
+                }
+            }
+        }
+        if let Some((specificity, quality, order)) = priority
+            && quality > 0.0
+        {
+            let rank = (quality, specificity, order, Reverse(offer_index));
+            if selected.is_none_or(|(current, _)| rank > current) {
+                selected = Some((rank, offer));
+            }
+        }
+    }
+    selected.map(|(_, offer)| offer)
 }
 
 async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolution>> {
@@ -2146,13 +2226,26 @@ fn retrieval_error_response(error: anyhow::Error) -> Response {
     }
 }
 
-fn unmatched_response(method: &Method, uri: &Uri) -> Response {
-    let message = format!("Cannot {method} {}", uri.path())
+fn invalid_id_response(id: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        [("content-type", "text/html; charset=utf-8")],
+        format!("Invalid ID: {id}"),
+    )
+        .into_response()
+}
+
+fn escape_html(value: &str) -> String {
+    value
         .replace('&', "&amp;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
         .replace('<', "&lt;")
-        .replace('>', "&gt;");
+        .replace('>', "&gt;")
+}
+
+fn unmatched_response(method: &Method, uri: &Uri) -> Response {
+    let message = escape_html(&format!("Cannot {method} {}", uri.path()));
     let body = format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Error</title>\n</head>\n<body>\n<pre>{message}</pre>\n</body>\n</html>\n"
     );
@@ -2991,6 +3084,19 @@ mod tests {
             );
             assert_eq!(response.bytes().await.unwrap().as_ref(), b"hello");
         }
+        let malformed = client
+            .get(format!("{base}/hello.txt"))
+            .header(HOST, "deep.example.com")
+            .header("range", "broken")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            malformed.headers()[CACHE_CONTROL],
+            "public, max-age=3600, must-revalidate"
+        );
+        assert_eq!(malformed.text().await.unwrap(), "Malformed 'range' header");
         for (host, path) in [
             ("deep.example.com", "/blocked".to_owned()),
             ("deep.example.com", "/missing".to_owned()),
@@ -3038,6 +3144,47 @@ mod tests {
             )
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn negotiates_redirect_bodies_without_overriding_explicit_exclusions() {
+        for (accept, expected_type) in [
+            (
+                "text/html;q=0.8,text/plain;q=0.2",
+                Some("text/html; charset=utf-8"),
+            ),
+            (
+                "text/html;q=0,text/*;q=1",
+                Some("text/plain; charset=utf-8"),
+            ),
+            ("text/plain;q=0,text/html;q=0,*/*;q=1", None),
+            ("text/html,text/plain", Some("text/html; charset=utf-8")),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("accept", accept.parse().unwrap());
+            let response =
+                redirect_response(StatusCode::FOUND, "/next?a=1&b=2".to_owned(), &headers);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-type")
+                    .map(|value| value.to_str().unwrap()),
+                expected_type
+            );
+            assert_eq!(response.headers()["vary"], "Accept");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            if expected_type == Some("text/html; charset=utf-8") {
+                assert!(
+                    std::str::from_utf8(&body)
+                        .unwrap()
+                        .contains("/next?a=1&amp;b=2")
+                );
+            } else if expected_type.is_none() {
+                assert!(body.is_empty());
+            }
+        }
     }
 
     #[test]
