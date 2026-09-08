@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
 };
-use tokio::time::timeout;
+use tokio::{sync::mpsc, time::timeout};
 
 use crate::{
     BundleItems, CONSENSUS_DEPTH, Gateway, MAX_BUNDLE_DEPTH, NodeInfo,
@@ -126,15 +127,13 @@ pub(crate) async fn follow_chain_step(gateway: &Gateway, store: &mut BlockStore)
     .min(info.height);
     let summary = import_range(gateway, store, 0, end).await?;
     let pending = store.pending_metadata_blocks(0, end, 1).await?;
-    let height = if let Some(block) = pending.first() {
-        Some(block.height)
-    } else {
-        store
-            .pending_transactions(0, end, 1)
-            .await?
-            .first()
-            .map(|(_, height)| *height)
-    };
+    let pending_transaction = store.pending_transactions(0, end, 1).await?;
+    let height = pending
+        .first()
+        .map(|block| block.height)
+        .into_iter()
+        .chain(pending_transaction.first().map(|(_, height)| *height))
+        .min();
     if let Some(height) = height {
         import_metadata(gateway, store, height, height.saturating_add(31).min(end)).await?;
     }
@@ -333,27 +332,34 @@ pub async fn import_metadata(
         if blocks.is_empty() {
             break;
         }
-        for block in blocks {
-            timeout(deadline, async {
-                let header = gateway.verified_block(&block).await?;
-                let transaction_ids = header
-                    .txs
-                    .iter()
-                    .map(|id| {
-                        let id = decode_b64(id, "block transaction ID")?;
-                        ensure!(id.len() == 32, "invalid block transaction ID length");
-                        Ok(id)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                store
-                    .record_block_metadata(&block, header.timestamp, &transaction_ids)
-                    .await
-            })
-            .await
-            .with_context(|| format!("block metadata at height {} timed out", block.height))?
-            .with_context(|| format!("importing block metadata at height {}", block.height))?;
-            imported_blocks += 1;
-        }
+        let (sender, mut ready) = mpsc::channel(1);
+        let produce = async {
+            let headers = block_metadata(gateway, blocks);
+            tokio::pin!(headers);
+            while let Some(header) = headers.next().await {
+                let failed = header.is_err();
+                if sender.send(header).await.is_err() || failed {
+                    break;
+                }
+            }
+            drop(sender);
+            Ok::<_, anyhow::Error>(())
+        };
+        let consume = async {
+            while let Some(header) = ready.recv().await {
+                let (block, timestamp, transaction_ids) = header?;
+                timeout(
+                    deadline,
+                    store.record_block_metadata(&block, timestamp, &transaction_ids),
+                )
+                .await
+                .with_context(|| format!("block metadata at height {} timed out", block.height))?
+                .with_context(|| format!("importing block metadata at height {}", block.height))?;
+                imported_blocks += 1;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::try_join!(produce, consume)?;
     }
 
     let mut imported_transactions = 0;
@@ -492,6 +498,137 @@ pub async fn import_metadata(
         imported_blocks,
         imported_transactions,
     })
+}
+
+fn block_metadata(
+    gateway: &Gateway,
+    blocks: Vec<IndexBlock>,
+) -> impl futures_util::Stream<Item = Result<(IndexBlock, u64, Vec<Vec<u8>>)>> + '_ {
+    stream::iter(blocks)
+        .map(move |block| async move {
+            let metadata = timeout(gateway.config.request_timeout, async {
+                let header = gateway.verified_block(&block).await?;
+                let transaction_ids = header
+                    .txs
+                    .iter()
+                    .map(|id| {
+                        let id = decode_b64(id, "block transaction ID")?;
+                        ensure!(id.len() == 32, "invalid block transaction ID length");
+                        Ok(id)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok::<_, anyhow::Error>((header.timestamp, transaction_ids))
+            })
+            .await
+            .with_context(|| format!("block metadata at height {} timed out", block.height))?
+            .with_context(|| format!("importing block metadata at height {}", block.height))?;
+            Ok((block, metadata.0, metadata.1))
+        })
+        .buffered(16)
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use axum::{Router, extract::Path, routing::get};
+    use std::sync::Arc;
+    use tokio::{net::TcpListener, sync::Notify};
+
+    #[tokio::test]
+    async fn headers_overlap_but_yield_verified_prefix_in_order() {
+        let mut blocks = Vec::new();
+        let mut responses = HashMap::new();
+        for index in 0..32 {
+            let mut value = serde_json::json!({
+                "indep_hash": "", "height": 1_000_000 + index,
+                "previous_block": "", "timestamp": index + 1,
+                "nonce": "AQ", "last_retarget": 1, "diff": "1",
+                "cumulative_diff": "1", "reward_pool": "0", "wallet_list": "",
+                "hash_list_merkle": "", "hash": "", "block_size": "0",
+                "weave_size": "0", "tx_root": "", "reward_addr": "unclaimed",
+                "tags": [], "txs": [], "packing_2_5_threshold": "0",
+                "strict_data_split_threshold": "0", "usd_to_ar_rate": ["1", "1"],
+                "scheduled_usd_to_ar_rate": ["1", "1"],
+                "poa": {"option": "1", "tx_path": "", "data_path": "", "chunk": ""}
+            });
+            let header = serde_json::from_value(value.clone()).unwrap();
+            let hash = crate::block_indep_hash(&header).unwrap();
+            let id = URL_SAFE_NO_PAD.encode(hash);
+            value["indep_hash"] = id.clone().into();
+            if index == 3 {
+                value["timestamp"] = 999.into();
+            }
+            blocks.push(IndexBlock {
+                height: 1_000_000 + index,
+                hash: hash.to_vec(),
+                previous_hash: None,
+                tx_root: Vec::new(),
+                weave_size: 0,
+            });
+            responses.insert(id, (index, value));
+        }
+        let responses = Arc::new(responses);
+        let gate = Arc::new(Notify::new());
+        let (requested, mut requests) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/block/hash/{id}",
+            get({
+                let gate = gate.clone();
+                move |Path(id): Path<String>| {
+                    let (index, value) = responses[&id].clone();
+                    let gate = gate.clone();
+                    let requested = requested.clone();
+                    async move {
+                        requested.send(index).unwrap();
+                        if index == 0 {
+                            gate.notified().await;
+                        }
+                        ([("content-type", "application/json")], value.to_string())
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = crate::Config::new(
+            &url,
+            &url,
+            vec![url.clone()],
+            Duration::from_secs(5),
+            1,
+            1024,
+        )
+        .unwrap();
+        let gateway = Gateway::new(config).unwrap();
+        let headers = block_metadata(&gateway, blocks);
+        tokio::pin!(headers);
+        timeout(Duration::from_secs(5), async {
+            {
+                let first = headers.next();
+                tokio::pin!(first);
+                let mut started = Vec::new();
+                while started.len() < 16 {
+                    tokio::select! {
+                        result = &mut first => panic!("yielded before first header was released: {result:?}"),
+                        index = requests.recv() => started.push(index.unwrap()),
+                    }
+                }
+                started.sort_unstable();
+                assert_eq!(started, (0..16).collect::<Vec<_>>());
+                gate.notify_one();
+                assert_eq!(first.await.unwrap().unwrap().0.height, 1_000_000);
+            }
+            for height in [1_000_001, 1_000_002] {
+                assert_eq!(headers.next().await.unwrap().unwrap().0.height, height);
+            }
+            let error = headers.next().await.unwrap().unwrap_err();
+            assert!(format!("{error:#}").contains("block indep_hash verification failed"));
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
 }
 
 pub async fn import_bundles(
