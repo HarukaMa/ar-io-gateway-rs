@@ -781,46 +781,146 @@ pub(crate) async fn index_bundle_content(
             return Ok(0);
         }
 
-        let mut traversal = BundleTraversal::new(root.bytes.clone(), &root_id).await?;
-        let mut occurrences = 0;
-        let mut verification_time = Duration::ZERO;
-        let mut persistence_time = Duration::ZERO;
-        loop {
-            let (count, complete) = timeout(deadline, async {
-                let started = Instant::now();
-                let mut objects = Vec::with_capacity(256);
-                let mut locations = Vec::with_capacity(256);
-                let mut complete = false;
-                while locations.len() < 256 {
-                    let Some((object, location)) = traversal.next().await? else {
-                        complete = true;
-                        break;
-                    };
-                    objects.push(object);
-                    locations.push(location);
-                }
-                verification_time += started.elapsed();
-                let started = Instant::now();
-                store
-                    .commit_bundle_batch(&root_id, &objects, &locations, complete)
-                    .await?;
-                persistence_time += started.elapsed();
-                Ok::<_, anyhow::Error>((locations.len() as u64, complete))
-            })
-            .await
-            .with_context(|| format!("indexing bundle {encoded_id} batch timed out"))??;
-            occurrences += count;
-            if complete {
-                eprintln!(
-                    "indexed bundle {encoded_id}: occurrences={occurrences} cache_hit={} reused_root_facts={reused_facts} item_verification_ms={} persistence_ms={}",
-                    root.cache_hit, verification_time.as_millis(), persistence_time.as_millis(),
-                );
-                return Ok(occurrences);
-            }
-        }
+        persist_bundle(
+            gateway,
+            store,
+            &root_id,
+            root.bytes.clone(),
+            root.cache_hit,
+            reused_facts,
+        )
+        .await
     })
     .await
     .with_context(|| format!("indexing bundle {encoded_id} timed out"))?
+}
+
+pub(crate) async fn index_streamed_bundle(
+    gateway: &Gateway,
+    store: &mut BlockStore,
+    id: &[u8; 32],
+    height: u64,
+) -> Result<u64> {
+    let prepared = timeout(gateway.config.request_timeout, async {
+        let state = store
+            .state()
+            .await?
+            .context("block index is not initialized")?;
+        ensure!(
+            state.source == gateway.config.trusted_node_url,
+            "trusted node source does not match stored import"
+        );
+        let status = store
+            .bundle_status(id)
+            .await?
+            .context("bundle lacks canonical metadata")?;
+        ensure!(status.0 == height, "bundle root canonical height changed");
+        let data_root = store.bundle_data_root(id).await?;
+        Ok::<_, anyhow::Error>((status, data_root))
+    })
+    .await
+    .context("preparing streamed bundle timed out")??;
+    let ((_, size, complete), data_root) = prepared;
+    if complete {
+        return Ok(0);
+    }
+    let encoded = URL_SAFE_NO_PAD.encode(id);
+    let Some(data_root) = data_root.filter(|root| !root.is_empty()) else {
+        let root = gateway.retrieve_direct_with_tags(&encoded).await?;
+        return index_bundle_content(gateway, store, root).await;
+    };
+    let geometry = timeout(gateway.config.request_timeout, async {
+        let (previous, block) = store
+            .block_pair(height)
+            .await?
+            .context("bundle block anchors unavailable")?;
+        let offset: crate::TxOffset = gateway
+            .get_json(&gateway.config.archive_url, &format!("tx/{encoded}/offset"))
+            .await?;
+        ensure!(
+            parse_u128(&offset.size, "offset data size")? == size,
+            "transaction size and offset size differ"
+        );
+        let end_offset = parse_u128(&offset.offset, "transaction end offset")?;
+        let first_offset = end_offset
+            .checked_sub(size)
+            .and_then(|start| start.checked_add(1))
+            .context("transaction offset underflow")?;
+        ensure!(
+            first_offset > previous.weave_size && end_offset <= block.weave_size,
+            "transaction offset outside anchored block"
+        );
+        Ok::<_, anyhow::Error>(crate::Geometry {
+            tx_root: block
+                .tx_root
+                .as_slice()
+                .try_into()
+                .context("invalid anchored transaction root")?,
+            data_root: data_root
+                .as_slice()
+                .try_into()
+                .context("invalid signed data root")?,
+            block_weave_size: block.weave_size,
+            previous_weave_size: previous.weave_size,
+            first_offset,
+            end_offset,
+            data_size: size,
+        })
+    })
+    .await
+    .context("preparing bundle chunk geometry timed out")??;
+    let content = crate::content::Content::streamed(
+        crate::streaming::ChunkSource::new(gateway, geometry),
+        usize::try_from(size).context("bundle size exceeds addressable range")?,
+    );
+    persist_bundle(gateway, store, id, content, false, false).await
+}
+
+async fn persist_bundle(
+    gateway: &Gateway,
+    store: &mut BlockStore,
+    root_id: &[u8; 32],
+    content: crate::content::Content,
+    cache_hit: bool,
+    reused_facts: bool,
+) -> Result<u64> {
+    let encoded_id = URL_SAFE_NO_PAD.encode(root_id);
+    let mut traversal = BundleTraversal::new(content, root_id).await?;
+    let mut occurrences = 0;
+    let mut verification_time = Duration::ZERO;
+    let mut persistence_time = Duration::ZERO;
+    loop {
+        let started = Instant::now();
+        let mut objects = Vec::with_capacity(256);
+        let mut locations = Vec::with_capacity(256);
+        let mut complete = false;
+        while locations.len() < 256 {
+            let Some((object, location)) = traversal.next().await? else {
+                complete = true;
+                break;
+            };
+            objects.push(object);
+            locations.push(location);
+        }
+        verification_time += started.elapsed();
+        let started = Instant::now();
+        timeout(
+            gateway.config.request_timeout,
+            store.commit_bundle_batch(root_id, &objects, &locations, complete),
+        )
+        .await
+        .context("committing bundle metadata timed out")??;
+        persistence_time += started.elapsed();
+        occurrences += locations.len() as u64;
+        if complete {
+            eprintln!(
+                "indexed bundle {encoded_id}: occurrences={occurrences} cache_hit={cache_hit} reused_root_facts={reused_facts} item_verification_ms={} persistence_ms={}",
+                verification_time.as_millis(),
+                persistence_time.as_millis()
+            );
+            return Ok(occurrences);
+        }
+    }
 }
 
 struct BundleFrame {

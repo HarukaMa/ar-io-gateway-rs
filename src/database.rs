@@ -916,6 +916,17 @@ impl BlockStore {
             .transpose()
     }
 
+    pub(crate) async fn bundle_data_root(&self, id: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.client
+            .query_one(
+                "SELECT data_root FROM public.objects WHERE id=$1 AND kind=0 AND metadata_complete",
+                &[&id],
+            )
+            .await?
+            .try_get(0)
+            .map_err(Into::into)
+    }
+
     pub(crate) async fn bundle_complete(&self, id: &[u8]) -> Result<bool> {
         Ok(self
             .bundle_status(id)

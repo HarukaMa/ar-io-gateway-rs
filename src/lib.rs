@@ -6,6 +6,7 @@ mod historical;
 pub mod indexer;
 mod peers;
 pub mod server;
+mod streaming;
 mod transactions;
 
 use std::{
@@ -2474,6 +2475,20 @@ fn verify_chunk(
     relative_offset: u128,
     geometry: &Geometry,
 ) -> Result<Vec<u8>> {
+    let proof = verify_chunk_range(chunk, absolute_offset, relative_offset, geometry)?;
+    ensure!(
+        proof.data.start == relative_offset,
+        "data_path does not start at requested offset"
+    );
+    Ok(proof.bytes)
+}
+
+fn verify_chunk_range(
+    chunk: JsonChunk,
+    absolute_offset: u128,
+    relative_offset: u128,
+    geometry: &Geometry,
+) -> Result<ProvenChunk> {
     let proof = verify_chunk_proof(
         chunk,
         absolute_offset,
@@ -2503,11 +2518,7 @@ fn verify_chunk(
         proof.relative_offset == relative_offset,
         "tx_path relative offset mismatch"
     );
-    ensure!(
-        proof.data.start == relative_offset,
-        "data_path does not start at requested offset"
-    );
-    Ok(proof.bytes)
+    Ok(proof)
 }
 
 fn verify_chunk_proof(
@@ -3900,6 +3911,56 @@ mod tests {
             writer.write(chunk).await.unwrap();
         }
         writer.finish().await.unwrap().0
+    }
+
+    #[tokio::test]
+    async fn streamed_nested_items_verify_beyond_spool_and_payload_limits() {
+        use std::sync::atomic::Ordering;
+        let payload = vec![42; 128 * 1024];
+        let (child, child_id) = signed_data_item(&payload, &[]);
+        let inner = encode_bundle(&[&child]);
+        let tags: &[(&[u8], &[u8])] =
+            &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+        let (parent, parent_id) = signed_data_item(&inner, tags);
+        let bytes = encode_bundle(&[&parent]);
+        let (mut gateway, _, corrupt, server, requests) =
+            retrieval_fixture(&bytes, tags, None).await;
+        gateway.config.max_data_size = 1;
+        gateway.config.max_memory_data_size = 1;
+        gateway.config.max_spool_bytes = 1;
+        gateway.spool_budget = Arc::new(SpoolBudget::new(1));
+        let end = note(bytes.len() as u128);
+        let data_root = hash_leaf(&sha256(&[&bytes]), &end);
+        let geometry = Geometry {
+            tx_root: hash_leaf(&data_root, &end),
+            data_root,
+            block_weave_size: bytes.len() as u128,
+            previous_weave_size: 0,
+            first_offset: 1,
+            end_offset: bytes.len() as u128,
+            data_size: bytes.len() as u128,
+        };
+        let content =
+            Content::streamed(streaming::ChunkSource::new(&gateway, geometry), bytes.len());
+        let (verified_parent, _) = verify_bundle_item(content, &parent_id, None).await.unwrap();
+        let (verified_child, _) = verify_bundle_item(verified_parent.data, &child_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            verified_child
+                .data
+                .read_all(payload.len())
+                .await
+                .unwrap()
+                .as_ref(),
+            payload.as_slice()
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        corrupt.store(true, Ordering::SeqCst);
+        let content =
+            Content::streamed(streaming::ChunkSource::new(&gateway, geometry), bytes.len());
+        assert!(verify_bundle_item(content, &parent_id, None).await.is_err());
+        server.abort();
     }
 
     async fn retrieval_fixture(

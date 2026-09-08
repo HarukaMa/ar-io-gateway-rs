@@ -129,6 +129,11 @@ enum Storage {
         offset: usize,
         len: usize,
     },
+    Stream {
+        source: Arc<crate::streaming::ChunkSource>,
+        offset: usize,
+        len: usize,
+    },
 }
 
 impl From<Vec<u8>> for Content {
@@ -148,6 +153,14 @@ impl From<Bytes> for Content {
 }
 
 impl Content {
+    pub(crate) fn streamed(source: Arc<crate::streaming::ChunkSource>, len: usize) -> Self {
+        Self(Storage::Stream {
+            source,
+            offset: 0,
+            len,
+        })
+    }
+
     // The caller must verify the entire file and provide a read-only handle.
     pub(crate) fn persistent(
         file: std::fs::File,
@@ -204,6 +217,9 @@ impl Content {
                     )?;
                     &buffer[..end - start]
                 }
+                Storage::Stream { .. } => {
+                    anyhow::bail!("streamed indexing content cannot enter the disk cache")
+                }
             };
             sha256.update(bytes);
             output.write_all(bytes)?;
@@ -219,6 +235,7 @@ impl Content {
         match &self.0 {
             Storage::Memory { bytes, .. } => bytes.len(),
             Storage::File { len, .. } => *len,
+            Storage::Stream { len, .. } => *len,
         }
     }
 
@@ -234,13 +251,14 @@ impl Content {
         match &self.0 {
             Storage::Memory { resident_len, .. } => *resident_len,
             Storage::File { .. } => 0,
+            Storage::Stream { .. } => 2 * crate::MAX_CHUNK_SIZE as usize,
         }
     }
 
     pub fn memory_bytes(&self) -> Option<&Bytes> {
         match &self.0 {
             Storage::Memory { bytes, .. } => Some(bytes),
-            Storage::File { .. } => None,
+            Storage::File { .. } | Storage::Stream { .. } => None,
         }
     }
 
@@ -264,6 +282,13 @@ impl Content {
                     .context("content slice offset overflow")?,
                 len: range.end - range.start,
             }),
+            Storage::Stream { source, offset, .. } => Self(Storage::Stream {
+                source: Arc::clone(source),
+                offset: offset
+                    .checked_add(range.start)
+                    .context("stream slice offset overflow")?,
+                len: range.end - range.start,
+            }),
         })
     }
 
@@ -272,6 +297,14 @@ impl Content {
             .checked_add(length)
             .context("content read offset overflow")?;
         let view = self.slice(offset..end)?;
+        if let Storage::Stream {
+            source,
+            offset,
+            len,
+        } = &view.0
+        {
+            return source.read_at(*offset, *len).await;
+        }
         if let Some(bytes) = view.memory_bytes() {
             return Ok(bytes.clone());
         }
@@ -295,6 +328,21 @@ impl Content {
     }
 
     pub async fn hashes(&self) -> Result<([u8; 32], [u8; 48])> {
+        if matches!(self.0, Storage::Stream { .. }) {
+            let mut hashers = (Sha256::new(), Sha384::new());
+            for offset in (0..self.len()).step_by(IO_CHUNK_SIZE) {
+                let bytes = self
+                    .read_at(offset, IO_CHUNK_SIZE.min(self.len() - offset))
+                    .await?;
+                hashers = crate::cpu_work(move || {
+                    hashers.0.update(&bytes);
+                    hashers.1.update(&bytes);
+                    Ok(hashers)
+                })
+                .await?;
+            }
+            return Ok((hashers.0.finalize().into(), hashers.1.finalize().into()));
+        }
         let content = self.clone();
         crate::cpu_work(move || {
             let mut sha256 = Sha256::new();
@@ -320,6 +368,7 @@ impl Content {
                         sha384.update(&buffer[..length]);
                     }
                 }
+                Storage::Stream { .. } => unreachable!(),
             }
             Ok((sha256.finalize().into(), sha384.finalize().into()))
         })
@@ -335,6 +384,34 @@ impl Content {
                 buffer: Vec::new(),
                 consumed: 0,
             }),
+            Storage::Stream {
+                source,
+                offset,
+                len,
+            } => {
+                let source = Arc::clone(source);
+                let start = *offset;
+                let end = start
+                    .checked_add(*len)
+                    .context("stream reader offset overflow")?;
+                let stream = futures_util::stream::try_unfold(
+                    (source, start),
+                    move |(source, position)| async move {
+                        if position == end {
+                            return Ok::<_, io::Error>(None);
+                        }
+                        let length = IO_CHUNK_SIZE.min(end - position);
+                        let bytes = source
+                            .read_at(position, length)
+                            .await
+                            .map_err(io::Error::other)?;
+                        Ok(Some((bytes, (source, position + length))))
+                    },
+                );
+                ReadState::Stream(Box::pin(tokio_util::io::StreamReader::new(Box::pin(
+                    stream,
+                ))))
+            }
         };
         Ok(ContentReader {
             state,
@@ -352,17 +429,24 @@ impl Content {
     }
 }
 
-#[derive(Debug)]
 pub struct ContentReader {
     state: ReadState,
     remaining: usize,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for ContentReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContentReader")
+            .field("remaining", &self.remaining)
+            .finish_non_exhaustive()
+    }
+}
+
 enum ReadState {
     Memory(Bytes),
     File(ReaderFile),
     Reading(JoinHandle<io::Result<ReaderFile>>),
+    Stream(Pin<Box<dyn AsyncRead + Send>>),
     Failed,
 }
 
@@ -386,6 +470,12 @@ impl AsyncRead for ContentReader {
         }
         loop {
             match &mut this.state {
+                ReadState::Stream(reader) => {
+                    let before = output.filled().len();
+                    let result = reader.as_mut().poll_read(cx, output);
+                    this.remaining -= output.filled().len() - before;
+                    return result;
+                }
                 ReadState::Memory(bytes) => {
                     let offset = bytes.len() - this.remaining;
                     let length = output.remaining().min(this.remaining);

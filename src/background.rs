@@ -157,9 +157,14 @@ impl Drop for Reservation {
     }
 }
 
+enum JobContent {
+    Complete(Arc<VerifiedRoot>),
+    Streamed { height: u64 },
+}
+
 struct Job {
     // Content and metadata are dropped before their admission is released.
-    root: Arc<VerifiedRoot>,
+    root: JobContent,
     reservation: Reservation,
 }
 
@@ -187,7 +192,7 @@ impl BundleSubmitter {
             return;
         };
         permit.send(Job {
-            root: Arc::clone(root),
+            root: JobContent::Complete(Arc::clone(root)),
             reservation,
         });
     }
@@ -281,9 +286,14 @@ pub(crate) async fn start(
                         let store = BlockStore::connect(&database_url).await?;
                         // Fail startup if the bundle schema is absent. Never migrate here.
                         store.pending_bundle_after(None, None).await?;
-                        Ok::<_, anyhow::Error>((gateway, store))
+                        let chain_store = if gateway.config.index_chain {
+                            Some(BlockStore::connect(&database_url).await?)
+                        } else {
+                            None
+                        };
+                        Ok::<_, anyhow::Error>((gateway, store, chain_store))
                     };
-                    let (gateway, mut store) = tokio::select! {
+                    let (gateway, mut store, mut chain_store) = tokio::select! {
                         biased;
                         _ = &mut cancelled => return Ok(()),
                         result = timeout(startup_timeout, initialize) => {
@@ -293,10 +303,27 @@ pub(crate) async fn start(
                     if ready.send(()).is_err() {
                         return Ok(());
                     }
+                    let follow_chain = async {
+                        let Some(store) = chain_store.as_mut() else {
+                            return std::future::pending::<Result<()>>().await;
+                        };
+                        loop {
+                            match crate::indexer::follow_chain_step(&gateway, store).await {
+                                Ok(true) => tokio::task::yield_now().await,
+                                result => {
+                                    if let Err(error) = result {
+                                        eprintln!("following chain failed: {error:#}");
+                                    }
+                                    tokio::time::sleep(RETRY_INTERVAL).await;
+                                }
+                            }
+                        }
+                    };
                     tokio::select! {
                         biased;
                         _ = &mut cancelled => Ok(()),
                         result = run(&gateway, &mut store, Some(receiver), worker_admission, None) => result.map(|_| ()),
+                        result = follow_chain => result,
                     }
                 }));
                 // Runtime shutdown (including blocking I/O) is on its owning OS thread.
@@ -348,20 +375,8 @@ async fn run(
     let consume = async {
         let mut roots = 0;
         let mut occurrences = 0;
-        let mut next_chain_poll = Instant::now();
         loop {
             let job = tokio::select! {
-                _ = sleep_until(next_chain_poll), if range.is_none() && gateway.config.index_chain => {
-                    match crate::indexer::follow_chain_step(gateway, store).await {
-                        Ok(true) => next_chain_poll = Instant::now(),
-                        Ok(false) => next_chain_poll = Instant::now() + RETRY_INTERVAL,
-                        Err(error) => {
-                            eprintln!("following chain failed: {error:#}");
-                            next_chain_poll = Instant::now() + RETRY_INTERVAL;
-                        }
-                    }
-                    continue;
-                }
                 job = async { requests.as_mut().unwrap().recv().await }, if requests.is_some() => {
                     match job {
                         Some(job) => job,
@@ -373,7 +388,7 @@ async fn run(
                     job
                 }
             };
-            let id = job.root.data.id.clone();
+            let id = URL_SAFE_NO_PAD.encode(job.reservation.id);
             match process_job(gateway, store, job).await {
                 Ok(count) => {
                     roots += 1;
@@ -410,42 +425,47 @@ async fn download_pending(
                 .as_slice()
                 .try_into()
                 .context("invalid pending bundle ID")?;
-            let size = usize::try_from(data_size).ok().filter(|size| {
-                *size <= gateway.config.max_data_size
-                    && (*size <= gateway.config.max_memory_data_size
-                        || *size <= gateway.config.max_spool_bytes)
-                    && size
-                        .checked_add(MAX_JSON_BYTES)
-                        .is_some_and(|bytes| bytes <= admission.max_scheduled_bytes)
-            });
-            if size.is_none() {
-                let error = anyhow::anyhow!(
-                    "bundle {} exceeds indexing byte limits",
-                    URL_SAFE_NO_PAD.encode(id)
-                );
-                if range.is_some() {
-                    return Err(error);
-                }
-                eprintln!("{error:#}");
-                cursor = Some(root_id);
-            } else if admission.state.lock().ids.contains(&id) {
+            let size = usize::try_from(data_size).context("bundle exceeds addressable range")?;
+            let streamed = size > gateway.config.max_data_size
+                || (size > gateway.config.max_memory_data_size
+                    && size > gateway.config.max_spool_bytes)
+                || size
+                    .checked_add(MAX_JSON_BYTES)
+                    .is_none_or(|bytes| bytes > admission.max_scheduled_bytes);
+            // Streaming charges the bounded parser/hash working set, independent of payload length.
+            let charge = if streamed { 16 * MAX_JSON_BYTES } else { size };
+            ensure!(
+                charge
+                    .checked_add(MAX_JSON_BYTES)
+                    .is_some_and(|bytes| bytes <= admission.max_scheduled_bytes),
+                "indexing byte budget cannot hold the streaming working set"
+            );
+            if admission.state.lock().ids.contains(&id) {
                 cursor = Some(root_id);
             } else {
-                let size = size.unwrap();
-                let spool = if size <= gateway.config.max_memory_data_size {
+                let spool = if streamed || size <= gateway.config.max_memory_data_size {
                     Ok(None)
                 } else {
                     gateway.spool_budget.reserve(size).map(Some)
                 };
                 let reserved = spool.ok().and_then(|spool| {
                     admission
-                        .reserve_scheduled(id, size)
+                        .reserve_scheduled(id, charge)
                         .map(|reservation| (reservation, spool))
                 });
                 if let Some((mut reservation, spool)) = reserved {
                     cursor = Some(root_id);
                     downloads.push(async move {
                         let encoded = URL_SAFE_NO_PAD.encode(id);
+                        if streamed {
+                            return (
+                                encoded,
+                                Ok(Some(Job {
+                                    root: JobContent::Streamed { height },
+                                    reservation,
+                                })),
+                            );
+                        }
                         let result = crate::content::DOWNLOAD_SPOOL
                             .scope(std::cell::RefCell::new(spool), async {
                                 let Some(root) =
@@ -458,7 +478,10 @@ async fn download_pending(
                                     "bundle size changed after admission"
                                 );
                                 reservation.shrink(job_bytes(&root))?;
-                                Ok::<_, anyhow::Error>(Some(Job { root, reservation }))
+                                Ok::<_, anyhow::Error>(Some(Job {
+                                    root: JobContent::Complete(root),
+                                    reservation,
+                                }))
                             })
                             .await;
                         (encoded, result)
@@ -534,6 +557,16 @@ async fn fetch_scheduled(
 
 async fn process_job(gateway: &Gateway, store: &mut BlockStore, job: Job) -> Result<u64> {
     let Job { root, reservation } = job;
+    let root = match root {
+        JobContent::Streamed { height } => {
+            let count =
+                crate::indexer::index_streamed_bundle(gateway, store, &reservation.id, height)
+                    .await?;
+            reservation.admission.indexed(count);
+            return Ok(count);
+        }
+        JobContent::Complete(root) => root,
+    };
     timeout(gateway.config.retrieval_timeout, async {
         if timeout(
             gateway.config.request_timeout,
@@ -700,7 +733,10 @@ mod tests {
         let (submitter, mut receiver) = submitter(job_bytes(&root(0, vec![0].into())) * MAX_JOBS);
         submitter.submit(&root(0, vec![0].into()));
         let active = receiver.try_recv().unwrap();
-        submitter.submit(&active.root);
+        let JobContent::Complete(active_root) = &active.root else {
+            panic!("request handoff was streamed")
+        };
+        submitter.submit(active_root);
         assert!(receiver.try_recv().is_err());
         for id in 1..MAX_JOBS as u8 {
             submitter.submit(&root(id, vec![0].into()));
@@ -813,8 +849,11 @@ mod tests {
         let requested = receiver
             .try_recv()
             .expect("scheduled fetch blocked a request handoff");
+        let JobContent::Complete(requested_root) = &requested.root else {
+            panic!("request handoff was streamed")
+        };
         assert_eq!(
-            requested.root.data.bytes.memory_bytes().unwrap().as_ref(),
+            requested_root.data.bytes.memory_bytes().unwrap().as_ref(),
             &[0; 1024]
         );
         assert!(
@@ -869,9 +908,12 @@ mod tests {
         let job = receiver
             .try_recv()
             .expect("RAM cache hit did not retry its parent");
-        assert_eq!(job.root.data.id, parent.data.id);
+        let JobContent::Complete(root) = &job.root else {
+            panic!("request handoff was streamed")
+        };
+        assert_eq!(root.data.id, parent.data.id);
         assert_eq!(
-            job.root.data.bytes.read_all(12).await?.as_ref(),
+            root.data.bytes.read_all(12).await?.as_ref(),
             b"parent bytes"
         );
         Ok(())
