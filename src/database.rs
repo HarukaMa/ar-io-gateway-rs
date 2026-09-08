@@ -146,6 +146,7 @@ pub(crate) struct IndexedBundle {
 pub struct BlockStore {
     client: Client,
     driver: JoinHandle<()>,
+    connection_config: Config,
 }
 
 impl Drop for BlockStore {
@@ -165,7 +166,80 @@ impl BlockStore {
             // Connection errors are also returned by the client's pending requests.
             let _ = connection.await;
         });
-        Ok(Self { client, driver })
+        Ok(Self {
+            client,
+            driver,
+            connection_config: config,
+        })
+    }
+
+    pub(crate) async fn indexing_status(&self) -> Result<serde_json::Value> {
+        let mut config = self.connection_config.clone();
+        config.options(
+            "-c default_transaction_read_only=on -c statement_timeout=3000 \
+            -c lock_timeout=1000 -c search_path=pg_catalog,public",
+        );
+        let (client, connection) = timeout(CONNECT_TIMEOUT, config.connect(NoTls)).await??;
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        // ponytail: exact totals scan placements under the query deadline.
+        // Use incremental counters if growing history reaches that deadline.
+        let row = client.query_one(
+            "WITH progress AS MATERIALIZED (
+                SELECT min(height) FILTER (WHERE NOT metadata_complete) AS pending
+                FROM public.canonical_blocks
+             ), bundle_objects AS MATERIALIZED (
+                SELECT t.object_key FROM public.object_tags t
+                JOIN public.tag_names n ON n.key=t.name_key
+                JOIN public.tag_values v ON v.key=t.value_key
+                WHERE n.digest=sha256('Bundle-Format'::bytea) AND n.value='Bundle-Format'::bytea
+                    AND v.digest=sha256('binary'::bytea) AND v.value='binary'::bytea
+                INTERSECT
+                SELECT t.object_key FROM public.object_tags t
+                JOIN public.tag_names n ON n.key=t.name_key
+                JOIN public.tag_values v ON v.key=t.value_key
+                WHERE n.digest=sha256('Bundle-Version'::bytea) AND n.value='Bundle-Version'::bytea
+                    AND v.digest=sha256('2.0.0'::bytea) AND v.value='2.0.0'::bytea
+             ), totals AS MATERIALIZED (
+                SELECT count(*) FILTER (WHERE p.kind=0 AND o.metadata_complete) AS transactions,
+                    count(*) FILTER (WHERE p.kind=0 AND NOT o.metadata_complete) AS pending,
+                    count(*) FILTER (WHERE p.kind=1 AND o.metadata_complete) AS items
+                FROM public.canonical_placements p JOIN public.objects o ON o.key=p.object_key
+             ), roots AS (
+                SELECT o.data_size AS bytes, coalesce(bp.complete, false) AS complete
+                FROM bundle_objects k
+                JOIN public.objects o ON o.key=k.object_key AND o.kind=0 AND o.metadata_complete
+                JOIN public.canonical_placements p ON p.object_key=o.key
+                JOIN public.block_index_state s ON s.singleton
+                    AND p.block_height>s.start_height AND p.block_height<=s.imported_through
+                JOIN public.canonical_blocks c ON c.height=p.block_height
+                JOIN public.blocks b ON b.height=c.height AND b.hash=c.block_hash AND b.timestamp IS NOT NULL
+                JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
+                    AND bt.position=p.position AND bt.object_key=o.key
+                LEFT JOIN public.bundle_progress bp ON bp.root_key=o.key
+             )
+             SELECT json_build_object(
+                'chain', (SELECT json_build_object(
+                    'start_height', s.start_height, 'anchor_height', s.imported_through,
+                    'checkpoint_height', s.checkpoint_height,
+                    'metadata_height', CASE WHEN p.pending=s.start_height THEN NULL
+                        ELSE coalesce(p.pending-1, s.imported_through) END,
+                    'first_pending_height', p.pending
+                ) FROM public.block_index_state s CROSS JOIN progress p WHERE singleton),
+                'transactions', (SELECT json_build_object(
+                    'complete', transactions, 'pending', pending
+                ) FROM totals),
+                'bundles', (SELECT json_build_object(
+                    'discovered_roots', count(*),
+                    'complete_roots', count(*) FILTER (WHERE complete),
+                    'pending_roots', count(*) FILTER (WHERE NOT complete),
+                    'pending_bytes', coalesce(sum(bytes) FILTER (WHERE NOT complete), 0)::text,
+                    'items', (SELECT items FROM totals),
+                    'nested_bundles', (SELECT count(*) FROM bundle_objects k
+                        JOIN public.objects o ON o.key=k.object_key AND o.metadata_complete
+                        JOIN public.canonical_placements p ON p.object_key=o.key AND p.kind=1)
+                ) FROM roots)
+             )::text", &[]).await?;
+        Ok(serde_json::from_str(row.get::<_, &str>(0))?)
     }
 
     pub async fn migrate(&mut self) -> Result<()> {

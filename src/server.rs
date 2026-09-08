@@ -309,6 +309,7 @@ struct AppState {
     config: ServerConfig,
     request_permits: Arc<Semaphore>,
     started_at: Instant,
+    indexing_status: Mutex<serde_json::Value>,
 }
 
 struct Resolution {
@@ -373,6 +374,7 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     let state = Arc::new(AppState {
         request_permits: Arc::new(Semaphore::new(config.max_concurrent_requests)),
         started_at: Instant::now(),
+        indexing_status: Mutex::new(serde_json::Value::Null),
         gateway,
         config,
     });
@@ -408,9 +410,14 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
             }
         }
     });
+    if state.gateway.block_store.is_some() {
+        refresh_tasks.spawn(refresh_indexing_status(Arc::clone(&state)));
+    }
     let app = Router::new()
         .route("/ar-io/info", get(serve_info))
         .route("/ar-io/healthcheck", get(serve_healthcheck))
+        .route("/ar-io/status", get(serve_indexing_page))
+        .route("/ar-io/status.json", get(serve_indexing_status))
         .route("/ar-io/peers", get(serve_peers))
         .route("/ar-io/resolver/{name}", get(serve_resolver))
         .route("/ar-io/offsets/{id}", get(serve_offsets))
@@ -606,6 +613,102 @@ async fn serve_info(State(state): State<Arc<AppState>>) -> Response {
         });
     }
     json_response(&info)
+}
+
+async fn refresh_indexing_status(state: Arc<AppState>) {
+    let mut ticks = interval(Duration::from_secs(30));
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut previous: Option<(Instant, serde_json::Value)> = None;
+    loop {
+        ticks.tick().await;
+        let store = state.gateway.block_store.as_ref().expect("status database");
+        let result = tokio::time::timeout(Duration::from_secs(10), store.indexing_status()).await;
+        let mut snapshot = match result {
+            Ok(Ok(snapshot)) => snapshot,
+            error => {
+                eprintln!("indexing status refresh failed: {error:?}");
+                let mut snapshot = state.indexing_status.lock();
+                if snapshot.is_null() {
+                    *snapshot = serde_json::json!({});
+                }
+                snapshot["state"] = serde_json::json!("unavailable");
+                continue;
+            }
+        };
+        let tip = tokio::time::timeout(
+            Duration::from_secs(5),
+            state
+                .gateway
+                .get_json::<crate::NodeInfo>(&state.gateway.config.trusted_node_url, "info"),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|info| info.height);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        snapshot["state"] = serde_json::json!("ready");
+        snapshot["sampled_at"] = serde_json::json!(now);
+        snapshot["trusted_tip"] = serde_json::json!(tip);
+        snapshot["last_progress_at"] = serde_json::Value::Null;
+        snapshot["transactions"]["per_second"] = serde_json::Value::Null;
+        if let Some((started, old)) = &previous {
+            snapshot["last_progress_at"] = old["last_progress_at"].clone();
+            if [
+                ("chain", "anchor_height"),
+                ("chain", "metadata_height"),
+                ("transactions", "complete"),
+                ("bundles", "complete_roots"),
+                ("bundles", "items"),
+            ]
+            .iter()
+            .any(|(group, key)| snapshot[*group][*key].as_u64() > old[*group][*key].as_u64())
+            {
+                snapshot["last_progress_at"] = serde_json::json!(now);
+            }
+            if let (Some(current), Some(before)) = (
+                snapshot["transactions"]["complete"].as_u64(),
+                old["transactions"]["complete"].as_u64(),
+            ) {
+                snapshot["transactions"]["per_second"] = serde_json::json!(
+                    current
+                        .checked_sub(before)
+                        .map(|delta| delta as f64 / started.elapsed().as_secs_f64())
+                );
+            }
+        }
+        previous = Some((Instant::now(), snapshot.clone()));
+        *state.indexing_status.lock() = snapshot;
+    }
+}
+
+async fn serve_indexing_status(State(state): State<Arc<AppState>>) -> Response {
+    let mut snapshot = state.indexing_status.lock().clone();
+    if snapshot.is_null() {
+        snapshot = serde_json::json!({
+            "state": if state.gateway.block_store.is_some() { "starting" } else { "disabled" },
+        });
+    }
+    snapshot["worker"] = state
+        .gateway
+        .bundle_indexer
+        .as_ref()
+        .map_or(serde_json::Value::Null, |worker| worker.status());
+    let mut response = json_response(&snapshot);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn serve_indexing_page() -> Response {
+    let mut response = axum::response::Html(include_str!("status.html")).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn serve_resolver(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
@@ -2906,6 +3009,7 @@ mod tests {
             .unwrap(),
             request_permits: Arc::new(Semaphore::new(8)),
             started_at: Instant::now(),
+            indexing_status: Mutex::new(serde_json::Value::Null),
         };
         for (name, status, index) in [
             ("lolcchekc", StatusCode::OK, Some("0")),
@@ -3067,6 +3171,7 @@ mod tests {
             config,
             request_permits: Arc::new(Semaphore::new(1)),
             started_at: Instant::now(),
+            indexing_status: Mutex::new(serde_json::Value::Null),
         });
         let app = Router::new()
             .route("/", get(serve_arns))
@@ -3249,6 +3354,7 @@ mod tests {
             .unwrap(),
             request_permits: Arc::new(Semaphore::new(1)),
             started_at: Instant::now(),
+            indexing_status: Mutex::new(serde_json::Value::Null),
         });
         let app = Router::new()
             .route("/raw/{id}", get(serve_raw))

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Indexing status - AR.IO</title>
+<style>
+:root{color-scheme:light dark;font-family:system-ui,sans-serif;background:#101719;color:#e6edef}
+*{box-sizing:border-box}body{max-width:1080px;margin:auto;padding:36px 24px}header{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:28px}h1{font-size:28px;margin:0 0 6px}h2{font-size:17px;margin:0 0 22px}p{color:#a5b6bb;margin:0;line-height:1.6}a{color:#8bdbc6}#state{border:1px solid #45655b;border-radius:20px;padding:7px 13px;color:#a2e8d1;font-size:14px}.warning{color:#f2c48e!important;border-color:#986b39!important}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}section{background:#192326;border:1px solid #304044;border-radius:12px;padding:24px}dl{margin:0}dl>div{display:flex;justify-content:space-between;gap:18px;margin:16px 0}dt{color:#a5b6bb}dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}progress{width:100%;height:8px;accent-color:#80d4bb}small{display:block;color:#a5b6bb;margin-top:7px}.note{font-size:13px;margin-top:18px}footer{display:flex;justify-content:space-between;gap:12px;margin-top:24px;font-size:13px;color:#a5b6bb}@media(max-width:650px){body{padding:24px 16px}.grid{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}section{padding:20px}footer{flex-direction:column}}
+</style>
+</head>
+<body>
+<header><div><h1>Indexing status</h1><p>AR.IO gateway</p></div><output id="state" aria-live="polite">Connecting</output></header>
+<main class="grid">
+<section><h2>Chain</h2><dl>
+<div><dt>Trusted tip</dt><dd id="tip">-</dd></div>
+<div><dt>Stable checkpoint</dt><dd id="checkpoint">-</dd></div>
+<div><dt>Anchor height</dt><dd id="anchors">-</dd></div>
+</dl><progress id="anchor-progress" aria-label="Anchor coverage"></progress><small id="anchor-percent">Waiting for a snapshot</small><dl>
+<div><dt>Metadata height</dt><dd id="metadata">-</dd></div>
+<div><dt>Metadata lag</dt><dd id="lag">-</dd></div>
+</dl><progress id="metadata-progress" aria-label="Metadata coverage"></progress><small id="metadata-percent">Waiting for a snapshot</small>
+<p class="note">Coverage starts at block <span id="start">-</span>. Percentages describe block heights.</p></section>
+<section><h2>Transactions</h2><dl>
+<div><dt>Completed</dt><dd id="transactions">-</dd></div>
+<div><dt>Pending metadata</dt><dd id="pending-transactions">-</dd></div>
+<div><dt>Recent rate</dt><dd id="transaction-rate">-</dd></div>
+</dl></section>
+<section><h2>Bundles <small>Discovered so far</small></h2><dl>
+<div><dt>Root bundles</dt><dd id="roots">-</dd></div>
+<div><dt>Completed roots</dt><dd id="completed-roots">-</dd></div>
+<div><dt>Pending roots</dt><dd id="pending-roots">-</dd></div>
+<div><dt>Pending root bytes</dt><dd id="pending-bytes">-</dd></div>
+<div><dt>Nested bundles found</dt><dd id="nested">-</dd></div>
+<div><dt>Indexed items</dt><dd id="items">-</dd></div>
+</dl><p class="note">Recognized ANS-104 bundles. Pending bytes use full declared root sizes, including partially processed roots.</p></section>
+<section><h2>Worker</h2><dl>
+<div><dt>State</dt><dd id="worker">-</dd></div>
+<div><dt>Chain activity</dt><dd id="chain-activity">-</dd></div>
+<div><dt>Bundle activity</dt><dd id="bundle-activity">-</dd></div>
+<div><dt>Last observed progress</dt><dd id="progress-at">-</dd></div>
+<div><dt>Recent failure</dt><dd id="failure">-</dd></div>
+</dl></section>
+</main>
+<footer><span id="updated">Waiting for status</span><a href="/ar-io/status.json">JSON status</a></footer>
+<noscript><p>JavaScript is required for live updates. Use the JSON status link to read the snapshot.</p></noscript>
+<script>
+const element = id => document.getElementById(id);
+const text = (id, value) => { element(id).textContent = value; };
+const number = value => value == null ? '-' : Number(value).toLocaleString(undefined, {maximumFractionDigits: 2});
+const date = value => value == null ? '-' : new Date(value * 1000).toLocaleString();
+function bytes(value) {
+  if (value == null) return '-';
+  let size = Number(value), unit = 0;
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB'];
+  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; }
+  return `${number(size)} ${units[unit]}`;
+}
+function coverage(id, height, tip, start) {
+  const bar = element(`${id}-progress`);
+  if (height == null || tip == null || start == null || tip < start) {
+    bar.hidden = true;
+    text(`${id}-percent`, 'Coverage unavailable');
+    return;
+  }
+  bar.hidden = false;
+  const covered = Math.max(0, height - start + 1), total = tip - start + 1;
+  bar.max = total; bar.value = covered;
+  text(`${id}-percent`, `${number(100 * covered / total)}% of block heights`);
+}
+async function refresh() {
+  try {
+    const response = await fetch('/ar-io/status.json', {cache: 'no-store', signal: AbortSignal.timeout(5000)});
+    if (!response.ok) throw new Error('Status request failed');
+    const data = await response.json();
+    const chain = data.chain || {}, tx = data.transactions || {}, bundles = data.bundles || {};
+    const stale = data.sampled_at != null && Date.now() / 1000 - data.sampled_at > 90;
+    const stopped = data.worker?.running === false;
+    const labels = {ready: 'Live', starting: 'Collecting status', disabled: 'Database not configured', unavailable: 'Status refresh failed'};
+    text('state', stale ? 'Snapshot stale' : (data.state === 'ready' && stopped ? 'Worker stopped' : (labels[data.state] || 'Status unavailable')));
+    element('state').classList.toggle('warning', stale || data.state === 'unavailable' || stopped);
+    text('tip', number(data.trusted_tip)); text('checkpoint', number(chain.checkpoint_height));
+    text('anchors', number(chain.anchor_height)); text('metadata', number(chain.metadata_height));
+    text('start', number(chain.start_height));
+    text('lag', data.trusted_tip == null || chain.metadata_height == null ? '-' : `${number(Math.max(0, data.trusted_tip - chain.metadata_height))} blocks`);
+    coverage('anchor', chain.anchor_height, data.trusted_tip, chain.start_height);
+    coverage('metadata', chain.metadata_height, data.trusted_tip, chain.start_height);
+    text('transactions', number(tx.complete)); text('pending-transactions', number(tx.pending));
+    text('transaction-rate', tx.per_second == null ? '-' : `${number(tx.per_second)} / sec`);
+    text('roots', number(bundles.discovered_roots)); text('completed-roots', number(bundles.complete_roots));
+    text('pending-roots', number(bundles.pending_roots)); text('pending-bytes', bytes(bundles.pending_bytes));
+    text('nested', number(bundles.nested_bundles)); text('items', number(bundles.items));
+    text('worker', data.worker == null ? 'Disabled' : (data.worker.running ? 'Running' : 'Stopped'));
+    text('chain-activity', data.worker?.chain || '-'); text('bundle-activity', data.worker?.bundles || '-');
+    text('progress-at', date(data.last_progress_at));
+    const failure = data.worker?.last_failure;
+    text('failure', failure ? `${failure.message} (${date(failure.at)})` : 'None recorded');
+    text('updated', data.sampled_at == null ? 'No snapshot available' : `Snapshot: ${date(data.sampled_at)}`);
+  } catch {
+    text('state', 'Connection unavailable'); element('state').classList.add('warning');
+  } finally { setTimeout(refresh, 5000); }
+}
+refresh();
+</script>
+</body>
+</html>

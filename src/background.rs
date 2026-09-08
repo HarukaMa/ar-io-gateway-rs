@@ -26,6 +26,12 @@ const MAX_JOBS: usize = 8;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
+struct WorkerStatus {
+    chain: &'static str,
+    bundles: &'static str,
+    last_failure: Option<serde_json::Value>,
+}
+
 struct Admission {
     state: Mutex<AdmissionState>,
     max_bytes: usize,
@@ -34,6 +40,7 @@ struct Admission {
     max_scheduled_bytes: usize,
     changed: tokio::sync::Notify,
     last_indexed_at: AtomicU64,
+    status: Mutex<WorkerStatus>,
 }
 
 struct AdmissionState {
@@ -47,6 +54,11 @@ struct AdmissionState {
 impl Admission {
     fn new(max_bytes: usize, max_jobs: usize, request_headroom: bool) -> Arc<Self> {
         Arc::new(Self {
+            status: Mutex::new(WorkerStatus {
+                chain: "disabled",
+                bundles: "idle",
+                last_failure: None,
+            }),
             state: Mutex::new(AdmissionState {
                 ids: HashSet::with_capacity(max_jobs),
                 bytes: 0,
@@ -117,6 +129,13 @@ impl Admission {
                 self.last_indexed_at.store(now.as_secs(), Ordering::Relaxed);
             }
         }
+    }
+
+    fn failed(&self, message: &'static str) {
+        self.status.lock().last_failure = Some(serde_json::json!({
+            "message": message,
+            "at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        }));
     }
 }
 
@@ -204,6 +223,18 @@ impl BundleSubmitter {
     pub(crate) fn is_closed(&self) -> bool {
         self.sender.is_closed()
     }
+
+    pub(crate) fn status(&self) -> serde_json::Value {
+        let status = self.admission.status.lock();
+        serde_json::json!({
+            "running": !self.is_closed(),
+            "chain": status.chain,
+            "bundles": if status.bundles == "idle" && !self.admission.state.lock().ids.is_empty() {
+                "fetching or queued"
+            } else { status.bundles },
+            "last_failure": status.last_failure,
+        })
+    }
 }
 
 fn job_bytes(root: &VerifiedRoot) -> usize {
@@ -262,6 +293,11 @@ pub(crate) async fn start(
         config.index_downloads + MAX_JOBS,
         true,
     );
+    admission.status.lock().chain = if config.index_chain {
+        "starting"
+    } else {
+        "disabled"
+    };
     let (sender, receiver) = mpsc::channel(MAX_JOBS);
     let (cancel, mut cancelled) = oneshot::channel();
     let (ready, readiness) = oneshot::channel();
@@ -308,11 +344,14 @@ pub(crate) async fn start(
                             return std::future::pending::<Result<()>>().await;
                         };
                         loop {
+                            worker_admission.status.lock().chain = "indexing";
                             match crate::indexer::follow_chain_step(&gateway, store).await {
                                 Ok(true) => tokio::task::yield_now().await,
                                 result => {
+                                    worker_admission.status.lock().chain = if result.is_err() { "retrying" } else { "waiting" };
                                     if let Err(error) = result {
                                         eprintln!("following chain failed: {error:#}");
+                                        worker_admission.failed("Chain indexing failed");
                                     }
                                     tokio::time::sleep(RETRY_INTERVAL).await;
                                 }
@@ -322,7 +361,7 @@ pub(crate) async fn start(
                     tokio::select! {
                         biased;
                         _ = &mut cancelled => Ok(()),
-                        result = run(&gateway, &mut store, Some(receiver), worker_admission, None) => result.map(|_| ()),
+                        result = run(&gateway, &mut store, Some(receiver), Arc::clone(&worker_admission), None) => result.map(|_| ()),
                         result = follow_chain => result,
                     }
                 }));
@@ -389,13 +428,19 @@ async fn run(
                 }
             };
             let id = URL_SAFE_NO_PAD.encode(job.reservation.id);
-            match process_job(gateway, store, job).await {
+            admission.status.lock().bundles = "indexing";
+            let result = process_job(gateway, store, job).await;
+            admission.status.lock().bundles = "idle";
+            match result {
                 Ok(count) => {
                     roots += 1;
                     occurrences += count;
                 }
                 Err(error) if range.is_some() => return Err(error),
-                Err(error) => eprintln!("indexing bundle {id} failed: {error:#}"),
+                Err(error) => {
+                    admission.failed("Bundle indexing failed");
+                    eprintln!("indexing bundle {id} failed: {error:#}");
+                }
             }
         }
         Ok((roots, occurrences))
@@ -501,7 +546,10 @@ async fn download_pending(
                     Ok(Some(job)) => sender.send(job).await.map_err(|_| anyhow::anyhow!("bundle writer stopped"))?,
                     Ok(None) => {}
                     Err(error) if range.is_some() => return Err(error),
-                    Err(error) => eprintln!("retrieving scheduled bundle {id} failed: {error:#}"),
+                    Err(error) => {
+                        admission.failed("Bundle retrieval failed");
+                        eprintln!("retrieving scheduled bundle {id} failed: {error:#}");
+                    }
                 }
             }
             _ = admission.changed.notified() => {}
@@ -521,6 +569,7 @@ async fn download_pending(
                     Err(error) if range.is_some() => return Err(error),
                     Err(error) => {
                         eprintln!("discovering pending bundles failed: {error:#}");
+                        admission.failed("Bundle discovery failed");
                         next_poll = Instant::now() + RETRY_INTERVAL;
                     }
                 }
