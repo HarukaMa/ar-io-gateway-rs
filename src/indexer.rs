@@ -135,7 +135,7 @@ pub(crate) async fn follow_chain_step(gateway: &Gateway, store: &mut BlockStore)
         .chain(pending_transaction.first().map(|(_, height)| *height))
         .min();
     if let Some(height) = height {
-        import_metadata(gateway, store, height, height.saturating_add(31).min(end)).await?;
+        import_metadata(gateway, store, height, height.saturating_add(255).min(end)).await?;
     }
     Ok(summary.imported_blocks > 0 || height.is_some())
 }
@@ -326,7 +326,7 @@ pub async fn import_metadata(
 
     let mut imported_blocks = 0;
     loop {
-        let blocks = timeout(deadline, store.pending_metadata_blocks(start, end, 32))
+        let blocks = timeout(deadline, store.pending_metadata_blocks(start, end, 256))
             .await
             .context("pending block metadata query timed out")??;
         if blocks.is_empty() {
@@ -524,7 +524,7 @@ fn block_metadata(
             .with_context(|| format!("importing block metadata at height {}", block.height))?;
             Ok((block, metadata.0, metadata.1))
         })
-        .buffered(16)
+        .buffered(32)
 }
 
 #[cfg(test)]
@@ -538,7 +538,7 @@ mod metadata_tests {
     async fn headers_overlap_but_yield_verified_prefix_in_order() {
         let mut blocks = Vec::new();
         let mut responses = HashMap::new();
-        for index in 0..32 {
+        for index in 0..64 {
             let mut value = serde_json::json!({
                 "indep_hash": "", "height": 1_000_000 + index,
                 "previous_block": "", "timestamp": index + 1,
@@ -608,14 +608,14 @@ mod metadata_tests {
                 let first = headers.next();
                 tokio::pin!(first);
                 let mut started = Vec::new();
-                while started.len() < 16 {
+                while started.len() < 32 {
                     tokio::select! {
                         result = &mut first => panic!("yielded before first header was released: {result:?}"),
                         index = requests.recv() => started.push(index.unwrap()),
                     }
                 }
                 started.sort_unstable();
-                assert_eq!(started, (0..16).collect::<Vec<_>>());
+                assert_eq!(started, (0..32).collect::<Vec<_>>());
                 gate.notify_one();
                 assert_eq!(first.await.unwrap().unwrap().0.height, 1_000_000);
             }
