@@ -66,7 +66,7 @@ const CANONICAL_BUNDLES: &str = "
         JOIN public.canonical_blocks c
           ON c.height > s.start_height AND c.height <= s.imported_through
         JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
-        JOIN public.blocks b ON b.hash=c.block_hash
+        JOIN public.blocks b ON b.hash=c.block_hash AND b.height=c.height
         WHERE s.singleton AND c.height=p.block_height AND bt.position=p.position
           AND bt.object_key=o.key AND b.timestamp IS NOT NULL)
     AND EXISTS (
