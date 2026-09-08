@@ -99,6 +99,48 @@ impl RootFacts {
     }
 }
 
+pub(crate) async fn follow_chain_step(gateway: &Gateway, store: &mut BlockStore) -> Result<bool> {
+    let state = store.state().await?;
+    ensure!(
+        state.as_ref().is_none_or(|state| state.start_height == 0),
+        "automatic full-chain indexing requires coverage starting at genesis"
+    );
+    let info: NodeInfo = gateway
+        .get_json(&gateway.config.trusted_node_url, "info")
+        .await?;
+    let through = state.as_ref().and_then(|state| state.imported_through);
+    let backlog = if let Some(through) = through {
+        !store
+            .pending_metadata_blocks(0, through, 1)
+            .await?
+            .is_empty()
+            || !store.pending_transactions(0, through, 1).await?.is_empty()
+    } else {
+        false
+    };
+    let end = if backlog {
+        through.unwrap()
+    } else {
+        through.map_or(255, |height| height.saturating_add(256))
+    }
+    .min(info.height);
+    let summary = import_range(gateway, store, 0, end).await?;
+    let pending = store.pending_metadata_blocks(0, end, 1).await?;
+    let height = if let Some(block) = pending.first() {
+        Some(block.height)
+    } else {
+        store
+            .pending_transactions(0, end, 1)
+            .await?
+            .first()
+            .map(|(_, height)| *height)
+    };
+    if let Some(height) = height {
+        import_metadata(gateway, store, height, height.saturating_add(31).min(end)).await?;
+    }
+    Ok(summary.imported_blocks > 0 || height.is_some())
+}
+
 pub async fn import_range(
     gateway: &Gateway,
     store: &mut BlockStore,
@@ -109,7 +151,7 @@ pub async fn import_range(
     let coverage_start = start.saturating_sub(1);
     let source = gateway.config.trusted_node_url.as_str();
     let deadline = gateway.config.request_timeout;
-    let state = timeout(deadline, async {
+    let (state, tip) = timeout(deadline, async {
         let existing = store.state().await?;
         if let Some(state) = &existing {
             ensure!(
@@ -129,10 +171,8 @@ pub async fn import_range(
             .height
             .checked_sub(CONSENSUS_DEPTH)
             .context("trusted node has no stable block index")?;
-        ensure!(
-            end <= stable_height,
-            "import end is inside the trusted node consensus window"
-        );
+        ensure!(end <= info.height, "import end exceeds trusted node height");
+        let tip = read_checkpoint(gateway, info.height).await?;
         let checkpoint = match existing {
             Some(state) => {
                 ensure!(
@@ -140,7 +180,30 @@ pub async fn import_range(
                     "stored checkpoint is no longer stable at the trusted node"
                 );
                 verify_checkpoint(gateway, &state.checkpoint).await?;
-                if end > state.checkpoint.height {
+                if let Some(through) = state
+                    .imported_through
+                    .filter(|height| *height > state.checkpoint.height)
+                {
+                    let mut ancestor = through.min(info.height);
+                    loop {
+                        let remote = read_checkpoint(gateway, ancestor).await?;
+                        if store.canonical_hash(ancestor).await?.as_deref()
+                            == Some(remote.hash.as_slice())
+                        {
+                            break;
+                        }
+                        ensure!(
+                            ancestor > state.checkpoint.height,
+                            "reorg crosses protected checkpoint"
+                        );
+                        ancestor -= 1;
+                    }
+                    verify_checkpoint(gateway, &tip).await?;
+                    if ancestor < through {
+                        store.rewind(ancestor, &state.checkpoint, source).await?;
+                    }
+                }
+                if stable_height > state.checkpoint.height {
                     let next = read_checkpoint(gateway, stable_height).await?;
                     verify_checkpoint(gateway, &state.checkpoint).await?;
                     verify_checkpoint(gateway, &next).await?;
@@ -154,7 +217,10 @@ pub async fn import_range(
             }
             None => read_checkpoint(gateway, stable_height).await?,
         };
-        store.initialize(coverage_start, &checkpoint, source).await
+        let state = store
+            .initialize(coverage_start, &checkpoint, source)
+            .await?;
+        Ok::<_, anyhow::Error>((state, tip))
     })
     .await
     .context("import initialization timed out")??;
@@ -211,6 +277,7 @@ pub async fn import_range(
                 });
             }
             verify_checkpoint(gateway, &state.checkpoint).await?;
+            verify_checkpoint(gateway, &tip).await?;
             store
                 .commit_batch(&blocks[skip..], &state.checkpoint, source)
                 .await?;

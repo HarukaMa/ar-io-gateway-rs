@@ -69,6 +69,8 @@ pub struct Config {
     /// Active and queued bundle bytes, configured by AR_IO_INDEX_MAX_BYTES.
     /// The serving worker reserves half for HTTP-discovered bundle handoffs.
     pub index_max_bytes: usize,
+    /// Follow the trusted chain from genesis when AR_IO_INDEX_CHAIN is enabled.
+    pub index_chain: bool,
     pub retrieval_timeout: Duration,
     pub stream_idle_timeout: Duration,
     pub stream_timeout: Duration,
@@ -114,6 +116,7 @@ impl Config {
             max_spool_bytes: 4 * 1024 * 1024 * 1024,
             index_downloads: 32,
             index_max_bytes: 8 * 1024 * 1024 * 1024,
+            index_chain: false,
             retrieval_timeout: Duration::from_secs(30 * 60),
             stream_idle_timeout: Duration::from_secs(30),
             stream_timeout: Duration::from_secs(30 * 60),
@@ -131,6 +134,8 @@ pub struct VerifiedData {
     pub cache_hit: bool,
     pub id: String,
     pub block_height: u64,
+    #[serde(skip_serializing)]
+    block_hash: Option<[u8; 48]>,
     pub content_type: String,
     pub content_encoding: Option<String>,
     pub content_length: usize,
@@ -379,7 +384,10 @@ impl Gateway {
     }
 
     pub async fn with_database(mut self, url: &str) -> Result<Self> {
-        let store = database::BlockStore::connect(url).await?;
+        let mut store = database::BlockStore::connect(url).await?;
+        if self.config.index_chain && store.state().await?.is_none() {
+            indexer::import_range(&self, &mut store, 0, 0).await?;
+        }
         let state = store
             .state()
             .await?
@@ -438,7 +446,7 @@ impl Gateway {
             return Ok(None);
         };
         let key = decode_fixed::<32>(id, "data ID")?;
-        let Some(metadata) = store.cached_content(&key).await? else {
+        let Some((metadata, block_hash)) = store.cached_content(&key).await? else {
             return Ok(None);
         };
         let entry: CachedContent =
@@ -468,6 +476,11 @@ impl Gateway {
                 bytes,
                 id: entry.id,
                 block_height: entry.block_height,
+                block_hash: Some(
+                    block_hash
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("invalid cached block hash"))?,
+                ),
                 content_type: entry.content_type,
                 content_encoding: entry.content_encoding,
                 content_length: entry.length,
@@ -491,6 +504,10 @@ impl Gateway {
         let Some((_, block)) = store.block_pair(data.block_height).await? else {
             return Ok(());
         };
+        ensure!(
+            data.block_hash.as_ref().map(|hash| hash.as_slice()) == Some(block.hash.as_slice()),
+            "verified content block changed before cache admission"
+        );
         let digest = decode_fixed::<32>(data.etag.trim_matches('"'), "verified content digest")?;
         let bytes = if data.bytes.persistent_blob().is_some() {
             data.bytes.clone()
@@ -557,6 +574,23 @@ impl Gateway {
         Ok(data)
     }
 
+    async fn current_anchor(&self, data: &VerifiedData) -> Result<bool> {
+        let Some(store) = &self.block_store else {
+            return Ok(true);
+        };
+        let expected = data
+            .block_hash
+            .context("verified content lacks a block hash")?;
+        if let Some(hash) = store.canonical_hash(data.block_height).await? {
+            return Ok(hash.as_slice() == expected);
+        }
+        Ok(self
+            .trusted_block_index(data.block_height, data.block_height)
+            .await?
+            .and_then(|entries| entries.into_iter().next())
+            .is_some_and(|entry| entry.hash == URL_SAFE_NO_PAD.encode(expected)))
+    }
+
     async fn retrieve_cached(
         &self,
         cache: &Mutex<ContentCache>,
@@ -564,11 +598,18 @@ impl Gateway {
         cache_result: bool,
         retrieve: impl Future<Output = Result<VerifiedData>>,
     ) -> Result<VerifiedData> {
-        let (mut receiver, leader) = {
-            let mut state = cache.lock().unwrap();
-            if let Some(data) = state.get(id) {
+        let cached = { cache.lock().unwrap().get(id) };
+        if let Some(data) = cached {
+            if self.current_anchor(&data).await? {
                 return Ok(data);
             }
+            let mut state = cache.lock().unwrap();
+            if let Some((old, _)) = state.entries.remove(id) {
+                state.bytes -= old.cache_bytes();
+            }
+        }
+        let (mut receiver, leader) = {
+            let mut state = cache.lock().unwrap();
             match state.inflight.get(id) {
                 Some(sender) => (sender.subscribe(), None),
                 None => {
@@ -586,10 +627,17 @@ impl Gateway {
             }
         };
         if let Some(mut leader) = leader {
-            let result = tokio::time::timeout(self.config.retrieval_timeout, retrieve)
-                .await
-                .context("verified retrieval timed out")
-                .and_then(|result| result);
+            let result = tokio::time::timeout(self.config.retrieval_timeout, async {
+                let data = retrieve.await?;
+                ensure!(
+                    self.current_anchor(&data).await?,
+                    "content block changed during retrieval"
+                );
+                Ok(data)
+            })
+            .await
+            .context("verified retrieval timed out")
+            .and_then(|result| result);
             {
                 let mut cache = cache.lock().unwrap();
                 if cache_result && let Ok(data) = &result {
@@ -617,7 +665,7 @@ impl Gateway {
                 .await
                 .context("coalesced retrieval timed out")?
                 .context("coalesced retrieval canceled")?;
-            receiver
+            let data = receiver
                 .borrow_and_update()
                 .as_ref()
                 .context("coalesced retrieval returned no result")?
@@ -625,7 +673,12 @@ impl Gateway {
                 .map_err(|error| match error {
                     RetrievalFailure::NotFound => anyhow::Error::new(ContentNotFound),
                     RetrievalFailure::Other(message) => anyhow::Error::msg(message),
-                })
+                })?;
+            ensure!(
+                self.current_anchor(&data).await?,
+                "coalesced content block changed"
+            );
+            Ok(data)
         }
     }
 
@@ -643,6 +696,10 @@ impl Gateway {
         tokio::time::timeout(self.config.retrieval_timeout, async {
             decode_fixed::<32>(id, "data item ID")?;
             if let Some((data, None)) = self.load_content_cache(id).await? {
+                ensure!(
+                    self.current_anchor(&data).await?,
+                    "cached content block changed"
+                );
                 return Ok(data);
             }
             let hint = self
@@ -716,6 +773,12 @@ impl Gateway {
 
             self.peers
                 .record_chunk_result(source, Some((headers, body, proof.bytes.len())));
+            if self.block_store.is_some() {
+                ensure!(
+                    self.trusted_block_geometry(offset).await? == Some(geometry),
+                    "chunk block changed during retrieval"
+                );
+            }
             return Ok(Some(VerifiedChunk {
                 data_root: URL_SAFE_NO_PAD.encode(proof.transaction.data_root),
                 data_size: proof.transaction.size,
@@ -923,6 +986,7 @@ impl Gateway {
             cache_hit: parent.cache_hit,
             id: id.to_owned(),
             block_height: parent.block_height,
+            block_hash: parent.block_hash,
             content_type: item_content_type(&item.tags)?,
             content_encoding,
             etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
@@ -932,6 +996,10 @@ impl Gateway {
         if let Err(error) = self.save_content_cache(&mut data, None).await {
             eprintln!("content cache admission failed: {error:#}");
         }
+        ensure!(
+            self.current_anchor(&data).await?,
+            "bundle block changed during retrieval"
+        );
         Ok(data)
     }
 
@@ -981,32 +1049,30 @@ impl Gateway {
     }
 
     async fn retrieve_direct_with_tags(&self, id: &str) -> Result<Arc<VerifiedRoot>> {
-        let data = self
-            .retrieve_cached(&self.direct_cache, id, false, async {
-                let root = if let Some((data, Some(tags))) = self.load_content_cache(id).await? {
-                    VerifiedRoot {
-                        data,
-                        tags,
-                        facts: None,
-                    }
-                } else {
-                    let started = Instant::now();
-                    let (mut data, tags, facts) = self.fetch_direct_with_tags(id).await?;
-                    if facts.is_some() {
-                        eprintln!(
-                            "verified bundle root {id}: retrieval_ms={}",
-                            started.elapsed().as_millis()
-                        );
-                    }
-                    if let Err(error) = self.save_content_cache(&mut data, Some(tags.clone())).await
-                    {
-                        eprintln!("content cache admission failed: {error:#}");
-                    }
-                    VerifiedRoot { data, tags, facts }
-                };
-                Ok(Arc::new(root).verified())
-            })
-            .await?;
+        let data = Box::pin(self.retrieve_cached(&self.direct_cache, id, false, async {
+            let root = if let Some((data, Some(tags))) = self.load_content_cache(id).await? {
+                VerifiedRoot {
+                    data,
+                    tags,
+                    facts: None,
+                }
+            } else {
+                let started = Instant::now();
+                let (mut data, tags, facts) = self.fetch_direct_with_tags(id).await?;
+                if facts.is_some() {
+                    eprintln!(
+                        "verified bundle root {id}: retrieval_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                }
+                if let Err(error) = self.save_content_cache(&mut data, Some(tags.clone())).await {
+                    eprintln!("content cache admission failed: {error:#}");
+                }
+                VerifiedRoot { data, tags, facts }
+            };
+            Ok(Arc::new(root).verified())
+        }))
+        .await?;
         let root = data
             .indexing_root
             .context("direct retrieval lacks root metadata")?;
@@ -1156,6 +1222,7 @@ impl Gateway {
                     cache_hit: false,
                     id: id.to_owned(),
                     block_height: status.block_height,
+                    block_hash: Some(decode_fixed::<48>(&block.hash, "verified block hash")?),
                     content_type: content_type(&transaction.tags)?,
                     content_encoding,
                     content_length,
@@ -1252,6 +1319,7 @@ impl Gateway {
                 cache_hit: false,
                 id: id.to_owned(),
                 block_height: status.block_height,
+                block_hash: Some(decode_fixed::<48>(&block.hash, "verified block hash")?),
                 content_type,
                 content_encoding,
                 content_length: expected_len,
@@ -2382,7 +2450,7 @@ struct Geometry {
     data_size: u128,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct BlockGeometry {
     tx_root: [u8; 32],
     block_weave_size: u128,
@@ -4737,6 +4805,7 @@ mod cache_tests {
             cache_hit: false,
             id: id.to_owned(),
             block_height: 1,
+            block_hash: None,
             content_type: "text/plain".to_owned(),
             content_encoding: None,
             content_length: 5,

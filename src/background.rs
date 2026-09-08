@@ -348,8 +348,20 @@ async fn run(
     let consume = async {
         let mut roots = 0;
         let mut occurrences = 0;
+        let mut next_chain_poll = Instant::now();
         loop {
             let job = tokio::select! {
+                _ = sleep_until(next_chain_poll), if range.is_none() && gateway.config.index_chain => {
+                    match crate::indexer::follow_chain_step(gateway, store).await {
+                        Ok(true) => next_chain_poll = Instant::now(),
+                        Ok(false) => next_chain_poll = Instant::now() + RETRY_INTERVAL,
+                        Err(error) => {
+                            eprintln!("following chain failed: {error:#}");
+                            next_chain_poll = Instant::now() + RETRY_INTERVAL;
+                        }
+                    }
+                    continue;
+                }
                 job = async { requests.as_mut().unwrap().recv().await }, if requests.is_some() => {
                     match job {
                         Some(job) => job,
@@ -605,6 +617,7 @@ mod tests {
                 cache_hit: false,
                 id: URL_SAFE_NO_PAD.encode([id; 32]),
                 block_height: 1,
+                block_hash: None,
                 content_type: "application/octet-stream".to_owned(),
                 content_encoding: None,
                 etag: String::new(),

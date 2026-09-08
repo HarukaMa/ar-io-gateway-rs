@@ -88,6 +88,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| config.cache_max_bytes.to_string())
         .parse()
         .context("invalid AR_IO_CACHE_MAX_BYTES")?;
+    let index_chain = env::var("AR_IO_INDEX_CHAIN")
+        .unwrap_or_else(|_| "false".to_owned())
+        .parse::<bool>()
+        .context("invalid AR_IO_INDEX_CHAIN")?;
+    config.index_chain = index_chain;
     let mut gateway = Gateway::new(config)?;
     if let Ok(url) = env::var("DATABASE_URL") {
         gateway = gateway.with_database(&url).await?;
@@ -104,10 +109,11 @@ async fn main() -> Result<()> {
         if args.next().is_some() {
             bail!("{USAGE}");
         }
-        let index_bundles = env::var("AR_IO_INDEX_BUNDLES")
-            .unwrap_or_else(|_| "false".to_owned())
-            .parse::<bool>()
-            .context("invalid AR_IO_INDEX_BUNDLES")?;
+        let index_bundles = index_chain
+            || env::var("AR_IO_INDEX_BUNDLES")
+                .unwrap_or_else(|_| "false".to_owned())
+                .parse::<bool>()
+                .context("invalid AR_IO_INDEX_BUNDLES")?;
         for name in ["ANS104_UNBUNDLE_FILTER", "ANS104_INDEX_FILTER"] {
             if let Ok(value) = env::var(name) {
                 let filter: serde_json::Value =

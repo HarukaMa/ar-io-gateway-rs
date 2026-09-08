@@ -13,6 +13,13 @@ use super::{
 const FORK_2_0_HEIGHT: u64 = 422_250;
 const FORK_2_4_HEIGHT: u64 = 633_720;
 
+// SHA-256 of the JSON tuples below, ordered by raw transaction ID, from
+// ArweaveTeam/arweave@50e47de6d054afefdee112fa124695eb8d0176fc/genesis_data/genesis_txs.
+const MAINNET_GENESIS_RECORDS_SHA256: [u8; 32] = [
+    0x07, 0xbd, 0x8c, 0xce, 0x7d, 0x85, 0x65, 0x5e, 0x24, 0x86, 0x35, 0x42, 0xca, 0xba, 0xda, 0x99,
+    0x98, 0x26, 0xd3, 0xc8, 0xb6, 0x78, 0x12, 0x22, 0xc4, 0xb1, 0x6c, 0x64, 0x13, 0x17, 0x98, 0xf8,
+];
+
 pub(super) struct VerifiedTransaction {
     pub(super) metadata: ObjectMetadata,
     pub(super) inline_data: Option<Vec<u8>>,
@@ -307,7 +314,23 @@ pub(super) fn verify_block_data_root(
     );
     // Erlang sorts full #tx{} records: format precedes the raw ID in the tuple.
     objects.sort_unstable_by(|left, right| (left.format, &left.id).cmp(&(right.format, &right.id)));
-    let mut row = Vec::with_capacity(objects.len() * 2);
+    let mut genesis = (block.height == 0).then(Sha256::new);
+    if genesis.is_some() {
+        ensure!(
+            objects.len() == 314
+                && block.indep_hash
+                    == "7wIU7KolICAjClMlcZ38LZzshhI7xGkm2tDCJR7Wvhe3ESUo2-Z4-y0x1uaglRJE"
+                && parse_u128(&block.block_size, "block size")? == 0
+                && parse_u128(&block.weave_size, "weave size")? == 0
+                && block.tx_root == "P_OiqMNN1s4ltcaq0HXb9VFos_Zz6LFjM8ogUG0vJek",
+            "unsupported genesis block"
+        );
+    }
+    let mut row = Vec::with_capacity(if genesis.is_some() {
+        0
+    } else {
+        objects.len() * 2
+    });
     let mut end = 0u128;
     for object in objects {
         let id: [u8; 32] = object
@@ -323,6 +346,27 @@ pub(super) fn verify_block_data_root(
             .data_root
             .as_deref()
             .context("missing transaction data root")?;
+        if let Some(digest) = genesis.as_mut() {
+            // Bind every source field, including the ambiguous v1 metadata boundaries.
+            serde_json::to_writer(
+                digest,
+                &(
+                    &object.id,
+                    &object.signature,
+                    &object.anchor,
+                    &object.owner_public_key,
+                    &object.target,
+                    object.data_size,
+                    &object.data_root,
+                    object.format,
+                    &object.quantity,
+                    &object.reward,
+                    object.denomination,
+                    &object.tags,
+                ),
+            )?;
+            continue;
+        }
         end = end
             .checked_add(object.data_size)
             .context("block data size overflow")?;
@@ -335,6 +379,14 @@ pub(super) fn verify_block_data_root(
                 row.push((hash_leaf(&[], &note(end)), end));
             }
         }
+    }
+    if let Some(digest) = genesis {
+        let actual: [u8; 32] = digest.finalize().into();
+        ensure!(
+            actual == MAINNET_GENESIS_RECORDS_SHA256,
+            "genesis transaction records differ from the official snapshot"
+        );
+        return Ok(());
     }
     ensure!(
         end == parse_u128(&block.block_size, "block size")?,
@@ -636,6 +688,68 @@ mod tests {
                 case["root"]
             );
         }
+    }
+
+    #[test]
+    fn mainnet_genesis_requires_pinned_records() {
+        let snapshot: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/mainnet-genesis-transactions.json"
+        ))
+        .unwrap();
+        let mut objects: Vec<_> = snapshot
+            .iter()
+            .map(|value| {
+                let transaction = decode_transaction(value.clone()).unwrap();
+                verify_transaction(&transaction, &transaction.id, 0)
+                    .unwrap()
+                    .metadata
+            })
+            .collect();
+        let mut block = BlockHeader {
+            height: 0,
+            indep_hash: "7wIU7KolICAjClMlcZ38LZzshhI7xGkm2tDCJR7Wvhe3ESUo2-Z4-y0x1uaglRJE"
+                .to_owned(),
+            txs: objects
+                .iter()
+                .map(|object| URL_SAFE_NO_PAD.encode(&object.id))
+                .collect(),
+            block_size: "0".to_owned(),
+            weave_size: "0".to_owned(),
+            tx_root: "P_OiqMNN1s4ltcaq0HXb9VFos_Zz6LFjM8ogUG0vJek".to_owned(),
+            ..BlockHeader::default()
+        };
+        objects.reverse();
+        verify_block_data_root(&block, &mut objects).unwrap();
+
+        // Empty tag boundaries preserve the v1 signature but change indexed metadata.
+        let original = objects[0].clone();
+        let mut changed = snapshot[0].clone();
+        changed
+            .as_object_mut()
+            .unwrap()
+            .entry("tags")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "", "value": ""}));
+        let transaction = decode_transaction(changed).unwrap();
+        objects[0] = verify_transaction(&transaction, &transaction.id, 0)
+            .unwrap()
+            .metadata;
+        assert!(verify_block_data_root(&block, &mut objects).is_err());
+        objects[0] = original;
+        objects[0].data_root.as_mut().unwrap()[0] ^= 1;
+        assert!(verify_block_data_root(&block, &mut objects).is_err());
+        objects[0].data_root.as_mut().unwrap()[0] ^= 1;
+        block.height = 1;
+        assert!(verify_block_data_root(&block, &mut objects).is_err());
+        block.height = 0;
+        let genesis_hash = std::mem::take(&mut block.indep_hash);
+        assert!(verify_block_data_root(&block, &mut objects).is_err());
+        block.indep_hash = genesis_hash;
+        objects.pop();
+        block.txs.pop();
+        assert!(verify_block_data_root(&block, &mut objects).is_err());
     }
 
     #[test]

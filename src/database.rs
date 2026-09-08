@@ -23,6 +23,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "005_cache_cleanup",
         include_str!("../migrations/005_cache_cleanup.sql"),
     ),
+    (
+        "006_chain_reorg",
+        include_str!("../migrations/006_chain_reorg.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -278,10 +282,10 @@ impl BlockStore {
             .collect()
     }
 
-    pub(crate) async fn cached_content(&self, id: &[u8; 32]) -> Result<Option<String>> {
+    pub(crate) async fn cached_content(&self, id: &[u8; 32]) -> Result<Option<(String, Vec<u8>)>> {
         self.client
             .query_opt(
-                "SELECT cached.metadata FROM public.content_cache cached
+                "SELECT cached.metadata, cached.block_hash FROM public.content_cache cached
                  JOIN public.canonical_blocks c
                    ON c.height = cached.block_height AND c.block_hash = cached.block_hash
                  JOIN public.block_index_state s
@@ -291,7 +295,7 @@ impl BlockStore {
                 &[&id.as_slice()],
             )
             .await?
-            .map(|row| row.try_get(0).map_err(Into::into))
+            .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
             .transpose()
     }
 
@@ -346,6 +350,56 @@ impl BlockStore {
             .as_ref()
             .map(state_from_row)
             .transpose()
+    }
+
+    pub(crate) async fn canonical_hash(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        self.client
+            .query_opt(
+                "SELECT block_hash FROM public.canonical_blocks WHERE height=$1",
+                &[&sql_height(height)?],
+            )
+            .await?
+            .map(|row| row.try_get(0).map_err(Into::into))
+            .transpose()
+    }
+
+    pub(crate) async fn rewind(
+        &mut self,
+        ancestor: u64,
+        checkpoint: &Checkpoint,
+        source: &str,
+    ) -> Result<()> {
+        let transaction = self.client.transaction().await?;
+        let state = state_from_row(&transaction.query_one(
+            "SELECT start_height, imported_through, checkpoint_height, checkpoint_hash, source
+             FROM public.block_index_state WHERE singleton FOR UPDATE", &[],
+        ).await?)?;
+        validate_pin(&state, checkpoint, source)?;
+        ensure!(
+            ancestor >= checkpoint.height,
+            "reorg crosses protected checkpoint"
+        );
+        ensure!(
+            state
+                .imported_through
+                .is_some_and(|height| ancestor <= height),
+            "invalid reorg ancestor"
+        );
+        let height = sql_height(ancestor)?;
+        transaction
+            .execute(
+                "UPDATE public.block_index_state SET imported_through=$1 WHERE singleton",
+                &[&height],
+            )
+            .await?;
+        transaction
+            .execute(
+                "DELETE FROM public.canonical_blocks WHERE height>$1",
+                &[&height],
+            )
+            .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub(crate) async fn advance_checkpoint(
@@ -550,7 +604,7 @@ impl BlockStore {
                  JOIN public.canonical_blocks c
                    ON c.height >= s.start_height AND c.height <= s.imported_through
                  JOIN public.blocks b ON b.height = c.height AND b.hash = c.block_hash
-                 WHERE s.singleton AND c.height BETWEEN $1 AND $2 AND b.timestamp IS NULL
+                 WHERE s.singleton AND c.height BETWEEN $1 AND $2 AND NOT c.metadata_complete
                  ORDER BY c.height LIMIT $3",
                 &[
                     &sql_height(start)?,
@@ -623,6 +677,12 @@ impl BlockStore {
         timestamp: u64,
         transaction_ids: &[Vec<u8>],
     ) -> Result<()> {
+        transaction
+            .query_one(
+                "SELECT singleton FROM public.block_index_state WHERE singleton FOR SHARE",
+                &[],
+            )
+            .await?;
         let height = sql_height(block.height)?;
         let timestamp = i64::try_from(timestamp).context("timestamp exceeds PostgreSQL bigint")?;
         let count = i32::try_from(transaction_ids.len()).context("too many block transactions")?;
@@ -712,7 +772,7 @@ impl BlockStore {
             stored_count == i64::from(count),
             "conflicting immutable block membership count"
         );
-        if stored_timestamp.is_none() {
+        {
             for ids in identities.chunks(ROW_BATCH_SIZE) {
                 transaction
                     .execute(
@@ -761,6 +821,10 @@ impl BlockStore {
                 after = last;
             }
         }
+        transaction.execute(
+            "UPDATE public.canonical_blocks SET metadata_complete=true WHERE height=$1 AND block_hash=$2",
+            &[&height, &block.hash],
+        ).await?;
         Ok(())
     }
 
@@ -930,6 +994,12 @@ impl BlockStore {
             .build_transaction()
             .isolation_level(IsolationLevel::ReadCommitted)
             .start()
+            .await?;
+        transaction
+            .query_one(
+                "SELECT singleton FROM public.block_index_state WHERE singleton FOR SHARE",
+                &[],
+            )
             .await?;
         Self::lock_bundle_roots(&transaction, &[root_id]).await?;
         let root = transaction.query_opt(
@@ -1766,8 +1836,12 @@ fn validate_batch<'a>(
             block.height
         );
         ensure!(
-            block.height <= state.checkpoint.height,
-            "block exceeds pinned checkpoint"
+            block.height
+                <= state
+                    .checkpoint
+                    .height
+                    .saturating_add(crate::CONSENSUS_DEPTH),
+            "block exceeds tracked consensus window"
         );
         ensure!(block.hash.len() == 48, "block hash must be 48 bytes");
         ensure!(
@@ -2076,7 +2150,14 @@ mod tests {
                     .is_err(),
                 "conflicting immutable descriptor was accepted"
             );
-            ensure!(store.cached_content(&id).await?.as_deref() == Some(metadata));
+            ensure!(
+                store
+                    .cached_content(&id)
+                    .await?
+                    .map(|(text, _)| text)
+                    .as_deref()
+                    == Some(metadata)
+            );
             store
                 .client
                 .execute(
@@ -2434,6 +2515,23 @@ mod tests {
         next.previous_hash = Some(previous.hash.clone());
         next.hash[0] ^= 1;
         assert!(validate_batch(&[next], &state, Some(&previous)).is_err());
+
+        let mut state = state;
+        state.checkpoint = Checkpoint {
+            height: previous.height,
+            hash: previous.hash.clone(),
+        };
+        let tip: Vec<_> = (8..=58)
+            .map(|height| IndexBlock {
+                height,
+                hash: vec![height as u8; 48],
+                previous_hash: Some(vec![height as u8 - 1; 48]),
+                tx_root: Vec::new(),
+                weave_size: u128::MAX,
+            })
+            .collect();
+        validate_batch(&tip[..50], &state, Some(&previous)).unwrap();
+        assert!(validate_batch(&tip, &state, Some(&previous)).is_err());
     }
 
     #[test]
