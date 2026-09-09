@@ -27,6 +27,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "006_chain_reorg",
         include_str!("../migrations/006_chain_reorg.sql"),
     ),
+    (
+        "007_pending_transactions",
+        include_str!("../migrations/007_pending_transactions.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -922,7 +926,8 @@ impl BlockStore {
                      SELECT 1 FROM public.block_index_state s
                      JOIN public.canonical_blocks c
                        ON c.height >= s.start_height AND c.height <= s.imported_through
-                     JOIN public.block_transactions bt ON bt.block_hash = c.block_hash
+                     JOIN public.blocks b ON b.height = c.height AND b.hash = c.block_hash
+                     JOIN public.block_transactions bt ON bt.block_hash = b.hash
                      WHERE s.singleton AND c.height BETWEEN $1 AND $2 AND bt.object_key = o.key
                  )
                  ORDER BY p.block_height, p.position, p.kind, p.id LIMIT $3",
@@ -1998,6 +2003,93 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; fixture changes are rolled back"]
+    async fn pending_transactions_preserve_membership_range_and_order() -> Result<()> {
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store
+            .client
+            .batch_execute(
+                "BEGIN; SET LOCAL statement_timeout = '3s'; SET LOCAL lock_timeout = '1s'",
+            )
+            .await?;
+        let result: Result<()> = async {
+            let indexed: bool = store.client.query_one(
+                "SELECT EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
+                 WHERE version = 7 AND name = '007_pending_transactions')", &[],
+            ).await?.get(0);
+            if !indexed {
+                store.client.batch_execute(include_str!("../migrations/007_pending_transactions.sql")).await?;
+            }
+            let rows = store.client.query(
+                "SELECT o.key, o.id, p.block_height, p.position, c.block_hash
+                 FROM public.canonical_placements p
+                 JOIN public.objects o ON o.key = p.object_key
+                 JOIN public.canonical_blocks c ON c.height = p.block_height
+                 JOIN public.block_transactions bt ON bt.block_hash = c.block_hash
+                   AND bt.object_key = o.key AND bt.position = p.position
+                 WHERE o.kind = 0 AND o.metadata_complete
+                 ORDER BY p.block_height, p.position, p.kind, p.id LIMIT 2", &[],
+            ).await?;
+            ensure!(rows.len() == 2, "requires two indexed L1 fixtures");
+            let height: i64 = rows[0].get(2);
+            ensure!(rows[1].get::<_, i64>(2) == height, "fixtures must share a block");
+            ensure!(store.pending_transactions(height as u64, height as u64, 256).await?.is_empty(),
+                "fixture block already has pending transactions");
+            let keys: Vec<i64> = rows.iter().map(|row| row.get(0)).collect();
+            let expected: Vec<(Vec<u8>, u64)> = rows.iter().map(|row| (row.get(1), height as u64)).collect();
+            let original_hash: Vec<u8> = rows[0].get(4);
+            store.client.execute("UPDATE public.objects SET metadata_complete = false WHERE key = ANY($1)", &[&keys]).await?;
+            ensure!(store.pending_transactions(height as u64, height as u64, 1).await? == expected[..1],
+                "pending limit or chronology changed");
+            ensure!(store.pending_transactions(height as u64, height as u64, 256).await? == expected,
+                "pending canonical members were lost");
+
+            let next = store.client.query_one(
+                "SELECT c.height, c.block_hash FROM public.canonical_blocks c
+                 JOIN public.block_index_state s ON s.singleton
+                 WHERE c.height > $1 AND c.height <= s.imported_through
+                   AND NOT EXISTS (SELECT 1 FROM public.block_transactions bt WHERE bt.block_hash = c.block_hash)
+                 ORDER BY c.height LIMIT 1", &[&height],
+            ).await?;
+            let next_height: i64 = next.get(0);
+            let next_hash: Vec<u8> = next.get(1);
+            ensure!(store.pending_transactions(next_height as u64, next_height as u64, 256).await?.is_empty(),
+                "empty range returned pending transactions");
+            store.client.execute(
+                "INSERT INTO public.block_transactions (block_hash, position, object_key) VALUES ($1, 0, $2)",
+                &[&next_hash, &keys[0]],
+            ).await?;
+            ensure!(store.pending_transactions(next_height as u64, next_height as u64, 256).await? == expected[..1],
+                "canonical occurrence was confused with preferred placement");
+
+            let fork_hash = vec![0xa6u8; 48];
+            store.client.execute(
+                "INSERT INTO public.blocks (height, hash, previous_hash, tx_root, weave_size, timestamp)
+                 SELECT height, $1, previous_hash, tx_root, weave_size, timestamp FROM public.blocks WHERE hash = $2",
+                &[&fork_hash, &original_hash],
+            ).await?;
+            store.client.execute(
+                "UPDATE public.block_transactions SET block_hash = $1 WHERE block_hash = $2 AND object_key = $3",
+                &[&fork_hash, &original_hash, &keys[1]],
+            ).await?;
+            ensure!(store.pending_transactions(height as u64, height as u64, 256).await? == expected[..1],
+                "noncanonical membership was accepted");
+            Ok(())
+        }.await;
+        store.client.batch_execute("ROLLBACK").await?;
+        result
+    }
 
     #[tokio::test]
     #[ignore = "requires ar_io_rust_test; uses only a connection-local temporary table"]
