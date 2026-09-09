@@ -35,6 +35,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "008_json_bundles",
         include_str!("../migrations/008_json_bundles.sql"),
     ),
+    (
+        "009_status_totals",
+        include_str!("../migrations/009_status_totals.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -248,7 +252,7 @@ impl BlockStore {
         })
     }
 
-    pub(crate) async fn indexing_status(&self) -> Result<serde_json::Value> {
+    async fn status_query(&self, sql: &str) -> Result<serde_json::Value> {
         let mut config = self.connection_config.clone();
         config.options(
             "-c default_transaction_read_only=on -c statement_timeout=3000 \
@@ -256,55 +260,66 @@ impl BlockStore {
         );
         let (client, connection) = timeout(CONNECT_TIMEOUT, config.connect(NoTls)).await??;
         let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
-        // ponytail: exact totals scan placements under the query deadline.
-        // Use incremental counters if growing history reaches that deadline.
-        let row = client.query_one(
-            &format!("{BUNDLE_TAGS} {BUNDLE_CANDIDATES}, progress AS MATERIALIZED (
-                SELECT min(height) FILTER (WHERE NOT metadata_complete) AS pending
-                FROM public.canonical_blocks
-             ), bundle_objects AS MATERIALIZED (
-                SELECT DISTINCT object_key FROM bundle_candidates
-             ), totals AS MATERIALIZED (
-                SELECT count(*) FILTER (WHERE p.kind=0 AND o.metadata_complete) AS transactions,
-                    count(*) FILTER (WHERE p.kind=0 AND NOT o.metadata_complete) AS pending,
-                    count(*) FILTER (WHERE p.kind=1 AND o.metadata_complete) AS items
-                FROM public.canonical_placements p JOIN public.objects o ON o.key=p.object_key
-             ), roots AS (
-                SELECT o.data_size AS bytes, coalesce(bp.complete, false) AS complete
+        let row = client.query_one(sql, &[]).await?;
+        Ok(serde_json::from_str(row.get::<_, &str>(0))?)
+    }
+
+    const STATUS_PROGRESS: &str = "
+        WITH progress AS (
+            SELECT height AS pending FROM public.canonical_blocks
+            WHERE NOT metadata_complete ORDER BY height LIMIT 1
+        ), pending AS (
+            SELECT count(*) FILTER (WHERE p.kind=0) AS transactions,
+                count(*) FILTER (WHERE p.kind=1) AS items
+            FROM public.objects o JOIN public.canonical_placements p ON p.object_key=o.key
+            WHERE NOT o.metadata_complete
+        ), totals AS (
+            SELECT coalesce(sum(transactions),0) AS transactions, coalesce(sum(items),0) AS items
+            FROM public.status_totals
+        )
+        SELECT json_build_object(
+            'chain', (SELECT json_build_object(
+                'start_height',s.start_height,'anchor_height',s.imported_through,
+                'checkpoint_height',s.checkpoint_height,
+                'metadata_height',CASE WHEN p.pending=s.start_height THEN NULL
+                    ELSE coalesce(p.pending-1,s.imported_through) END,
+                'first_pending_height',p.pending
+            ) FROM public.block_index_state s LEFT JOIN progress p ON true WHERE singleton),
+            'transactions',(SELECT json_build_object(
+                'complete',t.transactions-p.transactions,'pending',p.transactions) FROM totals t CROSS JOIN pending p),
+            'bundles',(SELECT json_build_object('items',t.items-p.items) FROM totals t CROSS JOIN pending p)
+        )::text";
+
+    pub(crate) async fn indexing_progress(&self) -> Result<serde_json::Value> {
+        self.status_query(Self::STATUS_PROGRESS).await
+    }
+
+    pub(crate) async fn indexing_totals(&self) -> Result<serde_json::Value> {
+        // Placements record verified canonical membership and cascade on reorg.
+        self.status_query(&format!(
+            "{BUNDLE_TAGS} {BUNDLE_CANDIDATES},
+             bundle_objects AS MATERIALIZED (SELECT DISTINCT object_key FROM bundle_candidates),
+             placed AS MATERIALIZED (
+                SELECT p.kind, p.block_height, o.data_size AS bytes,
+                    coalesce(bp.complete,false) AS complete
                 FROM bundle_objects k
-                JOIN public.objects o ON o.key=k.object_key AND o.kind=0 AND o.metadata_complete
+                JOIN public.objects o ON o.key=k.object_key AND o.metadata_complete
                 JOIN public.canonical_placements p ON p.object_key=o.key
-                JOIN public.block_index_state s ON s.singleton
-                    AND p.block_height>s.start_height AND p.block_height<=s.imported_through
-                JOIN public.canonical_blocks c ON c.height=p.block_height
-                JOIN public.blocks b ON b.height=c.height AND b.hash=c.block_hash AND b.timestamp IS NOT NULL
-                JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
-                    AND bt.position=p.position AND bt.object_key=o.key
                 LEFT JOIN public.bundle_progress bp ON bp.root_key=o.key
+             ), roots AS (
+                SELECT placed.bytes, placed.complete FROM placed
+                JOIN public.block_index_state s ON s.singleton
+                    AND placed.block_height>s.start_height AND placed.block_height<=s.imported_through
+                WHERE placed.kind=0
              )
              SELECT json_build_object(
-                'chain', (SELECT json_build_object(
-                    'start_height', s.start_height, 'anchor_height', s.imported_through,
-                    'checkpoint_height', s.checkpoint_height,
-                    'metadata_height', CASE WHEN p.pending=s.start_height THEN NULL
-                        ELSE coalesce(p.pending-1, s.imported_through) END,
-                    'first_pending_height', p.pending
-                ) FROM public.block_index_state s CROSS JOIN progress p WHERE singleton),
-                'transactions', (SELECT json_build_object(
-                    'complete', transactions, 'pending', pending
-                ) FROM totals),
-                'bundles', (SELECT json_build_object(
-                    'discovered_roots', count(*),
-                    'complete_roots', count(*) FILTER (WHERE complete),
-                    'pending_roots', count(*) FILTER (WHERE NOT complete),
-                    'pending_bytes', coalesce(sum(bytes) FILTER (WHERE NOT complete), 0)::text,
-                    'items', (SELECT items FROM totals),
-                    'nested_bundles', (SELECT count(*) FROM bundle_objects k
-                        JOIN public.objects o ON o.key=k.object_key AND o.metadata_complete
-                        JOIN public.canonical_placements p ON p.object_key=o.key AND p.kind=1)
-                ) FROM roots)
-             )::text"), &[]).await?;
-        Ok(serde_json::from_str(row.get::<_, &str>(0))?)
+                'discovered_roots',count(*),
+                'complete_roots',count(*) FILTER (WHERE complete),
+                'pending_roots',count(*) FILTER (WHERE NOT complete),
+                'pending_bytes',coalesce(sum(bytes) FILTER (WHERE NOT complete),0)::text,
+                'nested_bundles',(SELECT count(*) FROM placed WHERE kind=1)
+             )::text FROM roots"
+        )).await
     }
 
     pub async fn migrate(&mut self) -> Result<()> {
@@ -2087,6 +2102,93 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[tokio::test]
+    #[ignore = "requires schema 009 in ar_io_rust_test; all changes roll back"]
+    async fn status_totals_follow_metadata_placement_and_reorg() -> Result<()> {
+        async fn consistent(client: &impl tokio_postgres::GenericClient) -> Result<()> {
+            let snapshot: serde_json::Value = serde_json::from_str(
+                client
+                    .query_one(BlockStore::STATUS_PROGRESS, &[])
+                    .await?
+                    .get(0),
+            )?;
+            let expected: Vec<i64> = client
+                .query_one(
+                    "SELECT ARRAY[count(*) FILTER (WHERE p.kind=0 AND o.metadata_complete),
+                    count(*) FILTER (WHERE p.kind=0 AND NOT o.metadata_complete),
+                    count(*) FILTER (WHERE p.kind=1 AND o.metadata_complete)]
+                 FROM public.canonical_placements p JOIN public.objects o ON o.key=p.object_key",
+                    &[],
+                )
+                .await?
+                .get(0);
+            ensure!(
+                serde_json::json!([
+                    snapshot["transactions"]["complete"],
+                    snapshot["transactions"]["pending"],
+                    snapshot["bundles"]["items"]
+                ]) == serde_json::json!(expected),
+                "incremental status differs from canonical counts"
+            );
+            Ok(())
+        }
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let transaction = store.client.transaction().await?;
+        consistent(&transaction).await?;
+        let fixture = transaction
+            .query_one(
+                "SELECT p.object_key,p.block_height FROM public.canonical_placements p
+             JOIN public.objects o ON o.key=p.object_key
+             JOIN public.block_index_state s ON s.singleton
+             WHERE p.kind=0 AND o.metadata_complete AND p.block_height<>s.imported_through
+             ORDER BY p.block_height LIMIT 1",
+                &[],
+            )
+            .await?;
+        let key: i64 = fixture.get(0);
+        let height: i64 = fixture.get(1);
+        transaction
+            .execute(
+                "CREATE TEMP TABLE saved_status_placement ON COMMIT DROP AS
+             SELECT * FROM public.canonical_placements WHERE object_key=$1",
+                &[&key],
+            )
+            .await?;
+        for sql in [
+            "UPDATE public.objects SET metadata_complete=false WHERE key=$1",
+            "UPDATE public.objects SET metadata_complete=false WHERE key=$1",
+            "UPDATE public.objects SET metadata_complete=true WHERE key=$1",
+            "UPDATE public.canonical_placements SET block_height=(
+                SELECT min(height) FROM public.canonical_blocks) WHERE object_key=$1",
+            "DELETE FROM public.canonical_placements WHERE object_key=$1",
+            "INSERT INTO public.canonical_placements SELECT * FROM saved_status_placement WHERE object_key=$1",
+            "INSERT INTO public.canonical_placements SELECT * FROM saved_status_placement WHERE object_key=$1
+                ON CONFLICT (object_key) DO UPDATE SET position=EXCLUDED.position",
+        ] {
+            transaction.execute(sql, &[&key]).await?;
+            consistent(&transaction).await.with_context(|| format!("after {sql}"))?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM public.canonical_blocks WHERE height=$1",
+                &[&height],
+            )
+            .await?;
+        consistent(&transaction).await?;
+        transaction.rollback().await?;
+        consistent(&store.client).await?;
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires a completed range in ar_io_rust_test; read-only"]

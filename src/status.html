@@ -33,7 +33,7 @@
 <div><dt>Pending root bytes</dt><dd id="pending-bytes">-</dd></div>
 <div><dt>Nested bundles found</dt><dd id="nested">-</dd></div>
 <div><dt>Indexed items</dt><dd id="items">-</dd></div>
-</dl><p class="note">Recognized ANS-104 bundles. Pending bytes use full declared root sizes, including partially processed roots.</p></section>
+</dl><p id="bundle-status" class="note" aria-live="polite">Collecting bundle totals</p><p class="note">Recognized binary and JSON bundles. Pending bytes use full declared root sizes, including partially processed roots.</p></section>
 <section><h2>Worker</h2><dl>
 <div><dt>State</dt><dd id="worker">-</dd></div>
 <div><dt>Chain activity</dt><dd id="chain-activity">-</dd></div>
@@ -90,6 +90,11 @@ async function refresh() {
     text('roots', number(bundles.discovered_roots)); text('completed-roots', number(bundles.complete_roots));
     text('pending-roots', number(bundles.pending_roots)); text('pending-bytes', bytes(bundles.pending_bytes));
     text('nested', number(bundles.nested_bundles)); text('items', number(bundles.items));
+    const totalsStale = bundles.sampled_at != null && Date.now() / 1000 - bundles.sampled_at > 90;
+    const totalsFailed = bundles.state === 'unavailable';
+    const totalsTime = bundles.sampled_at == null ? '' : ` (${date(bundles.sampled_at)})`;
+    text('bundle-status', (totalsFailed ? 'Bundle totals refresh failed' : totalsStale ? 'Bundle totals stale' : bundles.state === 'ready' ? 'Bundle totals updated' : 'Collecting bundle totals') + totalsTime);
+    element('bundle-status').classList.toggle('warning', totalsFailed || totalsStale);
     text('worker', data.worker == null ? 'Disabled' : (data.worker.running ? 'Running' : 'Stopped'));
     text('chain-activity', data.worker?.chain || '-'); text('bundle-activity', data.worker?.bundles || '-');
     text('progress-at', date(data.last_progress_at));

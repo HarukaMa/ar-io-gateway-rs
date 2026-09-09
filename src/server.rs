@@ -414,6 +414,7 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     });
     if state.gateway.block_store.is_some() {
         refresh_tasks.spawn(refresh_indexing_status(Arc::clone(&state)));
+        refresh_tasks.spawn(refresh_bundle_totals(Arc::clone(&state)));
     }
     let app = Router::new()
         .route("/ar-io/info", get(serve_info))
@@ -624,7 +625,7 @@ async fn refresh_indexing_status(state: Arc<AppState>) {
     loop {
         ticks.tick().await;
         let store = state.gateway.block_store.as_ref().expect("status database");
-        let result = tokio::time::timeout(Duration::from_secs(10), store.indexing_status()).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), store.indexing_progress()).await;
         let mut snapshot = match result {
             Ok(Ok(snapshot)) => snapshot,
             error => {
@@ -662,7 +663,6 @@ async fn refresh_indexing_status(state: Arc<AppState>) {
                 ("chain", "anchor_height"),
                 ("chain", "metadata_height"),
                 ("transactions", "complete"),
-                ("bundles", "complete_roots"),
                 ("bundles", "items"),
             ]
             .iter()
@@ -682,15 +682,60 @@ async fn refresh_indexing_status(state: Arc<AppState>) {
             }
         }
         previous = Some((Instant::now(), snapshot.clone()));
-        *state.indexing_status.lock() = snapshot;
+        let mut cached = state.indexing_status.lock();
+        if let Some(totals) = cached["bundles"].as_object() {
+            for (key, value) in totals {
+                if key != "items" {
+                    snapshot["bundles"][key] = value.clone();
+                }
+            }
+        }
+        if cached["last_progress_at"].as_u64() > snapshot["last_progress_at"].as_u64() {
+            snapshot["last_progress_at"] = cached["last_progress_at"].clone();
+        }
+        *cached = snapshot;
+    }
+}
+
+async fn refresh_bundle_totals(state: Arc<AppState>) {
+    let mut ticks = interval(Duration::from_secs(30));
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticks.tick().await;
+        let store = state.gateway.block_store.as_ref().expect("status database");
+        let result = tokio::time::timeout(Duration::from_secs(10), store.indexing_totals()).await;
+        let mut cached = state.indexing_status.lock();
+        match result {
+            Ok(Ok(mut totals)) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if totals["complete_roots"].as_u64() > cached["bundles"]["complete_roots"].as_u64()
+                    && cached["bundles"]["complete_roots"].is_number()
+                {
+                    cached["last_progress_at"] = serde_json::json!(now);
+                }
+                totals["items"] = cached["bundles"]["items"].clone();
+                totals["state"] = serde_json::json!("ready");
+                totals["sampled_at"] = serde_json::json!(now);
+                cached["bundles"] = totals;
+            }
+            error => {
+                eprintln!("bundle status refresh failed: {error:?}");
+                cached["bundles"]["state"] = serde_json::json!("unavailable");
+            }
+        }
     }
 }
 
 async fn serve_indexing_status(State(state): State<Arc<AppState>>) -> Response {
     let mut snapshot = state.indexing_status.lock().clone();
-    if snapshot.is_null() {
-        snapshot = serde_json::json!({
-            "state": if state.gateway.block_store.is_some() { "starting" } else { "disabled" },
+    if snapshot["state"].is_null() {
+        snapshot["state"] = serde_json::json!(if state.gateway.block_store.is_some() {
+            "starting"
+        } else {
+            "disabled"
         });
     }
     snapshot["worker"] = state
