@@ -1019,11 +1019,11 @@ impl BlockStore {
             .collect()
     }
 
-    pub(crate) async fn pending_bundle_after(
+    pub(crate) async fn pending_bundles_after(
         &self,
         after: Option<&[u8]>,
         range: Option<(u64, u64)>,
-    ) -> Result<Option<(Vec<u8>, u64, u128)>> {
+    ) -> Result<Vec<(Vec<u8>, u64, u128)>> {
         ensure!(
             after.is_none_or(|id| id.len() == 32),
             "bundle cursor ID must be 32 bytes"
@@ -1036,10 +1036,10 @@ impl BlockStore {
         let end = range.map(|(_, end)| sql_height(end)).transpose()?;
         // Sort tag candidates before the parameterized canonical check.
         self.client
-            .query_opt(
+            .query(
                 &format!(
                     "{BUNDLE_TAGS} {BUNDLE_CANDIDATES}, ordered AS MATERIALIZED (
-                        SELECT o.id, o.key, o.data_size, p.block_height, p.position
+                        SELECT DISTINCT o.id, o.key, o.data_size, p.block_height, p.position
                         FROM bundle_candidates candidates
                         JOIN public.canonical_placements p ON p.object_key=candidates.object_key
                         JOIN public.objects o ON o.key=p.object_key
@@ -1059,11 +1059,12 @@ impl BlockStore {
                         WHERE c.height=ordered.block_height AND bt.position=ordered.position
                             AND bt.object_key=ordered.key AND b.timestamp IS NOT NULL
                         LIMIT 1) IS TRUE
-                    ORDER BY id LIMIT 1"
+                    ORDER BY id LIMIT 64"
                 ),
                 &[&after, &start, &end],
             )
             .await?
+            .into_iter()
             .map(|row| {
                 Ok((
                     row.try_get(0)?,
@@ -1071,7 +1072,7 @@ impl BlockStore {
                     row.try_get::<_, String>(2)?.parse()?,
                 ))
             })
-            .transpose()
+            .collect()
     }
 
     pub(crate) async fn bundle_status(
@@ -2411,7 +2412,7 @@ mod tests {
         );
         store.client.batch_execute("BEGIN").await?;
         let result = async {
-            let roots = store
+            let mut roots = store
                 .client
                 .query(&format!("{BUNDLE_TAGS} {BUNDLE_CANDIDATES} {CANONICAL_BUNDLES} ORDER BY o.id LIMIT 1"), &[])
                 .await?
@@ -2425,6 +2426,41 @@ mod tests {
                 })
                 .collect::<Result<Vec<_>>>()?;
             ensure!(roots.len() == 1, "requires a canonical bundle root");
+            // Synthetic memberships exercise both sides of the 64-root page boundary.
+            let clones = store.client.query(
+                "INSERT INTO public.objects OVERRIDING SYSTEM VALUE
+                 SELECT copy.* FROM public.objects o CROSS JOIN generate_series(1,65) n
+                 CROSS JOIN LATERAL jsonb_populate_record(NULL::public.objects, to_jsonb(o) ||
+                    jsonb_build_object('key',nextval(pg_get_serial_sequence('public.objects','key')),
+                        'id',sha256(o.id || int4send(n)))
+                 ) copy
+                 WHERE o.id=$1 RETURNING key,id", &[&roots[0].0]
+            ).await?;
+            let keys: Vec<i64> = clones.iter().map(|row| row.get(0)).collect();
+            store.client.execute(
+                "INSERT INTO public.object_tags
+                 SELECT k,t.ordinal,t.name_key,t.value_key FROM unnest($1::bigint[]) k
+                 CROSS JOIN public.object_tags t JOIN public.objects o ON o.key=t.object_key
+                 WHERE o.id=$2", &[&keys,&roots[0].0]
+            ).await?;
+            let height = i64::try_from(roots[0].1)?;
+            store.client.execute(
+                "INSERT INTO public.block_transactions(block_hash,position,object_key)
+                 SELECT c.block_hash,(SELECT coalesce(max(position),-1)+1 FROM public.block_transactions
+                    WHERE block_hash=c.block_hash)+k.n::integer-1,k.key
+                 FROM unnest($1::bigint[]) WITH ORDINALITY k(key,n)
+                 CROSS JOIN public.canonical_blocks c WHERE c.height=$2", &[&keys,&height]
+            ).await?;
+            store.client.execute(
+                "INSERT INTO public.canonical_placements(object_key,block_height,position,kind,id)
+                 SELECT o.key,c.height,bt.position,o.kind,o.id FROM public.objects o
+                 JOIN public.block_transactions bt ON bt.object_key=o.key
+                 JOIN public.canonical_blocks c ON c.block_hash=bt.block_hash
+                 WHERE o.key=ANY($1::bigint[])", &[&keys]
+            ).await?;
+            let size = roots[0].2;
+            roots.extend(clones.iter().map(|row| (row.get(1),height as u64,size)));
+            roots.sort_unstable_by(|left,right| left.0.cmp(&right.0));
             let ids: Vec<_> = roots.iter().map(|(id, _, _)| id.as_slice()).collect();
             store
                 .client
@@ -2435,12 +2471,14 @@ mod tests {
                     &[&ids],
                 )
                 .await?;
-            ensure!(store.pending_bundle_after(None, None).await? == Some(roots[0].clone()));
-            ensure!(
-                store.pending_bundle_after(Some(&roots[0].0), None).await?
-                    != Some(roots[0].clone()),
-                "scheduled discovery repeated its cursor root"
-            );
+            let first = store.pending_bundles_after(None, None).await?;
+            ensure!(first == roots[..64], "first discovery page differs");
+            let second = store.pending_bundles_after(Some(&first.last().unwrap().0), None).await?;
+            ensure!(second == roots[64..], "second discovery page lost or repeated a root");
+            ensure!(store.pending_bundles_after(Some(&roots.last().unwrap().0), None).await?.is_empty(),
+                "discovery repeated its final cursor root");
+            ensure!(store.pending_bundles_after(None, Some((0,0))).await?.is_empty(),
+                "discovery ignored the height range");
             store
                 .client
                 .execute(
@@ -2451,7 +2489,7 @@ mod tests {
                 .await?;
             ensure!(
                 store.bundle_complete(&roots[0].0).await?
-                    && store.pending_bundle_after(None, None).await? != Some(roots[0].clone()),
+                    && !store.pending_bundles_after(None, None).await?.contains(&roots[0]),
                 "a completed root remained eligible for scheduled retrieval"
             );
             store
@@ -2463,7 +2501,7 @@ mod tests {
                 .await?;
             ensure!(
                 !store.bundle_complete(&roots[0].0).await?
-                    && store.pending_bundle_after(None, None).await?.is_none(),
+                    && store.pending_bundles_after(None, None).await?.is_empty(),
                 "bundle completion or discovery survived loss of canonical coverage"
             );
             Ok(())

@@ -347,7 +347,7 @@ pub(crate) async fn start(
                         gateway.peers = peers;
                         let store = BlockStore::connect(&database_url).await?;
                         // Fail startup if the bundle schema is absent. Never migrate here.
-                        store.pending_bundle_after(None, None).await?;
+                        store.pending_bundles_after(None, None).await?;
                         let chain_store = if gateway.config.index_chain {
                             Some(BlockStore::connect(&database_url).await?)
                         } else {
@@ -488,9 +488,14 @@ async fn download_pending(
     let mut downloads = FuturesUnordered::new();
     let mut cursor: Option<Vec<u8>> = None;
     let mut pending: Option<(Vec<u8>, u64, u128)> = None;
+    let mut candidates = Vec::<(Vec<u8>, u64, u128)>::new().into_iter();
+    let mut discovery = None;
     let mut exhausted = false;
     let mut next_poll = Instant::now();
     loop {
+        if pending.is_none() && downloads.len() < gateway.config.index_downloads {
+            pending = candidates.next();
+        }
         if let Some((root_id, height, data_size)) = pending.take() {
             let id: [u8; 32] = root_id
                 .as_slice()
@@ -565,6 +570,25 @@ async fn download_pending(
         if exhausted && downloads.is_empty() && range.is_some() {
             return Ok(());
         }
+        if discovery.is_none()
+            && pending.is_none()
+            && candidates.len() == 0
+            && downloads.len() < gateway.config.index_downloads
+            && (!exhausted || range.is_none())
+        {
+            let after = cursor.clone();
+            let poll_at = next_poll;
+            // Keep this query alive across download completions and admission wakeups.
+            discovery = Some(Box::pin(async move {
+                sleep_until(poll_at).await;
+                timeout(
+                    gateway.config.request_timeout,
+                    store.pending_bundles_after(after.as_deref(), range),
+                )
+                .await
+                .context("discovering pending bundles timed out")?
+            }));
+        }
         tokio::select! {
             result = downloads.next(), if !downloads.is_empty() => {
                 let (id, result) = result.expect("nonempty downloads");
@@ -580,14 +604,15 @@ async fn download_pending(
             }
             _ = admission.changed.notified() => {}
             _ = gateway.spool_budget.released.notified(), if pending.is_some() => {}
-            result = async {
-                sleep_until(next_poll).await;
-                timeout(gateway.config.request_timeout, store.pending_bundle_after(cursor.as_deref(), range))
-                    .await.context("discovering pending bundle timed out")?
-            }, if pending.is_none() && downloads.len() < gateway.config.index_downloads && (!exhausted || range.is_none()) => {
+            result = async { discovery.as_mut().expect("pending discovery").await }, if discovery.is_some() => {
+                discovery = None;
                 match result {
-                    Ok(Some(root)) => { pending = Some(root); exhausted = false; next_poll = Instant::now(); }
-                    Ok(None) => {
+                    Ok(roots) if !roots.is_empty() => {
+                        candidates = roots.into_iter();
+                        exhausted = false;
+                        next_poll = Instant::now();
+                    }
+                    Ok(_) => {
                         exhausted = true;
                         cursor = None;
                         next_poll = Instant::now() + RETRY_INTERVAL;
@@ -600,6 +625,8 @@ async fn download_pending(
                     }
                 }
             }
+            _ = std::future::ready(()), if pending.is_none()
+                && candidates.len() > 0 && downloads.len() < gateway.config.index_downloads => {}
             _ = tokio::time::sleep(POLL_INTERVAL), if pending.is_some() => {}
         }
     }

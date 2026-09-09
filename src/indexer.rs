@@ -1429,8 +1429,8 @@ mod bundle_tests {
             ).await?;
             let mut cursor = root_id;
             cursor[31] -= 1;
-            let discovered = store.pending_bundle_after(Some(&cursor), Some((height as u64, height as u64))).await?
-                .context("JSON root was not discovered")?;
+            let discovered = store.pending_bundles_after(Some(&cursor), Some((height as u64, height as u64))).await?
+                .into_iter().next().context("JSON root was not discovered")?;
             ensure!(discovered.0 == root_id && discovered.2 == bytes.len() as u128, "wrong JSON discovery result");
             store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
             let indexed = store.bundle_location(&leaf_id).await?.context("JSON child has no indexed location")?;
@@ -1440,8 +1440,8 @@ mod bundle_tests {
             store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
             ensure!(client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == written, "bundle replay added rows");
             ensure!(store.bundle_complete(&root_id).await?, "JSON root was not completed");
-            ensure!(store.pending_bundle_after(Some(&cursor), Some((height as u64, height as u64))).await?
-                .is_none_or(|candidate| candidate.0 != root_id), "completed JSON root was rediscovered");
+            ensure!(store.pending_bundles_after(Some(&cursor), Some((height as u64, height as u64))).await?
+                .iter().all(|candidate| candidate.0 != root_id), "completed JSON root was rediscovered");
             let mut corrupt = locations.clone();
             corrupt[0].json = false;
             ensure!(store.commit_bundle_batch(&root_id, &objects, &corrupt, true).await.is_err(), "conflicting JSON encoding was accepted");
