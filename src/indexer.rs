@@ -4,6 +4,7 @@ use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use std::{
     collections::HashMap,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, time::timeout};
@@ -325,6 +326,7 @@ pub async fn import_metadata(
     );
 
     let mut imported_blocks = 0;
+    let mut imported_transactions = 0;
     loop {
         let blocks = timeout(deadline, store.pending_metadata_blocks(start, end, 256))
             .await
@@ -334,11 +336,11 @@ pub async fn import_metadata(
         }
         let (sender, mut ready) = mpsc::channel(1);
         let produce = async {
-            let headers = block_metadata(gateway, blocks);
+            let headers = block_metadata(gateway, blocks).chunks(32);
             tokio::pin!(headers);
-            while let Some(header) = headers.next().await {
-                let failed = header.is_err();
-                if sender.send(header).await.is_err() || failed {
+            while let Some(batch) = headers.next().await {
+                let failed = batch.iter().any(Result::is_err);
+                if sender.send(batch).await.is_err() || failed {
                     break;
                 }
             }
@@ -346,149 +348,32 @@ pub async fn import_metadata(
             Ok::<_, anyhow::Error>(())
         };
         let consume = async {
-            while let Some(header) = ready.recv().await {
-                let (block, timestamp, transaction_ids) = header?;
-                timeout(
-                    deadline,
-                    store.record_block_metadata(&block, timestamp, &transaction_ids),
-                )
-                .await
-                .with_context(|| format!("block metadata at height {} timed out", block.height))?
-                .with_context(|| format!("importing block metadata at height {}", block.height))?;
-                imported_blocks += 1;
+            while let Some(batch) = ready.recv().await {
+                let mut through = start;
+                for header in batch {
+                    let (block, timestamp, transaction_ids) = header?;
+                    through = block.height;
+                    timeout(
+                        deadline,
+                        store.record_block_metadata(&block, timestamp, &transaction_ids),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("block metadata at height {} timed out", block.height)
+                    })?
+                    .with_context(|| {
+                        format!("importing block metadata at height {}", block.height)
+                    })?;
+                    imported_blocks += 1;
+                }
+                imported_transactions +=
+                    import_pending_transactions(gateway, store, start, through).await?;
             }
             Ok::<_, anyhow::Error>(())
         };
         tokio::try_join!(produce, consume)?;
     }
-
-    let mut imported_transactions = 0;
-    // Keep only one fully authenticated block, without inline payloads, across
-    // resumable four-object commits. Partial root reconstructions never enter it.
-    let mut authenticated_height = None;
-    let mut authenticated_objects = HashMap::<Vec<u8>, ObjectMetadata>::new();
-    loop {
-        let pending = timeout(deadline, store.pending_transactions(start, end, 4))
-            .await
-            .context("pending transaction metadata query timed out")??;
-        if pending.is_empty() {
-            break;
-        }
-        let batch_count = pending.len() as u64;
-        timeout(deadline, async {
-            let mut pending = pending.into_iter();
-            let fetch = |transaction: Option<(Vec<u8>, u64)>| {
-                let cached = transaction.as_ref().is_some_and(|(id, height)| {
-                    authenticated_height == Some(*height) && authenticated_objects.contains_key(id)
-                });
-                async move {
-                    let Some((id, height)) = transaction else {
-                        return Ok(None);
-                    };
-                    if cached {
-                        return Ok(Some((id, height, None)));
-                    }
-                    let encoded_id = URL_SAFE_NO_PAD.encode(&id);
-                    let remaining = std::sync::atomic::AtomicUsize::new(usize::MAX);
-                    let (_, verified) = gateway
-                        .fetch_transaction(&encoded_id, height, &remaining)
-                        .await
-                        .with_context(|| format!("importing transaction metadata {encoded_id}"))?;
-                    Ok::<_, anyhow::Error>(Some((
-                        id,
-                        height,
-                        Some((
-                            verified.metadata,
-                            usize::MAX - remaining.load(std::sync::atomic::Ordering::Relaxed),
-                        )),
-                    )))
-                }
-            };
-            // Inline futures are dropped together on errors, timeout, or cancellation.
-            let (first, second, third, fourth) = tokio::try_join!(
-                fetch(pending.next()),
-                fetch(pending.next()),
-                fetch(pending.next()),
-                fetch(pending.next()),
-            )?;
-            let mut objects = Vec::with_capacity(4);
-            for (id, height, fetched) in [first, second, third, fourth].into_iter().flatten() {
-                if authenticated_height == Some(height)
-                    && let Some(object) = authenticated_objects.remove(&id)
-                {
-                    objects.push(object);
-                    continue;
-                }
-                let (object, fetched_bytes) =
-                    fetched.context("verified block metadata is missing")?;
-                if object.format != Some(1) || object.denomination != Some(0) {
-                    objects.push(object);
-                    continue;
-                }
-                let header = if let Some((previous, block)) = store.block_pair(height).await? {
-                    let header = gateway.verified_block(&block).await?;
-                    ensure!(
-                        block.weave_size.checked_sub(previous.weave_size)
-                            == Some(parse_u128(&header.block_size, "block size")?),
-                        "block size does not match trusted weave geometry"
-                    );
-                    header
-                } else {
-                    // The coverage boundary/genesis may have no stored predecessor.
-                    let entries = gateway
-                        .trusted_block_index(height.saturating_sub(1), height)
-                        .await?
-                        .context("trusted transaction block index is unavailable")?;
-                    let block = entries
-                        .last()
-                        .context("missing trusted transaction block")?;
-                    let entry = crate::BlockIndexEntry {
-                        hash: block.hash.clone(),
-                        tx_root: block.tx_root.clone(),
-                        weave_size: block.weave_size.to_string(),
-                    };
-                    let encoded_id = URL_SAFE_NO_PAD.encode(&id);
-                    let header = gateway
-                        .authenticate_block(&entry, height, Some(&encoded_id))
-                        .await?;
-                    let previous_size = if height == 0 {
-                        0
-                    } else {
-                        entries[0].weave_size
-                    };
-                    ensure!(
-                        block.weave_size.checked_sub(previous_size)
-                            == Some(parse_u128(&header.block_size, "block size")?),
-                        "block size does not match trusted weave geometry"
-                    );
-                    if height > 0 {
-                        ensure!(
-                            header.previous_block == entries[0].hash,
-                            "block predecessor does not match trusted index"
-                        );
-                    }
-                    header
-                };
-                let (_, verified) = gateway
-                    .verify_block_transactions(header, object, fetched_bytes)
-                    .await?;
-                authenticated_objects = verified
-                    .into_iter()
-                    .map(|object| (object.id.clone(), object))
-                    .collect();
-                authenticated_height = Some(height);
-                objects.push(
-                    authenticated_objects
-                        .remove(&id)
-                        .context("verified transaction is missing")?,
-                );
-            }
-            store.record_objects(&objects).await
-        })
-        .await
-        .context("transaction metadata batch timed out")??;
-        imported_transactions += batch_count;
-    }
+    imported_transactions += import_pending_transactions(gateway, store, start, end).await?;
 
     if imported_blocks > 0 || imported_transactions > 0 {
         timeout(deadline, store.analyze_metadata())
@@ -501,6 +386,168 @@ pub async fn import_metadata(
         imported_blocks,
         imported_transactions,
     })
+}
+
+async fn import_pending_transactions(
+    gateway: &Gateway,
+    store: &mut BlockStore,
+    start: u64,
+    end: u64,
+) -> Result<u64> {
+    let deadline = gateway.config.request_timeout;
+    let mut imported_transactions = 0;
+    // Ordered consumption keeps one authenticated block reusable across commits.
+    let authenticated = Mutex::new((None, HashMap::<Vec<u8>, ObjectMetadata>::new()));
+    loop {
+        let pending = timeout(deadline, store.pending_transactions(start, end, 256))
+            .await
+            .context("pending transaction metadata query timed out")??;
+        if pending.is_empty() {
+            break;
+        }
+        let (sender, mut ready) = mpsc::channel(1);
+        let produce = async {
+            let fetched = transaction_metadata(gateway, pending, &authenticated).chunks(32);
+            tokio::pin!(fetched);
+            while let Some(batch) = fetched.next().await {
+                let failed = batch.iter().any(Result::is_err);
+                if sender.send(batch).await.is_err() || failed {
+                    break;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let consume = async {
+            while let Some(batch) = ready.recv().await {
+                let batch_count = batch.len() as u64;
+                timeout(deadline, async {
+                    let mut objects = Vec::with_capacity(batch.len());
+                    for result in batch {
+                        let (id, height, fetched) = result?;
+                        let cached = {
+                            let mut cached = authenticated.lock().unwrap();
+                            if cached.0 == Some(height) {
+                                cached.1.remove(&id)
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(object) = cached {
+                            objects.push(object);
+                            continue;
+                        }
+                        let (object, fetched_bytes) =
+                            fetched.context("verified block metadata is missing")?;
+                        if object.format != Some(1) || object.denomination != Some(0) {
+                            objects.push(object);
+                            continue;
+                        }
+                        let header =
+                            if let Some((previous, block)) = store.block_pair(height).await? {
+                                let header = gateway.verified_block(&block).await?;
+                                ensure!(
+                                    block.weave_size.checked_sub(previous.weave_size)
+                                        == Some(parse_u128(&header.block_size, "block size")?),
+                                    "block size does not match trusted weave geometry"
+                                );
+                                header
+                            } else {
+                                // The coverage boundary/genesis may have no stored predecessor.
+                                let entries = gateway
+                                    .trusted_block_index(height.saturating_sub(1), height)
+                                    .await?
+                                    .context("trusted transaction block index is unavailable")?;
+                                let block = entries
+                                    .last()
+                                    .context("missing trusted transaction block")?;
+                                let entry = crate::BlockIndexEntry {
+                                    hash: block.hash.clone(),
+                                    tx_root: block.tx_root.clone(),
+                                    weave_size: block.weave_size.to_string(),
+                                };
+                                let encoded_id = URL_SAFE_NO_PAD.encode(&id);
+                                let header = gateway
+                                    .authenticate_block(&entry, height, Some(&encoded_id))
+                                    .await?;
+                                let previous_size = if height == 0 {
+                                    0
+                                } else {
+                                    entries[0].weave_size
+                                };
+                                ensure!(
+                                    block.weave_size.checked_sub(previous_size)
+                                        == Some(parse_u128(&header.block_size, "block size")?),
+                                    "block size does not match trusted weave geometry"
+                                );
+                                if height > 0 {
+                                    ensure!(
+                                        header.previous_block == entries[0].hash,
+                                        "block predecessor does not match trusted index"
+                                    );
+                                }
+                                header
+                            };
+                        let (_, verified) = gateway
+                            .verify_block_transactions(header, object, fetched_bytes)
+                            .await?;
+                        let mut verified: HashMap<_, _> = verified
+                            .into_iter()
+                            .map(|object| (object.id.clone(), object))
+                            .collect();
+                        objects.push(
+                            verified
+                                .remove(&id)
+                                .context("verified transaction is missing")?,
+                        );
+                        *authenticated.lock().unwrap() = (Some(height), verified);
+                    }
+                    store.record_objects(&objects).await
+                })
+                .await
+                .context("transaction metadata batch timed out")??;
+                imported_transactions += batch_count;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::try_join!(produce, consume)?;
+    }
+    Ok(imported_transactions)
+}
+
+fn transaction_metadata<'a>(
+    gateway: &'a Gateway,
+    pending: Vec<(Vec<u8>, u64)>,
+    authenticated: &'a Mutex<(Option<u64>, HashMap<Vec<u8>, ObjectMetadata>)>,
+) -> impl futures_util::Stream<Item = Result<(Vec<u8>, u64, Option<(ObjectMetadata, usize)>)>> + 'a
+{
+    stream::iter(pending)
+        .map(move |(id, height)| async move {
+            let cached = {
+                let cached = authenticated.lock().unwrap();
+                cached.0 == Some(height) && cached.1.contains_key(&id)
+            };
+            if cached {
+                return Ok((id, height, None));
+            }
+            let encoded_id = URL_SAFE_NO_PAD.encode(&id);
+            let remaining = std::sync::atomic::AtomicUsize::new(usize::MAX);
+            let (_, verified) = timeout(
+                gateway.config.request_timeout,
+                gateway.fetch_transaction(&encoded_id, height, &remaining),
+            )
+            .await
+            .with_context(|| format!("transaction metadata {encoded_id} timed out"))?
+            .with_context(|| format!("importing transaction metadata {encoded_id}"))?;
+            Ok((
+                id,
+                height,
+                Some((
+                    verified.metadata,
+                    usize::MAX - remaining.load(std::sync::atomic::Ordering::Relaxed),
+                )),
+            ))
+        })
+        .buffered(32)
 }
 
 fn block_metadata(
@@ -532,6 +579,96 @@ fn block_metadata(
 
 #[cfg(test)]
 mod metadata_tests {
+    #[tokio::test]
+    async fn transaction_headers_overlap_reuse_verified_metadata_and_reject_corruption() {
+        let fixture: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/mainnet-genesis-transactions.json"
+        ))
+        .unwrap();
+        let mut responses = HashMap::new();
+        let mut pending = Vec::new();
+        for (index, mut value) in fixture.into_iter().take(65).enumerate() {
+            let id = value["id"].as_str().unwrap().to_owned();
+            pending.push((decode_b64(&id, "fixture ID").unwrap(), 0));
+            if index == 64 {
+                value["id"] = URL_SAFE_NO_PAD.encode([0u8; 32]).into();
+            }
+            responses.insert(id, (index, value));
+        }
+        let responses = Arc::new(responses);
+        let gate = Arc::new(Notify::new());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (requested, mut requests) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/tx/{id}",
+            get({
+                let gate = gate.clone();
+                let count = count.clone();
+                move |Path(id): Path<String>| {
+                    let (index, value) = responses[&id].clone();
+                    let gate = gate.clone();
+                    let requested = requested.clone();
+                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async move {
+                        requested.send(index).unwrap();
+                        if index == 0 {
+                            gate.notified().await;
+                        }
+                        ([("content-type", "application/json")], value.to_string())
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = crate::Config::new(
+            &url,
+            &url,
+            vec![url.clone()],
+            Duration::from_secs(5),
+            1,
+            1024,
+        )
+        .unwrap();
+        let gateway = Gateway::new(config).unwrap();
+        let authenticated = Mutex::new((None, HashMap::new()));
+        let first_id = pending[0].0.clone();
+        let headers = transaction_metadata(&gateway, pending, &authenticated);
+        tokio::pin!(headers);
+        timeout(Duration::from_secs(10), async {
+            let first = headers.next();
+            tokio::pin!(first);
+            let mut started = Vec::new();
+            while started.len() < 32 {
+                tokio::select! {
+                    result = &mut first => panic!("yielded before first header was released: {result:?}"),
+                    index = requests.recv() => started.push(index.unwrap()),
+                }
+            }
+            started.sort_unstable();
+            assert_eq!(started, (0..32).collect::<Vec<_>>());
+            gate.notify_one();
+            let (id, height, fetched) = first.await.unwrap().unwrap();
+            let metadata = fetched.unwrap().0;
+            assert_eq!(metadata.id, first_id);
+            *authenticated.lock().unwrap() = (Some(height), HashMap::from([(id, metadata)]));
+            for _ in 1..64 {
+                let (id, _, fetched) = headers.next().await.unwrap().unwrap();
+                assert_eq!(fetched.unwrap().0.id, id);
+            }
+            assert!(headers.next().await.unwrap().is_err(), "corrupt header was accepted");
+            let before = count.load(std::sync::atomic::Ordering::Relaxed);
+            let cached = transaction_metadata(
+                &gateway, vec![(first_id, 0)], &authenticated,
+            );
+            tokio::pin!(cached);
+            assert!(cached.next().await.unwrap().unwrap().2.is_none());
+            assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), before);
+        }).await.unwrap();
+        server.abort();
+    }
+
     use super::*;
     use axum::{Router, extract::Path, routing::get};
     use std::sync::Arc;
