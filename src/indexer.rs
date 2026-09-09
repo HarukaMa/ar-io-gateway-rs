@@ -400,7 +400,7 @@ async fn import_pending_transactions(
     let deadline = gateway.config.request_timeout;
     let mut imported_transactions = 0;
     let mut authenticated = (None, HashMap::<Vec<u8>, ObjectMetadata>::new());
-    let slots = tokio::sync::Semaphore::new(32);
+    let slots = tokio::sync::Semaphore::new(64);
     loop {
         let pending = timeout(deadline, store.pending_transactions(start, end, 256))
             .await
@@ -440,8 +440,8 @@ async fn import_pending_transactions(
                     .with_context(|| format!("transaction metadata at height {height} timed out"))?
                 }
             })
-            // Eight bounded block reconstructions share 32 HTTP fetch slots.
-            .buffer_unordered(8);
+            // 32 bounded block reconstructions share 64 HTTP fetch slots.
+            .buffer_unordered(32);
         let produce = queue_metadata(fetched, sender);
         let consume = async {
             while let Some(batch) = ready.recv().await {
