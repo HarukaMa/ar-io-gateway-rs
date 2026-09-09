@@ -56,6 +56,8 @@ const MAX_BLOCK_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 const BUNDLE_ENTRY_SIZE: usize = 64;
 const MAX_DATA_ITEM_TAGS: usize = 128;
 const MAX_DATA_ITEM_TAG_BYTES: usize = 4096;
+// Type 6 has the largest signature/owner; flags, lengths and tags are bounded.
+const MAX_DATA_ITEM_HEADER_BYTES: usize = 2 + 2_052 + 1_025 + 2 * 33 + 16 + MAX_DATA_ITEM_TAG_BYTES;
 const MAX_BUNDLE_DEPTH: usize = 32;
 const STRICT_DATA_SPLIT_THRESHOLD: u128 = 30_607_159_107_830;
 const MERKLE_REBASE_SUPPORT_THRESHOLD: u128 = 151_066_495_197_430;
@@ -1219,6 +1221,7 @@ impl Gateway {
         id: &str,
     ) -> Result<(VerifiedData, Vec<Tag>, Option<indexer::RootFacts>)> {
         let root = self.authenticate_root(id).await?;
+        checked_data_size(root.bytes.len() as u128, self.config.max_data_size)?;
         let (bytes, body_hash) = root
             .bytes
             .materialize(
@@ -1423,7 +1426,8 @@ impl Gateway {
             data_size,
         };
 
-        let expected_len = checked_data_size(data_size, self.config.max_data_size)?;
+        let expected_len =
+            usize::try_from(data_size).context("parent size exceeds addressable range")?;
         Ok(AuthenticatedRoot {
             id: id.to_owned(),
             bytes: Content::streamed(streaming::ChunkSource::new(self, geometry), expected_len),
@@ -2897,6 +2901,14 @@ async fn verify_bundle_item(
     let entry = found.context("data item is absent from verified parent at the expected offset")?;
     let bytes = match materialize {
         Some(gateway) => {
+            ensure!(
+                entry.bytes.len()
+                    <= gateway
+                        .config
+                        .max_data_size
+                        .saturating_add(MAX_DATA_ITEM_HEADER_BYTES),
+                "data item exceeds configured data size limit"
+            );
             entry
                 .bytes
                 .materialize(
@@ -3008,9 +3020,9 @@ fn data_item_signature_payload(
 }
 
 async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Result<VerifiedItem> {
-    // Type 6 has the largest signature/owner; flags, lengths and tags are bounded.
-    const MAX_HEADER_SIZE: usize = 2 + 2_052 + 1_025 + 2 * 33 + 16 + MAX_DATA_ITEM_TAG_BYTES;
-    let header = item.read_at(0, item.len().min(MAX_HEADER_SIZE)).await?;
+    let header = item
+        .read_at(0, item.len().min(MAX_DATA_ITEM_HEADER_BYTES))
+        .await?;
     // Early binary items omit the type prefix. The signature hash selects
     // their layout even when the first signature bytes resemble a modern type.
     let legacy = header
@@ -4395,7 +4407,7 @@ mod tests {
         let (fixture, _, corrupt, server, requests) =
             retrieval_fixture(&bundle, tags, Some((&id, payload.len()))).await;
         let mut config = fixture.config.clone();
-        config.max_data_size = bundle.len();
+        config.max_data_size = payload.len();
         config.max_memory_data_size = 64 * 1024;
         let gateway = Gateway::new(config.clone()).unwrap();
         let data = gateway.retrieve(&id).await.unwrap();
@@ -4403,6 +4415,16 @@ mod tests {
         assert!(
             requests.load(Ordering::SeqCst) <= 3,
             "unrelated chunks were downloaded"
+        );
+        let Some(IndexingRoot::Partial(root)) = &data.indexing_root else {
+            panic!("missing partial parent");
+        };
+        let fetched = requests.load(Ordering::SeqCst);
+        assert!(gateway.retrieve_direct(&root.id).await.is_err());
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            fetched,
+            "oversized direct root was downloaded"
         );
         corrupt.store(true, Ordering::SeqCst);
         assert!(Gateway::new(config).unwrap().retrieve(&id).await.is_err());

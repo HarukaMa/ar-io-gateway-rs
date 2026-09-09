@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
             }
         }
         let max_concurrent_requests = env::var("AR_IO_MAX_CONCURRENT_REQUESTS")
-            .unwrap_or_else(|_| "8".to_owned())
+            .unwrap_or_else(|_| "128".to_owned())
             .parse()
             .context("invalid AR_IO_MAX_CONCURRENT_REQUESTS")?;
         let mut config = ServerConfig::new(
