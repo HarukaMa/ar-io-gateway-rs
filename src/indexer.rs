@@ -4,6 +4,7 @@ use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use std::{
     collections::HashMap,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, time::timeout};
@@ -326,6 +327,7 @@ pub async fn import_metadata(
 
     let mut transaction_store = store.reconnect().await?;
     let (progress, mut updates) = tokio::sync::watch::channel(());
+    let headers = Mutex::new(HashMap::new());
     let blocks = async {
         let mut imported = 0;
         loop {
@@ -336,7 +338,7 @@ pub async fn import_metadata(
                 break;
             }
             let (sender, mut ready) = mpsc::channel(1);
-            let produce = queue_metadata(block_metadata(gateway, blocks), sender);
+            let produce = queue_metadata(block_metadata(gateway, blocks, &headers), sender);
             let consume = async {
                 while let Some(batch) = ready.recv().await {
                     for header in batch {
@@ -365,7 +367,8 @@ pub async fn import_metadata(
         loop {
             updates.borrow_and_update();
             imported +=
-                import_pending_transactions(gateway, &mut transaction_store, start, end).await?;
+                import_pending_transactions(gateway, &mut transaction_store, start, end, &headers)
+                    .await?;
             if updates.changed().await.is_err() {
                 break;
             }
@@ -392,6 +395,7 @@ async fn import_pending_transactions(
     store: &mut BlockStore,
     start: u64,
     end: u64,
+    headers: &Mutex<HashMap<Vec<u8>, crate::BlockHeader>>,
 ) -> Result<u64> {
     let deadline = gateway.config.request_timeout;
     let mut imported_transactions = 0;
@@ -417,6 +421,10 @@ async fn import_pending_transactions(
                 HashMap::new()
             };
             let anchor = timeout(deadline, store.block_pair(height)).await??;
+            let anchor = anchor.map(|(previous, block)| {
+                let header = headers.lock().unwrap().remove(&block.hash);
+                (previous, block, header)
+            });
             jobs.push((height, ids, anchor, cached));
         }
         let (sender, mut ready) = mpsc::channel(1);
@@ -488,7 +496,7 @@ async fn transaction_metadata(
     gateway: &Gateway,
     height: u64,
     ids: Vec<Vec<u8>>,
-    anchor: Option<(IndexBlock, IndexBlock)>,
+    anchor: Option<(IndexBlock, IndexBlock, Option<crate::BlockHeader>)>,
     mut cached: HashMap<Vec<u8>, ObjectMetadata>,
     slots: &tokio::sync::Semaphore,
 ) -> Result<(u64, Vec<Vec<u8>>, HashMap<Vec<u8>, ObjectMetadata>)> {
@@ -522,14 +530,8 @@ async fn transaction_metadata(
         .iter()
         .any(|object| object.format == Some(1) && object.denomination == Some(0))
     {
-        let header = if let Some((previous, block)) = anchor {
-            let header = gateway.verified_block(&block).await?;
-            ensure!(
-                block.weave_size.checked_sub(previous.weave_size)
-                    == Some(parse_u128(&header.block_size, "block size")?),
-                "block size does not match trusted weave geometry"
-            );
-            header
+        let header = if let Some((previous, block, header)) = anchor {
+            transaction_block(gateway, &previous, &block, header).await?
         } else {
             let entries = gateway
                 .trusted_block_index(height.saturating_sub(1), height)
@@ -583,10 +585,60 @@ async fn transaction_metadata(
     Ok((height, ids, cached))
 }
 
-fn block_metadata(
+async fn transaction_block(
     gateway: &Gateway,
+    previous: &IndexBlock,
+    block: &IndexBlock,
+    header: Option<crate::BlockHeader>,
+) -> Result<crate::BlockHeader> {
+    let header = match header {
+        Some(header) => header,
+        None => gateway.verified_block(block).await?,
+    };
+    ensure!(
+        block.weave_size.checked_sub(previous.weave_size)
+            == Some(parse_u128(&header.block_size, "block size")?),
+        "block size does not match trusted weave geometry"
+    );
+    Ok(header)
+}
+
+fn retain_transaction_header(
+    headers: &Mutex<HashMap<Vec<u8>, crate::BlockHeader>>,
+    hash: &[u8],
+    header: crate::BlockHeader,
+) {
+    // Keep only fields used by transaction-root verification.
+    let header = crate::BlockHeader {
+        indep_hash: header.indep_hash,
+        height: header.height,
+        txs: header.txs,
+        tx_root: header.tx_root,
+        block_size: header.block_size,
+        weave_size: header.weave_size,
+        ..crate::BlockHeader::default()
+    };
+    let bytes = std::mem::size_of_val(&header)
+        + hash.len()
+        + header.txs.capacity() * std::mem::size_of::<String>()
+        + header.txs.iter().map(String::capacity).sum::<usize>()
+        + header.indep_hash.capacity()
+        + header.tx_root.capacity()
+        + header.block_size.capacity()
+        + header.weave_size.capacity();
+    if bytes <= 128 * 1024 {
+        let mut headers = headers.lock().unwrap();
+        if headers.len() < 256 {
+            headers.insert(hash.to_vec(), header);
+        }
+    }
+}
+
+fn block_metadata<'a>(
+    gateway: &'a Gateway,
     blocks: Vec<IndexBlock>,
-) -> impl futures_util::Stream<Item = Result<(IndexBlock, u64, Vec<Vec<u8>>)>> + '_ {
+    headers: &'a Mutex<HashMap<Vec<u8>, crate::BlockHeader>>,
+) -> impl futures_util::Stream<Item = Result<(IndexBlock, u64, Vec<Vec<u8>>)>> + 'a {
     stream::iter(blocks)
         .map(move |block| async move {
             let metadata = timeout(gateway.config.request_timeout, async {
@@ -600,7 +652,9 @@ fn block_metadata(
                         Ok(id)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Ok::<_, anyhow::Error>((header.timestamp, transaction_ids))
+                let timestamp = header.timestamp;
+                retain_transaction_header(headers, &block.hash, header);
+                Ok::<_, anyhow::Error>((timestamp, transaction_ids))
             })
             .await
             .with_context(|| format!("block metadata at height {} timed out", block.height))?
@@ -836,7 +890,9 @@ mod metadata_tests {
         )
         .unwrap();
         let gateway = Gateway::new(config).unwrap();
-        let headers = block_metadata(&gateway, blocks);
+        let first_block = blocks[0].clone();
+        let handoff = Mutex::new(HashMap::new());
+        let headers = block_metadata(&gateway, blocks, &handoff);
         tokio::pin!(headers);
         timeout(Duration::from_secs(5), async {
             let mut heights = Vec::new();
@@ -869,6 +925,13 @@ mod metadata_tests {
             heights.sort_unstable();
             assert_eq!(heights, (1_000_000..1_000_063).collect::<Vec<_>>());
             assert!(rejected);
+            let cached = handoff.lock().unwrap().remove(&first_block.hash).unwrap();
+            let mut previous = first_block.clone();
+            previous.height -= 1;
+            let header = transaction_block(&gateway, &previous, &first_block, Some(cached)).await.unwrap();
+            assert_eq!(header.indep_hash, URL_SAFE_NO_PAD.encode(&first_block.hash));
+            previous.weave_size = 1;
+            assert!(transaction_block(&gateway, &previous, &first_block, Some(header)).await.is_err());
         })
         .await
         .unwrap();
