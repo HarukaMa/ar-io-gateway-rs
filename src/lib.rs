@@ -290,7 +290,7 @@ struct CachedContent {
 
 #[derive(Debug)]
 pub struct VerifiedChunk {
-    pub bytes: Vec<u8>,
+    pub bytes: Content,
     pub chunk: String,
     pub data_path: String,
     pub tx_path: String,
@@ -302,6 +302,47 @@ pub struct VerifiedChunk {
     pub tx_start_offset: u128,
     pub source_host: String,
 }
+
+impl VerifiedChunk {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.bytes.resident_len()
+            + self.chunk.capacity()
+            + self.data_path.capacity()
+            + self.tx_path.capacity()
+            + self.data_root.capacity()
+            + self.source_host.capacity()
+    }
+}
+
+type ChunkResponse = Option<(Arc<VerifiedChunk>, bool)>;
+type ChunkOutcome = Option<std::result::Result<ChunkResponse, RetrievalFailure>>;
+
+#[derive(Default)]
+struct ChunkCache {
+    entries: HashMap<u128, (Arc<VerifiedChunk>, BlockGeometry, u64, Instant)>,
+    inflight: HashMap<u128, tokio::sync::watch::Sender<ChunkOutcome>>,
+    bytes: usize,
+}
+
+struct ChunkLeader<'a> {
+    cache: &'a Mutex<ChunkCache>,
+    offset: u128,
+    completed: bool,
+}
+
+impl Drop for ChunkLeader<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.cache.lock().unwrap().inflight.remove(&self.offset);
+    }
+}
+
+const CHUNK_DEADLINE: Duration = Duration::from_secs(20);
+const CHUNK_PEER_DEADLINE: Duration = Duration::from_secs(3);
+static CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 
 #[derive(Debug)]
 pub(crate) struct ContentNotFound;
@@ -393,6 +434,7 @@ pub struct Gateway {
     disk_cache: Option<disk_cache::DiskCache>,
     direct_cache: Arc<Mutex<ContentCache>>,
     bundle_indexer: Option<background::BundleSubmitter>,
+    chunk_cache: Mutex<ChunkCache>,
 }
 
 impl Gateway {
@@ -434,6 +476,7 @@ impl Gateway {
             config,
             client,
             cache: Mutex::new(ContentCache::default()),
+            chunk_cache: Mutex::new(ChunkCache::default()),
             peers,
             block_store: None,
             disk_cache: None,
@@ -777,35 +820,182 @@ impl Gateway {
         .context("verified bundle retrieval timed out")?
     }
 
-    pub async fn retrieve_chunk(&self, offset: u128) -> Result<Option<VerifiedChunk>> {
-        match tokio::time::timeout(
-            self.config.request_timeout,
-            self.retrieve_chunk_inner(offset),
+    pub async fn retrieve_chunk(&self, offset: u128) -> Result<ChunkResponse> {
+        tokio::time::timeout(
+            self.config.request_timeout.min(Duration::from_secs(60)),
+            async {
+                let (mut receiver, leader) = {
+                    let mut cache = self.chunk_cache.lock().unwrap();
+                    if let Some(sender) = cache.inflight.get(&offset) {
+                        (sender.subscribe(), false)
+                    } else {
+                        let (sender, receiver) = tokio::sync::watch::channel(None);
+                        cache.inflight.insert(offset, sender);
+                        (receiver, true)
+                    }
+                };
+                if !leader {
+                    receiver
+                        .changed()
+                        .await
+                        .context("coalesced chunk retrieval canceled")?;
+                    return match receiver
+                        .borrow()
+                        .clone()
+                        .context("missing chunk retrieval result")?
+                    {
+                        Ok(result) => Ok(result),
+                        Err(RetrievalFailure::Other(message)) => bail!("{message}"),
+                        Err(RetrievalFailure::NotFound) => Ok(None),
+                    };
+                }
+                let mut leader = ChunkLeader {
+                    cache: &self.chunk_cache,
+                    offset,
+                    completed: false,
+                };
+                let result = self.retrieve_cached_chunk(offset).await;
+                if let Some(sender) = self.chunk_cache.lock().unwrap().inflight.remove(&offset) {
+                    sender.send_replace(Some(match &result {
+                        Ok(result) => Ok(result.clone()),
+                        Err(error) => Err(RetrievalFailure::Other(format!("{error:#}"))),
+                    }));
+                }
+                leader.completed = true;
+                result
+            },
         )
         .await
-        {
-            Ok(result) => result,
-            Err(_) => Ok(None),
-        }
+        .context("chunk retrieval timed out")?
     }
 
-    async fn retrieve_chunk_inner(&self, offset: u128) -> Result<Option<VerifiedChunk>> {
-        let Some(geometry) = self.trusted_block_geometry(offset).await? else {
+    async fn retrieve_cached_chunk(&self, offset: u128) -> Result<ChunkResponse> {
+        let cached = {
+            let mut cache = self.chunk_cache.lock().unwrap();
+            cache
+                .entries
+                .get_mut(&offset)
+                .map(|(chunk, geometry, height, used)| {
+                    *used = Instant::now();
+                    (Arc::clone(chunk), *geometry, *height)
+                })
+        };
+        if let Some((chunk, geometry, height)) = cached {
+            if self.chunk_anchor_matches(geometry, height).await? {
+                return Ok(Some((chunk, true)));
+            }
+            let mut cache = self.chunk_cache.lock().unwrap();
+            if let Some((old, _, _, _)) = cache.entries.remove(&offset) {
+                cache.bytes -= old.retained_bytes();
+            }
+        }
+        let nearby = {
+            let cache = self.chunk_cache.lock().unwrap();
+            cache
+                .entries
+                .values()
+                .find(|(_, geometry, _, _)| {
+                    offset > geometry.previous_weave_size && offset <= geometry.block_weave_size
+                })
+                .map(|(_, geometry, height, _)| (*geometry, *height))
+        };
+        let anchor = match nearby {
+            Some((geometry, height)) if self.chunk_anchor_matches(geometry, height).await? => {
+                Some((geometry, height))
+            }
+            _ => self.trusted_chunk_anchor(offset).await?,
+        };
+        let Some((geometry, height)) = anchor else {
             return Ok(None);
         };
+        let Some(chunk) = tokio::time::timeout(
+            self.config.request_timeout.min(CHUNK_DEADLINE),
+            self.retrieve_chunk_inner(offset, geometry),
+        )
+        .await
+        .context("chunk peer search timed out")??
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            self.chunk_anchor_matches(geometry, height).await?,
+            "chunk block changed during retrieval"
+        );
+        let chunk = Arc::new(chunk);
+        let size = chunk.retained_bytes();
+        let max_bytes = self.config.cache_max_bytes.min(64 * 1024 * 1024);
+        let max_entries = self.config.cache_max_entries.min(256);
+        if max_entries > 0 && size <= max_bytes {
+            let mut cache = self.chunk_cache.lock().unwrap();
+            while cache.entries.len() >= max_entries || cache.bytes > max_bytes - size {
+                let victim = *cache
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, (_, _, _, used))| *used)
+                    .unwrap()
+                    .0;
+                cache.bytes -= cache.entries.remove(&victim).unwrap().0.retained_bytes();
+            }
+            cache.entries.insert(
+                offset,
+                (Arc::clone(&chunk), geometry, height, Instant::now()),
+            );
+            cache.bytes += size;
+        }
+        Ok(Some((chunk, false)))
+    }
+
+    async fn chunk_anchor_matches(&self, geometry: BlockGeometry, height: u64) -> Result<bool> {
+        if let Some(store) = &self.block_store
+            && let Some((previous, block)) = store.block_pair(height).await?
+        {
+            return Ok(block.tx_root.as_slice() == geometry.tx_root
+                && block.weave_size == geometry.block_weave_size
+                && previous.weave_size == geometry.previous_weave_size);
+        }
+        let entries = self
+            .trusted_block_index(height.saturating_sub(1), height)
+            .await?
+            .context("trusted chunk anchor is unavailable")?;
+        let block = entries.last().context("trusted chunk anchor is empty")?;
+        Ok(
+            decode_fixed::<32>(&block.tx_root, "block tx_root")? == geometry.tx_root
+                && block.weave_size == geometry.block_weave_size
+                && (if height == 0 {
+                    0
+                } else {
+                    entries[0].weave_size
+                }) == geometry.previous_weave_size,
+        )
+    }
+
+    async fn retrieve_chunk_inner(
+        &self,
+        offset: u128,
+        geometry: BlockGeometry,
+    ) -> Result<Option<VerifiedChunk>> {
         let mut invalid = Vec::new();
         let sources = self
             .peers
             .chunk_candidates(offset, &self.config.chunk_sources);
 
-        for source in &sources {
-            let (candidate, headers, body) = match self.fetch_chunk(source, offset).await {
+        let mut pending = sources.iter();
+        let mut fetches = FuturesUnordered::new();
+        loop {
+            while fetches.len() < 3 {
+                let Some(source) = pending.next() else { break };
+                fetches.push(async move { (source, self.fetch_chunk(source, offset).await) });
+            }
+            let Some((source, result)) = fetches.next().await else {
+                break;
+            };
+            let (candidate, headers, body) = match result {
                 Ok(candidate) => candidate,
                 Err(error) => {
                     self.peers.record_chunk_result(source, None);
                     if error
                         .downcast_ref::<reqwest::Error>()
-                        .is_none_or(|error| error.is_body() || error.is_decode())
+                        .is_none_or(|error| error.status() != Some(reqwest::StatusCode::NOT_FOUND))
                     {
                         invalid.push(format!("{source}: {error:#}"));
                     }
@@ -836,18 +1026,12 @@ impl Gateway {
 
             self.peers
                 .record_chunk_result(source, Some((headers, body, proof.bytes.len())));
-            if self.block_store.is_some() {
-                ensure!(
-                    self.trusted_block_geometry(offset).await? == Some(geometry),
-                    "chunk block changed during retrieval"
-                );
-            }
             return Ok(Some(VerifiedChunk {
                 data_root: URL_SAFE_NO_PAD.encode(proof.transaction.data_root),
                 data_size: proof.transaction.size,
                 relative_start_offset: proof.data.start,
                 tx_start_offset: proof.first_offset,
-                bytes: proof.bytes,
+                bytes: proof.bytes.into(),
                 chunk: proof.chunk,
                 data_path: proof.data_path,
                 tx_path: proof.tx_path,
@@ -860,14 +1044,11 @@ impl Gateway {
         if invalid.is_empty() {
             Ok(None)
         } else {
-            bail!(
-                "all returned chunk proofs were invalid: {}",
-                invalid.join("; ")
-            )
+            bail!("all chunk candidates failed: {}", invalid.join("; "))
         }
     }
 
-    async fn trusted_block_geometry(&self, offset: u128) -> Result<Option<BlockGeometry>> {
+    async fn trusted_chunk_anchor(&self, offset: u128) -> Result<Option<(BlockGeometry, u64)>> {
         if offset == 0 {
             return Ok(None);
         }
@@ -878,34 +1059,27 @@ impl Gateway {
                 offset > previous.weave_size && offset <= block.weave_size,
                 "stored block index returned inconsistent offset geometry"
             );
-            return Ok(Some(BlockGeometry {
-                tx_root: block
-                    .tx_root
-                    .as_slice()
-                    .try_into()
-                    .context("invalid stored tx_root")?,
-                block_weave_size: block.weave_size,
-                previous_weave_size: previous.weave_size,
-            }));
+            return Ok(Some((
+                BlockGeometry {
+                    tx_root: block
+                        .tx_root
+                        .as_slice()
+                        .try_into()
+                        .context("invalid stored tx_root")?,
+                    block_weave_size: block.weave_size,
+                    previous_weave_size: previous.weave_size,
+                },
+                block.height,
+            )));
         }
-        let Some(info): Option<NodeInfo> = self
-            .request_optional_json(
-                self.client
-                    .get(endpoint(&self.config.trusted_node_url, "info")),
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
+        let info: NodeInfo = self.get_json(&self.config.trusted_node_url, "info").await?;
         let Some(stable_height) = info.height.checked_sub(CONSENSUS_DEPTH) else {
             return Ok(None);
         };
-        let Some(tip) = self
+        let tip = self
             .trusted_block_index(stable_height, stable_height)
             .await?
-        else {
-            return Ok(None);
-        };
+            .context("trusted stable chunk anchor is unavailable")?;
         let tip_weave_size = tip[0].weave_size;
         if offset > tip_weave_size {
             return Ok(None);
@@ -915,9 +1089,10 @@ impl Gateway {
         let mut high = stable_height;
         while low < high {
             let height = low + (high - low) / 2;
-            let Some(entry) = self.trusted_block_index(height, height).await? else {
-                return Ok(None);
-            };
+            let entry = self
+                .trusted_block_index(height, height)
+                .await?
+                .context("trusted chunk search anchor is unavailable")?;
             let weave_size = entry[0].weave_size;
             if offset <= weave_size {
                 high = height;
@@ -927,9 +1102,10 @@ impl Gateway {
         }
 
         let (start, block_index) = if low == 0 { (0, 0) } else { (low - 1, 1) };
-        let Some(entries) = self.trusted_block_index(start, low).await? else {
-            return Ok(None);
-        };
+        let entries = self
+            .trusted_block_index(start, low)
+            .await?
+            .context("trusted chunk anchor is unavailable")?;
         let block = &entries[block_index];
         let block_weave_size = block.weave_size;
         let previous_weave_size = if low == 0 { 0 } else { entries[0].weave_size };
@@ -938,11 +1114,14 @@ impl Gateway {
             "trusted block index returned inconsistent offset geometry"
         );
 
-        Ok(Some(BlockGeometry {
-            tx_root: decode_fixed(&block.tx_root, "block tx_root")?,
-            block_weave_size,
-            previous_weave_size,
-        }))
+        Ok(Some((
+            BlockGeometry {
+                tx_root: decode_fixed(&block.tx_root, "block tx_root")?,
+                block_weave_size,
+                previous_weave_size,
+            },
+            low,
+        )))
     }
 
     async fn trusted_block_index(
@@ -1688,6 +1867,10 @@ impl Gateway {
         source: &str,
         offset: u128,
     ) -> Result<(JsonChunk, Duration, Duration)> {
+        let _permit = CHUNK_FETCHES
+            .acquire()
+            .await
+            .context("chunk fetch admission closed")?;
         let url = endpoint(source, &format!("chunk/{offset}"));
         let request = if self
             .config
@@ -1702,7 +1885,7 @@ impl Gateway {
         let started = Instant::now();
         // Reserve time for fallback within the shared chunk deadline.
         let response = request
-            .timeout(self.config.request_timeout / 4)
+            .timeout((self.config.request_timeout / 4).min(CHUNK_PEER_DEADLINE))
             .send()
             .await?
             .error_for_status()?;
@@ -3924,6 +4107,49 @@ mod tests {
                 server.abort();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn outbound_chunk_requests_share_a_global_limit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&active);
+        let observed = Arc::clone(&peak);
+        let app = axum::Router::new().fallback(move || {
+            let active = Arc::clone(&counted);
+            let peak = Arc::clone(&observed);
+            async move {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                r#"{"chunk":"","data_path":"","tx_path":""}"#
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let gateway = Gateway::new(
+            Config::new(
+                &base,
+                &base,
+                vec![base.clone()],
+                Duration::from_secs(10),
+                1,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let results = futures_util::future::join_all(
+            (1..=128).map(|offset| gateway.fetch_chunk(&base, offset)),
+        )
+        .await;
+        for result in results {
+            result.unwrap();
+        }
+        assert!((2..=64).contains(&peak.load(Ordering::SeqCst)));
+        server.abort();
     }
 
     fn note(value: u128) -> [u8; 32] {

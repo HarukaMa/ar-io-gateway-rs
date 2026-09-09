@@ -308,6 +308,7 @@ struct AppState {
     gateway: Gateway,
     config: ServerConfig,
     request_permits: Arc<Semaphore>,
+    chunk_permits: Arc<Semaphore>,
     started_at: Instant,
     indexing_status: Mutex<serde_json::Value>,
 }
@@ -373,6 +374,7 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     println!("listening on http://{}", listener.local_addr()?);
     let state = Arc::new(AppState {
         request_permits: Arc::new(Semaphore::new(config.max_concurrent_requests)),
+        chunk_permits: Arc::new(Semaphore::new((config.max_concurrent_requests / 2).max(1))),
         started_at: Instant::now(),
         indexing_status: Mutex::new(serde_json::Value::Null),
         gateway,
@@ -907,10 +909,20 @@ fn json_response(value: &serde_json::Value) -> Response {
         .unwrap()
 }
 
-fn request_permit(permits: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, Response> {
+#[derive(Debug)]
+struct RequestPermit {
+    _request: OwnedSemaphorePermit,
+    chunk: Option<OwnedSemaphorePermit>,
+}
+
+fn request_permit(permits: &Arc<Semaphore>) -> Result<RequestPermit, Response> {
     permits
         .clone()
         .try_acquire_owned()
+        .map(|permit| RequestPermit {
+            _request: permit,
+            chunk: None,
+        })
         .map_err(|_| error_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"))
 }
 
@@ -942,9 +954,13 @@ async fn serve_chunk_response(
     method: &Method,
     uri: &Uri,
 ) -> Response {
-    let permit = match request_permit(&state.request_permits) {
+    let mut permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
         Err(response) => return response,
+    };
+    permit.chunk = match state.chunk_permits.clone().try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),
     };
     if offset.is_empty() || !offset.bytes().all(|byte| byte.is_ascii_digit()) {
         return unmatched_response(method, uri);
@@ -1084,7 +1100,7 @@ async fn serve_arns_path(
     state: &AppState,
     headers: &HeaderMap,
     path: &str,
-    permit: OwnedSemaphorePermit,
+    permit: RequestPermit,
 ) -> Response {
     if let Some(id) = &state.config.apex_tx_id
         && request_host(headers).is_some_and(|host| {
@@ -1154,7 +1170,7 @@ async fn retrieve_response(
     query: Option<&str>,
     resolution: Option<&Resolution>,
     headers: &HeaderMap,
-    permit: OwnedSemaphorePermit,
+    permit: RequestPermit,
 ) -> Response {
     if state.config.blocklist.ids.contains(id) {
         return blocked_response(id);
@@ -1948,7 +1964,7 @@ impl AsyncRead for SequentialReader {
 }
 
 struct ResponseStreamState {
-    resources: Option<(SequentialReader, OwnedSemaphorePermit)>,
+    resources: Option<(SequentialReader, RequestPermit)>,
     expires_at: StreamInstant,
     total_deadline: StreamInstant,
     waker: Option<Waker>,
@@ -2004,11 +2020,7 @@ impl Drop for ResponseReader {
     }
 }
 
-async fn content_body(
-    content: Content,
-    limits: &Config,
-    permit: OwnedSemaphorePermit,
-) -> Result<Body> {
+async fn content_body(content: Content, limits: &Config, permit: RequestPermit) -> Result<Body> {
     if content.is_empty() {
         return Ok(Body::empty());
     }
@@ -2019,7 +2031,7 @@ async fn response_body(
     content: Content,
     remaining: std::vec::IntoIter<Content>,
     limits: &Config,
-    permit: OwnedSemaphorePermit,
+    permit: RequestPermit,
 ) -> Result<Body> {
     let now = StreamInstant::now();
     let total_deadline = now
@@ -2085,7 +2097,7 @@ async fn verified_response(
     config: &ServerConfig,
     request_headers: &HeaderMap,
     limits: &Config,
-    permit: OwnedSemaphorePermit,
+    permit: RequestPermit,
 ) -> Result<Response> {
     if config.blocklist.blocks(&verified) {
         return Ok(blocked_response(&verified.id));
@@ -2239,12 +2251,13 @@ async fn verified_response(
 }
 
 async fn chunk_response(
-    chunk: VerifiedChunk,
+    chunk: (Arc<VerifiedChunk>, bool),
     raw: bool,
     request_headers: &HeaderMap,
     limits: &Config,
-    permit: OwnedSemaphorePermit,
+    permit: RequestPermit,
 ) -> Result<Response> {
+    let (chunk, cache_hit) = chunk;
     let VerifiedChunk {
         bytes,
         chunk,
@@ -2257,9 +2270,9 @@ async fn chunk_response(
         read_offset,
         tx_start_offset,
         source_host,
-    } = chunk;
+    } = chunk.as_ref();
     let body = if raw {
-        bytes
+        bytes.clone()
     } else {
         serde_json::to_vec(&ChunkJsonResponse {
             chunk: &chunk,
@@ -2268,8 +2281,13 @@ async fn chunk_response(
             packing: "unpacked",
         })
         .context("failed to encode chunk response")?
+        .into()
     };
-    let digest: [u8; 32] = Sha256::digest(&body).into();
+    let digest: [u8; 32] = Sha256::digest(
+        body.memory_bytes()
+            .context("chunk response is not memory-backed")?,
+    )
+    .into();
     let digest_url = URL_SAFE_NO_PAD.encode(digest);
     let etag = format!("\"{digest_url}\"");
     let content_type = if raw {
@@ -2285,7 +2303,7 @@ async fn chunk_response(
         )
         .header("x-ar-io-chunk-source-type", "arweave-network")
         .header("x-ar-io-chunk-host", source_host)
-        .header("x-cache", "MISS");
+        .header("x-cache", if cache_hit { "HIT" } else { "MISS" });
     if raw {
         builder = builder
             .header("x-arweave-chunk-data-path", data_path)
@@ -2317,7 +2335,7 @@ async fn chunk_response(
         .header("content-type", content_type)
         .header("content-length", body.len().to_string())
         .header("cache-control", "public, max-age=30")
-        .body(content_body(body.into(), limits, permit).await?)
+        .body(content_body(body, limits, permit).await?)
         .context("failed to construct chunk response")
 }
 
@@ -3008,6 +3026,7 @@ mod tests {
             )
             .unwrap(),
             request_permits: Arc::new(Semaphore::new(8)),
+            chunk_permits: Arc::new(Semaphore::new(4)),
             started_at: Instant::now(),
             indexing_status: Mutex::new(serde_json::Value::Null),
         };
@@ -3152,7 +3171,7 @@ mod tests {
             "http://127.0.0.1:1",
             ARNS_PROGRAM,
             ANT_PROGRAM,
-            1,
+            2,
         )
         .unwrap()
         .with_routing(Some(&manifest_id), None, 3600)
@@ -3169,13 +3188,17 @@ mod tests {
         let state = Arc::new(AppState {
             gateway,
             config,
-            request_permits: Arc::new(Semaphore::new(1)),
+            request_permits: Arc::new(Semaphore::new(2)),
+            chunk_permits: Arc::new(Semaphore::new(1)),
             started_at: Instant::now(),
             indexing_status: Mutex::new(serde_json::Value::Null),
         });
+        let mut occupied_chunk = request_permit(&state.request_permits).unwrap();
+        occupied_chunk.chunk = Some(state.chunk_permits.clone().try_acquire_owned().unwrap());
         let app = Router::new()
             .route("/", get(serve_arns))
             .route("/raw/{id}", get(serve_raw))
+            .route("/chunk/{offset}", get(serve_chunk))
             .route("/{*path}", get(serve_path))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3185,6 +3208,15 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
+        assert_eq!(
+            client
+                .get(format!("{base}/chunk/1"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
         for path in ["/", "/hello.txt"] {
             let response = client
                 .get(format!("{base}{path}"))
@@ -3353,6 +3385,7 @@ mod tests {
             )
             .unwrap(),
             request_permits: Arc::new(Semaphore::new(1)),
+            chunk_permits: Arc::new(Semaphore::new(1)),
             started_at: Instant::now(),
             indexing_status: Mutex::new(serde_json::Value::Null),
         });
@@ -3883,18 +3916,23 @@ mod tests {
     async fn builds_chunk_json_raw_and_conditional_responses() {
         let limits = stream_limits();
         let permits = Arc::new(Semaphore::new(1));
-        let verified = || VerifiedChunk {
-            bytes: b"hello".to_vec(),
-            chunk: "aGVsbG8".to_owned(),
-            data_path: "data-path".to_owned(),
-            tx_path: "tx-path".to_owned(),
-            data_root: "data-root".to_owned(),
-            data_size: 5,
-            start_offset: 100,
-            relative_start_offset: 2,
-            read_offset: 102,
-            tx_start_offset: 98,
-            source_host: "arweave.net".to_owned(),
+        let verified = || {
+            (
+                Arc::new(VerifiedChunk {
+                    bytes: b"hello".to_vec().into(),
+                    chunk: "aGVsbG8".to_owned(),
+                    data_path: "data-path".to_owned(),
+                    tx_path: "tx-path".to_owned(),
+                    data_root: "data-root".to_owned(),
+                    data_size: 5,
+                    start_offset: 100,
+                    relative_start_offset: 2,
+                    read_offset: 102,
+                    tx_start_offset: 98,
+                    source_host: "arweave.net".to_owned(),
+                }),
+                false,
+            )
         };
 
         let response = chunk_response(

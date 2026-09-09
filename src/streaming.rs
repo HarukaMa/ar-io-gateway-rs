@@ -36,7 +36,7 @@ impl ChunkSource {
             client: gateway.client.clone(),
             peers: gateway.peers.clone(),
             sources: gateway.config.chunk_sources.clone(),
-            timeout: gateway.config.request_timeout,
+            timeout: gateway.config.request_timeout.min(crate::CHUNK_DEADLINE),
             geometry,
             cached: Mutex::new(VecDeque::with_capacity(2)),
         })
@@ -137,6 +137,10 @@ impl ChunkSource {
             for source in sources {
                 let mut sample = None;
                 let result = async {
+                    let _permit = crate::CHUNK_FETCHES
+                        .acquire()
+                        .await
+                        .context("chunk fetch admission closed")?;
                     let path = format!("chunk/{absolute}");
                     let request = if self.sources.iter().any(|configured| configured == &source) {
                         self.client.get(endpoint(&source, &path))
@@ -146,7 +150,7 @@ impl ChunkSource {
                     let started = Instant::now();
                     // Reserve time for fallback within the shared chunk deadline.
                     let response = request
-                        .timeout(self.timeout / 4)
+                        .timeout((self.timeout / 4).min(crate::CHUNK_PEER_DEADLINE))
                         .send()
                         .await?
                         .error_for_status()?;

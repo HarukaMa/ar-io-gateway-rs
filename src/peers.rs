@@ -1122,16 +1122,50 @@ mod tests {
             ("/trusted/block_index2/0/0", previous.clone()),
             ("/trusted/block_index2/1/1", current.clone()),
             ("/trusted/block_index2/0/1", [previous, current].concat()),
+            ("/chunk/1002", chunk.clone()),
             ("/chunk/1001", chunk),
         ]));
         let failed_attempts = Arc::new(AtomicUsize::new(0));
         let attempts = failed_attempts.clone();
+        let mode = Arc::new(AtomicUsize::new(0));
+        let mode_in = Arc::clone(&mode);
+        let chunk_requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&chunk_requests);
         let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
             let replies = replies.clone();
             let attempts = attempts.clone();
+            let mode = Arc::clone(&mode_in);
+            let counted = Arc::clone(&counted);
             async move {
+                if request.uri().path().starts_with("/stalled") {
+                    std::future::pending::<()>().await;
+                }
+                if mode.load(Ordering::Relaxed) == 5 && request.uri().path() == "/trusted/info" {
+                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new());
+                }
+                if request.uri().path().starts_with("/chunk/") {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    match mode.load(Ordering::Relaxed) {
+                        1 => std::future::pending::<()>().await,
+                        2 => return (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+                        3 => {
+                            return (
+                                axum::http::StatusCode::OK,
+                                br#"{"chunk":"AA","data_path":"","tx_path":""}"#.to_vec(),
+                            );
+                        }
+                        _ => {}
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
                 if let Some(body) = replies.get(request.uri().path()) {
-                    (axum::http::StatusCode::OK, body.clone())
+                    let mut body = body.clone();
+                    if mode.load(Ordering::Relaxed) == 4
+                        && request.uri().path().contains("block_index2")
+                    {
+                        *body.last_mut().unwrap() ^= 1;
+                    }
+                    (axum::http::StatusCode::OK, body)
                 } else {
                     if request.uri().path().starts_with("/unavailable") {
                         attempts.fetch_add(1, Ordering::Relaxed);
@@ -1146,8 +1180,8 @@ mod tests {
         let config = crate::Config::new(
             format!("{base}/trusted"),
             format!("{base}/archive"),
-            (0..3)
-                .map(|index| format!("{base}/unavailable{index}"))
+            std::iter::once(format!("{base}/stalled"))
+                .chain((0..3).map(|index| format!("{base}/unavailable{index}")))
                 .collect(),
             Duration::from_secs(5),
             3,
@@ -1181,11 +1215,76 @@ mod tests {
                 .as_ref(),
             body
         );
+        let calls = futures_util::future::join_all((0..32).map(|_| gateway.retrieve_chunk(1001)));
+        let shared = tokio::time::timeout(Duration::from_millis(750), calls)
+            .await
+            .expect("stalled peer blocked the working peer");
+        for result in shared {
+            let (chunk, hit) = result.unwrap().unwrap();
+            assert!(!hit);
+            assert_eq!(
+                chunk.bytes.read_all(body.len()).await.unwrap().as_ref(),
+                body
+            );
+        }
         assert_eq!(
-            gateway.retrieve_chunk(1001).await.unwrap().unwrap().bytes,
-            body
+            chunk_requests.load(Ordering::Relaxed),
+            2,
+            "identical cold requests were duplicated"
         );
         assert_eq!(failed_attempts.load(Ordering::Relaxed), 6);
+        mode.store(5, Ordering::Relaxed);
+        let (nearby, hit) = gateway.retrieve_chunk(1002).await.unwrap().unwrap();
+        assert!(!hit);
+        assert_eq!(nearby.read_offset, 1);
+        assert_eq!(
+            nearby.bytes.read_all(body.len()).await.unwrap().as_ref(),
+            body
+        );
+        mode.store(3, Ordering::Relaxed);
+        assert!(gateway.retrieve_chunk(1001).await.unwrap().unwrap().1);
+        assert_eq!(
+            chunk_requests.load(Ordering::Relaxed),
+            3,
+            "cache hit fetched chunk content"
+        );
+        mode.store(4, Ordering::Relaxed);
+        assert!(gateway.retrieve_chunk(1001).await.is_err());
+        let mut config = gateway.config.clone();
+        config.chunk_sources = vec![base.clone()];
+        config.request_timeout = Duration::from_millis(200);
+        config.cache_max_bytes = 1;
+        let fresh = crate::Gateway::new(config).unwrap();
+        mode.store(1, Ordering::Relaxed);
+        assert!(
+            fresh.retrieve_chunk(1001).await.is_err(),
+            "timeout was reported as missing"
+        );
+        mode.store(2, Ordering::Relaxed);
+        assert!(fresh.retrieve_chunk(1001).await.unwrap().is_none());
+        mode.store(0, Ordering::Relaxed);
+        let before = chunk_requests.load(Ordering::Relaxed);
+        assert!(!fresh.retrieve_chunk(1001).await.unwrap().unwrap().1);
+        assert!(!fresh.retrieve_chunk(1001).await.unwrap().unwrap().1);
+        assert_eq!(
+            chunk_requests.load(Ordering::Relaxed),
+            before + 2,
+            "over-budget chunk was retained"
+        );
+        assert_eq!(
+            gateway
+                .retrieve_chunk(1001)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .bytes
+                .read_all(body.len())
+                .await
+                .unwrap()
+                .as_ref(),
+            body
+        );
         server.abort();
     }
 }
