@@ -380,6 +380,26 @@ impl BlockStore {
         Ok(())
     }
 
+    pub(crate) async fn require_bundle_schema(&self) -> Result<()> {
+        let installed: bool = self
+            .client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
+                    WHERE version = 8 AND name = '008_json_bundles')
+                    AND to_regclass('public.bundle_progress') IS NOT NULL
+                    AND to_regclass('public.item_locations') IS NOT NULL
+                    AND to_regclass('public.canonical_placements') IS NOT NULL",
+                &[],
+            )
+            .await?
+            .try_get(0)?;
+        ensure!(
+            installed,
+            "bundle indexing requires schema migration 008_json_bundles"
+        );
+        Ok(())
+    }
+
     pub(crate) async fn require_content_cache(&self) -> Result<()> {
         let installed: bool = self
             .client

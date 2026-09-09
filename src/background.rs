@@ -347,7 +347,7 @@ pub(crate) async fn start(
                         gateway.peers = peers;
                         let store = BlockStore::connect(&database_url).await?;
                         // Fail startup if the bundle schema is absent. Never migrate here.
-                        store.pending_bundles_after(None, None).await?;
+                        store.require_bundle_schema().await?;
                         let chain_store = if gateway.config.index_chain {
                             Some(BlockStore::connect(&database_url).await?)
                         } else {
