@@ -13,14 +13,18 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use content::{Content, ContentWriter, SpoolBudget};
+use content::{Content, SpoolBudget};
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use k256::ecdsa::{
     RecoveryId, Signature as Secp256k1Signature, VerifyingKey as Secp256k1VerifyingKey,
     signature::hazmat::PrehashVerifier,
@@ -44,6 +48,7 @@ const BRANCH_SIZE: usize = HASH_SIZE * 2 + NOTE_SIZE;
 const LEAF_SIZE: usize = HASH_SIZE + NOTE_SIZE;
 const MAX_CHUNK_SIZE: u128 = 256 * 1024;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
+const MAX_GRAPHQL_SOURCES: usize = 4;
 const MAX_PROOF_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_INDEX_BYTES: usize = 256 * 99;
 const MAX_BLOCK_TRANSACTIONS: usize = 1000;
@@ -60,6 +65,8 @@ pub struct Config {
     pub trusted_node_url: String,
     pub archive_url: String,
     pub chunk_sources: Vec<String>,
+    /// Full GraphQL endpoint URLs used only for untrusted location hints.
+    pub graphql_sources: Vec<String>,
     pub request_timeout: Duration,
     pub max_peer_attempts: usize,
     pub max_data_size: usize,
@@ -108,6 +115,7 @@ impl Config {
 
         Ok(Self {
             trusted_node_url,
+            graphql_sources: vec![endpoint(&archive_url, "graphql")],
             archive_url,
             chunk_sources,
             request_timeout,
@@ -143,7 +151,7 @@ pub struct VerifiedData {
     pub etag: String,
     pub sha256: String,
     #[serde(skip_serializing)]
-    indexing_root: Option<Arc<VerifiedRoot>>,
+    indexing_root: Option<IndexingRoot>,
 }
 
 #[derive(Debug)]
@@ -153,10 +161,44 @@ pub(crate) struct VerifiedRoot {
     facts: Option<indexer::RootFacts>,
 }
 
+#[derive(Clone, Debug)]
+enum IndexingRoot {
+    Complete(Arc<VerifiedRoot>),
+    Partial(Arc<AuthenticatedRoot>),
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthenticatedRoot {
+    id: String,
+    bytes: Content,
+    block_height: u64,
+    block_hash: [u8; 48],
+    tags: Vec<Tag>,
+    content_encoding: Option<String>,
+    facts: Option<indexer::RootFacts>,
+}
+
+impl AuthenticatedRoot {
+    fn metadata_bytes(&self) -> usize {
+        self.tags.iter().fold(
+            std::mem::size_of::<Self>()
+                .saturating_add(self.id.capacity())
+                .saturating_add(self.content_encoding.as_ref().map_or(0, String::capacity))
+                .saturating_add(self.tags.capacity() * std::mem::size_of::<Tag>())
+                .saturating_add(self.facts.as_ref().map_or(0, |facts| facts.heap_bytes())),
+            |bytes, tag| {
+                bytes
+                    .saturating_add(tag.name.capacity())
+                    .saturating_add(tag.value.capacity())
+            },
+        )
+    }
+}
+
 impl VerifiedRoot {
     fn verified(self: &Arc<Self>) -> VerifiedData {
         let mut data = self.data.clone();
-        data.indexing_root = Some(Arc::clone(self));
+        data.indexing_root = Some(IndexingRoot::Complete(Arc::clone(self)));
         data
     }
 
@@ -194,11 +236,16 @@ impl VerifiedData {
     }
 
     fn cache_bytes(&self) -> usize {
-        self.string_bytes().saturating_add(
-            self.indexing_root
-                .as_ref()
-                .map_or_else(|| self.bytes.resident_len(), |root| root.retained_bytes()),
-        )
+        self.string_bytes()
+            .saturating_add(match &self.indexing_root {
+                Some(IndexingRoot::Complete(root)) => root.retained_bytes(),
+                Some(IndexingRoot::Partial(root)) => self
+                    .bytes
+                    .resident_len()
+                    .saturating_add(root.metadata_bytes())
+                    .saturating_add(root.bytes.resident_len()),
+                None => self.bytes.resident_len(),
+            })
     }
 }
 
@@ -347,7 +394,7 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(mut config: Config) -> Result<Self> {
         ensure!(
             config.max_data_size > 0,
             "maximum data size must be positive"
@@ -365,6 +412,15 @@ impl Gateway {
                 && !config.stream_idle_timeout.is_zero()
                 && !config.stream_timeout.is_zero(),
             "retrieval and stream timeouts must be positive"
+        );
+        for source in &mut config.graphql_sources {
+            *source = normalize_base_url(source.trim())?;
+        }
+        config.graphql_sources.sort();
+        config.graphql_sources.dedup();
+        ensure!(
+            (1..=MAX_GRAPHQL_SOURCES).contains(&config.graphql_sources.len()),
+            "between one and four GraphQL sources are required"
         );
         let client = Client::builder()
             .timeout(config.request_timeout)
@@ -563,14 +619,22 @@ impl Gateway {
                 }
                 return Ok(data);
             }
-            match self.discover(id).await? {
-                Some(hint) => self.retrieve_bundled_with_hint(id, hint).await,
-                None => self.retrieve_direct(id).await,
+            match self.retrieve_discovered(id).await {
+                Ok(Some(data)) => Ok(data),
+                Ok(None) => self.retrieve_direct(id).await,
+                Err(discovery_error) => match self.retrieve_direct(id).await {
+                    Ok(data) => Ok(data),
+                    Err(error) if error.is::<ContentNotFound>() => Err(discovery_error),
+                    Err(error) => Err(error),
+                },
             }
         }))
         .await?;
         if let (Some(indexer), Some(root)) = (&self.bundle_indexer, &data.indexing_root) {
-            indexer.submit(root);
+            match root {
+                IndexingRoot::Complete(root) => indexer.submit(root),
+                IndexingRoot::Partial(root) => indexer.submit_partial(root),
+            }
         }
         Ok(data)
     }
@@ -703,11 +767,9 @@ impl Gateway {
                 );
                 return Ok(data);
             }
-            let hint = self
-                .discover(id)
+            self.retrieve_discovered(id)
                 .await?
-                .context("discovery returned an unbundled transaction")?;
-            self.retrieve_bundled_with_hint(id, hint).await
+                .context("discovery returned an unbundled transaction")
         })
         .await
         .context("verified bundle retrieval timed out")?
@@ -730,11 +792,9 @@ impl Gateway {
             return Ok(None);
         };
         let mut invalid = Vec::new();
-        let sources = self.peers.chunk_candidates(
-            offset,
-            self.config.max_peer_attempts,
-            &self.config.chunk_sources,
-        );
+        let sources = self
+            .peers
+            .chunk_candidates(offset, &self.config.chunk_sources);
 
         for source in &sources {
             let (candidate, headers, body) = match self.fetch_chunk(source, offset).await {
@@ -951,24 +1011,48 @@ impl Gateway {
             ),
         };
         let hinted_size = checked_data_size(size, self.config.max_data_size)?;
-        let parent_root = self
-            .retrieve_direct_with_tags(&parent_id)
-            .await
-            .map_err(|error| {
-                if error.is::<ContentNotFound>() {
-                    anyhow::anyhow!("bundle parent transaction {parent_id} was not found")
-                } else {
-                    error
-                }
-            })?;
-        let parent = &parent_root.data;
-        require_bundle_tags(&parent_root.tags)?;
+        let cached = self.load_content_cache(&parent_id).await?;
+        let parent_root = if let Some((data, Some(tags))) = cached {
+            IndexingRoot::Complete(Arc::new(VerifiedRoot {
+                data,
+                tags,
+                facts: None,
+            }))
+        } else {
+            IndexingRoot::Partial(Arc::new(self.authenticate_root(&parent_id).await.map_err(
+                |error| {
+                    if error.is::<ContentNotFound>() {
+                        anyhow::anyhow!("bundle parent transaction {parent_id} was not found")
+                    } else {
+                        error
+                    }
+                },
+            )?))
+        };
+        let (parent_bytes, block_height, block_hash, cache_hit, tags) = match &parent_root {
+            IndexingRoot::Complete(root) => (
+                &root.data.bytes,
+                root.data.block_height,
+                root.data.block_hash,
+                root.data.cache_hit,
+                &root.tags,
+            ),
+            IndexingRoot::Partial(root) => (
+                &root.bytes,
+                root.block_height,
+                Some(root.block_hash),
+                false,
+                &root.tags,
+            ),
+        };
+        require_bundle_tags(tags)?;
         let item = match &hint {
             BundleHint::Indexed(indexed) => {
-                verify_indexed_bundle(parent.bytes.clone(), &expected_id, indexed).await?
+                verify_indexed_bundle(parent_bytes.clone(), &expected_id, indexed, Some(self))
+                    .await?
             }
             BundleHint::External { .. } => {
-                verify_bundle_item(parent.bytes.clone(), &expected_id, None)
+                verify_bundle_item(parent_bytes.clone(), &expected_id, None, Some(self))
                     .await?
                     .0
             }
@@ -984,15 +1068,15 @@ impl Gateway {
         let mut data = VerifiedData {
             content_length: bytes.len(),
             bytes,
-            cache_hit: parent.cache_hit,
+            cache_hit,
             id: id.to_owned(),
-            block_height: parent.block_height,
-            block_hash: parent.block_hash,
+            block_height,
+            block_hash,
             content_type: item_content_type(&item.tags)?,
             content_encoding,
             etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
             sha256: hex(&body_hash),
-            indexing_root: Some(Arc::clone(&parent_root)),
+            indexing_root: Some(parent_root),
         };
         if let Err(error) = self.save_content_cache(&mut data, None).await {
             eprintln!("content cache admission failed: {error:#}");
@@ -1004,17 +1088,60 @@ impl Gateway {
         Ok(data)
     }
 
-    async fn discover(&self, id: &str) -> Result<Option<BundleHint>> {
+    async fn retrieve_discovered(&self, id: &str) -> Result<Option<VerifiedData>> {
         if let Some(store) = &self.block_store {
-            let id = decode_fixed::<32>(id, "data ID")?;
-            if let Some(indexed) = store.bundle_location(&id).await? {
-                return Ok(Some(BundleHint::Indexed(indexed)));
+            let item_id = decode_fixed::<32>(id, "data ID")?;
+            if let Some(indexed) = store.bundle_location(&item_id).await? {
+                return self
+                    .retrieve_bundled_with_hint(id, BundleHint::Indexed(indexed))
+                    .await
+                    .map(Some);
             }
         }
+        let mut seen = HashSet::new();
+        let mut discoveries = FuturesUnordered::new();
+        for source in &self.config.graphql_sources {
+            discoveries.push(self.discover_from(id, source));
+        }
+        let mut candidates = FuturesUnordered::new();
+        let mut failures = Vec::new();
+        while !discoveries.is_empty() || !candidates.is_empty() {
+            tokio::select! {
+                Some(result) = discoveries.next(), if !discoveries.is_empty() => {
+                    match result {
+                        Ok(Some(hint)) => {
+                            if let BundleHint::External { parent_id, data_size } = &hint
+                                && !seen.insert((parent_id.clone(), data_size.clone()))
+                            {
+                                continue;
+                            }
+                            candidates.push(self.retrieve_bundled_with_hint(id, hint));
+                        }
+                        Ok(None) => {}
+                        Err(error) => failures.push(format!("{error:#}")),
+                    }
+                }
+                Some(result) = candidates.next(), if !candidates.is_empty() => {
+                    match result {
+                        Ok(data) => return Ok(Some(data)),
+                        Err(error) => failures.push(format!("{error:#}")),
+                    }
+                }
+            }
+        }
+        ensure!(
+            failures.is_empty(),
+            "bundle discovery failed: {}",
+            failures.join("; ")
+        );
+        Ok(None)
+    }
+
+    async fn discover_from(&self, id: &str, source: &str) -> Result<Option<BundleHint>> {
         let response: GraphQlResponse = self
             .request_json(
                 self.client
-                    .post(endpoint(&self.config.archive_url, "graphql"))
+                    .post(source)
                     .json(&serde_json::json!({
                         "query": "query($ids: [ID!]!) { transactions(ids: $ids, first: 2) { edges { node { id bundledIn { id } data { size } } } } }",
                         "variables": { "ids": [id] }
@@ -1074,9 +1201,9 @@ impl Gateway {
             Ok(Arc::new(root).verified())
         }))
         .await?;
-        let root = data
-            .indexing_root
-            .context("direct retrieval lacks root metadata")?;
+        let Some(IndexingRoot::Complete(root)) = data.indexing_root else {
+            bail!("direct retrieval lacks complete root metadata");
+        };
         ensure!(
             root.data.bytes.len() <= self.config.max_data_size,
             "shared root exceeds size limit"
@@ -1091,6 +1218,34 @@ impl Gateway {
         &self,
         id: &str,
     ) -> Result<(VerifiedData, Vec<Tag>, Option<indexer::RootFacts>)> {
+        let root = self.authenticate_root(id).await?;
+        let (bytes, body_hash) = root
+            .bytes
+            .materialize(
+                self.config.max_memory_data_size,
+                Arc::clone(&self.spool_budget),
+            )
+            .await?;
+        Ok((
+            VerifiedData {
+                content_length: bytes.len(),
+                bytes,
+                cache_hit: false,
+                id: root.id,
+                block_height: root.block_height,
+                block_hash: Some(root.block_hash),
+                content_type: content_type(&root.tags)?,
+                content_encoding: root.content_encoding,
+                etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
+                sha256: hex(&body_hash),
+                indexing_root: None,
+            },
+            root.tags,
+            root.facts,
+        ))
+    }
+
+    async fn authenticate_root(&self, id: &str) -> Result<AuthenticatedRoot> {
         decode_fixed::<32>(id, "transaction ID")?;
 
         let status_url = endpoint(&self.config.archive_url, &format!("tx/{id}/status"));
@@ -1162,9 +1317,9 @@ impl Gateway {
             .authenticate_block(block, status.block_height, Some(id))
             .await?;
 
-        let mut remaining = usize::MAX;
+        let remaining = AtomicUsize::new(usize::MAX);
         let (transaction, mut verified) = self
-            .fetch_transaction(id, status.block_height, &mut remaining)
+            .fetch_transaction(id, status.block_height, &remaining)
             .await?;
         let root_metadata = (self.bundle_indexer.is_some()
             && require_bundle_tags(&transaction.tags).is_ok())
@@ -1191,7 +1346,11 @@ impl Gateway {
             // Legacy signatures bind concatenated fields, not the data boundary.
             // Authenticate the ID-to-payload association before returning inline bytes.
             (header, _) = self
-                .verify_block_transactions(header, verified.metadata, usize::MAX - remaining)
+                .verify_block_transactions(
+                    header,
+                    verified.metadata,
+                    usize::MAX - remaining.load(Ordering::Relaxed),
+                )
                 .await?;
         }
         let facts = root_metadata
@@ -1211,29 +1370,15 @@ impl Gateway {
             })
             .transpose()?;
         if let Some(bytes) = verified.inline_data {
-            let (bytes, body_hash) = cpu_work(move || {
-                let body_hash = sha256(&[&bytes]);
-                Ok((bytes, body_hash))
-            })
-            .await?;
-            let content_length = bytes.len();
-            return Ok((
-                VerifiedData {
-                    bytes: bytes.into(),
-                    cache_hit: false,
-                    id: id.to_owned(),
-                    block_height: status.block_height,
-                    block_hash: Some(decode_fixed::<48>(&block.hash, "verified block hash")?),
-                    content_type: content_type(&transaction.tags)?,
-                    content_encoding,
-                    content_length,
-                    etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
-                    sha256: hex(&body_hash),
-                    indexing_root: None,
-                },
-                transaction.tags,
+            return Ok(AuthenticatedRoot {
+                id: id.to_owned(),
+                bytes: bytes.into(),
+                block_height: status.block_height,
+                block_hash: decode_fixed::<48>(&block.hash, "verified block hash")?,
+                tags: transaction.tags,
+                content_encoding,
                 facts,
-            ));
+            });
         }
 
         let offset: TxOffset = self
@@ -1279,58 +1424,15 @@ impl Gateway {
         };
 
         let expected_len = checked_data_size(data_size, self.config.max_data_size)?;
-        let mut writer = ContentWriter::new(
-            expected_len,
-            self.config.max_memory_data_size,
-            self.spool_budget.clone(),
-        )
-        .await?;
-        let mut received = 0usize;
-        let max_chunks = data_size.div_ceil(MAX_CHUNK_SIZE) + 1;
-        let mut chunks = 0u128;
-
-        while received < expected_len {
-            ensure!(
-                chunks < max_chunks,
-                "chunk count exceeded transaction bound"
-            );
-            let relative_offset = received as u128;
-            let absolute_offset = first_offset
-                .checked_add(relative_offset)
-                .context("chunk offset overflow")?;
-            let chunk = self
-                .fetch_verified_chunk(absolute_offset, relative_offset, &geometry)
-                .await?;
-            ensure!(!chunk.is_empty(), "verified chunk made no forward progress");
-            ensure!(
-                chunk.len() <= expected_len - received,
-                "verified chunk exceeds transaction size"
-            );
-            writer.write(&chunk).await?;
-            received += chunk.len();
-            chunks += 1;
-        }
-
-        let (bytes, body_hash) = writer.finish().await?;
-        let content_type = content_type(&transaction.tags)?;
-
-        Ok((
-            VerifiedData {
-                bytes,
-                cache_hit: false,
-                id: id.to_owned(),
-                block_height: status.block_height,
-                block_hash: Some(decode_fixed::<48>(&block.hash, "verified block hash")?),
-                content_type,
-                content_encoding,
-                content_length: expected_len,
-                etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
-                sha256: hex(&body_hash),
-                indexing_root: None,
-            },
-            transaction.tags,
+        Ok(AuthenticatedRoot {
+            id: id.to_owned(),
+            bytes: Content::streamed(streaming::ChunkSource::new(self, geometry), expected_len),
+            block_height: status.block_height,
+            block_hash: decode_fixed::<48>(&block.hash, "verified block hash")?,
+            tags: transaction.tags,
+            content_encoding,
             facts,
-        ))
+        })
     }
 
     async fn verified_block(&self, block: &database::IndexBlock) -> Result<BlockHeader> {
@@ -1353,7 +1455,7 @@ impl Gateway {
         &self,
         id: &str,
         height: u64,
-        remaining_bytes: &mut usize,
+        remaining_bytes: &AtomicUsize,
     ) -> Result<(Transaction, transactions::VerifiedTransaction)> {
         decode_fixed::<32>(id, "transaction ID")?;
         let limit = self
@@ -1426,9 +1528,11 @@ impl Gateway {
             block.txs.len() <= MAX_BLOCK_TRANSACTIONS,
             "block transaction count exceeds verification limit"
         );
-        let mut remaining = MAX_BLOCK_TRANSACTION_BYTES
-            .checked_sub(fetched_bytes)
-            .context("block transactions exceed aggregate response limit")?;
+        let remaining = AtomicUsize::new(
+            MAX_BLOCK_TRANSACTION_BYTES
+                .checked_sub(fetched_bytes)
+                .context("block transactions exceed aggregate response limit")?,
+        );
         let mut objects = Vec::with_capacity(block.txs.len());
         let first_id = URL_SAFE_NO_PAD.encode(&first.id);
         ensure!(
@@ -1436,15 +1540,22 @@ impl Gateway {
             "transaction ID is absent from authenticated block"
         );
         objects.push(first);
-        for id in &block.txs {
-            if id != &first_id {
-                let (_, verified) = self
-                    .fetch_transaction(id, block.height, &mut remaining)
-                    .await?;
-                // Only the requested transaction's inline bytes survive this loop.
+        {
+            let mut pending = block.txs.iter();
+            let mut fetches = FuturesUnordered::new();
+            loop {
+                while fetches.len() < 32 {
+                    let Some(id) = pending.next() else { break };
+                    if id != &first_id {
+                        fetches.push(self.fetch_transaction(id, block.height, &remaining));
+                    }
+                }
+                let Some(result) = fetches.next().await else {
+                    break;
+                };
+                let (_, verified) = result?;
                 objects.push(verified.metadata);
             }
-            tokio::task::yield_now().await;
         }
         cpu_work(move || {
             transactions::verify_block_data_root(&block, &mut objects)?;
@@ -1568,43 +1679,6 @@ impl Gateway {
         }
     }
 
-    async fn fetch_verified_chunk(
-        &self,
-        absolute_offset: u128,
-        relative_offset: u128,
-        geometry: &Geometry,
-    ) -> Result<Vec<u8>> {
-        let mut failures = Vec::new();
-        let sources = self.peers.chunk_candidates(
-            absolute_offset,
-            self.config.max_peer_attempts,
-            &self.config.chunk_sources,
-        );
-
-        for source in &sources {
-            let mut sample = None;
-            let result = async {
-                let (chunk, headers, body) = self.fetch_chunk(source, absolute_offset).await?;
-                let geometry = *geometry;
-                let bytes = cpu_work(move || {
-                    verify_chunk(chunk, absolute_offset, relative_offset, &geometry)
-                })
-                .await?;
-                sample = Some((headers, body, bytes.len()));
-                Ok::<_, anyhow::Error>(bytes)
-            }
-            .await;
-
-            self.peers.record_chunk_result(source, sample);
-            match result {
-                Ok(chunk) => return Ok(chunk),
-                Err(error) => failures.push(format!("{source}: {error:#}")),
-            }
-        }
-
-        bail!("all bounded chunk attempts failed: {}", failures.join("; "))
-    }
-
     async fn fetch_chunk(
         &self,
         source: &str,
@@ -1622,7 +1696,12 @@ impl Gateway {
             self.peers.get(url)
         };
         let started = Instant::now();
-        let response = request.send().await?.error_for_status()?;
+        // Reserve time for fallback within the shared chunk deadline.
+        let response = request
+            .timeout(self.config.request_timeout / 4)
+            .send()
+            .await?
+            .error_for_status()?;
         let headers = started.elapsed();
         let started = Instant::now();
         let chunk = read_json_response(response).await?;
@@ -1660,26 +1739,29 @@ impl Gateway {
 }
 
 async fn read_json_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
-    let mut remaining = MAX_JSON_BYTES;
-    read_json_response_with_limit(response, MAX_JSON_BYTES, &mut remaining).await
+    let remaining = AtomicUsize::new(MAX_JSON_BYTES);
+    read_json_response_with_limit(response, MAX_JSON_BYTES, &remaining).await
 }
 
 async fn read_json_response_with_limit<T: DeserializeOwned>(
     mut response: reqwest::Response,
     limit: usize,
-    remaining_bytes: &mut usize,
+    remaining_bytes: &AtomicUsize,
 ) -> Result<T> {
     if let Some(length) = response.content_length() {
         ensure!(
-            length <= limit.min(*remaining_bytes) as u64,
+            length <= limit.min(remaining_bytes.load(Ordering::Relaxed)) as u64,
             "JSON response exceeds size limit"
         );
     }
 
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.context("failed to read HTTP body")? {
-        let remaining = *remaining_bytes;
-        *remaining_bytes = remaining.saturating_sub(chunk.len());
+        let remaining = remaining_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(chunk.len()))
+            })
+            .unwrap();
         ensure!(
             chunk.len() <= remaining && body.len().saturating_add(chunk.len()) <= limit,
             "JSON response exceeds size limit"
@@ -2469,20 +2551,6 @@ struct ProvenChunk {
     first_offset: u128,
 }
 
-fn verify_chunk(
-    chunk: JsonChunk,
-    absolute_offset: u128,
-    relative_offset: u128,
-    geometry: &Geometry,
-) -> Result<Vec<u8>> {
-    let proof = verify_chunk_range(chunk, absolute_offset, relative_offset, geometry)?;
-    ensure!(
-        proof.data.start == relative_offset,
-        "data_path does not start at requested offset"
-    );
-    Ok(proof.bytes)
-}
-
 fn verify_chunk_range(
     chunk: JsonChunk,
     absolute_offset: u128,
@@ -2808,6 +2876,7 @@ async fn verify_bundle_item(
     bundle: content::Content,
     expected_id: &[u8; 32],
     expected_offset: Option<u128>,
+    materialize: Option<&Gateway>,
 ) -> Result<(VerifiedItem, usize)> {
     let mut entries = BundleItems::new(bundle).await?;
     let mut found = None;
@@ -2826,16 +2895,27 @@ async fn verify_bundle_item(
         }
     }
     let entry = found.context("data item is absent from verified parent at the expected offset")?;
-    Ok((
-        verify_data_item(entry.bytes, expected_id).await?,
-        entry.offset,
-    ))
+    let bytes = match materialize {
+        Some(gateway) => {
+            entry
+                .bytes
+                .materialize(
+                    gateway.config.max_memory_data_size,
+                    Arc::clone(&gateway.spool_budget),
+                )
+                .await?
+                .0
+        }
+        None => entry.bytes,
+    };
+    Ok((verify_data_item(bytes, expected_id).await?, entry.offset))
 }
 
 async fn verify_indexed_bundle(
     root: content::Content,
     expected_id: &[u8; 32],
     indexed: &database::IndexedBundle,
+    materialize: Option<&Gateway>,
 ) -> Result<VerifiedItem> {
     ensure!(
         indexed.root_id.len() == 32 && (1..=MAX_BUNDLE_DEPTH).contains(&indexed.locations.len()),
@@ -2855,7 +2935,13 @@ async fn verify_indexed_bundle(
             .as_slice()
             .try_into()
             .context("invalid indexed item ID")?;
-        let (item, offset) = verify_bundle_item(parent, id, Some(location.item_offset)).await?;
+        let (item, offset) = verify_bundle_item(
+            parent,
+            id,
+            Some(location.item_offset),
+            materialize.filter(|_| depth + 1 == indexed.locations.len()),
+        )
+        .await?;
         let root_offset = payload_offset
             .checked_add(offset as u128)
             .context("indexed root offset overflow")?;
@@ -3810,9 +3896,9 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            let mut remaining = usize::MAX;
+            let remaining = AtomicUsize::new(usize::MAX);
             let verified = gateway
-                .fetch_transaction(&id, height, &mut remaining)
+                .fetch_transaction(&id, height, &remaining)
                 .await
                 .unwrap();
             assert_eq!(
@@ -3820,7 +3906,7 @@ mod tests {
                 case["owner_address"]
             );
             available.store(false, Ordering::SeqCst);
-            let fallback = gateway.fetch_transaction(&id, height, &mut remaining).await;
+            let fallback = gateway.fetch_transaction(&id, height, &remaining).await;
             assert_eq!(fallback.is_err(), requires_trusted, "{name}");
             for server in servers {
                 server.abort();
@@ -3942,8 +4028,10 @@ mod tests {
         };
         let content =
             Content::streamed(streaming::ChunkSource::new(&gateway, geometry), bytes.len());
-        let (verified_parent, _) = verify_bundle_item(content, &parent_id, None).await.unwrap();
-        let (verified_child, _) = verify_bundle_item(verified_parent.data, &child_id, None)
+        let (verified_parent, _) = verify_bundle_item(content, &parent_id, None, None)
+            .await
+            .unwrap();
+        let (verified_child, _) = verify_bundle_item(verified_parent.data, &child_id, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -3959,7 +4047,135 @@ mod tests {
         corrupt.store(true, Ordering::SeqCst);
         let content =
             Content::streamed(streaming::ChunkSource::new(&gateway, geometry), bytes.len());
-        assert!(verify_bundle_item(content, &parent_id, None).await.is_err());
+        assert!(
+            verify_bundle_item(content, &parent_id, None, None)
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+
+    fn tree(chunks: &[&[u8]], start: usize) -> ([u8; 32], Vec<Vec<u8>>) {
+        if chunks.len() == 1 {
+            let hash = sha256(&[chunks[0]]);
+            let end = note((start + chunks[0].len()) as u128);
+            return (
+                hash_leaf(&hash, &end),
+                vec![[hash.as_slice(), &end].concat()],
+            );
+        }
+        let mid = chunks.len() / 2;
+        let boundary = start + chunks[..mid].iter().map(|chunk| chunk.len()).sum::<usize>();
+        let (left, left_paths) = tree(&chunks[..mid], start);
+        let (right, right_paths) = tree(&chunks[mid..], boundary);
+        let boundary = note(boundary as u128);
+        let branch = [left.as_slice(), &right, &boundary].concat();
+        let paths = left_paths
+            .into_iter()
+            .chain(right_paths)
+            .map(|path| [branch.as_slice(), &path].concat())
+            .collect();
+        (hash_branch(&left, &right, &boundary), paths)
+    }
+    #[tokio::test]
+    async fn streamed_read_ahead_overlaps_fetches_and_preserves_verification() {
+        use axum::{Router, extract::Path, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Requests {
+            active: AtomicUsize,
+            peak: AtomicUsize,
+            fault: AtomicUsize,
+            started: AtomicUsize,
+            first_pair: tokio::sync::Notify,
+        }
+        let payload: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i / 8191) as u8).collect();
+        let (item, id) = signed_data_item(&payload, &[]);
+        let bytes = encode_bundle(&[&item]);
+        // Uneven proof boundaries force read-ahead ranges to join multiple verified chunks.
+        let chunks: Vec<_> = bytes.chunks(192 * 1024).collect();
+        let (data_root, paths) = tree(&chunks, 0);
+        let end = note(bytes.len() as u128);
+        let tx_path = URL_SAFE_NO_PAD.encode([data_root.as_slice(), &end].concat());
+        let replies: Vec<_> = chunks
+            .iter()
+            .zip(paths)
+            .map(|(chunk, path)| {
+                serde_json::json!({
+                    "chunk": URL_SAFE_NO_PAD.encode(chunk),
+                    "data_path": URL_SAFE_NO_PAD.encode(path),
+                    "tx_path": tx_path,
+                })
+            })
+            .collect();
+        let requests = Arc::new(Requests::default());
+        let observed = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/chunk/{offset}",
+            get(move |Path(offset): Path<usize>| {
+                let index = (offset - 1) / (192 * 1024);
+                let mut reply = replies[index].clone();
+                let requests = Arc::clone(&observed);
+                async move {
+                    let active = requests.active.fetch_add(1, Ordering::SeqCst) + 1;
+                    requests.peak.fetch_max(active, Ordering::SeqCst);
+                    match requests.started.fetch_add(1, Ordering::SeqCst) {
+                        0 => requests.first_pair.notified().await,
+                        1 => requests.first_pair.notify_one(),
+                        _ => {}
+                    }
+                    let fault = requests.fault.load(Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(if fault == 2 { 200 } else { 25 }))
+                        .await;
+                    requests.active.fetch_sub(1, Ordering::SeqCst);
+                    if fault == 1 && index == 8 {
+                        reply["chunk"] = serde_json::json!(URL_SAFE_NO_PAD.encode(b"corrupt"));
+                    }
+                    reply.to_string()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let gateway = Gateway::new(
+            Config::new(&url, &url, vec![url.clone()], Duration::from_secs(5), 1, 1).unwrap(),
+        )
+        .unwrap();
+        let geometry = Geometry {
+            tx_root: hash_leaf(&data_root, &end),
+            data_root,
+            block_weave_size: bytes.len() as u128,
+            previous_weave_size: 0,
+            first_offset: 1,
+            end_offset: bytes.len() as u128,
+            data_size: bytes.len() as u128,
+        };
+        let fresh =
+            || Content::streamed(streaming::ChunkSource::new(&gateway, geometry), bytes.len());
+        let hashes = tokio::time::timeout(Duration::from_secs(10), fresh().hashes())
+            .await
+            .expect("streamed hashing stalled")
+            .unwrap();
+        assert_eq!(hashes, (sha256(&[&bytes]), sha384(&[&bytes])));
+        let peak = requests.peak.load(Ordering::SeqCst);
+        assert!((2..=8).contains(&peak), "peak in-flight requests: {peak}");
+        let (verified, _) = verify_bundle_item(fresh(), &id, None, None).await.unwrap();
+        let mut reader = verified.data.reader().await.unwrap();
+        let mut actual = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut actual)
+            .await
+            .unwrap();
+        assert_eq!(actual, payload);
+        requests.fault.store(1, Ordering::SeqCst);
+        assert!(verify_bundle_item(fresh(), &id, None, None).await.is_err());
+        requests.fault.store(2, Ordering::SeqCst);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), fresh().hashes())
+                .await
+                .is_err()
+        );
         server.abort();
     }
 
@@ -3979,11 +4195,12 @@ mod tests {
 
         let height = FORK_2_9_HEIGHT + 1;
         let end = note(data.len() as u128);
-        let data_hash = sha256(&[data]);
-        let data_root = if data.is_empty() {
-            Vec::new()
+        let chunks: Vec<_> = data.chunks(MAX_CHUNK_SIZE as usize).collect();
+        let (data_root, paths) = if chunks.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            hash_leaf(&data_hash, &end).to_vec()
+            let (root, paths) = tree(&chunks, 0);
+            (root.to_vec(), paths)
         };
         let tag_hashes = tags
             .iter()
@@ -4103,25 +4320,36 @@ mod tests {
             })
             .to_string(),
         );
-        responses.insert(
-            "/chunk/1".to_owned(),
-            serde_json::json!({
-                "chunk": URL_SAFE_NO_PAD.encode(data),
-                "data_path": URL_SAFE_NO_PAD.encode([data_hash.as_slice(), &end].concat()),
-                "tx_path": URL_SAFE_NO_PAD.encode([data_root.as_slice(), &end].concat()),
+        let chunk_replies: Vec<_> = chunks
+            .iter()
+            .zip(paths)
+            .map(|(chunk, path)| {
+                serde_json::json!({
+                    "chunk": URL_SAFE_NO_PAD.encode(chunk),
+                    "data_path": URL_SAFE_NO_PAD.encode(path),
+                    "tx_path": URL_SAFE_NO_PAD.encode([data_root.as_slice(), &end].concat()),
+                })
+                .to_string()
             })
-            .to_string(),
-        );
+            .collect();
         let corrupt_chunk = Arc::new(AtomicBool::new(false));
         let corrupt = corrupt_chunk.clone();
         let chunk_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&chunk_requests);
         let app = Router::new().fallback(move |uri: axum::http::Uri| {
-            if uri.path() == "/chunk/1" {
+            let offset = uri
+                .path()
+                .strip_prefix("/chunk/")
+                .and_then(|offset| offset.parse::<usize>().ok());
+            if offset.is_some() {
                 counted.fetch_add(1, Ordering::Relaxed);
             }
-            let response = responses.get(uri.path()).cloned();
-            let corrupt = uri.path() == "/chunk/1" && corrupt.load(Ordering::SeqCst);
+            let response = offset
+                .and_then(|offset| offset.checked_sub(1))
+                .and_then(|offset| chunk_replies.get(offset / MAX_CHUNK_SIZE as usize))
+                .or_else(|| responses.get(uri.path()))
+                .cloned();
+            let corrupt = offset.is_some() && corrupt.load(Ordering::SeqCst);
             async move {
                 match response {
                     Some(body) if corrupt => {
@@ -4151,6 +4379,224 @@ mod tests {
         .unwrap();
         let requested = bundled_item.map_or(id, |(id, _)| id.to_owned());
         (gateway, requested, corrupt_chunk, server, chunk_requests)
+    }
+
+    #[tokio::test]
+    async fn partial_retrieval_skips_unrelated_payload_and_rejects_invalid_items() {
+        use std::sync::atomic::Ordering;
+
+        let payload = vec![7; 49_247];
+        let (item, item_id) = signed_data_item(&payload, &[]);
+        let (other, _) = signed_data_item(&vec![3; 3 * 1024 * 1024], &[]);
+        let bundle = encode_bundle(&[&other, &item]);
+        let id = URL_SAFE_NO_PAD.encode(item_id);
+        let tags: &[(&[u8], &[u8])] =
+            &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+        let (fixture, _, corrupt, server, requests) =
+            retrieval_fixture(&bundle, tags, Some((&id, payload.len()))).await;
+        let mut config = fixture.config.clone();
+        config.max_data_size = bundle.len();
+        config.max_memory_data_size = 64 * 1024;
+        let gateway = Gateway::new(config.clone()).unwrap();
+        let data = gateway.retrieve(&id).await.unwrap();
+        assert_eq!(data.sha256, hex(&sha256(&[&payload])));
+        assert!(
+            requests.load(Ordering::SeqCst) <= 3,
+            "unrelated chunks were downloaded"
+        );
+        corrupt.store(true, Ordering::SeqCst);
+        assert!(Gateway::new(config).unwrap().retrieve(&id).await.is_err());
+        server.abort();
+        assert_eq!(
+            data.bytes.read_all(payload.len()).await.unwrap().as_ref(),
+            payload
+        );
+        assert_eq!(
+            gateway
+                .retrieve(&id)
+                .await
+                .unwrap()
+                .bytes
+                .read_all(payload.len())
+                .await
+                .unwrap()
+                .as_ref(),
+            payload
+        );
+
+        let (worker, _, _, worker_server, _) = retrieval_fixture(&bundle, tags, None).await;
+        let Some(IndexingRoot::Partial(root)) = &data.indexing_root else {
+            panic!("missing partial root handoff");
+        };
+        let rebound = root.bytes.with_gateway(&worker).await;
+        assert_eq!(
+            rebound.hashes().await.unwrap(),
+            (sha256(&[&bundle]), sha384(&[&bundle]))
+        );
+        worker_server.abort();
+
+        let mut invalid = encode_bundle(&[&item]);
+        *invalid.last_mut().unwrap() ^= 1;
+        let (fixture, _, _, server, _) =
+            retrieval_fixture(&invalid, tags, Some((&id, payload.len()))).await;
+        let mut config = fixture.config.clone();
+        config.max_data_size = invalid.len();
+        assert!(Gateway::new(config).unwrap().retrieve(&id).await.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn alternate_discovery_sources_require_verified_content() {
+        use axum::{Router, response::IntoResponse};
+        use std::sync::atomic::Ordering;
+
+        let payload = b"verified through an alternate source";
+        let (item, item_id) = signed_data_item(payload, &[]);
+        let id = URL_SAFE_NO_PAD.encode(item_id);
+        let bundle = encode_bundle(&[&item]);
+        let tags: &[(&[u8], &[u8])] =
+            &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+        let (fixture, parent_id, corrupt, server, _) = retrieval_fixture(&bundle, tags, None).await;
+        let valid = serde_json::json!({
+            "data": {"transactions": {"edges": [{
+                "node": {"id": id, "bundledIn": {"id": parent_id},
+                         "data": {"size": payload.len().to_string()}}
+            }]}}
+        });
+        let mut wrong = valid.clone();
+        wrong["data"]["transactions"]["edges"][0]["node"]["data"]["size"] =
+            serde_json::json!((payload.len() + 1).to_string());
+        let app = Router::new().fallback(move |uri: axum::http::Uri| {
+            let wrong = wrong.to_string();
+            let valid = valid.to_string();
+            async move {
+                match uri.path() {
+                    "/stalled" => std::future::pending::<String>().await.into_response(),
+                    "/wrong" => wrong.into_response(),
+                    "/valid" => valid.into_response(),
+                    _ => r#"{"data":{"transactions":{"edges":[]}}}"#.into_response(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let sources = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = fixture.config.clone();
+        config.request_timeout = Duration::from_secs(60);
+        config.graphql_sources.extend([
+            format!("{base}/stalled"),
+            format!("{base}/wrong"),
+            format!("{base}/valid"),
+        ]);
+        for bundled_only in [false, true] {
+            let gateway = Gateway::new(config.clone()).unwrap();
+            let data = tokio::time::timeout(Duration::from_secs(5), async {
+                if bundled_only {
+                    gateway.retrieve_bundled(&id).await
+                } else {
+                    gateway.retrieve(&id).await
+                }
+            })
+            .await
+            .expect("a stalled source blocked a verified result")
+            .unwrap();
+            assert_eq!(
+                data.bytes.read_all(payload.len()).await.unwrap().as_ref(),
+                payload
+            );
+        }
+
+        config
+            .graphql_sources
+            .retain(|source| !source.ends_with("/stalled"));
+        corrupt.store(true, Ordering::SeqCst);
+        let error = Gateway::new(config)
+            .unwrap()
+            .retrieve(&id)
+            .await
+            .unwrap_err();
+        assert!(!error.is::<ContentNotFound>(), "{error:#}");
+        server.abort();
+
+        let (direct, direct_id, _, direct_server, _) = retrieval_fixture(payload, &[], None).await;
+        let mut config = direct.config.clone();
+        config.graphql_sources = vec![format!("{base}/wrong")];
+        let data = Gateway::new(config)
+            .unwrap()
+            .retrieve(&direct_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            data.bytes.read_all(payload.len()).await.unwrap().as_ref(),
+            payload
+        );
+        direct_server.abort();
+        sources.abort();
+    }
+
+    #[tokio::test]
+    async fn chunk_fallback_passes_stalled_and_missing_peers() {
+        use axum::{Router, http::StatusCode, response::IntoResponse};
+
+        let payload = b"verified after failed peers";
+        let (fixture, id, _, fixture_server, _) = retrieval_fixture(payload, &[], None).await;
+        let response = fixture
+            .client
+            .get(endpoint(&fixture.config.archive_url, "chunk/1"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let app = Router::new().fallback(move |uri: axum::http::Uri| {
+            let response = response.clone();
+            async move {
+                if uri.path().starts_with("/z-stall/") {
+                    std::future::pending::<()>().await;
+                }
+                if uri.path().starts_with("/3-valid/") {
+                    response.into_response()
+                } else {
+                    StatusCode::NOT_FOUND.into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = fixture.config.clone();
+        config.request_timeout = Duration::from_secs(1);
+        config.chunk_sources = ["z-stall", "0-missing", "1-missing", "2-missing", "3-valid"]
+            .map(|path| format!("{base}/{path}"))
+            .to_vec();
+        let gateway = Gateway::new(config.clone()).unwrap();
+        let data = gateway.retrieve(&id).await.unwrap();
+        assert_eq!(
+            data.bytes.read_all(payload.len()).await.unwrap().as_ref(),
+            payload
+        );
+
+        let size = payload.len() as u128;
+        let end = note(size);
+        let data_root = hash_leaf(&sha256(&[payload]), &end);
+        let geometry = Geometry {
+            tx_root: hash_leaf(&data_root, &end),
+            data_root,
+            block_weave_size: size,
+            previous_weave_size: 0,
+            first_offset: 1,
+            end_offset: size,
+            data_size: size,
+        };
+        let gateway = Gateway::new(config).unwrap();
+        let source = streaming::ChunkSource::new(&gateway, geometry);
+        assert_eq!(
+            source.read_at(0, payload.len()).await.unwrap().as_ref(),
+            payload
+        );
+        server.abort();
+        fixture_server.abort();
     }
 
     #[tokio::test]
@@ -4484,7 +4930,12 @@ mod tests {
             data_size: body.len() as u128,
         };
 
-        assert_eq!(verify_chunk(chunk(), 1_001, 0, &geometry).unwrap(), body);
+        assert_eq!(
+            verify_chunk_range(chunk(), 1_001, 0, &geometry)
+                .unwrap()
+                .bytes,
+            body
+        );
         let proof = verify_chunk_proof(
             chunk(),
             1_006,
@@ -4500,22 +4951,22 @@ mod tests {
 
         let mut corrupt_bytes = chunk();
         corrupt_bytes.chunk = URL_SAFE_NO_PAD.encode(b"corrupt");
-        assert!(verify_chunk(corrupt_bytes, 1_001, 0, &geometry).is_err());
+        assert!(verify_chunk_range(corrupt_bytes, 1_001, 0, &geometry).is_err());
 
         let mut incomplete_data_path = chunk();
         incomplete_data_path.data_path = URL_SAFE_NO_PAD.encode(&data_path[..data_path.len() - 1]);
-        assert!(verify_chunk(incomplete_data_path, 1_001, 0, &geometry).is_err());
+        assert!(verify_chunk_range(incomplete_data_path, 1_001, 0, &geometry).is_err());
 
         let mut incomplete_tx_path = chunk();
         incomplete_tx_path.tx_path = URL_SAFE_NO_PAD.encode(&tx_path[..tx_path.len() - 1]);
-        assert!(verify_chunk(incomplete_tx_path, 1_001, 0, &geometry).is_err());
+        assert!(verify_chunk_range(incomplete_tx_path, 1_001, 0, &geometry).is_err());
 
         geometry.data_root[0] ^= 1;
-        assert!(verify_chunk(chunk(), 1_001, 0, &geometry).is_err());
+        assert!(verify_chunk_range(chunk(), 1_001, 0, &geometry).is_err());
         geometry.data_root[0] ^= 1;
 
         geometry.end_offset += 1;
-        assert!(verify_chunk(chunk(), 1_001, 0, &geometry).is_err());
+        assert!(verify_chunk_range(chunk(), 1_001, 0, &geometry).is_err());
     }
 
     #[test]
@@ -4769,7 +5220,7 @@ mod tests {
         bundle.extend_from_slice(&expected_id);
         bundle.extend_from_slice(item);
         assert_eq!(
-            verify_bundle_item(bundle.clone().into(), &expected_id, None)
+            verify_bundle_item(bundle.clone().into(), &expected_id, None, None)
                 .await
                 .unwrap()
                 .0
@@ -4783,7 +5234,7 @@ mod tests {
         let mut wrong_id = bundle.clone();
         wrong_id[64] ^= 1;
         assert!(
-            verify_bundle_item(wrong_id.into(), &expected_id, None)
+            verify_bundle_item(wrong_id.into(), &expected_id, None, None)
                 .await
                 .is_err()
         );
@@ -4791,7 +5242,7 @@ mod tests {
         let mut wrong_size = bundle.clone();
         wrong_size[32] ^= 1;
         assert!(
-            verify_bundle_item(wrong_size.into(), &expected_id, None)
+            verify_bundle_item(wrong_size.into(), &expected_id, None, None)
                 .await
                 .is_err()
         );
@@ -4799,7 +5250,7 @@ mod tests {
         let mut truncated = bundle;
         truncated.pop();
         assert!(
-            verify_bundle_item(truncated.into(), &expected_id, None)
+            verify_bundle_item(truncated.into(), &expected_id, None, None)
                 .await
                 .is_err()
         );

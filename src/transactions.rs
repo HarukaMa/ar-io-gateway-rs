@@ -752,6 +752,169 @@ mod tests {
         assert!(verify_block_data_root(&block, &mut objects).is_err());
     }
 
+    #[tokio::test]
+    async fn block_reconstruction_overlaps_fetches_and_preserves_verification() {
+        use axum::{Router, response::IntoResponse};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let cases = fixtures();
+        let names = [
+            "public-format1-height34",
+            "format1-raw-variable-salt",
+            "format1-modern-width-boundary",
+            "format2-rsa-short-signed-root",
+        ];
+        let height = FORK_2_4_HEIGHT + 1;
+        let mut responses = std::collections::HashMap::new();
+        let mut objects = Vec::new();
+        let mut ids = Vec::new();
+        for name in names {
+            let value = cases["transactions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap()["transaction"]
+                .clone();
+            let transaction = decode_transaction(value.clone()).unwrap();
+            objects.push(
+                verify_transaction(&transaction, &transaction.id, height)
+                    .unwrap()
+                    .metadata,
+            );
+            ids.push(transaction.id.clone());
+            responses.insert(format!("/tx/{}", transaction.id), value);
+        }
+        let first = objects[0].clone();
+        objects.sort_unstable_by(|a, b| (a.format, &a.id).cmp(&(b.format, &b.id)));
+        let mut size = 0;
+        let leaves = objects
+            .iter()
+            .map(|object| {
+                size += object.data_size;
+                (
+                    hash_leaf(object.data_root.as_deref().unwrap(), &note(size)),
+                    size,
+                )
+            })
+            .collect();
+        let root = URL_SAFE_NO_PAD.encode(merkle_root(leaves).unwrap());
+        let block = || BlockHeader {
+            height,
+            txs: ids.clone(),
+            block_size: size.to_string(),
+            tx_root: root.clone(),
+            ..BlockHeader::default()
+        };
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mode = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&mode);
+        let app = Router::new().fallback(move |uri: axum::http::Uri| {
+            let value = responses.get(uri.path()).cloned();
+            let barrier = Arc::clone(&barrier);
+            let mode = Arc::clone(&observed);
+            async move {
+                let Some(mut value) = value else {
+                    return axum::http::StatusCode::NOT_FOUND.into_response();
+                };
+                barrier.wait().await;
+                match mode.load(Ordering::Relaxed) {
+                    1 => value["signature"] = serde_json::json!(URL_SAFE_NO_PAD.encode([0; 512])),
+                    2 => std::future::pending::<()>().await,
+                    _ => {}
+                }
+                value.to_string().into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let gateway = crate::Gateway::new(
+            crate::Config::new(
+                &url,
+                &url,
+                vec![url.clone()],
+                std::time::Duration::from_secs(2),
+                1,
+                2 * 1024 * 1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (_, actual) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            gateway.verify_block_transactions(block(), first.clone(), 0),
+        )
+        .await
+        .expect("transaction fetches did not overlap")
+        .unwrap();
+        assert_eq!(actual, objects);
+        let mut wrong_root = block();
+        wrong_root.tx_root = URL_SAFE_NO_PAD.encode([0; 32]);
+        assert!(
+            gateway
+                .verify_block_transactions(wrong_root, first.clone(), 0)
+                .await
+                .is_err()
+        );
+        mode.store(1, Ordering::Relaxed);
+        assert!(
+            gateway
+                .verify_block_transactions(block(), first.clone(), 0)
+                .await
+                .is_err()
+        );
+        mode.store(2, Ordering::Relaxed);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                gateway.verify_block_transactions(block(), first, 0),
+            )
+            .await
+            .is_err()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_chunked_responses_share_one_byte_budget() {
+        use axum::{
+            Router,
+            body::{Body, Bytes},
+            response::Response,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        let app = Router::new().fallback(|| async {
+            Response::new(Body::from_stream(futures_util::stream::iter([Ok::<
+                _,
+                std::io::Error,
+            >(
+                Bytes::from_static(b"{}     "),
+            )])))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        for (limit, accepted) in [(14, 2), (13, 1)] {
+            let budget = AtomicUsize::new(limit);
+            let read = || async {
+                let response = client.get(&url).send().await.unwrap();
+                crate::read_json_response_with_limit::<Value>(response, 14, &budget).await
+            };
+            let (left, right) = tokio::join!(read(), read());
+            assert_eq!(
+                usize::from(left.is_ok()) + usize::from(right.is_ok()),
+                accepted
+            );
+        }
+        server.abort();
+    }
+
     #[test]
     fn legacy_field_interpretation_cannot_change_authenticated_payload() {
         let fixtures = fixtures();

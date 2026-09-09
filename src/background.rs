@@ -179,6 +179,7 @@ impl Drop for Reservation {
 enum JobContent {
     Complete(Arc<VerifiedRoot>),
     Streamed { height: u64 },
+    Partial(Arc<crate::AuthenticatedRoot>),
 }
 
 struct Job {
@@ -212,6 +213,31 @@ impl BundleSubmitter {
         };
         permit.send(Job {
             root: JobContent::Complete(Arc::clone(root)),
+            reservation,
+        });
+    }
+
+    pub(crate) fn submit_partial(&self, root: &Arc<crate::AuthenticatedRoot>) {
+        let Ok(id) = crate::decode_fixed::<32>(&root.id, "bundle root ID") else {
+            return;
+        };
+        let metadata = root
+            .metadata_bytes()
+            .saturating_add(std::mem::size_of::<Job>());
+        if metadata > MAX_JSON_BYTES || require_bundle_tags(&root.tags).is_err() {
+            return;
+        }
+        let Some(reservation) = self.admission.reserve(
+            id,
+            metadata.saturating_add(root.bytes.len().max(root.bytes.resident_len())),
+        ) else {
+            return;
+        };
+        let Ok(permit) = self.sender.try_reserve() else {
+            return;
+        };
+        permit.send(Job {
+            root: JobContent::Partial(Arc::clone(root)),
             reservation,
         });
     }
@@ -611,6 +637,11 @@ async fn process_job(gateway: &Gateway, store: &mut BlockStore, job: Job) -> Res
             let count =
                 crate::indexer::index_streamed_bundle(gateway, store, &reservation.id, height)
                     .await?;
+            reservation.admission.indexed(count);
+            return Ok(count);
+        }
+        JobContent::Partial(root) => {
+            let count = crate::indexer::index_authenticated_bundle(gateway, store, &root).await?;
             reservation.admission.indexed(count);
             return Ok(count);
         }

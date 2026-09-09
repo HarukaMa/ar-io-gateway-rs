@@ -321,12 +321,7 @@ impl PeerState {
         json!({ "gateways": state.gateways, "arweaveNodes": nodes })
     }
 
-    pub(crate) fn chunk_candidates(
-        &self,
-        offset: u128,
-        limit: usize,
-        configured: &[String],
-    ) -> Vec<String> {
+    pub(crate) fn chunk_candidates(&self, offset: u128, configured: &[String]) -> Vec<String> {
         let mut state = self.state.lock().unwrap();
         let mut pool: BTreeMap<String, bool> = configured
             .iter()
@@ -347,6 +342,12 @@ impl PeerState {
                 timing: None,
                 weight: 50,
             });
+            if configured
+                .iter()
+                .any(|source| source.trim_end_matches('/') == url)
+            {
+                continue;
+            }
             let (latency, rate) = stats.timing.unwrap_or((1.0, 262_144.0));
             let cost = (latency + 262_144.0 / rate) * 50.0 / f64::from(stats.weight)
                 + f64::from(50u8.saturating_sub(stats.weight)) / 5.0;
@@ -359,7 +360,15 @@ impl PeerState {
             let probe = ranked.len() - 1 - (selection / 8) % ranked.len();
             ranked.swap(0, probe);
         }
-        ranked.into_iter().take(limit).map(|(_, url)| url).collect()
+        let mut sources = Vec::with_capacity(configured.len() + ranked.len());
+        for source in configured {
+            let source = source.trim_end_matches('/');
+            if !sources.iter().any(|existing| existing == source) {
+                sources.push(source.to_owned());
+            }
+        }
+        sources.extend(ranked.into_iter().map(|(_, url)| url));
+        sources
     }
 
     pub(crate) fn record_chunk_result(
@@ -868,19 +877,30 @@ mod tests {
     fn chunk_ranking_learns_speed_penalizes_failure_and_explores() -> Result<()> {
         let peers = PeerState::new("http://127.0.0.1:1984")?;
         let configured = vec!["https://slow".to_owned(), "https://new".to_owned()];
-        peers.state.lock().unwrap().nodes.insert(
-            "fast".to_owned(),
-            ArweavePeer {
-                url: "http://8.8.8.8:1984".to_owned(),
-                blocks: 1,
-                height: 1,
-                last_seen: 0,
-                coverage: None,
-                weight: 50,
-            },
-        );
         let fast = "http://8.8.8.8:1984";
-        peers.chunk_candidates(1, 3, &configured);
+        for url in [configured[0].as_str(), configured[1].as_str(), fast] {
+            peers.state.lock().unwrap().nodes.insert(
+                url.to_owned(),
+                ArweavePeer {
+                    url: url.to_owned(),
+                    blocks: 1,
+                    height: 1,
+                    last_seen: 0,
+                    coverage: None,
+                    weight: 50,
+                },
+            );
+        }
+        let candidates = peers.chunk_candidates(1, &configured);
+        assert_eq!(&candidates[..2], configured.as_slice());
+        assert_eq!(
+            candidates.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                fast.to_owned(),
+                configured[0].clone(),
+                configured[1].clone(),
+            ])
+        );
         peers.record_chunk_result(
             "https://slow",
             Some((Duration::from_secs(2), Duration::from_secs(2), 262_144)),
@@ -893,11 +913,11 @@ mod tests {
                 262_144,
             )),
         );
-        assert_eq!(peers.chunk_candidates(1, 1, &configured), [fast]);
+        assert_eq!(peers.chunk_candidates(1, &[])[0], fast);
         for _ in 0..4 {
             peers.record_chunk_result(fast, None);
         }
-        assert_ne!(peers.chunk_candidates(1, 1, &configured), [fast]);
+        assert_ne!(peers.chunk_candidates(1, &[])[0], fast);
         peers.record_chunk_result(
             fast,
             Some((
@@ -906,7 +926,17 @@ mod tests {
                 262_144,
             )),
         );
-        assert!((0..32).any(|_| peers.chunk_candidates(1, 1, &configured) == ["https://new"]));
+        assert!((0..32).any(|_| peers.chunk_candidates(1, &[])[0] == "https://new"));
+        for _ in 0..16 {
+            assert_eq!(
+                peers.chunk_candidates(1, &configured),
+                [
+                    configured[0].clone(),
+                    configured[1].clone(),
+                    fast.to_owned(),
+                ]
+            );
+        }
         Ok(())
     }
     fn bucket_frame(entries: &[(u8, f64)]) -> Vec<u8> {
@@ -1058,7 +1088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovered_chunks_remain_reachable_with_a_full_configured_attempt_budget() {
+    async fn discovered_chunks_remain_reachable_after_configured_failures() {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -1144,17 +1174,18 @@ mod tests {
             data_size: body.len() as u128,
         };
         assert_eq!(
-            gateway
-                .fetch_verified_chunk(1001, 0, &geometry)
+            crate::streaming::ChunkSource::new(&gateway, geometry)
+                .read_at(0, body.len())
                 .await
-                .unwrap(),
+                .unwrap()
+                .as_ref(),
             body
         );
         assert_eq!(
             gateway.retrieve_chunk(1001).await.unwrap().unwrap().bytes,
             body
         );
-        assert!(failed_attempts.load(Ordering::Relaxed) <= 4);
+        assert_eq!(failed_attempts.load(Ordering::Relaxed), 6);
         server.abort();
     }
 }

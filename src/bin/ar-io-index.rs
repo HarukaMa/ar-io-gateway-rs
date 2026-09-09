@@ -63,6 +63,18 @@ async fn main() -> Result<()> {
         max_attempts,
         max_data_size,
     )?;
+    config.graphql_sources = env::var("ARWEAVE_GRAPHQL_URLS")
+        .unwrap_or_else(|_| {
+            format!(
+                "{}/graphql,https://turbo-gateway.com/graphql",
+                config.archive_url
+            )
+        })
+        .split(',')
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .map(str::to_owned)
+        .collect();
     config.max_memory_data_size = env::var("ARWEAVE_MAX_MEMORY_DATA_SIZE_BYTES")
         .unwrap_or_else(|_| config.max_memory_data_size.to_string())
         .parse()

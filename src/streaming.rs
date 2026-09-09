@@ -6,8 +6,10 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use axum::body::Bytes;
+use futures_util::{Stream, StreamExt, stream};
 use reqwest::Client;
 use tokio::sync::Mutex;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::{
     Geometry, cpu_work, endpoint, peers::PeerState, read_json_response, verify_chunk_range,
@@ -17,7 +19,6 @@ pub(crate) struct ChunkSource {
     client: Client,
     peers: Arc<PeerState>,
     sources: Vec<String>,
-    attempts: usize,
     timeout: Duration,
     geometry: Geometry,
     cached: Mutex<VecDeque<(usize, Bytes)>>,
@@ -35,11 +36,51 @@ impl ChunkSource {
             client: gateway.client.clone(),
             peers: gateway.peers.clone(),
             sources: gateway.config.chunk_sources.clone(),
-            attempts: gateway.config.max_peer_attempts,
             timeout: gateway.config.request_timeout,
             geometry,
             cached: Mutex::new(VecDeque::with_capacity(2)),
         })
+    }
+
+    pub(crate) async fn with_gateway(&self, gateway: &crate::Gateway) -> Arc<Self> {
+        let cached = self.cached.lock().await.clone();
+        let source = Self::new(gateway, self.geometry);
+        *source.cached.lock().await = cached;
+        source
+    }
+
+    pub(crate) fn read_ahead(
+        self: Arc<Self>,
+        offset: usize,
+        length: usize,
+    ) -> Result<impl Stream<Item = Result<Bytes>>> {
+        let end = offset
+            .checked_add(length)
+            .context("stream range overflow")?;
+        ensure!(
+            end as u128 <= self.geometry.data_size,
+            "stream range exceeds transaction"
+        );
+        let size = crate::MAX_CHUNK_SIZE as usize;
+        let background = crate::BACKGROUND_CPU.try_with(|()| ()).is_ok();
+        Ok(stream::iter((offset..end).step_by(size))
+            .map(move |position| {
+                let source = Arc::clone(&self);
+                async move {
+                    // Proof checks must progress while the consumer waits for the same CPU pool.
+                    AbortOnDropHandle::new(tokio::spawn(async move {
+                        let read = source.read_at(position, size.min(end - position));
+                        if background {
+                            crate::BACKGROUND_CPU.scope((), read).await
+                        } else {
+                            read.await
+                        }
+                    }))
+                    .await
+                    .context("stream read-ahead task failed")?
+                }
+            })
+            .buffered(8))
     }
 
     pub(crate) async fn read_at(&self, offset: usize, length: usize) -> Result<Bytes> {
@@ -52,23 +93,29 @@ impl ChunkSource {
         );
         let mut output = Vec::new();
         output.try_reserve_exact(length)?;
-        let mut cached = self.cached.lock().await;
         let mut position = offset;
         while position < end {
-            if let Some(index) = cached
-                .iter()
-                .position(|(start, bytes)| *start <= position && position - start < bytes.len())
+            let hit = {
+                let cached = self.cached.lock().await;
+                cached
+                    .iter()
+                    .find(|(start, bytes)| *start <= position && position - start < bytes.len())
+                    .cloned()
+            };
+            let (start, bytes) = match hit {
+                Some(chunk) => chunk,
+                None => self.fetch(position).await?,
+            };
             {
-                let chunk = cached.remove(index).context("missing cached chunk")?;
-                cached.push_front(chunk);
-            } else {
-                let chunk = self.fetch(position).await?;
+                let mut cached = self.cached.lock().await;
+                if let Some(index) = cached.iter().position(|(offset, _)| *offset == start) {
+                    cached.remove(index);
+                }
                 if cached.len() == 2 {
                     cached.pop_back();
                 }
-                cached.push_front(chunk);
+                cached.push_front((start, bytes.clone()));
             }
-            let (start, bytes) = cached.front().context("missing verified chunk")?;
             let within = position - start;
             let count = (end - position).min(bytes.len() - within);
             ensure!(count > 0, "verified stream made no progress");
@@ -85,9 +132,7 @@ impl ChunkSource {
                 .first_offset
                 .checked_add(position as u128)
                 .context("stream chunk offset overflow")?;
-            let sources = self
-                .peers
-                .chunk_candidates(absolute, self.attempts, &self.sources);
+            let sources = self.peers.chunk_candidates(absolute, &self.sources);
             let mut failures = Vec::new();
             for source in sources {
                 let mut sample = None;
@@ -99,7 +144,12 @@ impl ChunkSource {
                         self.peers.get(endpoint(&source, &path))
                     };
                     let started = Instant::now();
-                    let response = request.send().await?.error_for_status()?;
+                    // Reserve time for fallback within the shared chunk deadline.
+                    let response = request
+                        .timeout(self.timeout / 4)
+                        .send()
+                        .await?
+                        .error_for_status()?;
                     let headers = started.elapsed();
                     let started = Instant::now();
                     let chunk = read_json_response(response).await?;
@@ -123,7 +173,7 @@ impl ChunkSource {
                 }
             }
             anyhow::bail!(
-                "all bounded streaming chunk attempts failed: {}",
+                "all streaming chunk candidates failed: {}",
                 failures.join("; ")
             )
         })

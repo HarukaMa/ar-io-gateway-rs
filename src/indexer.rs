@@ -389,15 +389,18 @@ pub async fn import_metadata(
                         return Ok(Some((id, height, None)));
                     }
                     let encoded_id = URL_SAFE_NO_PAD.encode(&id);
-                    let mut remaining = usize::MAX;
+                    let remaining = std::sync::atomic::AtomicUsize::new(usize::MAX);
                     let (_, verified) = gateway
-                        .fetch_transaction(&encoded_id, height, &mut remaining)
+                        .fetch_transaction(&encoded_id, height, &remaining)
                         .await
                         .with_context(|| format!("importing transaction metadata {encoded_id}"))?;
                     Ok::<_, anyhow::Error>(Some((
                         id,
                         height,
-                        Some((verified.metadata, usize::MAX - remaining)),
+                        Some((
+                            verified.metadata,
+                            usize::MAX - remaining.load(std::sync::atomic::Ordering::Relaxed),
+                        )),
                     )))
                 }
             };
@@ -694,7 +697,47 @@ pub(crate) async fn index_bundle_content(
         tags,
         facts,
     } = bundle.as_ref();
-    let encoded_id = &root.id;
+    index_bundle_source(
+        gateway,
+        store,
+        &root.id,
+        root.bytes.clone(),
+        root.block_height,
+        root.cache_hit,
+        tags,
+        facts.as_ref(),
+    )
+    .await
+}
+
+pub(crate) async fn index_authenticated_bundle(
+    gateway: &Gateway,
+    store: &mut BlockStore,
+    root: &crate::AuthenticatedRoot,
+) -> Result<u64> {
+    index_bundle_source(
+        gateway,
+        store,
+        &root.id,
+        root.bytes.with_gateway(gateway).await,
+        root.block_height,
+        false,
+        &root.tags,
+        root.facts.as_ref(),
+    )
+    .await
+}
+
+async fn index_bundle_source(
+    gateway: &Gateway,
+    store: &mut BlockStore,
+    encoded_id: &str,
+    content: crate::content::Content,
+    block_height: u64,
+    cache_hit: bool,
+    tags: &[crate::Tag],
+    facts: Option<&RootFacts>,
+) -> Result<u64> {
     let reused_facts = facts.is_some();
     timeout(gateway.config.retrieval_timeout, async {
         let root_id = crate::decode_fixed::<32>(encoded_id, "bundle root ID")?;
@@ -710,10 +753,10 @@ pub(crate) async fn index_bundle_content(
                 "trusted node source does not match stored import"
             );
             ensure!(
-                root.block_height >= state.start_height
+                block_height >= state.start_height
                     && state
                         .imported_through
-                        .is_some_and(|through| root.block_height <= through),
+                        .is_some_and(|through| block_height <= through),
                 "bundle root is outside imported block-index coverage"
             );
             store.bundle_status(&root_id).await
@@ -728,7 +771,7 @@ pub(crate) async fn index_bundle_content(
             ensure!(
                 facts.object.id.as_slice() == root_id
                     && facts.object.kind == 0
-                    && facts.object.data_size == root.bytes.len() as u128,
+                    && facts.object.data_size == content.len() as u128,
                 "authenticated bundle root metadata does not match verified content"
             );
             ensure!(
@@ -744,7 +787,7 @@ pub(crate) async fn index_bundle_content(
             }
             timeout(deadline, async {
                 let (_, block) = store
-                    .block_pair(root.block_height)
+                    .block_pair(block_height)
                     .await?
                     .context("bundle root has no imported canonical block pair")?;
                 ensure!(
@@ -764,7 +807,7 @@ pub(crate) async fn index_bundle_content(
             .await
             .context("recording authenticated bundle root timed out")??;
         } else if status.is_none() {
-            import_metadata(gateway, store, root.block_height, root.block_height).await?;
+            import_metadata(gateway, store, block_height, block_height).await?;
         }
         let (height, size, complete) = match status {
             Some(status) => status,
@@ -774,22 +817,14 @@ pub(crate) async fn index_bundle_content(
                 .context("bundle root lacks completed canonical ANS-104 metadata")?,
         };
         ensure!(
-            height == root.block_height && size == root.bytes.len() as u128,
+            height == block_height && size == content.len() as u128,
             "canonical bundle root metadata does not match verified content"
         );
         if complete {
             return Ok(0);
         }
 
-        persist_bundle(
-            gateway,
-            store,
-            &root_id,
-            root.bytes.clone(),
-            root.cache_hit,
-            reused_facts,
-        )
-        .await
+        persist_bundle(gateway, store, &root_id, content, cache_hit, reused_facts).await
     })
     .await
     .with_context(|| format!("indexing bundle {encoded_id} timed out"))?
@@ -1057,7 +1092,7 @@ mod bundle_tests {
             locations: vec![locations[3].clone(), locations[5].clone()],
         };
         for content in [root.clone().into(), root_content] {
-            let verified = verify_indexed_bundle(content, &leaf_id, &indexed())
+            let verified = verify_indexed_bundle(content, &leaf_id, &indexed(), None)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1081,7 +1116,7 @@ mod bundle_tests {
                 _ => unreachable!(),
             }
             assert!(
-                verify_indexed_bundle(root.clone().into(), &leaf_id, &hint)
+                verify_indexed_bundle(root.clone().into(), &leaf_id, &hint, None)
                     .await
                     .is_err()
             );
@@ -1089,21 +1124,21 @@ mod bundle_tests {
         let mut missing_ancestor = indexed();
         missing_ancestor.locations.remove(0);
         assert!(
-            verify_indexed_bundle(root.clone().into(), &leaf_id, &missing_ancestor)
+            verify_indexed_bundle(root.clone().into(), &leaf_id, &missing_ancestor, None)
                 .await
                 .is_err()
         );
         let mut corrupt_parent = root.clone();
         corrupt_parent[second_parent + 2] ^= 1;
         assert!(
-            verify_indexed_bundle(corrupt_parent.into(), &leaf_id, &indexed())
+            verify_indexed_bundle(corrupt_parent.into(), &leaf_id, &indexed(), None)
                 .await
                 .is_err()
         );
         let mut corrupt_table = root.clone();
         corrupt_table[96] ^= 1;
         assert!(
-            verify_indexed_bundle(corrupt_table.into(), &leaf_id, &indexed())
+            verify_indexed_bundle(corrupt_table.into(), &leaf_id, &indexed(), None)
                 .await
                 .is_err()
         );
@@ -1115,7 +1150,8 @@ mod bundle_tests {
             verify_bundle_item(
                 repeated.clone().into(),
                 &leaf_id,
-                Some((160 + leaf.len()) as u128)
+                Some((160 + leaf.len()) as u128),
+                None,
             )
             .await
             .unwrap()
@@ -1128,7 +1164,7 @@ mod bundle_tests {
             data
         );
         assert!(
-            verify_bundle_item(repeated.into(), &leaf_id, None)
+            verify_bundle_item(repeated.into(), &leaf_id, None, None)
                 .await
                 .is_err()
         );

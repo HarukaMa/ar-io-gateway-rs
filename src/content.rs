@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use axum::body::Bytes;
+use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256, Sha384};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
@@ -159,6 +160,21 @@ impl Content {
             offset: 0,
             len,
         })
+    }
+
+    pub(crate) async fn with_gateway(&self, gateway: &crate::Gateway) -> Self {
+        match &self.0 {
+            Storage::Stream {
+                source,
+                offset,
+                len,
+            } => Self(Storage::Stream {
+                source: source.with_gateway(gateway).await,
+                offset: *offset,
+                len: *len,
+            }),
+            _ => self.clone(),
+        }
     }
 
     // The caller must verify the entire file and provide a read-only handle.
@@ -327,13 +343,40 @@ impl Content {
         self.read_at(0, self.len()).await
     }
 
+    pub(crate) async fn materialize(
+        self,
+        memory_limit: usize,
+        budget: Arc<SpoolBudget>,
+    ) -> Result<(Self, [u8; 32])> {
+        let Storage::Stream {
+            source,
+            offset,
+            len,
+        } = &self.0
+        else {
+            let (hash, _) = self.hashes().await?;
+            return Ok((self, hash));
+        };
+        let mut writer = ContentWriter::new(*len, memory_limit, budget).await?;
+        let stream = Arc::clone(source).read_ahead(*offset, *len)?;
+        tokio::pin!(stream);
+        while let Some(bytes) = stream.try_next().await? {
+            writer.write(&bytes).await?;
+        }
+        writer.finish().await
+    }
+
     pub async fn hashes(&self) -> Result<([u8; 32], [u8; 48])> {
-        if matches!(self.0, Storage::Stream { .. }) {
+        if let Storage::Stream {
+            source,
+            offset,
+            len,
+        } = &self.0
+        {
+            let stream = Arc::clone(source).read_ahead(*offset, *len)?;
+            tokio::pin!(stream);
             let mut hashers = (Sha256::new(), Sha384::new());
-            for offset in (0..self.len()).step_by(IO_CHUNK_SIZE) {
-                let bytes = self
-                    .read_at(offset, IO_CHUNK_SIZE.min(self.len() - offset))
-                    .await?;
+            while let Some(bytes) = stream.try_next().await? {
                 hashers = crate::cpu_work(move || {
                     hashers.0.update(&bytes);
                     hashers.1.update(&bytes);
@@ -389,25 +432,9 @@ impl Content {
                 offset,
                 len,
             } => {
-                let source = Arc::clone(source);
-                let start = *offset;
-                let end = start
-                    .checked_add(*len)
-                    .context("stream reader offset overflow")?;
-                let stream = futures_util::stream::try_unfold(
-                    (source, start),
-                    move |(source, position)| async move {
-                        if position == end {
-                            return Ok::<_, io::Error>(None);
-                        }
-                        let length = IO_CHUNK_SIZE.min(end - position);
-                        let bytes = source
-                            .read_at(position, length)
-                            .await
-                            .map_err(io::Error::other)?;
-                        Ok(Some((bytes, (source, position + length))))
-                    },
-                );
+                let stream = Arc::clone(source)
+                    .read_ahead(*offset, *len)?
+                    .map_err(io::Error::other);
                 ReadState::Stream(Box::pin(tokio_util::io::StreamReader::new(Box::pin(
                     stream,
                 ))))
