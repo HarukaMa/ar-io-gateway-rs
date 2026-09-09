@@ -135,6 +135,11 @@ enum Storage {
         offset: usize,
         len: usize,
     },
+    Base64 {
+        source: Arc<crate::json_bundle::Base64Data>,
+        offset: usize,
+        len: usize,
+    },
 }
 
 impl From<Vec<u8>> for Content {
@@ -154,6 +159,15 @@ impl From<Bytes> for Content {
 }
 
 impl Content {
+    pub(crate) fn decoded_base64(source: Arc<crate::json_bundle::Base64Data>) -> Self {
+        let len = source.len;
+        Self(Storage::Base64 {
+            source,
+            offset: 0,
+            len,
+        })
+    }
+
     pub(crate) fn streamed(source: Arc<crate::streaming::ChunkSource>, len: usize) -> Self {
         Self(Storage::Stream {
             source,
@@ -170,6 +184,15 @@ impl Content {
                 len,
             } => Self(Storage::Stream {
                 source: source.with_gateway(gateway).await,
+                offset: *offset,
+                len: *len,
+            }),
+            Storage::Base64 {
+                source,
+                offset,
+                len,
+            } => Self(Storage::Base64 {
+                source: Arc::new(source.with_gateway(gateway).await),
                 offset: *offset,
                 len: *len,
             }),
@@ -233,8 +256,8 @@ impl Content {
                     )?;
                     &buffer[..end - start]
                 }
-                Storage::Stream { .. } => {
-                    anyhow::bail!("streamed indexing content cannot enter the disk cache")
+                Storage::Stream { .. } | Storage::Base64 { .. } => {
+                    anyhow::bail!("streamed or decoded content must be materialized before caching")
                 }
             };
             sha256.update(bytes);
@@ -252,6 +275,7 @@ impl Content {
             Storage::Memory { bytes, .. } => bytes.len(),
             Storage::File { len, .. } => *len,
             Storage::Stream { len, .. } => *len,
+            Storage::Base64 { len, .. } => *len,
         }
     }
 
@@ -268,13 +292,14 @@ impl Content {
             Storage::Memory { resident_len, .. } => *resident_len,
             Storage::File { .. } => 0,
             Storage::Stream { .. } => 2 * crate::MAX_CHUNK_SIZE as usize,
+            Storage::Base64 { source, .. } => source.resident_len(),
         }
     }
 
     pub fn memory_bytes(&self) -> Option<&Bytes> {
         match &self.0 {
             Storage::Memory { bytes, .. } => Some(bytes),
-            Storage::File { .. } | Storage::Stream { .. } => None,
+            Storage::File { .. } | Storage::Stream { .. } | Storage::Base64 { .. } => None,
         }
     }
 
@@ -303,6 +328,13 @@ impl Content {
                 offset: offset
                     .checked_add(range.start)
                     .context("stream slice offset overflow")?,
+                len: range.end - range.start,
+            }),
+            Storage::Base64 { source, offset, .. } => Self(Storage::Base64 {
+                source: Arc::clone(source),
+                offset: offset
+                    .checked_add(range.start)
+                    .context("decoded slice offset overflow")?,
                 len: range.end - range.start,
             }),
         })
@@ -348,6 +380,19 @@ impl Content {
         memory_limit: usize,
         budget: Arc<SpoolBudget>,
     ) -> Result<(Self, [u8; 32])> {
+        if matches!(&self.0, Storage::Base64 { .. }) {
+            let mut writer = ContentWriter::new(self.len(), memory_limit, budget).await?;
+            let mut reader = self.reader().await?;
+            let mut buffer = vec![0; IO_CHUNK_SIZE.min(self.len())];
+            loop {
+                let count = reader.read(&mut buffer).await?;
+                if count == 0 {
+                    break;
+                }
+                writer.write(&buffer[..count]).await?;
+            }
+            return writer.finish().await;
+        }
         let Storage::Stream {
             source,
             offset,
@@ -367,6 +412,24 @@ impl Content {
     }
 
     pub async fn hashes(&self) -> Result<([u8; 32], [u8; 48])> {
+        if matches!(&self.0, Storage::Base64 { .. }) {
+            let mut reader = self.reader().await?;
+            let mut buffer = vec![0; IO_CHUNK_SIZE.min(self.len())];
+            let mut hashers = (Sha256::new(), Sha384::new());
+            loop {
+                let count = reader.read(&mut buffer).await?;
+                if count == 0 {
+                    break;
+                }
+                (hashers, buffer) = crate::cpu_work(move || {
+                    hashers.0.update(&buffer[..count]);
+                    hashers.1.update(&buffer[..count]);
+                    Ok((hashers, buffer))
+                })
+                .await?;
+            }
+            return Ok((hashers.0.finalize().into(), hashers.1.finalize().into()));
+        }
         if let Storage::Stream {
             source,
             offset,
@@ -411,7 +474,7 @@ impl Content {
                         sha384.update(&buffer[..length]);
                     }
                 }
-                Storage::Stream { .. } => unreachable!(),
+                Storage::Stream { .. } | Storage::Base64 { .. } => unreachable!(),
             }
             Ok((sha256.finalize().into(), sha384.finalize().into()))
         })
@@ -439,6 +502,13 @@ impl Content {
                     stream,
                 ))))
             }
+            Storage::Base64 {
+                source,
+                offset,
+                len,
+            } => ReadState::Stream(Box::pin(tokio_util::io::StreamReader::new(
+                Arc::clone(source).stream(*offset, *len).await?,
+            ))),
         };
         Ok(ContentReader {
             state,

@@ -31,6 +31,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "007_pending_transactions",
         include_str!("../migrations/007_pending_transactions.sql"),
     ),
+    (
+        "008_json_bundles",
+        include_str!("../migrations/008_json_bundles.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -39,31 +43,42 @@ const BUNDLE_OVERLAP: &str = "
     SELECT key FROM (
         SELECT key, item_offset,
                lag(item_offset + item_size) OVER (
-                   PARTITION BY parent_offset ORDER BY item_offset, key
+                   PARTITION BY parent_path ORDER BY item_offset, key
                ) AS previous_end
         FROM public.item_locations WHERE root_key=$1
     ) siblings
     WHERE item_offset < previous_end LIMIT 1";
 
-const BUNDLE_ANCESTRY: &str = "
-    WITH RECURSIVE ancestors AS (
-        SELECT root_offset AS target, parent_offset, 1 AS depth
-        FROM public.item_locations
-        WHERE root_key=$1 AND root_offset IN (SELECT unnest($2::text[])::numeric)
-          AND parent_offset IS NOT NULL
-        UNION ALL
-        SELECT a.target, p.parent_offset, a.depth+1
-        FROM ancestors a
-        JOIN public.item_locations p ON p.root_key=$1 AND p.root_offset=a.parent_offset
-        WHERE a.depth < 32 AND a.parent_offset IS NOT NULL
-    )
-    SELECT target FROM ancestors
-    GROUP BY target HAVING NOT bool_or(parent_offset IS NULL) LIMIT 1";
+const BUNDLE_TAGS: &str = "
+    WITH bundle_tags AS MATERIALIZED (
+        SELECT fn.key AS format_name, fv.key AS format_value,
+               vn.key AS version_name, vv.key AS version_value, formats.json
+        FROM (VALUES ('binary', '2.0.0', false), ('json', '1.0.0', true))
+            AS formats(format, version, json)
+        JOIN public.tag_names fn ON fn.digest=sha256('Bundle-Format'::bytea)
+            AND fn.value='Bundle-Format'::bytea
+        JOIN public.tag_values fv ON fv.digest=sha256(convert_to(formats.format, 'UTF8'))
+            AND fv.value=convert_to(formats.format, 'UTF8')
+        JOIN public.tag_names vn ON vn.digest=sha256('Bundle-Version'::bytea)
+            AND vn.value='Bundle-Version'::bytea
+        JOIN public.tag_values vv ON vv.digest=sha256(convert_to(formats.version, 'UTF8'))
+            AND vv.value=convert_to(formats.version, 'UTF8')
+    )";
+
+const BUNDLE_CANDIDATES: &str = "
+    , bundle_candidates AS MATERIALIZED (
+        SELECT f.object_key, criteria.json FROM bundle_tags criteria
+        JOIN public.object_tags f ON f.name_key=criteria.format_name AND f.value_key=criteria.format_value
+        INTERSECT
+        SELECT v.object_key, criteria.json FROM bundle_tags criteria
+        JOIN public.object_tags v ON v.name_key=criteria.version_name AND v.value_key=criteria.version_value
+    )";
 
 const CANONICAL_BUNDLES: &str = "
-    SELECT o.id, p.block_height, o.data_size::text, coalesce(progress.complete, false)
-    FROM public.canonical_placements p
-    JOIN public.objects o ON o.key=p.object_key
+    SELECT o.id, p.block_height, o.data_size::text, coalesce(progress.complete, false), candidates.json, o.key
+    FROM bundle_candidates candidates
+    JOIN public.objects o ON o.key=candidates.object_key
+    JOIN public.canonical_placements p ON p.object_key=o.key
     LEFT JOIN public.bundle_progress progress ON progress.root_key=o.key
     WHERE o.kind=0 AND o.metadata_complete AND EXISTS (
         SELECT 1 FROM public.block_index_state s
@@ -72,17 +87,23 @@ const CANONICAL_BUNDLES: &str = "
         JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
         JOIN public.blocks b ON b.hash=c.block_hash AND b.height=c.height
         WHERE s.singleton AND c.height=p.block_height AND bt.position=p.position
-          AND bt.object_key=o.key AND b.timestamp IS NOT NULL)
-    AND EXISTS (
-        SELECT 1 FROM public.object_tags t
-        JOIN public.tag_names n ON n.key=t.name_key
-        JOIN public.tag_values v ON v.key=t.value_key
-        WHERE t.object_key=o.key AND n.value='Bundle-Format'::bytea AND v.value='binary'::bytea)
-    AND EXISTS (
-        SELECT 1 FROM public.object_tags t
-        JOIN public.tag_names n ON n.key=t.name_key
-        JOIN public.tag_values v ON v.key=t.value_key
-        WHERE t.object_key=o.key AND n.value='Bundle-Version'::bytea AND v.value='2.0.0'::bytea)";
+          AND bt.object_key=o.key AND b.timestamp IS NOT NULL)";
+
+const BUNDLE_FORMAT_MATCH: &str = "
+    (SELECT true FROM public.object_tags f WHERE f.object_key=requested.key
+        AND f.name_key=criteria.format_name AND f.value_key=criteria.format_value LIMIT 1) IS TRUE
+    AND (SELECT true FROM public.object_tags v WHERE v.object_key=requested.key
+        AND v.name_key=criteria.version_name AND v.value_key=criteria.version_value LIMIT 1) IS TRUE";
+
+fn bundle_lookup_sql() -> String {
+    format!(
+        "{BUNDLE_TAGS}, bundle_candidates AS (
+        SELECT requested.key AS object_key, criteria.json
+        FROM public.objects requested CROSS JOIN bundle_tags criteria
+        WHERE requested.id=$1 AND {BUNDLE_FORMAT_MATCH}
+    ) {CANONICAL_BUNDLES} AND o.id=$1"
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkpoint {
@@ -128,15 +149,51 @@ pub(crate) struct ObjectMetadata {
     pub(crate) tags: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+impl ObjectMetadata {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let mut bytes = 0usize;
+        for value in [
+            &self.id,
+            &self.signature,
+            &self.anchor,
+            &self.owner_address,
+            &self.owner_public_key,
+            &self.target,
+        ] {
+            bytes = bytes.saturating_add(value.capacity());
+        }
+        for value in [
+            &self.content_type,
+            &self.content_encoding,
+            &self.quantity,
+            &self.reward,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes.saturating_add(value.capacity());
+        }
+        bytes = bytes.saturating_add(self.data_root.as_ref().map_or(0, Vec::capacity));
+        bytes =
+            bytes.saturating_add(self.tags.capacity() * std::mem::size_of::<(Vec<u8>, Vec<u8>)>());
+        for (name, value) in &self.tags {
+            bytes = bytes
+                .saturating_add(name.capacity())
+                .saturating_add(value.capacity());
+        }
+        bytes
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BundleLocation {
     pub(crate) id: Vec<u8>,
     pub(crate) parent_id: Vec<u8>,
-    pub(crate) parent_offset: Option<u128>,
+    pub(crate) path: Vec<u128>,
     pub(crate) item_offset: u128,
     pub(crate) item_size: u128,
     pub(crate) data_offset: u128,
-    pub(crate) root_offset: u128,
+    pub(crate) json: bool,
 }
 
 #[derive(Debug)]
@@ -202,21 +259,11 @@ impl BlockStore {
         // ponytail: exact totals scan placements under the query deadline.
         // Use incremental counters if growing history reaches that deadline.
         let row = client.query_one(
-            "WITH progress AS MATERIALIZED (
+            &format!("{BUNDLE_TAGS} {BUNDLE_CANDIDATES}, progress AS MATERIALIZED (
                 SELECT min(height) FILTER (WHERE NOT metadata_complete) AS pending
                 FROM public.canonical_blocks
              ), bundle_objects AS MATERIALIZED (
-                SELECT t.object_key FROM public.object_tags t
-                JOIN public.tag_names n ON n.key=t.name_key
-                JOIN public.tag_values v ON v.key=t.value_key
-                WHERE n.digest=sha256('Bundle-Format'::bytea) AND n.value='Bundle-Format'::bytea
-                    AND v.digest=sha256('binary'::bytea) AND v.value='binary'::bytea
-                INTERSECT
-                SELECT t.object_key FROM public.object_tags t
-                JOIN public.tag_names n ON n.key=t.name_key
-                JOIN public.tag_values v ON v.key=t.value_key
-                WHERE n.digest=sha256('Bundle-Version'::bytea) AND n.value='Bundle-Version'::bytea
-                    AND v.digest=sha256('2.0.0'::bytea) AND v.value='2.0.0'::bytea
+                SELECT DISTINCT object_key FROM bundle_candidates
              ), totals AS MATERIALIZED (
                 SELECT count(*) FILTER (WHERE p.kind=0 AND o.metadata_complete) AS transactions,
                     count(*) FILTER (WHERE p.kind=0 AND NOT o.metadata_complete) AS pending,
@@ -256,7 +303,7 @@ impl BlockStore {
                         JOIN public.objects o ON o.key=k.object_key AND o.metadata_complete
                         JOIN public.canonical_placements p ON p.object_key=o.key AND p.kind=1)
                 ) FROM roots)
-             )::text", &[]).await?;
+             )::text"), &[]).await?;
         Ok(serde_json::from_str(row.get::<_, &str>(0))?)
     }
 
@@ -972,14 +1019,32 @@ impl BlockStore {
         );
         let start = range.map(|(start, _)| sql_height(start)).transpose()?;
         let end = range.map(|(_, end)| sql_height(end)).transpose()?;
+        // Sort tag candidates before the parameterized canonical check.
         self.client
             .query_opt(
                 &format!(
-                    "{CANONICAL_BUNDLES}
-                    AND NOT coalesce(progress.complete, false)
-                    AND ($1::bytea IS NULL OR o.id > $1)
-                    AND ($2::bigint IS NULL OR p.block_height BETWEEN $2 AND $3)
-                    ORDER BY o.id LIMIT 1"
+                    "{BUNDLE_TAGS} {BUNDLE_CANDIDATES}, ordered AS MATERIALIZED (
+                        SELECT o.id, o.key, o.data_size, p.block_height, p.position
+                        FROM bundle_candidates candidates
+                        JOIN public.canonical_placements p ON p.object_key=candidates.object_key
+                        JOIN public.objects o ON o.key=p.object_key
+                        JOIN public.block_index_state s ON s.singleton
+                            AND p.block_height>s.start_height AND p.block_height<=s.imported_through
+                        LEFT JOIN public.bundle_progress progress ON progress.root_key=o.key
+                        WHERE p.kind=0 AND o.kind=0 AND o.metadata_complete
+                            AND NOT coalesce(progress.complete, false)
+                            AND ($1::bytea IS NULL OR o.id > $1)
+                            AND ($2::bigint IS NULL OR p.block_height BETWEEN $2 AND $3)
+                        ORDER BY o.id
+                    )
+                    SELECT id, block_height, data_size::text FROM ordered
+                    WHERE (SELECT true FROM public.canonical_blocks c
+                        JOIN public.blocks b ON b.hash=c.block_hash AND b.height=c.height
+                        JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
+                        WHERE c.height=ordered.block_height AND bt.position=ordered.position
+                            AND bt.object_key=ordered.key AND b.timestamp IS NOT NULL
+                        LIMIT 1) IS TRUE
+                    ORDER BY id LIMIT 1"
                 ),
                 &[&after, &start, &end],
             )
@@ -994,16 +1059,24 @@ impl BlockStore {
             .transpose()
     }
 
-    pub(crate) async fn bundle_status(&self, id: &[u8]) -> Result<Option<(u64, u128, bool)>> {
+    pub(crate) async fn bundle_status(
+        &self,
+        id: &[u8],
+    ) -> Result<Option<(u64, u128, bool, crate::BundleFormat)>> {
         ensure!(id.len() == 32, "bundle root ID must be 32 bytes");
         self.client
-            .query_opt(&format!("{CANONICAL_BUNDLES} AND o.id=$1"), &[&id])
+            .query_opt(&bundle_lookup_sql(), &[&id])
             .await?
             .map(|row| {
                 Ok((
                     u64::try_from(row.try_get::<_, i64>(1)?)?,
                     row.try_get::<_, String>(2)?.parse()?,
                     row.try_get(3)?,
+                    if row.try_get(4)? {
+                        crate::BundleFormat::Json
+                    } else {
+                        crate::BundleFormat::Binary
+                    },
                 ))
             })
             .transpose()
@@ -1024,7 +1097,7 @@ impl BlockStore {
         Ok(self
             .bundle_status(id)
             .await?
-            .is_some_and(|(_, _, complete)| complete))
+            .is_some_and(|(_, _, complete, _)| complete))
     }
 
     pub(crate) async fn commit_bundle_batch(
@@ -1040,12 +1113,12 @@ impl BlockStore {
             "bundle batch exceeds 256 occurrences or objects"
         );
         let mut locations: Vec<_> = locations.iter().collect();
-        locations.sort_unstable_by_key(|location| location.root_offset);
+        locations.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         ensure!(
             locations
                 .windows(2)
-                .all(|pair| pair[0].root_offset != pair[1].root_offset),
-            "duplicate bundle offset in batch"
+                .all(|pair| pair[0].path != pair[1].path),
+            "duplicate bundle path in batch"
         );
         let metadata: std::collections::BTreeMap<_, _> = objects
             .iter()
@@ -1076,22 +1149,25 @@ impl BlockStore {
                 .get(location.id.as_slice())
                 .context("bundle occurrence lacks metadata")?;
             ensure!(
-                location.item_offset >= 96
+                (1..=crate::MAX_BUNDLE_DEPTH).contains(&location.path.len())
+                    && location.path.last() == Some(&location.item_offset)
+                    && location.item_offset > 0
+                    && (location.json || location.item_offset >= 96)
                     && location.data_offset > 0
-                    && location.item_size.checked_sub(location.data_offset)
-                        == Some(object.data_size),
-                "invalid bundle item offsets or size"
+                    && location
+                        .item_size
+                        .checked_sub(location.data_offset)
+                        .is_some_and(|remaining| if location.json {
+                            object.data_size <= remaining
+                        } else {
+                            object.data_size == remaining
+                        }),
+                "invalid bundle item path, offsets or size"
             );
-            match location.parent_offset {
-                None => ensure!(
-                    location.parent_id == root_id && location.root_offset == location.item_offset,
-                    "direct bundle occurrence has an invalid parent or root offset"
-                ),
-                Some(parent) => ensure!(
-                    parent < location.root_offset && location.parent_id != root_id,
-                    "nested bundle occurrence has an invalid parent"
-                ),
-            }
+            ensure!(
+                (location.path.len() == 1) == (location.parent_id == root_id),
+                "bundle occurrence has an invalid parent"
+            );
         }
         let transaction = self
             .client
@@ -1106,39 +1182,24 @@ impl BlockStore {
             )
             .await?;
         Self::lock_bundle_roots(&transaction, &[root_id]).await?;
-        let root = transaction.query_opt(
-            "SELECT o.key, o.data_size::text
-             FROM public.objects o
-             WHERE o.id=$1 AND o.kind=0 AND o.metadata_complete
-               AND EXISTS (
-                   SELECT 1 FROM public.block_index_state s
-                   JOIN public.canonical_blocks cb
-                     ON cb.height > s.start_height AND cb.height <= s.imported_through
-                   JOIN public.blocks b ON b.hash=cb.block_hash
-                   JOIN public.block_transactions bt ON bt.block_hash=cb.block_hash
-                   WHERE s.singleton AND bt.object_key=o.key AND b.timestamp IS NOT NULL)
-               AND EXISTS (
-                   SELECT 1 FROM public.object_tags t
-                   JOIN public.tag_names n ON n.key=t.name_key
-                   JOIN public.tag_values v ON v.key=t.value_key
-                   WHERE t.object_key=o.key AND n.value='Bundle-Format'::bytea AND v.value='binary'::bytea)
-               AND EXISTS (
-                   SELECT 1 FROM public.object_tags t
-                   JOIN public.tag_names n ON n.key=t.name_key
-                   JOIN public.tag_values v ON v.key=t.value_key
-                   WHERE t.object_key=o.key AND n.value='Bundle-Version'::bytea AND v.value='2.0.0'::bytea)",
-            &[&root_id],
-        ).await?.context("bundle root lacks completed canonical ANS-104 metadata")?;
-        let root_key: i64 = root.try_get(0)?;
-        let root_size: u128 = root.try_get::<_, String>(1)?.parse()?;
+        let root = transaction
+            .query_opt(&bundle_lookup_sql(), &[&root_id])
+            .await?
+            .context("bundle root lacks completed canonical metadata")?;
+        let root_key: i64 = root.try_get(5)?;
+        let root_size: u128 = root.try_get::<_, String>(2)?.parse()?;
+        let root_json: bool = root.try_get(4)?;
         for location in &locations {
-            ensure!(
-                location
-                    .root_offset
-                    .checked_add(location.item_size)
-                    .is_some_and(|end| end <= root_size),
-                "bundle occurrence exceeds root payload"
-            );
+            if location.path.len() == 1 {
+                ensure!(
+                    location.json == root_json
+                        && location
+                            .item_offset
+                            .checked_add(location.item_size)
+                            .is_some_and(|end| end <= root_size),
+                    "bundle occurrence format or root bounds differ"
+                );
+            }
         }
         let was_complete: bool = transaction
             .query_one(
@@ -1157,9 +1218,19 @@ impl BlockStore {
             .iter()
             .map(|location| location.parent_id.as_slice())
             .collect();
-        let parent_offsets: Vec<_> = locations
+        let paths: Vec<_> = locations
             .iter()
-            .map(|location| location.parent_offset.map(|offset| offset.to_string()))
+            .map(|location| {
+                format!(
+                    "{{{}}}",
+                    location
+                        .path
+                        .iter()
+                        .map(u128::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            })
             .collect();
         let item_offsets: Vec<_> = locations
             .iter()
@@ -1173,86 +1244,87 @@ impl BlockStore {
             .iter()
             .map(|location| location.data_offset.to_string())
             .collect();
-        let root_offsets: Vec<_> = locations
-            .iter()
-            .map(|location| location.root_offset.to_string())
-            .collect();
+        let formats: Vec<_> = locations.iter().map(|location| location.json).collect();
         const INPUT: &str = "unnest($2::bytea[], $3::bytea[], $4::text[], $5::text[],
-            $6::text[], $7::text[], $8::text[]) AS incoming(
-            id, parent_id, parent_offset, item_offset, item_size, data_offset, root_offset)";
+            $6::text[], $7::text[], $8::boolean[]) AS incoming(
+            id, parent_id, path, item_offset, item_size, data_offset, json)";
         let parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
             &root_key,
             &ids,
             &parents,
-            &parent_offsets,
+            &paths,
             &item_offsets,
             &item_sizes,
             &data_offsets,
-            &root_offsets,
+            &formats,
         ];
-        let inserted = transaction.query(&format!(
-            "INSERT INTO public.item_locations
-                (object_key, parent_key, root_key, parent_offset, item_offset, item_size, data_offset, root_offset)
-             SELECT o.key, p.key, $1, incoming.parent_offset::public.uint128,
+        let inserted = transaction
+            .query(
+                &format!(
+                    "INSERT INTO public.item_locations
+                (object_key, parent_key, root_key, path, item_offset, item_size, data_offset, json)
+             SELECT o.key, p.key, $1, incoming.path::numeric[],
                 incoming.item_offset::public.uint128, incoming.item_size::public.uint128,
-                incoming.data_offset::public.uint128, incoming.root_offset::public.uint128
+                incoming.data_offset::public.uint128, incoming.json
              FROM {INPUT}
              JOIN public.objects o ON o.id=incoming.id AND o.kind=1 AND o.metadata_complete
              JOIN public.objects p ON p.id=incoming.parent_id AND p.metadata_complete
-             ORDER BY incoming.root_offset::numeric
-             ON CONFLICT (root_key, root_offset) DO NOTHING RETURNING key"
-        ), parameters).await?;
+             ORDER BY incoming.path::numeric[]
+             ON CONFLICT (root_key, path) DO NOTHING RETURNING key"
+                ),
+                parameters,
+            )
+            .await?;
         ensure!(
             !was_complete || inserted.is_empty(),
             "completed bundle cannot acquire new occurrences"
         );
-        let matched = transaction.query(&format!(
-            "SELECT l.key FROM {INPUT}
-             JOIN public.item_locations l ON l.root_key=$1 AND l.root_offset=incoming.root_offset::numeric
+        let matched = transaction
+            .query(
+                &format!(
+                    "SELECT l.key FROM {INPUT}
+             JOIN public.item_locations l ON l.root_key=$1 AND l.path=incoming.path::numeric[]
              JOIN public.objects o ON o.key=l.object_key
              JOIN public.objects p ON p.key=l.parent_key
-             WHERE ROW(o.id, p.id, l.parent_offset, l.item_offset, l.item_size, l.data_offset)
-                IS NOT DISTINCT FROM ROW(incoming.id, incoming.parent_id, incoming.parent_offset::numeric,
-                    incoming.item_offset::numeric, incoming.item_size::numeric, incoming.data_offset::numeric)"
-        ), parameters).await?;
+             WHERE ROW(o.id, p.id, l.path, l.item_offset, l.item_size, l.data_offset, l.json)
+                IS NOT DISTINCT FROM ROW(incoming.id, incoming.parent_id, incoming.path::numeric[],
+                    incoming.item_offset::numeric, incoming.item_size::numeric,
+                    incoming.data_offset::numeric, incoming.json)"
+                ),
+                parameters,
+            )
+            .await?;
         ensure!(
             matched.len() == locations.len(),
             "conflicting immutable bundle occurrence or missing parent"
         );
-        let conflict = transaction.query_opt(
-            "SELECT l.key FROM public.item_locations l
-             LEFT JOIN public.item_locations p ON p.root_key=l.root_key AND p.root_offset=l.parent_offset
-             WHERE l.root_key=$1 AND l.root_offset IN (SELECT unnest($2::text[])::numeric)
-               AND l.parent_offset IS NOT NULL AND (
-                   p.object_key IS DISTINCT FROM l.parent_key
-                   OR l.root_offset <> p.root_offset + p.data_offset + l.item_offset
-                   OR l.item_offset + l.item_size > p.item_size - p.data_offset
-                   OR NOT EXISTS (
-                       SELECT 1 FROM public.object_tags t
-                       JOIN public.tag_names n ON n.key=t.name_key
-                       JOIN public.tag_values v ON v.key=t.value_key
-                       WHERE t.object_key=l.parent_key AND n.value='Bundle-Format'::bytea AND v.value='binary'::bytea)
-                   OR NOT EXISTS (
-                       SELECT 1 FROM public.object_tags t
-                       JOIN public.tag_names n ON n.key=t.name_key
-                       JOIN public.tag_values v ON v.key=t.value_key
-                       WHERE t.object_key=l.parent_key AND n.value='Bundle-Version'::bytea AND v.value='2.0.0'::bytea))
-             LIMIT 1",
-            &[&root_key, &root_offsets],
-        ).await?;
-        ensure!(
-            conflict.is_none(),
-            "invalid nested bundle parent or offsets"
-        );
-        let conflict = transaction.query_opt(BUNDLE_OVERLAP, &[&root_key]).await?;
-        ensure!(conflict.is_none(), "overlapping bundle siblings");
         let conflict = transaction
-            .query_opt(BUNDLE_ANCESTRY, &[&root_key, &root_offsets])
+            .query_opt(
+                &format!(
+                    "{BUNDLE_TAGS}
+             SELECT l.key FROM public.item_locations l
+             JOIN unnest($2::text[]) incoming(path) ON l.path=incoming.path::numeric[]
+             LEFT JOIN public.item_locations p ON p.root_key=l.root_key AND p.path=l.parent_path
+             JOIN public.objects requested ON requested.key=l.parent_key
+             LEFT JOIN LATERAL (
+                 SELECT count(*) AS matches, bool_or(criteria.json) AS json
+                 FROM bundle_tags criteria WHERE {BUNDLE_FORMAT_MATCH}
+             ) format ON true
+             WHERE l.root_key=$1 AND (
+                 format.matches<>1 OR format.json<>l.json OR NOT requested.metadata_complete
+                 OR (l.parent_path IS NOT NULL AND p.object_key IS DISTINCT FROM l.parent_key)
+                 OR l.item_offset + l.item_size > requested.data_size)
+             LIMIT 1"
+                ),
+                &[&root_key, &paths],
+            )
             .await?;
         ensure!(
             conflict.is_none(),
-            "bundle parent chain is missing or exceeds 32 levels"
+            "invalid nested bundle parent, format or offsets"
         );
+        let conflict = transaction.query_opt(BUNDLE_OVERLAP, &[&root_key]).await?;
+        ensure!(conflict.is_none(), "overlapping bundle siblings");
         Self::refresh_item_placements(&transaction, &keys).await?;
         if complete {
             transaction
@@ -1280,16 +1352,16 @@ impl BlockStore {
                  JOIN public.block_index_state s
                    ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
                  WHERE l.object_key=ANY($1::bigint[])
-                 ORDER BY l.object_key, cb.height, bt.position, l.root_offset
+                 ORDER BY l.object_key, cb.height, bt.position, l.path
              ) candidate JOIN public.objects o ON o.key=candidate.object_key
              ORDER BY o.id
              ON CONFLICT (object_key) DO UPDATE SET block_height=EXCLUDED.block_height,
                  position=EXCLUDED.position, location_key=EXCLUDED.location_key,
                  kind=EXCLUDED.kind, id=EXCLUDED.id
              WHERE ROW(EXCLUDED.block_height, EXCLUDED.position,
-                       (SELECT root_offset FROM public.item_locations WHERE key=EXCLUDED.location_key))
+                       (SELECT path FROM public.item_locations WHERE key=EXCLUDED.location_key))
                  < ROW(stored.block_height, stored.position,
-                       (SELECT root_offset FROM public.item_locations WHERE key=stored.location_key))",
+                       (SELECT path FROM public.item_locations WHERE key=stored.location_key))",
             &[&keys],
         ).await?;
         Ok(())
@@ -1322,7 +1394,7 @@ impl BlockStore {
         }
         // Read current membership, not just the cached placement, so stale hints fail closed.
         let rows = self.client.query(
-            "WITH RECURSIVE selected AS (
+            "WITH selected AS (
                 SELECT l.*, root.id AS root_id, root.data_size AS root_size, o.data_size AS target_size
                 FROM public.objects o
                 JOIN public.item_locations l ON l.object_key=o.key
@@ -1333,22 +1405,19 @@ impl BlockStore {
                 JOIN public.block_index_state s
                   ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
                 WHERE o.id=$1 AND o.kind=1 AND o.metadata_complete
-                ORDER BY cb.height, bt.position, l.root_offset LIMIT 1
-             ), path AS (
-                SELECT selected.*, 1 AS depth FROM selected
-                UNION ALL
-                SELECT p.*, path.root_id, path.root_size, path.target_size, path.depth+1
-                FROM path JOIN public.item_locations p
-                  ON p.root_key=path.root_key AND p.root_offset=path.parent_offset
-                WHERE path.depth < 32
+                ORDER BY cb.height, bt.position, l.path LIMIT 1
              )
-             SELECT o.id, parent.id, path.parent_offset::text, path.item_offset::text,
-                path.item_size::text, path.data_offset::text, path.root_offset::text,
-                path.root_id, path.root_size::text, path.target_size::text, o.content_type
-             FROM path
-             JOIN public.objects o ON o.key=path.object_key AND o.kind=1 AND o.metadata_complete
-             JOIN public.objects parent ON parent.key=path.parent_key AND parent.metadata_complete
-             ORDER BY path.depth DESC",
+             SELECT o.id, parent.id, array_to_json(l.path)::text, l.item_offset::text,
+                l.item_size::text, l.data_offset::text, l.json,
+                selected.root_id, selected.root_size::text, selected.target_size::text,
+                o.content_type, o.data_size::text
+             FROM selected
+             CROSS JOIN LATERAL generate_subscripts(selected.path, 1) AS depth(n)
+             JOIN public.item_locations l ON l.root_key=selected.root_key
+                AND l.path=selected.path[1:depth.n]
+             JOIN public.objects o ON o.key=l.object_key AND o.kind=1 AND o.metadata_complete
+             JOIN public.objects parent ON parent.key=l.parent_key AND parent.metadata_complete
+             ORDER BY depth.n",
             &[&id],
         ).await?;
         let Some(first) = rows.first() else {
@@ -1362,50 +1431,51 @@ impl BlockStore {
             .context("missing stored bundle target")?
             .try_get(10)?;
         let mut locations: Vec<BundleLocation> = Vec::with_capacity(rows.len());
+        let mut payload_size = root_size;
         for row in rows {
             let location = BundleLocation {
                 id: row.try_get(0)?,
                 parent_id: row.try_get(1)?,
-                parent_offset: row
-                    .try_get::<_, Option<String>>(2)?
-                    .map(|offset| offset.parse())
-                    .transpose()?,
+                path: serde_json::from_str(&row.try_get::<_, String>(2)?)?,
                 item_offset: row.try_get::<_, String>(3)?.parse()?,
                 item_size: row.try_get::<_, String>(4)?.parse()?,
                 data_offset: row.try_get::<_, String>(5)?.parse()?,
-                root_offset: row.try_get::<_, String>(6)?.parse()?,
+                json: row.try_get(6)?,
             };
-            let (parent_id, parent_offset, payload_start, payload_size) = match locations.last() {
-                Some(parent) => (
-                    parent.id.as_slice(),
-                    Some(parent.root_offset),
-                    parent
-                        .root_offset
-                        .checked_add(parent.data_offset)
-                        .context("bundle parent offset overflow")?,
-                    parent.item_size - parent.data_offset,
-                ),
-                None => (root_id.as_slice(), None, 0, root_size),
+            let decoded_size: u128 = row.try_get::<_, String>(11)?.parse()?;
+            let (parent_id, parent_path) = match locations.last() {
+                Some(parent) => (parent.id.as_slice(), parent.path.as_slice()),
+                None => (root_id.as_slice(), &[][..]),
             };
             ensure!(
                 location.parent_id == parent_id
-                    && location.parent_offset == parent_offset
-                    && payload_start.checked_add(location.item_offset)
-                        == Some(location.root_offset)
-                    && location.item_offset >= 96
+                    && location.path.len() == locations.len() + 1
+                    && location.path.len() <= crate::MAX_BUNDLE_DEPTH
+                    && location.path[..location.path.len() - 1] == *parent_path
+                    && location.path.last() == Some(&location.item_offset)
+                    && location.item_offset > 0
+                    && (location.json || location.item_offset >= 96)
                     && location.data_offset > 0
-                    && location.data_offset <= location.item_size
+                    && location
+                        .item_size
+                        .checked_sub(location.data_offset)
+                        .is_some_and(|remaining| if location.json {
+                            decoded_size <= remaining
+                        } else {
+                            decoded_size == remaining
+                        })
                     && location
                         .item_offset
                         .checked_add(location.item_size)
                         .is_some_and(|end| end <= payload_size),
-                "invalid stored bundle parent chain or offsets"
+                "invalid stored bundle parent path, offsets or size"
             );
+            payload_size = decoded_size;
             locations.push(location);
         }
         let target = locations.last().context("missing stored bundle target")?;
         ensure!(
-            target.id == id && target.item_size - target.data_offset == data_size,
+            target.id == id && payload_size == data_size,
             "invalid stored bundle target identity or size"
         );
         Ok(Some(IndexedBundle {
@@ -2169,87 +2239,57 @@ mod tests {
             database == "ar_io_rust_test",
             "requires the dedicated test database"
         );
-        store
-            .client
-            .batch_execute(
-                "CREATE TEMP TABLE geometry (
-                key bigint PRIMARY KEY, root_key bigint, parent_offset numeric,
-                root_offset numeric, item_offset numeric, item_size numeric
-             );
-             INSERT INTO geometry VALUES
-                (1,1,NULL,96,96,100), (2,1,NULL,196,196,10),
-                (3,1,96,500,96,100), (4,2,NULL,96,96,100);",
-            )
-            .await?;
+        store.client.batch_execute(
+            "CREATE TEMP TABLE geometry (LIKE public.item_locations INCLUDING ALL);
+             ALTER TABLE geometry ADD FOREIGN KEY (root_key, parent_path) REFERENCES geometry(root_key, path);
+             INSERT INTO geometry (key, object_key, parent_key, root_key, path, item_offset, item_size, data_offset)
+             OVERRIDING SYSTEM VALUE VALUES
+                (1,11,10,10,'{96}',96,100,1), (2,12,10,10,'{196}',196,10,1),
+                (3,13,11,10,'{96,96}',96,100,1), (4,21,20,20,'{96}',96,100,1);"
+        ).await?;
         let overlap = BUNDLE_OVERLAP.replace("public.item_locations", "pg_temp.geometry");
-        let ancestry = BUNDLE_ANCESTRY.replace("public.item_locations", "pg_temp.geometry");
-        assert!(store.client.query_opt(&overlap, &[&1i64]).await?.is_none());
-        // Containment, identical starts, and an earlier interval crossing its successor.
-        for (start, size) in [(97, 1), (96, 1), (95, 2)] {
-            store
-                .client
-                .batch_execute(&format!(
-                    "INSERT INTO geometry VALUES (5,1,NULL,{start},{start},{size})"
-                ))
-                .await?;
-            assert!(store.client.query_opt(&overlap, &[&1i64]).await?.is_some());
+        assert!(store.client.query_opt(&overlap, &[&10i64]).await?.is_none());
+        for (start, size) in [(97, 1), (195, 2)] {
+            store.client.batch_execute(&format!(
+                "INSERT INTO geometry (key,object_key,parent_key,root_key,path,item_offset,item_size,data_offset)
+                 OVERRIDING SYSTEM VALUE VALUES (5,99,10,10,'{{{start}}}',{start},{size},1)"
+            )).await?;
+            assert!(store.client.query_opt(&overlap, &[&10i64]).await?.is_some());
             store
                 .client
                 .batch_execute("DELETE FROM geometry WHERE key=5")
                 .await?;
         }
-        let offsets = vec!["96".to_owned(), "500".to_owned()];
-        assert!(
-            store
-                .client
-                .query_opt(&ancestry, &[&1i64, &offsets])
-                .await?
-                .is_none()
+        let duplicate = store.client.batch_execute(
+            "INSERT INTO geometry (key,object_key,parent_key,root_key,path,item_offset,item_size,data_offset)
+             OVERRIDING SYSTEM VALUE VALUES (5,99,10,10,'{96}',96,1,1)"
+        ).await.unwrap_err();
+        assert_eq!(
+            duplicate.code(),
+            Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
         );
-        store
+        let missing = store
             .client
-            .batch_execute("UPDATE geometry SET parent_offset=999 WHERE key=3")
-            .await?;
-        assert!(
-            store
-                .client
-                .query_opt(&ancestry, &[&1i64, &offsets])
-                .await?
-                .is_some()
+            .batch_execute("UPDATE geometry SET path='{999,96}' WHERE key=3")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            missing.code(),
+            Some(&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION)
         );
-        store
-            .client
-            .batch_execute(
-                "TRUNCATE geometry;
-             INSERT INTO geometry
-             SELECT n, 1, CASE WHEN n=1 THEN NULL ELSE n-1 END, n, 96, 1
-             FROM generate_series(1,33) n;",
-            )
-            .await?;
-        assert!(
-            store
-                .client
-                .query_opt(&ancestry, &[&1i64, &vec!["32".to_owned()]])
-                .await?
-                .is_none()
-        );
-        assert!(
-            store
-                .client
-                .query_opt(&ancestry, &[&1i64, &vec!["33".to_owned()]])
-                .await?
-                .is_some()
-        );
-        store
-            .client
-            .batch_execute("UPDATE geometry SET parent_offset=2 WHERE key=1")
-            .await?;
-        assert!(
-            store
-                .client
-                .query_opt(&ancestry, &[&1i64, &vec!["2".to_owned()]])
-                .await?
-                .is_some()
+        store.client.batch_execute(
+            "TRUNCATE geometry;
+             INSERT INTO geometry (object_key,parent_key,root_key,path,item_offset,item_size,data_offset)
+             SELECT n+100, CASE WHEN n=1 THEN 10 ELSE n+99 END, 10, array_fill(96::numeric, ARRAY[n]),96,100,1
+             FROM generate_series(1,32) n;"
+        ).await?;
+        let depth = store.client.batch_execute(
+            "INSERT INTO geometry (object_key,parent_key,root_key,path,item_offset,item_size,data_offset)
+             VALUES (133,132,10,array_fill(96::numeric,ARRAY[33]),96,100,1)"
+        ).await.unwrap_err();
+        assert_eq!(
+            depth.code(),
+            Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION)
         );
         Ok(())
     }
@@ -2271,7 +2311,7 @@ mod tests {
         let result = async {
             let roots = store
                 .client
-                .query(&format!("{CANONICAL_BUNDLES} ORDER BY o.id LIMIT 1"), &[])
+                .query(&format!("{BUNDLE_TAGS} {BUNDLE_CANDIDATES} {CANONICAL_BUNDLES} ORDER BY o.id LIMIT 1"), &[])
                 .await?
                 .iter()
                 .map(|row| {
@@ -2489,7 +2529,7 @@ mod tests {
              JOIN public.objects root ON root.key=l.root_key
              JOIN public.bundle_progress progress ON progress.root_key=l.root_key
              JOIN public.canonical_placements p ON p.object_key=root.key
-             WHERE l.parent_offset IS NULL AND o.data_size>0 AND l.data_offset>1
+             WHERE l.parent_path IS NULL AND NOT l.json AND o.data_size>0 AND l.data_offset>1
              ORDER BY l.key LIMIT 1",
                 &[],
             )
@@ -2533,11 +2573,11 @@ mod tests {
         let mut location = BundleLocation {
             id: object.id.clone(),
             parent_id: root_id.clone(),
-            parent_offset: None,
+            path: vec![item_offset],
             item_offset,
             item_size: row.try_get::<_, String>(14)?.parse()?,
             data_offset: row.try_get::<_, String>(15)?.parse()?,
-            root_offset: item_offset,
+            json: false,
         };
         let snapshot = "SELECT ARRAY[
             (SELECT count(*) FROM public.objects), (SELECT count(*) FROM public.owners),
@@ -2566,7 +2606,7 @@ mod tests {
         location.id = object.id.clone();
         let mut new_occurrence = location.clone();
         new_occurrence.item_offset += 1;
-        new_occurrence.root_offset += 1;
+        new_occurrence.path[0] += 1;
         new_occurrence.item_size -= 1;
         new_occurrence.data_offset -= 1;
         ensure!(

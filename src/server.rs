@@ -776,14 +776,24 @@ async fn serve_offsets(State(state): State<Arc<AppState>>, Path(id): Path<String
             return Ok(None);
         };
         let target = indexed.locations.last().context("missing indexed target")?;
-        let data_offset = target
-            .root_offset
-            .checked_add(target.data_offset)
-            .context("indexed data offset overflow")?;
+        let mut root_offset = 0u128;
+        let mut data_offset = 0u128;
+        for location in &indexed.locations {
+            // JSON payloads require decoding and have no raw root-byte data range.
+            if location.json {
+                return Ok(None);
+            }
+            root_offset = data_offset
+                .checked_add(location.item_offset)
+                .context("indexed item offset overflow")?;
+            data_offset = root_offset
+                .checked_add(location.data_offset)
+                .context("indexed data offset overflow")?;
+        }
         let root_id = URL_SAFE_NO_PAD.encode(&indexed.root_id);
         let mut offsets = serde_json::json!({
             "rootTxId": root_id,
-            "rootOffset": target.root_offset,
+            "rootOffset": root_offset,
             "rootDataOffset": data_offset,
             "size": target.item_size,
             "dataSize": indexed.data_size,

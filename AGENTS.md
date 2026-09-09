@@ -5,8 +5,8 @@
 - Repository: `HarukaMa/ar-io-gateway-rs`. Primary branch: `slave`.
 - GitHub Issues are the project tracker. Use umbrella #1, the existing phase issues, and detailed sub-issues for the active phase. Check existing issues before creating new ones.
 - Keep implementation scope, acceptance criteria, blockers, and delivery evidence in the relevant GitHub issue. Session todos are temporary execution bookkeeping.
-- `HANDOFF.md` holds local architecture and operational context. Verify mutable facts before acting because its status notes can become stale.
-- Keep `HANDOFF.md` untracked. Never publish credentials, private-network addresses, or live deployment identifiers in tracked files or GitHub issues.
+- Verify mutable operational facts before acting.
+- Never publish credentials, private-network addresses, or live deployment identifiers in tracked files or GitHub issues.
 
 ## Architecture
 
@@ -30,7 +30,7 @@
 
 ## Storage
 
-- PostgreSQL is the sole permanent write and indexing database. The planned legacy SQLite import is a one-time migration. Do not add interchangeable backends or a live legacy-database dependency.
+- PostgreSQL is the sole permanent write and indexing database. Rebuild its historical index through Rust's verified indexing pipeline. Do not migrate legacy SQLite rows or add interchangeable backends or a live legacy-database dependency. Keep Node and its SQLite databases intact for rollback.
 - Store immutable metadata and ordered tags once. Keep canonical membership, bundle occurrences, progress, and the stable-chain watermark separate. Restrict fork rollback to unstable membership.
 - Reuse the selected normalized tag dictionaries and canonical-placement layout. Search optimization requires evidence from the relevant workload.
 - Use bounded bulk ingestion and safe write concurrency. Keep facts, membership, placement updates, and progress transactionally consistent. Reject conflicting immutable records and support resumability.

@@ -12,7 +12,7 @@ use tokio::{sync::mpsc, time::timeout};
 use crate::{
     BundleItems, CONSENSUS_DEPTH, Gateway, MAX_BUNDLE_DEPTH, NodeInfo,
     database::{BlockStore, BundleLocation, Checkpoint, IndexBlock, ObjectMetadata},
-    decode_b64, endpoint, parse_u128, require_bundle_tags, verify_data_item,
+    decode_b64, endpoint, parse_u128, require_bundle_tags,
 };
 
 #[derive(Debug, Serialize)]
@@ -51,53 +51,12 @@ pub(crate) struct RootFacts {
 
 impl RootFacts {
     pub(crate) fn heap_bytes(&self) -> usize {
-        let ObjectMetadata {
-            id,
-            kind: _,
-            signature,
-            anchor,
-            owner_address,
-            owner_public_key,
-            target,
-            data_size: _,
-            content_type,
-            content_encoding,
-            signature_type: _,
-            format: _,
-            quantity,
-            reward,
-            denomination: _,
-            data_root,
-            tags,
-        } = &self.object;
-        let mut bytes = self.transaction_ids.capacity() * std::mem::size_of::<Vec<u8>>();
-        for id in &self.transaction_ids {
-            bytes = bytes.saturating_add(id.capacity());
-        }
-        for value in [
-            id,
-            signature,
-            anchor,
-            owner_address,
-            owner_public_key,
-            target,
-        ] {
-            bytes = bytes.saturating_add(value.capacity());
-        }
-        for value in [content_type, content_encoding, quantity, reward]
-            .into_iter()
-            .flatten()
-        {
-            bytes = bytes.saturating_add(value.capacity());
-        }
-        bytes = bytes.saturating_add(data_root.as_ref().map_or(0, Vec::capacity));
-        bytes = bytes.saturating_add(tags.capacity() * std::mem::size_of::<(Vec<u8>, Vec<u8>)>());
-        for (name, value) in tags {
-            bytes = bytes
-                .saturating_add(name.capacity())
-                .saturating_add(value.capacity());
-        }
-        bytes
+        self.transaction_ids.iter().fold(
+            self.object
+                .heap_bytes()
+                .saturating_add(self.transaction_ids.capacity() * std::mem::size_of::<Vec<u8>>()),
+            |bytes, id| bytes.saturating_add(id.capacity()),
+        )
     }
 }
 
@@ -1046,7 +1005,7 @@ async fn index_bundle_source(
     let reused_facts = facts.is_some();
     timeout(gateway.config.retrieval_timeout, async {
         let root_id = crate::decode_fixed::<32>(encoded_id, "bundle root ID")?;
-        require_bundle_tags(tags)?;
+        let format = require_bundle_tags(tags)?;
         let deadline = gateway.config.request_timeout;
         let status = timeout(deadline, async {
             let state = store
@@ -1068,7 +1027,7 @@ async fn index_bundle_source(
         })
         .await
         .context("bundle metadata lookup timed out")??;
-        if status.is_some_and(|(_, _, complete)| complete) {
+        if status.is_some_and(|(_, _, complete, _)| complete) {
             return Ok(0);
         }
 
@@ -1114,22 +1073,31 @@ async fn index_bundle_source(
         } else if status.is_none() {
             import_metadata(gateway, store, block_height, block_height).await?;
         }
-        let (height, size, complete) = match status {
+        let (height, size, complete, stored_format) = match status {
             Some(status) => status,
             None => timeout(deadline, store.bundle_status(&root_id))
                 .await
                 .context("bundle metadata lookup timed out")??
-                .context("bundle root lacks completed canonical ANS-104 metadata")?,
+                .context("bundle root lacks completed canonical metadata")?,
         };
         ensure!(
-            height == block_height && size == content.len() as u128,
+            height == block_height && size == content.len() as u128 && stored_format == format,
             "canonical bundle root metadata does not match verified content"
         );
         if complete {
             return Ok(0);
         }
 
-        persist_bundle(gateway, store, &root_id, content, cache_hit, reused_facts).await
+        persist_bundle(
+            gateway,
+            store,
+            &root_id,
+            content,
+            format,
+            cache_hit,
+            reused_facts,
+        )
+        .await
     })
     .await
     .with_context(|| format!("indexing bundle {encoded_id} timed out"))?
@@ -1160,7 +1128,7 @@ pub(crate) async fn index_streamed_bundle(
     })
     .await
     .context("preparing streamed bundle timed out")??;
-    let ((_, size, complete), data_root) = prepared;
+    let ((_, size, complete, format), data_root) = prepared;
     if complete {
         return Ok(0);
     }
@@ -1213,7 +1181,7 @@ pub(crate) async fn index_streamed_bundle(
         crate::streaming::ChunkSource::new(gateway, geometry),
         usize::try_from(size).context("bundle size exceeds addressable range")?,
     );
-    persist_bundle(gateway, store, id, content, false, false).await
+    persist_bundle(gateway, store, id, content, format, false, false).await
 }
 
 async fn persist_bundle(
@@ -1221,11 +1189,12 @@ async fn persist_bundle(
     store: &mut BlockStore,
     root_id: &[u8; 32],
     content: crate::content::Content,
+    format: crate::BundleFormat,
     cache_hit: bool,
     reused_facts: bool,
 ) -> Result<u64> {
     let encoded_id = URL_SAFE_NO_PAD.encode(root_id);
-    let mut traversal = BundleTraversal::new(content, root_id).await?;
+    let mut traversal = BundleTraversal::new(content, root_id, format).await?;
     let mut occurrences = 0;
     let mut verification_time = Duration::ZERO;
     let mut persistence_time = Duration::ZERO;
@@ -1233,12 +1202,14 @@ async fn persist_bundle(
         let started = Instant::now();
         let mut objects = Vec::with_capacity(256);
         let mut locations = Vec::with_capacity(256);
+        let mut metadata_bytes = 0usize;
         let mut complete = false;
-        while locations.len() < 256 {
+        while locations.len() < 256 && metadata_bytes < crate::MAX_JSON_BYTES {
             let Some((object, location)) = traversal.next().await? else {
                 complete = true;
                 break;
             };
+            metadata_bytes = metadata_bytes.saturating_add(object.heap_bytes());
             objects.push(object);
             locations.push(location);
         }
@@ -1266,9 +1237,8 @@ async fn persist_bundle(
 struct BundleFrame {
     items: BundleItems,
     id: [u8; 32],
-    item_offset: Option<u128>,
-    payload_offset: u128,
-    framing_checked: bool,
+    path: Vec<u128>,
+    pending: Option<crate::BundleEntry>,
 }
 
 struct BundleTraversal {
@@ -1276,67 +1246,64 @@ struct BundleTraversal {
 }
 
 impl BundleTraversal {
-    async fn new(root: crate::content::Content, root_id: &[u8; 32]) -> Result<Self> {
+    async fn new(
+        root: crate::content::Content,
+        root_id: &[u8; 32],
+        format: crate::BundleFormat,
+    ) -> Result<Self> {
         Ok(Self {
             stack: vec![BundleFrame {
-                items: BundleItems::new(root).await?,
+                items: BundleItems::checked(root, format).await?,
                 id: *root_id,
-                item_offset: None,
-                payload_offset: 0,
-                framing_checked: false,
+                path: Vec::new(),
+                pending: None,
             }],
         })
     }
 
     async fn next(&mut self) -> Result<Option<(ObjectMetadata, BundleLocation)>> {
         while let Some(parent) = self.stack.last_mut() {
-            if !parent.framing_checked {
-                let mut table = BundleItems::new(parent.items.bundle.clone()).await?;
-                let mut checked = 0;
-                while table.next().await?.is_some() {
-                    checked += 1;
-                    if checked % 256 == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                }
-                parent.framing_checked = true;
-            }
             tokio::task::yield_now().await;
-            let Some(entry) = parent.items.next().await? else {
+            let entry = match parent.pending.take() {
+                Some(entry) => Some(entry),
+                None => parent.items.next().await?,
+            };
+            let Some(entry) = entry else {
                 self.stack.pop();
                 continue;
             };
-            let item_size = entry.bytes.len() as u128;
-            let item = verify_data_item(entry.bytes, &entry.id).await?;
-            let root_offset = parent
-                .payload_offset
-                .checked_add(entry.offset as u128)
-                .context("bundle root offset overflow")?;
-            let location = BundleLocation {
-                id: entry.id.to_vec(),
-                parent_id: parent.id.to_vec(),
-                parent_offset: parent.item_offset,
-                item_offset: entry.offset as u128,
-                item_size,
-                data_offset: item.data_offset as u128,
-                root_offset,
+            let Some(id) = entry.id().copied() else {
+                continue;
             };
-            let metadata = item.metadata(&entry.id);
-            if item.is_bundle() {
-                let items = BundleItems::new(item.data).await?;
-                if items.remaining > 0 {
+            let offset = entry.offset() as u128;
+            let json = entry.is_json();
+            let Some(item) = entry.verify(None).await? else {
+                continue;
+            };
+            let mut path = parent.path.clone();
+            path.push(offset);
+            let location = BundleLocation {
+                id: id.to_vec(),
+                parent_id: parent.id.to_vec(),
+                path: path.clone(),
+                item_offset: offset,
+                item_size: item.item_size as u128,
+                data_offset: item.data_offset as u128,
+                json,
+            };
+            let metadata = item.metadata(&id);
+            if let Some(format) = item.bundle_format() {
+                let mut items = BundleItems::checked(item.data, format).await?;
+                if let Some(first) = items.next().await? {
                     ensure!(
                         self.stack.len() < MAX_BUNDLE_DEPTH,
                         "nested bundle exceeds maximum depth {MAX_BUNDLE_DEPTH}"
                     );
                     self.stack.push(BundleFrame {
                         items,
-                        id: entry.id,
-                        item_offset: Some(root_offset),
-                        payload_offset: root_offset
-                            .checked_add(item.data_offset as u128)
-                            .context("nested bundle payload offset overflow")?,
-                        framing_checked: false,
+                        id,
+                        path,
+                        pending: Some(first),
                     });
                 }
             }
@@ -1359,6 +1326,274 @@ mod bundle_tests {
         &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
 
     #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; fixture rows are removed after the check"]
+    async fn json_bundle_database_roundtrip_preserves_existing_rows() -> Result<()> {
+        use futures_util::FutureExt;
+        let url = std::env::var("DATABASE_URL")?;
+        let mut store = BlockStore::connect(&url).await?;
+        let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let database: String = client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let bytes = include_bytes!("../tests/fixtures/json-binary-nested.json").to_vec();
+        let root_id = [0xa7; 32];
+        let mut traversal =
+            BundleTraversal::new(bytes.clone().into(), &root_id, crate::BundleFormat::Json).await?;
+        let mut objects = Vec::new();
+        let mut locations = Vec::new();
+        while let Some((object, location)) = traversal.next().await? {
+            objects.push(object);
+            locations.push(location);
+        }
+        let leaf_id = locations.last().context("missing fixture leaf")?.id.clone();
+        // Only the test's L1 membership is synthetic; child signatures are verified above.
+        let mut root = objects.first().context("missing fixture item")?.clone();
+        root.id = root_id.to_vec();
+        root.kind = 0;
+        root.format = Some(2);
+        root.quantity = Some("0".into());
+        root.reward = Some("0".into());
+        root.denomination = Some(0);
+        root.data_root = Some(vec![0; 32]);
+        root.data_size = bytes.len() as u128;
+        root.tags = vec![
+            (b"Bundle-Format".to_vec(), b"json".to_vec()),
+            (b"Bundle-Version".to_vec(), b"1.0.0".to_vec()),
+        ];
+        let mut ids: Vec<_> = objects.iter().map(|object| object.id.clone()).collect();
+        ids.push(root.id.clone());
+        ids.sort();
+        ids.dedup();
+        let occupied: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM public.objects WHERE id=ANY($1::bytea[]))",
+                &[&ids],
+            )
+            .await?
+            .get(0);
+        ensure!(
+            !occupied,
+            "JSON fixture IDs already exist; refusing to modify them"
+        );
+        let owner_ids: Vec<_> = objects
+            .iter()
+            .map(|object| object.owner_address.clone())
+            .collect();
+        let owners: Vec<(Vec<u8>, Option<Vec<u8>>)> = client
+            .query(
+                "SELECT address,public_key FROM public.owners WHERE address=ANY($1::bytea[])",
+                &[&owner_ids],
+            )
+            .await?
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let limits = client.query_one(
+            "SELECT coalesce((SELECT max(key) FROM public.tag_names),0), coalesce((SELECT max(key) FROM public.tag_values),0)", &[]
+        ).await?;
+        let name_limit: i64 = limits.get(0);
+        let value_limit: i64 = limits.get(1);
+        let counts = "SELECT ARRAY[
+            (SELECT count(*) FROM public.objects), (SELECT count(*) FROM public.owners),
+            (SELECT count(*) FROM public.tag_names), (SELECT count(*) FROM public.tag_values),
+            (SELECT count(*) FROM public.object_tags), (SELECT count(*) FROM public.item_locations),
+            (SELECT count(*) FROM public.bundle_progress), (SELECT count(*) FROM public.canonical_placements),
+            (SELECT count(*) FROM public.block_transactions)]";
+        let before: Vec<i64> = client.query_one(counts, &[]).await?.get(0);
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let block = client.query_one(
+                "SELECT c.height,c.block_hash FROM public.canonical_blocks c
+                 JOIN public.blocks b ON b.hash=c.block_hash AND b.timestamp IS NOT NULL
+                 JOIN public.block_index_state s ON s.singleton AND c.height>s.start_height AND c.height<=s.imported_through
+                 ORDER BY c.height LIMIT 1", &[]
+            ).await?;
+            let height: i64 = block.get(0);
+            let hash: Vec<u8> = block.get(1);
+            let position: i32 = client.query_one(
+                "SELECT coalesce(max(position),-1)+1 FROM public.block_transactions WHERE block_hash=$1", &[&hash]
+            ).await?.get(0);
+            store.record_objects(&[root]).await?;
+            let root_key: i64 = client.query_one("SELECT key FROM public.objects WHERE id=$1", &[&&root_id[..]]).await?.get(0);
+            client.execute(
+                "INSERT INTO public.block_transactions(block_hash,position,object_key) VALUES($1,$2,$3)", &[&hash,&position,&root_key]
+            ).await?;
+            client.execute(
+                "INSERT INTO public.canonical_placements(object_key,block_height,position,kind,id) VALUES($1,$2,$3,0,$4)",
+                &[&root_key,&height,&position,&&root_id[..]]
+            ).await?;
+            let mut cursor = root_id;
+            cursor[31] -= 1;
+            let discovered = store.pending_bundle_after(Some(&cursor), Some((height as u64, height as u64))).await?
+                .context("JSON root was not discovered")?;
+            ensure!(discovered.0 == root_id && discovered.2 == bytes.len() as u128, "wrong JSON discovery result");
+            store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
+            let indexed = store.bundle_location(&leaf_id).await?.context("JSON child has no indexed location")?;
+            let item = verify_indexed_bundle(bytes.clone().into(), crate::BundleFormat::Json, leaf_id.as_slice().try_into()?, &indexed, None).await?;
+            ensure!(item.data.read_all(1024).await?.as_ref() == b"JSON to binary nested payload", "indexed JSON child payload differs");
+            let written: Vec<i64> = client.query_one(counts, &[]).await?.get(0);
+            store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
+            ensure!(client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == written, "bundle replay added rows");
+            ensure!(store.bundle_complete(&root_id).await?, "JSON root was not completed");
+            ensure!(store.pending_bundle_after(Some(&cursor), Some((height as u64, height as u64))).await?
+                .is_none_or(|candidate| candidate.0 != root_id), "completed JSON root was rediscovered");
+            let mut corrupt = locations.clone();
+            corrupt[0].json = false;
+            ensure!(store.commit_bundle_batch(&root_id, &objects, &corrupt, true).await.is_err(), "conflicting JSON encoding was accepted");
+            ensure!(client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == written, "rejected bundle write changed rows");
+            Ok::<_, anyhow::Error>(())
+        }).catch_unwind().await;
+
+        let cleanup = client.transaction().await?;
+        let fixture_keys: Vec<i64> = cleanup
+            .query(
+                "SELECT key FROM public.objects WHERE id=ANY($1::bytea[])",
+                &[&ids],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let new_names: Vec<i64> = cleanup.query(
+            "SELECT DISTINCT name_key FROM public.object_tags WHERE object_key=ANY($1::bigint[]) AND name_key>$2",
+            &[&fixture_keys,&name_limit]
+        ).await?.into_iter().map(|row| row.get(0)).collect();
+        let new_values: Vec<i64> = cleanup.query(
+            "SELECT DISTINCT value_key FROM public.object_tags WHERE object_key=ANY($1::bigint[]) AND value_key>$2",
+            &[&fixture_keys,&value_limit]
+        ).await?.into_iter().map(|row| row.get(0)).collect();
+        cleanup
+            .execute(
+                "DELETE FROM public.canonical_placements WHERE object_key=ANY($1::bigint[])",
+                &[&fixture_keys],
+            )
+            .await?;
+        cleanup
+            .execute(
+                "DELETE FROM public.item_locations WHERE root_key=ANY($1::bigint[])",
+                &[&fixture_keys],
+            )
+            .await?;
+        cleanup
+            .execute(
+                "DELETE FROM public.bundle_progress WHERE root_key=ANY($1::bigint[])",
+                &[&fixture_keys],
+            )
+            .await?;
+        cleanup
+            .execute(
+                "DELETE FROM public.block_transactions WHERE object_key=ANY($1::bigint[])",
+                &[&fixture_keys],
+            )
+            .await?;
+        cleanup
+            .execute(
+                "DELETE FROM public.object_tags WHERE object_key=ANY($1::bigint[])",
+                &[&fixture_keys],
+            )
+            .await?;
+        cleanup
+            .execute(
+                "DELETE FROM public.objects WHERE key=ANY($1::bigint[])",
+                &[&fixture_keys],
+            )
+            .await?;
+        let new_owners: Vec<_> = owner_ids
+            .into_iter()
+            .filter(|id| !owners.iter().any(|(old, _)| old == id))
+            .collect();
+        cleanup.execute(
+            "DELETE FROM public.owners o WHERE address=ANY($1::bytea[]) AND NOT EXISTS(SELECT 1 FROM public.objects WHERE owner_address=o.address)",
+            &[&new_owners]
+        ).await?;
+        for (address, key) in owners {
+            cleanup
+                .execute(
+                    "UPDATE public.owners SET public_key=$2 WHERE address=$1",
+                    &[&address, &key],
+                )
+                .await?;
+        }
+        cleanup.execute("DELETE FROM public.tag_names n WHERE key=ANY($1::bigint[]) AND NOT EXISTS(SELECT 1 FROM public.object_tags WHERE name_key=n.key)", &[&new_names]).await?;
+        cleanup.execute("DELETE FROM public.tag_values v WHERE key=ANY($1::bigint[]) AND NOT EXISTS(SELECT 1 FROM public.object_tags WHERE value_key=v.key)", &[&new_values]).await?;
+        cleanup.commit().await?;
+        ensure!(
+            client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == before,
+            "JSON fixture cleanup changed existing row counts"
+        );
+        match outcome {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_json_binary_paths_retrieve_decoded_children() -> Result<()> {
+        let json = include_bytes!("../tests/fixtures/json-binary-nested.json").to_vec();
+        let (wrapped, _) = signed_data_item(
+            &json,
+            &[(b"Bundle-Format", b"json"), (b"Bundle-Version", b"1.0.0")],
+        );
+        let binary = encode_bundle(&[&wrapped]);
+        let leaf_id =
+            crate::decode_fixed::<32>("YqXCTYOMTqoT6Ho8p7CFNATNVTcfOl85oisVImD0lkU", "fixture ID")?;
+        let expected = b"JSON to binary nested payload";
+        let root_id = [9; 32];
+        let mut config = crate::Config::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            vec!["http://127.0.0.1:1".into()],
+            Duration::from_secs(5),
+            1,
+            1024 * 1024,
+        )?;
+        config.max_memory_data_size = 1;
+        let gateway = Gateway::new(config)?;
+        for (bytes, format, depth) in [
+            (json, crate::BundleFormat::Json, 2),
+            (binary, crate::BundleFormat::Binary, 3),
+        ] {
+            let content = crate::tests::spooled_content(&bytes).await;
+            let mut traversal = BundleTraversal::new(content.clone(), &root_id, format).await?;
+            let mut locations = Vec::new();
+            while let Some((_, location)) = traversal.next().await? {
+                locations.push(location);
+            }
+            let last = locations.last().context("missing nested leaf")?;
+            assert_eq!(last.id, leaf_id);
+            let path = last.path.clone();
+            let mut indexed = IndexedBundle {
+                root_id: root_id.to_vec(),
+                data_size: expected.len() as u128,
+                content_type: None,
+                locations: locations
+                    .into_iter()
+                    .filter(|location| path.starts_with(&location.path))
+                    .collect(),
+            };
+            assert_eq!(indexed.locations.len(), depth);
+            let item =
+                verify_indexed_bundle(content.clone(), format, &leaf_id, &indexed, Some(&gateway))
+                    .await?;
+            assert_eq!(item.data.read_all(expected.len()).await?.as_ref(), expected);
+            assert_eq!(item.body_hash, crate::sha256(&[expected]));
+            assert!(!item.data.is_memory());
+            indexed.locations.last_mut().unwrap().path[0] += 1;
+            assert!(
+                verify_indexed_bundle(content, format, &leaf_id, &indexed, None)
+                    .await
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn nested_repeated_occurrences_authenticate_exact_stored_paths() {
         let root_id = [9; 32];
         let payload = vec![0xa5; 128 * 1024 + 17];
@@ -1368,9 +1603,10 @@ mod bundle_tests {
         let (nested, nested_id) = signed_data_item(&nested_data, BUNDLE_TAGS);
         let root = encode_bundle(&[&nested, &nested]);
         let root_content = crate::tests::spooled_content(&root).await;
-        let mut traversal = BundleTraversal::new(root_content.clone(), &root_id)
-            .await
-            .unwrap();
+        let mut traversal =
+            BundleTraversal::new(root_content.clone(), &root_id, crate::BundleFormat::Binary)
+                .await
+                .unwrap();
         let mut locations = Vec::new();
         while let Some((_, location)) = traversal.next().await.unwrap() {
             locations.push(location);
@@ -1385,11 +1621,11 @@ mod bundle_tests {
                 .map(|id| id.as_slice())
                 .collect::<Vec<_>>()
         );
-        let payload_start = nested.len() - nested_data.len();
         let second_parent = 160 + nested.len();
-        let second_leaf = second_parent + payload_start + 160 + leaf.len();
-        assert_eq!(locations[5].root_offset, second_leaf as u128);
-        assert_eq!(locations[5].parent_offset, Some(second_parent as u128));
+        assert_eq!(
+            locations[5].path,
+            vec![second_parent as u128, (160 + leaf.len()) as u128]
+        );
         let indexed = || IndexedBundle {
             root_id: root_id.to_vec(),
             data_size: data.len() as u128,
@@ -1397,9 +1633,15 @@ mod bundle_tests {
             locations: vec![locations[3].clone(), locations[5].clone()],
         };
         for content in [root.clone().into(), root_content] {
-            let verified = verify_indexed_bundle(content, &leaf_id, &indexed(), None)
-                .await
-                .unwrap();
+            let verified = verify_indexed_bundle(
+                content,
+                crate::BundleFormat::Binary,
+                &leaf_id,
+                &indexed(),
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 verified.data.read_all(data.len()).await.unwrap().as_ref(),
                 data
@@ -1411,8 +1653,8 @@ mod bundle_tests {
             let location = &mut hint.locations[1];
             match field {
                 0 => location.item_offset += 1,
-                1 => location.root_offset += 1,
-                2 => location.parent_offset = Some(0),
+                1 => *location.path.last_mut().unwrap() += 1,
+                2 => location.path[0] = 0,
                 3 => location.data_offset += 1,
                 4 => location.item_size += 1,
                 5 => location.parent_id[0] ^= 1,
@@ -1421,31 +1663,55 @@ mod bundle_tests {
                 _ => unreachable!(),
             }
             assert!(
-                verify_indexed_bundle(root.clone().into(), &leaf_id, &hint, None)
-                    .await
-                    .is_err()
+                verify_indexed_bundle(
+                    root.clone().into(),
+                    crate::BundleFormat::Binary,
+                    &leaf_id,
+                    &hint,
+                    None
+                )
+                .await
+                .is_err()
             );
         }
         let mut missing_ancestor = indexed();
         missing_ancestor.locations.remove(0);
         assert!(
-            verify_indexed_bundle(root.clone().into(), &leaf_id, &missing_ancestor, None)
-                .await
-                .is_err()
+            verify_indexed_bundle(
+                root.clone().into(),
+                crate::BundleFormat::Binary,
+                &leaf_id,
+                &missing_ancestor,
+                None
+            )
+            .await
+            .is_err()
         );
         let mut corrupt_parent = root.clone();
         corrupt_parent[second_parent + 2] ^= 1;
         assert!(
-            verify_indexed_bundle(corrupt_parent.into(), &leaf_id, &indexed(), None)
-                .await
-                .is_err()
+            verify_indexed_bundle(
+                corrupt_parent.into(),
+                crate::BundleFormat::Binary,
+                &leaf_id,
+                &indexed(),
+                None
+            )
+            .await
+            .is_err()
         );
         let mut corrupt_table = root.clone();
         corrupt_table[96] ^= 1;
         assert!(
-            verify_indexed_bundle(corrupt_table.into(), &leaf_id, &indexed(), None)
-                .await
-                .is_err()
+            verify_indexed_bundle(
+                corrupt_table.into(),
+                crate::BundleFormat::Binary,
+                &leaf_id,
+                &indexed(),
+                None
+            )
+            .await
+            .is_err()
         );
 
         let mut corrupt_leaf = leaf.clone();
@@ -1454,6 +1720,7 @@ mod bundle_tests {
         assert_eq!(
             verify_bundle_item(
                 repeated.clone().into(),
+                crate::BundleFormat::Binary,
                 &leaf_id,
                 Some((160 + leaf.len()) as u128),
                 None,
@@ -1469,9 +1736,15 @@ mod bundle_tests {
             data
         );
         assert!(
-            verify_bundle_item(repeated.into(), &leaf_id, None, None)
-                .await
-                .is_err()
+            verify_bundle_item(
+                repeated.into(),
+                crate::BundleFormat::Binary,
+                &leaf_id,
+                None,
+                None
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -1483,18 +1756,23 @@ mod bundle_tests {
         let mut items = vec![leaf.as_slice(); 256];
         items.push(&corrupt);
         let root = encode_bundle(&items);
-        let mut first = BundleTraversal::new(root.clone().into(), &[9; 32])
-            .await
-            .unwrap();
-        let mut replay = BundleTraversal::new(crate::tests::spooled_content(&root).await, &[9; 32])
-            .await
-            .unwrap();
+        let mut first =
+            BundleTraversal::new(root.clone().into(), &[9; 32], crate::BundleFormat::Binary)
+                .await
+                .unwrap();
+        let mut replay = BundleTraversal::new(
+            crate::tests::spooled_content(&root).await,
+            &[9; 32],
+            crate::BundleFormat::Binary,
+        )
+        .await
+        .unwrap();
         for index in 0..256 {
             let original = first.next().await.unwrap().unwrap();
             assert_eq!(original, replay.next().await.unwrap().unwrap());
             assert_eq!(
-                original.1.root_offset,
-                (32 + 257 * 64 + index * leaf.len()) as u128
+                original.1.path,
+                vec![(32 + 257 * 64 + index * leaf.len()) as u128]
             );
         }
         assert!(first.next().await.is_err());
@@ -1510,8 +1788,11 @@ mod bundle_tests {
             root.clone().into(),
             crate::tests::spooled_content(&root).await,
         ] {
-            let mut traversal = BundleTraversal::new(content, &[9; 32]).await.unwrap();
-            assert!(traversal.next().await.is_err());
+            assert!(
+                BundleTraversal::new(content, &[9; 32], crate::BundleFormat::Binary)
+                    .await
+                    .is_err()
+            );
         }
     }
 
@@ -1519,7 +1800,7 @@ mod bundle_tests {
     async fn traversal_accepts_empty_bundles_and_enforces_table_and_depth_bounds() {
         let empty = encode_bundle(&[]);
         assert!(
-            BundleTraversal::new(empty.clone().into(), &[9; 32])
+            BundleTraversal::new(empty.clone().into(), &[9; 32], crate::BundleFormat::Binary)
                 .await
                 .unwrap()
                 .next()
@@ -1530,14 +1811,14 @@ mod bundle_tests {
         let mut trailing = empty.clone();
         trailing.push(0);
         assert!(
-            BundleTraversal::new(trailing.into(), &[9; 32])
+            BundleTraversal::new(trailing.into(), &[9; 32], crate::BundleFormat::Binary)
                 .await
                 .is_err()
         );
         let mut oversized = empty;
         oversized[31] = 1;
         assert!(
-            BundleTraversal::new(oversized.into(), &[9; 32])
+            BundleTraversal::new(oversized.into(), &[9; 32], crate::BundleFormat::Binary)
                 .await
                 .is_err()
         );
@@ -1548,18 +1829,20 @@ mod bundle_tests {
             let (parent, _) = signed_data_item(&root, BUNDLE_TAGS);
             root = encode_bundle(&[&parent]);
         }
-        let mut traversal = BundleTraversal::new(root.clone().into(), &[9; 32])
-            .await
-            .unwrap();
+        let mut traversal =
+            BundleTraversal::new(root.clone().into(), &[9; 32], crate::BundleFormat::Binary)
+                .await
+                .unwrap();
         for _ in 0..MAX_BUNDLE_DEPTH {
             assert!(traversal.next().await.unwrap().is_some());
         }
         assert!(traversal.next().await.unwrap().is_none());
         let (parent, _) = signed_data_item(&root, BUNDLE_TAGS);
         let too_deep = encode_bundle(&[&parent]);
-        let mut traversal = BundleTraversal::new(too_deep.into(), &[9; 32])
-            .await
-            .unwrap();
+        let mut traversal =
+            BundleTraversal::new(too_deep.into(), &[9; 32], crate::BundleFormat::Binary)
+                .await
+                .unwrap();
         for _ in 1..MAX_BUNDLE_DEPTH {
             traversal.next().await.unwrap().unwrap();
         }

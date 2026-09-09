@@ -4,6 +4,7 @@ pub mod database;
 mod disk_cache;
 mod historical;
 pub mod indexer;
+mod json_bundle;
 mod peers;
 pub mod server;
 mod streaming;
@@ -1226,14 +1227,20 @@ impl Gateway {
                 &root.tags,
             ),
         };
-        require_bundle_tags(tags)?;
+        let format = require_bundle_tags(tags)?;
         let item = match &hint {
             BundleHint::Indexed(indexed) => {
-                verify_indexed_bundle(parent_bytes.clone(), &expected_id, indexed, Some(self))
-                    .await?
+                verify_indexed_bundle(
+                    parent_bytes.clone(),
+                    format,
+                    &expected_id,
+                    indexed,
+                    Some(self),
+                )
+                .await?
             }
             BundleHint::External { .. } => {
-                verify_bundle_item(parent_bytes.clone(), &expected_id, None, Some(self))
+                verify_bundle_item(parent_bytes.clone(), format, &expected_id, None, Some(self))
                     .await?
                     .0
             }
@@ -2914,23 +2921,50 @@ fn response_content_encoding(value: Option<String>) -> Result<Option<String>> {
     Ok(value)
 }
 
-fn require_bundle_tags(tags: &[Tag]) -> Result<()> {
-    let mut format = false;
-    let mut version = false;
-    for tag in tags {
-        let name = decode_b64(&tag.name, "tag name")?;
-        let value = decode_b64(&tag.value, "tag value")?;
-        format |= name == b"Bundle-Format" && value == b"binary";
-        version |= name == b"Bundle-Version" && value == b"2.0.0";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BundleFormat {
+    Binary,
+    Json,
+}
+
+impl BundleFormat {
+    fn from_pairs<'a>(tags: impl Iterator<Item = (&'a [u8], &'a [u8])>) -> Result<Self> {
+        let (mut binary, mut json, mut v1, mut v2) = (false, false, false, false);
+        for (name, value) in tags {
+            binary |= name == b"Bundle-Format" && value == b"binary";
+            json |= name == b"Bundle-Format" && value == b"json";
+            v1 |= name == b"Bundle-Version" && value == b"1.0.0";
+            v2 |= name == b"Bundle-Version" && value == b"2.0.0";
+        }
+        match (binary && v2, json && v1) {
+            (true, false) => Ok(Self::Binary),
+            (false, true) => Ok(Self::Json),
+            _ => bail!("unsupported or ambiguous bundle format/version"),
+        }
     }
-    ensure!(format, "parent is missing Bundle-Format: binary");
-    ensure!(version, "parent is missing Bundle-Version: 2.0.0");
-    Ok(())
+}
+
+fn require_bundle_tags(tags: &[Tag]) -> Result<BundleFormat> {
+    let decoded = tags
+        .iter()
+        .map(|tag| {
+            Ok((
+                decode_b64(&tag.name, "tag name")?,
+                decode_b64(&tag.value, "tag value")?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    BundleFormat::from_pairs(
+        decoded
+            .iter()
+            .map(|(name, value)| (name.as_slice(), value.as_slice())),
+    )
 }
 
 struct VerifiedItem {
     data: content::Content,
     data_offset: usize,
+    item_size: usize,
     body_hash: [u8; 32],
     signature_type: u16,
     signature: axum::body::Bytes,
@@ -2950,14 +2984,13 @@ impl VerifiedItem {
         )
     }
 
-    fn is_bundle(&self) -> bool {
-        self.tags
-            .iter()
-            .any(|tag| tag.name.as_ref() == b"Bundle-Format" && tag.value.as_ref() == b"binary")
-            && self
-                .tags
+    fn bundle_format(&self) -> Option<BundleFormat> {
+        BundleFormat::from_pairs(
+            self.tags
                 .iter()
-                .any(|tag| tag.name.as_ref() == b"Bundle-Version" && tag.value.as_ref() == b"2.0.0")
+                .map(|tag| (tag.name.as_ref(), tag.value.as_ref())),
+        )
+        .ok()
     }
 
     fn metadata(&self, id: &[u8; 32]) -> database::ObjectMetadata {
@@ -2993,13 +3026,122 @@ struct ItemTag {
     value: axum::body::Bytes,
 }
 
-struct BundleEntry {
-    id: [u8; 32],
-    bytes: content::Content,
-    offset: usize,
+enum BundleEntry {
+    Binary {
+        id: [u8; 32],
+        bytes: content::Content,
+        offset: usize,
+    },
+    Json(json_bundle::JsonEntry),
 }
 
-struct BundleItems {
+impl BundleEntry {
+    fn id(&self) -> Option<&[u8; 32]> {
+        match self {
+            Self::Binary { id, .. } => Some(id),
+            Self::Json(entry) => entry.id.as_ref(),
+        }
+    }
+
+    fn offset(&self) -> usize {
+        match self {
+            Self::Binary { offset, .. } => *offset,
+            Self::Json(entry) => entry.offset,
+        }
+    }
+
+    fn is_json(&self) -> bool {
+        matches!(self, Self::Json(_))
+    }
+
+    async fn verify(self, materialize: Option<&Gateway>) -> Result<Option<VerifiedItem>> {
+        match self {
+            Self::Binary { id, mut bytes, .. } => {
+                if let Some(gateway) = materialize {
+                    ensure!(
+                        bytes.len()
+                            <= gateway
+                                .config
+                                .max_data_size
+                                .saturating_add(MAX_DATA_ITEM_HEADER_BYTES),
+                        "data item exceeds configured data size limit"
+                    );
+                    bytes = bytes
+                        .materialize(
+                            gateway.config.max_memory_data_size,
+                            Arc::clone(&gateway.spool_budget),
+                        )
+                        .await?
+                        .0;
+                }
+                Ok(Some(verify_data_item(bytes, &id).await?))
+            }
+            Self::Json(entry) => {
+                if let Some(gateway) = materialize {
+                    ensure!(
+                        entry.size
+                            <= gateway
+                                .config
+                                .max_data_size
+                                .saturating_mul(8)
+                                .saturating_add(MAX_JSON_BYTES),
+                        "JSON item exceeds configured data size limit"
+                    );
+                }
+                let Some(mut item) = entry.verify().await? else {
+                    return Ok(None);
+                };
+                if let Some(gateway) = materialize {
+                    checked_data_size(item.data.len() as u128, gateway.config.max_data_size)?;
+                    item.data = item
+                        .data
+                        .materialize(
+                            gateway.config.max_memory_data_size,
+                            Arc::clone(&gateway.spool_budget),
+                        )
+                        .await?
+                        .0;
+                }
+                Ok(Some(item))
+            }
+        }
+    }
+}
+
+enum BundleItems {
+    Binary(BinaryBundleItems),
+    Json(json_bundle::JsonBundle),
+}
+
+impl BundleItems {
+    async fn new(bundle: content::Content, format: BundleFormat) -> Result<Self> {
+        match format {
+            BundleFormat::Binary => Ok(Self::Binary(BinaryBundleItems::new(bundle).await?)),
+            BundleFormat::Json => Ok(Self::Json(json_bundle::JsonBundle::new(bundle).await?)),
+        }
+    }
+
+    async fn checked(bundle: content::Content, format: BundleFormat) -> Result<Self> {
+        let mut framing = Self::new(bundle.clone(), format).await?;
+        let mut count = 0;
+        while framing.next().await?.is_some() {
+            count += 1;
+            if count % 256 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        Self::new(bundle, format).await
+    }
+
+    async fn next(&mut self) -> Result<Option<BundleEntry>> {
+        match self {
+            Self::Binary(items) => items.next().await,
+            Self::Json(items) => Ok(items.next().await?.map(BundleEntry::Json)),
+        }
+    }
+}
+
+struct BinaryBundleItems {
     bundle: content::Content,
     remaining: usize,
     cursor: usize,
@@ -3007,7 +3149,7 @@ struct BundleItems {
     table: axum::body::Bytes,
 }
 
-impl BundleItems {
+impl BinaryBundleItems {
     async fn new(bundle: content::Content) -> Result<Self> {
         let header = bundle
             .read_at(0, 32)
@@ -3065,7 +3207,7 @@ impl BundleItems {
                 "bundle item sizes do not consume the parent"
             );
         }
-        let entry = BundleEntry {
+        let entry = BundleEntry::Binary {
             id,
             bytes: self.bundle.slice(self.item_start..end)?,
             offset: self.item_start,
@@ -3077,53 +3219,34 @@ impl BundleItems {
 
 async fn verify_bundle_item(
     bundle: content::Content,
+    format: BundleFormat,
     expected_id: &[u8; 32],
     expected_offset: Option<u128>,
     materialize: Option<&Gateway>,
 ) -> Result<(VerifiedItem, usize)> {
-    let mut entries = BundleItems::new(bundle).await?;
+    let mut entries = BundleItems::new(bundle, format).await?;
     let mut found = None;
     let mut scanned = 0;
     while let Some(entry) = entries.next().await? {
-        if &entry.id == expected_id
-            && expected_offset.is_none_or(|offset| offset == entry.offset as u128)
+        let offset = entry.offset();
+        if entry.id() == Some(expected_id)
+            && expected_offset.is_none_or(|expected| expected == offset as u128)
             && found.is_none()
         {
-            // Repeated IDs are distinct occurrences; absent an offset, use the first.
-            found = Some(entry);
+            // Invalid JSON occurrences do not hide a later valid copy of the same ID.
+            found = entry.verify(materialize).await?.map(|item| (item, offset));
         }
         scanned += 1;
         if scanned % 256 == 0 {
             tokio::task::yield_now().await;
         }
     }
-    let entry = found.context("data item is absent from verified parent at the expected offset")?;
-    let bytes = match materialize {
-        Some(gateway) => {
-            ensure!(
-                entry.bytes.len()
-                    <= gateway
-                        .config
-                        .max_data_size
-                        .saturating_add(MAX_DATA_ITEM_HEADER_BYTES),
-                "data item exceeds configured data size limit"
-            );
-            entry
-                .bytes
-                .materialize(
-                    gateway.config.max_memory_data_size,
-                    Arc::clone(&gateway.spool_budget),
-                )
-                .await?
-                .0
-        }
-        None => entry.bytes,
-    };
-    Ok((verify_data_item(bytes, expected_id).await?, entry.offset))
+    found.context("valid data item is absent from verified parent at the expected offset")
 }
 
 async fn verify_indexed_bundle(
     root: content::Content,
+    mut format: BundleFormat,
     expected_id: &[u8; 32],
     indexed: &database::IndexedBundle,
     materialize: Option<&Gateway>,
@@ -3134,12 +3257,11 @@ async fn verify_indexed_bundle(
     );
     let mut parent = root;
     let mut parent_id = indexed.root_id.as_slice();
-    let mut parent_offset = None;
-    let mut payload_offset = 0u128;
+    let mut path = Vec::with_capacity(indexed.locations.len());
     for (depth, location) in indexed.locations.iter().enumerate() {
         ensure!(
-            location.parent_id == parent_id && location.parent_offset == parent_offset,
-            "indexed bundle parent does not match authenticated path"
+            location.parent_id == parent_id && location.json == (format == BundleFormat::Json),
+            "indexed bundle parent or format does not match authenticated path"
         );
         let id = location
             .id
@@ -3148,19 +3270,18 @@ async fn verify_indexed_bundle(
             .context("invalid indexed item ID")?;
         let (item, offset) = verify_bundle_item(
             parent,
+            format,
             id,
             Some(location.item_offset),
             materialize.filter(|_| depth + 1 == indexed.locations.len()),
         )
         .await?;
-        let root_offset = payload_offset
-            .checked_add(offset as u128)
-            .context("indexed root offset overflow")?;
+        path.push(offset as u128);
         ensure!(
-            location.root_offset == root_offset
+            location.path == path
                 && location.data_offset == item.data_offset as u128
-                && location.item_size == (item.data_offset + item.data.len()) as u128,
-            "indexed bundle offsets or size do not match authenticated item"
+                && location.item_size == item.item_size as u128,
+            "indexed bundle path, offsets or size do not match authenticated item"
         );
         if depth + 1 == indexed.locations.len() {
             ensure!(id == expected_id, "indexed path ends at a different item");
@@ -3170,16 +3291,11 @@ async fn verify_indexed_bundle(
             );
             return Ok(item);
         }
-        ensure!(
-            item.is_bundle(),
-            "indexed ancestor is not an ANS-104 bundle"
-        );
+        format = item
+            .bundle_format()
+            .context("indexed ancestor is not a supported bundle")?;
         parent = item.data;
         parent_id = &location.id;
-        parent_offset = Some(root_offset);
-        payload_offset = root_offset
-            .checked_add(item.data_offset as u128)
-            .context("indexed payload offset overflow")?;
         tokio::task::yield_now().await;
     }
     bail!("indexed bundle path is empty")
@@ -3219,6 +3335,7 @@ fn data_item_signature_payload(
 }
 
 async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Result<VerifiedItem> {
+    let item_size = item.len();
     let header = item
         .read_at(0, item.len().min(MAX_DATA_ITEM_HEADER_BYTES))
         .await?;
@@ -3293,6 +3410,7 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
     Ok(VerifiedItem {
         data,
         data_offset: cursor,
+        item_size,
         body_hash,
         signature_type,
         signature: signature_bytes,
@@ -4282,12 +4400,19 @@ mod tests {
         };
         let content =
             Content::streamed(streaming::ChunkSource::new(&gateway, geometry), bytes.len());
-        let (verified_parent, _) = verify_bundle_item(content, &parent_id, None, None)
-            .await
-            .unwrap();
-        let (verified_child, _) = verify_bundle_item(verified_parent.data, &child_id, None, None)
-            .await
-            .unwrap();
+        let (verified_parent, _) =
+            verify_bundle_item(content, crate::BundleFormat::Binary, &parent_id, None, None)
+                .await
+                .unwrap();
+        let (verified_child, _) = verify_bundle_item(
+            verified_parent.data,
+            crate::BundleFormat::Binary,
+            &child_id,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             verified_child
                 .data
@@ -4302,7 +4427,7 @@ mod tests {
         let content =
             Content::streamed(streaming::ChunkSource::new(&gateway, geometry), bytes.len());
         assert!(
-            verify_bundle_item(content, &parent_id, None, None)
+            verify_bundle_item(content, BundleFormat::Binary, &parent_id, None, None)
                 .await
                 .is_err()
         );
@@ -4415,7 +4540,10 @@ mod tests {
         assert_eq!(hashes, (sha256(&[&bytes]), sha384(&[&bytes])));
         let peak = requests.peak.load(Ordering::SeqCst);
         assert!((2..=8).contains(&peak), "peak in-flight requests: {peak}");
-        let (verified, _) = verify_bundle_item(fresh(), &id, None, None).await.unwrap();
+        let (verified, _) =
+            verify_bundle_item(fresh(), crate::BundleFormat::Binary, &id, None, None)
+                .await
+                .unwrap();
         let mut reader = verified.data.reader().await.unwrap();
         let mut actual = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut actual)
@@ -4423,7 +4551,11 @@ mod tests {
             .unwrap();
         assert_eq!(actual, payload);
         requests.fault.store(1, Ordering::SeqCst);
-        assert!(verify_bundle_item(fresh(), &id, None, None).await.is_err());
+        assert!(
+            verify_bundle_item(fresh(), BundleFormat::Binary, &id, None, None)
+                .await
+                .is_err()
+        );
         requests.fault.store(2, Ordering::SeqCst);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), fresh().hashes())
@@ -5484,39 +5616,63 @@ mod tests {
         bundle.extend_from_slice(&expected_id);
         bundle.extend_from_slice(item);
         assert_eq!(
-            verify_bundle_item(bundle.clone().into(), &expected_id, None, None)
-                .await
-                .unwrap()
-                .0
-                .data
-                .read_all(2_982)
-                .await
-                .unwrap(),
+            verify_bundle_item(
+                bundle.clone().into(),
+                BundleFormat::Binary,
+                &expected_id,
+                None,
+                None
+            )
+            .await
+            .unwrap()
+            .0
+            .data
+            .read_all(2_982)
+            .await
+            .unwrap(),
             verified.data.read_all(2_982).await.unwrap()
         );
 
         let mut wrong_id = bundle.clone();
         wrong_id[64] ^= 1;
         assert!(
-            verify_bundle_item(wrong_id.into(), &expected_id, None, None)
-                .await
-                .is_err()
+            verify_bundle_item(
+                wrong_id.into(),
+                BundleFormat::Binary,
+                &expected_id,
+                None,
+                None
+            )
+            .await
+            .is_err()
         );
 
         let mut wrong_size = bundle.clone();
         wrong_size[32] ^= 1;
         assert!(
-            verify_bundle_item(wrong_size.into(), &expected_id, None, None)
-                .await
-                .is_err()
+            verify_bundle_item(
+                wrong_size.into(),
+                BundleFormat::Binary,
+                &expected_id,
+                None,
+                None
+            )
+            .await
+            .is_err()
         );
 
         let mut truncated = bundle;
         truncated.pop();
         assert!(
-            verify_bundle_item(truncated.into(), &expected_id, None, None)
-                .await
-                .is_err()
+            verify_bundle_item(
+                truncated.into(),
+                BundleFormat::Binary,
+                &expected_id,
+                None,
+                None
+            )
+            .await
+            .is_err()
         );
 
         let (signature_size, _) = data_item_signature_sizes(1).unwrap();
