@@ -335,18 +335,7 @@ pub async fn import_metadata(
             break;
         }
         let (sender, mut ready) = mpsc::channel(1);
-        let produce = async {
-            let headers = block_metadata(gateway, blocks).chunks(32);
-            tokio::pin!(headers);
-            while let Some(batch) = headers.next().await {
-                let failed = batch.iter().any(Result::is_err);
-                if sender.send(batch).await.is_err() || failed {
-                    break;
-                }
-            }
-            drop(sender);
-            Ok::<_, anyhow::Error>(())
-        };
+        let produce = queue_metadata(block_metadata(gateway, blocks), sender);
         let consume = async {
             while let Some(batch) = ready.recv().await {
                 let mut through = start;
@@ -406,17 +395,10 @@ async fn import_pending_transactions(
             break;
         }
         let (sender, mut ready) = mpsc::channel(1);
-        let produce = async {
-            let fetched = transaction_metadata(gateway, pending, &authenticated).chunks(32);
-            tokio::pin!(fetched);
-            while let Some(batch) = fetched.next().await {
-                let failed = batch.iter().any(Result::is_err);
-                if sender.send(batch).await.is_err() || failed {
-                    break;
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        };
+        let produce = queue_metadata(
+            transaction_metadata(gateway, pending, &authenticated),
+            sender,
+        );
         let consume = async {
             while let Some(batch) = ready.recv().await {
                 let batch_count = batch.len() as u64;
@@ -514,6 +496,21 @@ async fn import_pending_transactions(
     Ok(imported_transactions)
 }
 
+async fn queue_metadata<T>(
+    entries: impl futures_util::Stream<Item = Result<T>>,
+    sender: mpsc::Sender<Vec<Result<T>>>,
+) -> Result<()> {
+    let batches = entries.chunks(32);
+    tokio::pin!(batches);
+    while let Some(batch) = batches.next().await {
+        let failed = batch.iter().any(Result::is_err);
+        if sender.send(batch).await.is_err() || failed {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn transaction_metadata<'a>(
     gateway: &'a Gateway,
     pending: Vec<(Vec<u8>, u64)>,
@@ -579,6 +576,31 @@ fn block_metadata(
 
 #[cfg(test)]
 mod metadata_tests {
+    #[tokio::test]
+    async fn metadata_queue_flushes_partial_batch_and_terminates() {
+        let (sender, mut ready) = mpsc::channel(1);
+        let produce = queue_metadata(stream::iter((0..65).map(Ok)), sender);
+        let consume = async {
+            let mut received = Vec::new();
+            let mut sizes = Vec::new();
+            while let Some(batch) = ready.recv().await {
+                sizes.push(batch.len());
+                for entry in batch {
+                    received.push(entry?);
+                }
+            }
+            assert_eq!(sizes, [32, 32, 1]);
+            assert_eq!(received, (0..65).collect::<Vec<_>>());
+            Ok::<_, anyhow::Error>(())
+        };
+        timeout(Duration::from_secs(1), async {
+            tokio::try_join!(produce, consume)
+        })
+        .await
+        .expect("completed producer left its consumer waiting")
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn transaction_headers_overlap_reuse_verified_metadata_and_reject_corruption() {
         let fixture: Vec<serde_json::Value> = serde_json::from_str(include_str!(
