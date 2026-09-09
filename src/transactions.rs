@@ -846,7 +846,7 @@ mod tests {
         .unwrap();
         let (_, actual) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            gateway.verify_block_transactions(block(), first.clone(), 0),
+            gateway.verify_block_transactions(block(), vec![first.clone()], 0, None),
         )
         .await
         .expect("transaction fetches did not overlap")
@@ -856,14 +856,14 @@ mod tests {
         wrong_root.tx_root = URL_SAFE_NO_PAD.encode([0; 32]);
         assert!(
             gateway
-                .verify_block_transactions(wrong_root, first.clone(), 0)
+                .verify_block_transactions(wrong_root, vec![first.clone()], 0, None)
                 .await
                 .is_err()
         );
         mode.store(1, Ordering::Relaxed);
         assert!(
             gateway
-                .verify_block_transactions(block(), first.clone(), 0)
+                .verify_block_transactions(block(), vec![first.clone()], 0, None)
                 .await
                 .is_err()
         );
@@ -871,7 +871,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(50),
-                gateway.verify_block_transactions(block(), first, 0),
+                gateway.verify_block_transactions(block(), vec![first], 0, None),
             )
             .await
             .is_err()

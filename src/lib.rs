@@ -1530,8 +1530,9 @@ impl Gateway {
             (header, _) = self
                 .verify_block_transactions(
                     header,
-                    verified.metadata,
+                    vec![verified.metadata],
                     usize::MAX - remaining.load(Ordering::Relaxed),
+                    None,
                 )
                 .await?;
         }
@@ -1704,8 +1705,9 @@ impl Gateway {
     async fn verify_block_transactions(
         &self,
         block: BlockHeader,
-        first: database::ObjectMetadata,
+        mut objects: Vec<database::ObjectMetadata>,
         fetched_bytes: usize,
+        admission: Option<(&tokio::sync::Semaphore, &AtomicUsize)>,
     ) -> Result<(BlockHeader, Vec<database::ObjectMetadata>)> {
         ensure!(
             block.txs.len() <= MAX_BLOCK_TRANSACTIONS,
@@ -1716,21 +1718,35 @@ impl Gateway {
                 .checked_sub(fetched_bytes)
                 .context("block transactions exceed aggregate response limit")?,
         );
-        let mut objects = Vec::with_capacity(block.txs.len());
-        let first_id = URL_SAFE_NO_PAD.encode(&first.id);
+        let remaining = admission.map_or(&remaining, |(_, remaining)| remaining);
+        let known: HashSet<_> = objects
+            .iter()
+            .map(|object| URL_SAFE_NO_PAD.encode(&object.id))
+            .collect();
         ensure!(
-            block.txs.iter().any(|id| id == &first_id),
-            "transaction ID is absent from authenticated block"
+            known.len() == objects.len() && known.iter().all(|id| block.txs.contains(id)),
+            "transaction ID is absent from authenticated block or duplicated"
         );
-        objects.push(first);
+        objects.reserve(block.txs.len().saturating_sub(objects.len()));
         {
             let mut pending = block.txs.iter();
             let mut fetches = FuturesUnordered::new();
             loop {
                 while fetches.len() < 32 {
                     let Some(id) = pending.next() else { break };
-                    if id != &first_id {
-                        fetches.push(self.fetch_transaction(id, block.height, &remaining));
+                    if !known.contains(id) {
+                        fetches.push(async move {
+                            let _permit = match admission {
+                                Some((slots, _)) => Some(
+                                    slots
+                                        .acquire()
+                                        .await
+                                        .context("metadata fetch admission closed")?,
+                                ),
+                                None => None,
+                            };
+                            self.fetch_transaction(id, block.height, remaining).await
+                        });
                     }
                 }
                 let Some(result) = fetches.next().await else {

@@ -177,6 +177,20 @@ impl BlockStore {
         })
     }
 
+    pub(crate) async fn reconnect(&self) -> Result<Self> {
+        let (client, connection) = timeout(CONNECT_TIMEOUT, self.connection_config.connect(NoTls))
+            .await
+            .context("PostgreSQL connection timed out")??;
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(Self {
+            client,
+            driver,
+            connection_config: self.connection_config.clone(),
+        })
+    }
+
     pub(crate) async fn indexing_status(&self) -> Result<serde_json::Value> {
         let mut config = self.connection_config.clone();
         config.options(
@@ -2003,6 +2017,57 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[tokio::test]
+    #[ignore = "requires a completed range in ar_io_rust_test; read-only"]
+    async fn completed_metadata_import_terminates() -> Result<()> {
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store
+            .client
+            .batch_execute("SET default_transaction_read_only=on; SET statement_timeout='3s'")
+            .await?;
+        store
+            .connection_config
+            .options("-c default_transaction_read_only=on -c statement_timeout=3000");
+        let row = store.client.query_one(
+            "SELECT s.source, c.height FROM public.block_index_state s
+             JOIN public.canonical_blocks c ON c.height BETWEEN s.start_height AND s.imported_through
+             WHERE s.singleton AND c.metadata_complete AND NOT EXISTS (
+                 SELECT 1 FROM public.block_transactions bt
+                 JOIN public.objects o ON o.key=bt.object_key
+                 WHERE bt.block_hash=c.block_hash AND NOT o.metadata_complete
+             ) ORDER BY c.height LIMIT 1", &[],
+        ).await?;
+        let source: String = row.get(0);
+        let height = u64::try_from(row.get::<_, i64>(1))?;
+        let gateway = crate::Gateway::new(crate::Config::new(
+            &source,
+            &source,
+            vec![source.clone()],
+            Duration::from_secs(3),
+            1,
+            1024 * 1024,
+        )?)?;
+        let result = timeout(
+            Duration::from_secs(5),
+            crate::indexer::import_metadata(&gateway, &mut store, height, height),
+        )
+        .await??;
+        ensure!(
+            result.imported_blocks == 0 && result.imported_transactions == 0,
+            "completed range was reimported"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires ar_io_rust_test; fixture changes are rolled back"]
