@@ -1413,8 +1413,8 @@ impl BlockStore {
                  SELECT DISTINCT ON (l.object_key) l.object_key, cb.height, bt.position, l.key
                  FROM public.item_locations l
                  JOIN public.block_transactions bt ON bt.object_key=l.root_key
-                 JOIN public.canonical_blocks cb ON cb.block_hash=bt.block_hash
-                 JOIN public.blocks b ON b.hash=cb.block_hash AND b.timestamp IS NOT NULL
+                 JOIN public.blocks b ON b.hash=bt.block_hash AND b.timestamp IS NOT NULL
+                 JOIN public.canonical_blocks cb ON cb.height=b.height AND cb.block_hash=b.hash
                  JOIN public.block_index_state s
                    ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
                  WHERE l.object_key=ANY($1::bigint[])
