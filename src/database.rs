@@ -39,6 +39,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "009_status_totals",
         include_str!("../migrations/009_status_totals.sql"),
     ),
+    (
+        "010_bundle_totals",
+        include_str!("../migrations/010_bundle_totals.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -69,6 +73,7 @@ const BUNDLE_TAGS: &str = "
             AND vv.value=convert_to(formats.version, 'UTF8')
     )";
 
+#[cfg(test)]
 const BUNDLE_CANDIDATES: &str = "
     , bundle_candidates AS MATERIALIZED (
         SELECT f.object_key, criteria.json FROM bundle_tags criteria
@@ -208,6 +213,19 @@ pub(crate) struct IndexedBundle {
     pub(crate) locations: Vec<BundleLocation>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct BundleCursor {
+    pub(crate) height: i64,
+    pub(crate) position: i32,
+    pub(crate) kind: i16,
+    pub(crate) id: Vec<u8>,
+}
+
+pub(crate) struct BundlePage {
+    pub(crate) roots: Vec<(Vec<u8>, u64, u128)>,
+    pub(crate) after: Option<BundleCursor>,
+}
+
 pub struct BlockStore {
     client: Client,
     driver: JoinHandle<()>,
@@ -294,32 +312,21 @@ impl BlockStore {
         self.status_query(Self::STATUS_PROGRESS).await
     }
 
+    const BUNDLE_TOTALS: &str = "
+        WITH totals AS (
+            SELECT coalesce(sum(t.roots) FILTER (WHERE t.height>s.start_height AND t.height<=s.imported_through),0) AS roots,
+                coalesce(sum(t.bytes) FILTER (WHERE t.height>s.start_height AND t.height<=s.imported_through),0) AS bytes,
+                coalesce(sum(t.completed) FILTER (WHERE t.height>s.start_height AND t.height<=s.imported_through),0) AS completed,
+                coalesce(sum(t.completed_bytes) FILTER (WHERE t.height>s.start_height AND t.height<=s.imported_through),0) AS completed_bytes,
+                coalesce(sum(t.nested),0) AS nested
+            FROM public.bundle_totals t LEFT JOIN public.block_index_state s ON s.singleton
+        )
+        SELECT json_build_object('discovered_roots',roots,'complete_roots',completed,
+            'pending_roots',roots-completed,'pending_bytes',(bytes-completed_bytes)::text,
+            'nested_bundles',nested)::text FROM totals";
+
     pub(crate) async fn indexing_totals(&self) -> Result<serde_json::Value> {
-        // Placements record verified canonical membership and cascade on reorg.
-        self.status_query(&format!(
-            "{BUNDLE_TAGS} {BUNDLE_CANDIDATES},
-             bundle_objects AS MATERIALIZED (SELECT DISTINCT object_key FROM bundle_candidates),
-             placed AS MATERIALIZED (
-                SELECT p.kind, p.block_height, o.data_size AS bytes,
-                    coalesce(bp.complete,false) AS complete
-                FROM bundle_objects k
-                JOIN public.objects o ON o.key=k.object_key AND o.metadata_complete
-                JOIN public.canonical_placements p ON p.object_key=o.key
-                LEFT JOIN public.bundle_progress bp ON bp.root_key=o.key
-             ), roots AS (
-                SELECT placed.bytes, placed.complete FROM placed
-                JOIN public.block_index_state s ON s.singleton
-                    AND placed.block_height>s.start_height AND placed.block_height<=s.imported_through
-                WHERE placed.kind=0
-             )
-             SELECT json_build_object(
-                'discovered_roots',count(*),
-                'complete_roots',count(*) FILTER (WHERE complete),
-                'pending_roots',count(*) FILTER (WHERE NOT complete),
-                'pending_bytes',coalesce(sum(bytes) FILTER (WHERE NOT complete),0)::text,
-                'nested_bundles',(SELECT count(*) FROM placed WHERE kind=1)
-             )::text FROM roots"
-        )).await
+        self.status_query(Self::BUNDLE_TOTALS).await
     }
 
     pub async fn migrate(&mut self) -> Result<()> {
@@ -385,17 +392,18 @@ impl BlockStore {
             .client
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
-                    WHERE version = 8 AND name = '008_json_bundles')
+                    WHERE version = 10 AND name = '010_bundle_totals')
                     AND to_regclass('public.bundle_progress') IS NOT NULL
                     AND to_regclass('public.item_locations') IS NOT NULL
-                    AND to_regclass('public.canonical_placements') IS NOT NULL",
+                    AND to_regclass('public.canonical_placements') IS NOT NULL
+                    AND to_regclass('public.bundle_totals') IS NOT NULL",
                 &[],
             )
             .await?
             .try_get(0)?;
         ensure!(
             installed,
-            "bundle indexing requires schema migration 008_json_bundles"
+            "bundle indexing requires schema migration 010_bundle_totals"
         );
         Ok(())
     }
@@ -1041,12 +1049,15 @@ impl BlockStore {
 
     pub(crate) async fn pending_bundles_after(
         &self,
-        after: Option<&[u8]>,
+        after: Option<&BundleCursor>,
         range: Option<(u64, u64)>,
-    ) -> Result<Vec<(Vec<u8>, u64, u128)>> {
+    ) -> Result<BundlePage> {
         ensure!(
-            after.is_none_or(|id| id.len() == 32),
-            "bundle cursor ID must be 32 bytes"
+            after.is_none_or(|c| c.id.len() == 32
+                && c.height >= 0
+                && c.position >= 0
+                && matches!(c.kind, 0 | 1)),
+            "invalid bundle scan cursor"
         );
         ensure!(
             range.is_none_or(|(start, end)| start <= end),
@@ -1054,45 +1065,64 @@ impl BlockStore {
         );
         let start = range.map(|(start, _)| sql_height(start)).transpose()?;
         let end = range.map(|(_, end)| sql_height(end)).transpose()?;
-        // Sort tag candidates before the parameterized canonical check.
-        self.client
-            .query(
-                &format!(
-                    "{BUNDLE_TAGS} {BUNDLE_CANDIDATES}, ordered AS MATERIALIZED (
-                        SELECT DISTINCT o.id, o.key, o.data_size, p.block_height, p.position
-                        FROM bundle_candidates candidates
-                        JOIN public.canonical_placements p ON p.object_key=candidates.object_key
-                        JOIN public.objects o ON o.key=p.object_key
-                        JOIN public.block_index_state s ON s.singleton
-                            AND p.block_height>s.start_height AND p.block_height<=s.imported_through
-                        LEFT JOIN public.bundle_progress progress ON progress.root_key=o.key
-                        WHERE p.kind=0 AND o.kind=0 AND o.metadata_complete
-                            AND NOT coalesce(progress.complete, false)
-                            AND ($1::bytea IS NULL OR o.id > $1)
-                            AND ($2::bigint IS NULL OR p.block_height BETWEEN $2 AND $3)
-                        ORDER BY o.id
-                    )
-                    SELECT id, block_height, data_size::text FROM ordered
-                    WHERE (SELECT true FROM public.canonical_blocks c
+        // Both the coverage bounds and cursor use placement_chronology before the scan limit.
+        let mut rows = self.client.query(
+            "WITH scanned AS MATERIALIZED (
+                SELECT p.object_key,p.block_height,p.position,p.kind,p.id
+                FROM public.block_index_state s JOIN public.canonical_placements p
+                    ON p.block_height>s.start_height AND p.block_height<=s.imported_through
+                WHERE s.singleton
+                    AND ($1::bigint IS NULL OR (p.block_height,p.position,p.kind,p.id)>($1,$2::integer,$3::smallint,$4::bytea))
+                    AND ($5::bigint IS NULL OR p.block_height BETWEEN $5 AND $6)
+                ORDER BY p.block_height,p.position,p.kind,p.id LIMIT 256
+            ), candidates AS MATERIALIZED (
+                SELECT p.id,p.block_height,p.position,p.kind,o.data_size::text AS data_size
+                FROM scanned p JOIN public.objects o ON o.key=p.object_key
+                WHERE p.kind=0 AND o.kind=0 AND o.metadata_complete AND o.is_bundle
+                    AND NOT EXISTS (SELECT 1 FROM public.bundle_progress bp WHERE bp.root_key=o.key AND bp.complete)
+                    AND (SELECT true FROM public.canonical_blocks c
                         JOIN public.blocks b ON b.hash=c.block_hash AND b.height=c.height
                         JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
-                        WHERE c.height=ordered.block_height AND bt.position=ordered.position
-                            AND bt.object_key=ordered.key AND b.timestamp IS NOT NULL
-                        LIMIT 1) IS TRUE
-                    ORDER BY id LIMIT 64"
-                ),
-                &[&after, &start, &end],
+                        WHERE c.height=p.block_height AND bt.position=p.position
+                            AND bt.object_key=o.key AND b.timestamp IS NOT NULL LIMIT 1) IS TRUE
+                ORDER BY p.block_height,p.position,p.kind,p.id LIMIT 64
             )
-            .await?
+            SELECT id,block_height,position,kind,data_size,false AS boundary FROM candidates
+            UNION ALL
+            SELECT coalesce(c.id,p.id),coalesce(c.block_height,p.block_height),
+                coalesce(c.position,p.position),coalesce(c.kind,p.kind),NULL,true
+            FROM (VALUES(0)) dummy(n)
+            LEFT JOIN LATERAL (SELECT * FROM scanned ORDER BY block_height DESC,position DESC,kind DESC,id DESC LIMIT 1) p ON true
+            LEFT JOIN LATERAL (SELECT * FROM candidates ORDER BY block_height,position,kind,id OFFSET 63 LIMIT 1) c ON true
+            ORDER BY boundary,block_height,position,kind,id",
+            &[&after.map(|c| c.height), &after.map(|c| c.position), &after.map(|c| c.kind),
+              &after.map(|c| c.id.as_slice()), &start, &end],
+        ).await?;
+        let boundary = rows
+            .pop()
+            .context("bundle discovery omitted its scan cursor")?;
+        let after = boundary
+            .try_get::<_, Option<Vec<u8>>>(0)?
+            .map(|id| {
+                Ok::<_, anyhow::Error>(BundleCursor {
+                    height: boundary.try_get(1)?,
+                    position: boundary.try_get(2)?,
+                    kind: boundary.try_get(3)?,
+                    id,
+                })
+            })
+            .transpose()?;
+        let roots = rows
             .into_iter()
             .map(|row| {
                 Ok((
                     row.try_get(0)?,
                     u64::try_from(row.try_get::<_, i64>(1)?)?,
-                    row.try_get::<_, String>(2)?.parse()?,
+                    row.try_get::<_, String>(4)?.parse()?,
                 ))
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        Ok(BundlePage { roots, after })
     }
 
     pub(crate) async fn bundle_status(
@@ -1528,6 +1558,13 @@ impl BlockStore {
             .build_transaction()
             .isolation_level(IsolationLevel::ReadCommitted)
             .start()
+            .await?;
+        // Keep canonical membership stable while metadata completion changes its counters.
+        transaction
+            .query_opt(
+                "SELECT singleton FROM public.block_index_state WHERE singleton FOR SHARE",
+                &[],
+            )
             .await?;
         Self::write_objects(&transaction, objects).await?;
         transaction.commit().await?;
@@ -2125,7 +2162,7 @@ mod tests {
     use std::time::Instant;
 
     #[tokio::test]
-    #[ignore = "requires schema 009 in ar_io_rust_test; all changes roll back"]
+    #[ignore = "requires schema 010 and a canonical bundle in ar_io_rust_test; all changes roll back"]
     async fn status_totals_follow_metadata_placement_and_reorg() -> Result<()> {
         async fn consistent(client: &impl tokio_postgres::GenericClient) -> Result<()> {
             let snapshot: serde_json::Value = serde_json::from_str(
@@ -2152,6 +2189,39 @@ mod tests {
                 ]) == serde_json::json!(expected),
                 "incremental status differs from canonical counts"
             );
+            let bundles: serde_json::Value = serde_json::from_str(
+                client
+                    .query_one(BlockStore::BUNDLE_TOTALS, &[])
+                    .await?
+                    .get(0),
+            )?;
+            let expected_bundles: serde_json::Value = serde_json::from_str(
+                client.query_one(&format!(
+                    "{BUNDLE_TAGS} {BUNDLE_CANDIDATES}, matched AS (
+                        SELECT DISTINCT object_key FROM bundle_candidates
+                    ), placed AS (
+                        SELECT p.kind,p.block_height,o.data_size,coalesce(bp.complete,false) AS complete
+                        FROM matched k JOIN public.objects o ON o.key=k.object_key AND o.metadata_complete
+                        JOIN public.canonical_placements p ON p.object_key=o.key
+                        LEFT JOIN public.bundle_progress bp ON bp.root_key=o.key
+                    ), classified AS (
+                        SELECT p.*,(p.kind=0 AND p.block_height>s.start_height
+                            AND p.block_height<=s.imported_through) AS root
+                        FROM placed p LEFT JOIN public.block_index_state s ON s.singleton
+                    )
+                    SELECT json_build_object(
+                        'discovered_roots',count(*) FILTER (WHERE root),
+                        'complete_roots',count(*) FILTER (WHERE root AND complete),
+                        'pending_roots',count(*) FILTER (WHERE root AND NOT complete),
+                        'pending_bytes',coalesce(sum(data_size) FILTER (WHERE root AND NOT complete),0)::text,
+                        'nested_bundles',count(*) FILTER (WHERE kind=1)
+                    )::text FROM classified"
+                ), &[]).await?.get(0)
+            )?;
+            ensure!(
+                bundles == expected_bundles,
+                "bundle counters differ from canonical tagged objects"
+            );
             Ok(())
         }
         let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
@@ -2171,7 +2241,7 @@ mod tests {
                 "SELECT p.object_key,p.block_height FROM public.canonical_placements p
              JOIN public.objects o ON o.key=p.object_key
              JOIN public.block_index_state s ON s.singleton
-             WHERE p.kind=0 AND o.metadata_complete AND p.block_height<>s.imported_through
+             WHERE p.kind=0 AND o.metadata_complete AND o.is_bundle AND p.block_height<>s.imported_through
              ORDER BY p.block_height LIMIT 1",
                 &[],
             )
@@ -2185,10 +2255,23 @@ mod tests {
                 &[&key],
             )
             .await?;
+        transaction
+            .execute(
+                "CREATE TEMP TABLE saved_bundle_tags ON COMMIT DROP AS
+             SELECT * FROM public.object_tags WHERE object_key=$1",
+                &[&key],
+            )
+            .await?;
         for sql in [
             "UPDATE public.objects SET metadata_complete=false WHERE key=$1",
             "UPDATE public.objects SET metadata_complete=false WHERE key=$1",
             "UPDATE public.objects SET metadata_complete=true WHERE key=$1",
+            "UPDATE public.bundle_progress SET complete=false WHERE root_key=$1",
+            "UPDATE public.bundle_progress SET complete=true WHERE root_key=$1",
+            "DELETE FROM public.bundle_progress WHERE root_key=$1",
+            "INSERT INTO public.bundle_progress(root_key,complete) VALUES($1,true)",
+            "DELETE FROM public.object_tags WHERE object_key=$1",
+            "INSERT INTO public.object_tags SELECT * FROM saved_bundle_tags WHERE object_key=$1",
             "UPDATE public.canonical_placements SET block_height=(
                 SELECT min(height) FROM public.canonical_blocks) WHERE object_key=$1",
             "DELETE FROM public.canonical_placements WHERE object_key=$1",
@@ -2199,6 +2282,16 @@ mod tests {
             transaction.execute(sql, &[&key]).await?;
             consistent(&transaction).await.with_context(|| format!("after {sql}"))?;
         }
+        transaction.batch_execute("SAVEPOINT coverage").await?;
+        transaction
+            .batch_execute(
+                "UPDATE public.block_index_state SET imported_through=NULL WHERE singleton",
+            )
+            .await?;
+        consistent(&transaction).await?;
+        transaction
+            .batch_execute("ROLLBACK TO SAVEPOINT coverage")
+            .await?;
         transaction
             .execute(
                 "DELETE FROM public.canonical_blocks WHERE height=$1",
@@ -2420,6 +2513,25 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a canonical bundle root in ar_io_rust_test"]
     async fn scheduled_bundles_advance_past_pending_roots_and_recheck_coverage() -> Result<()> {
+        async fn collect(
+            store: &BlockStore,
+            mut after: Option<BundleCursor>,
+        ) -> Result<Vec<(Vec<u8>, u64, u128)>> {
+            let mut roots = Vec::new();
+            loop {
+                let page = store.pending_bundles_after(after.as_ref(), None).await?;
+                ensure!(page.roots.len() <= 64, "discovery exceeded its root limit");
+                roots.extend(page.roots);
+                let Some(next) = page.after else {
+                    return Ok(roots);
+                };
+                ensure!(
+                    after.as_ref().is_none_or(|previous| next > *previous),
+                    "discovery cursor did not advance"
+                );
+                after = Some(next);
+            }
+        }
         let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
         let database: String = store
             .client
@@ -2446,13 +2558,13 @@ mod tests {
                 })
                 .collect::<Result<Vec<_>>>()?;
             ensure!(roots.len() == 1, "requires a canonical bundle root");
-            // Synthetic memberships exercise both sides of the 64-root page boundary.
+            // Cover both the 64-root return limit and the 256-object scan limit.
             let clones = store.client.query(
                 "INSERT INTO public.objects OVERRIDING SYSTEM VALUE
-                 SELECT copy.* FROM public.objects o CROSS JOIN generate_series(1,65) n
+                 SELECT copy.* FROM public.objects o CROSS JOIN generate_series(1,257) n
                  CROSS JOIN LATERAL jsonb_populate_record(NULL::public.objects, to_jsonb(o) ||
                     jsonb_build_object('key',nextval(pg_get_serial_sequence('public.objects','key')),
-                        'id',sha256(o.id || int4send(n)))
+                        'id',decode(repeat('00',28),'hex') || int4send(n))
                  ) copy
                  WHERE o.id=$1 RETURNING key,id", &[&roots[0].0]
             ).await?;
@@ -2480,7 +2592,6 @@ mod tests {
             ).await?;
             let size = roots[0].2;
             roots.extend(clones.iter().map(|row| (row.get(1),height as u64,size)));
-            roots.sort_unstable_by(|left,right| left.0.cmp(&right.0));
             let ids: Vec<_> = roots.iter().map(|(id, _, _)| id.as_slice()).collect();
             store
                 .client
@@ -2491,14 +2602,34 @@ mod tests {
                     &[&ids],
                 )
                 .await?;
-            let first = store.pending_bundles_after(None, None).await?;
-            ensure!(first == roots[..64], "first discovery page differs");
-            let second = store.pending_bundles_after(Some(&first.last().unwrap().0), None).await?;
-            ensure!(second == roots[64..], "second discovery page lost or repeated a root");
-            ensure!(store.pending_bundles_after(Some(&roots.last().unwrap().0), None).await?.is_empty(),
+            ensure!(collect(&store, None).await? == roots, "chronological discovery lost or repeated a root");
+            let clone_start: i32 = store.client.query_one(
+                "SELECT min(position) FROM public.block_transactions WHERE object_key=ANY($1::bigint[])",
+                &[&keys],
+            ).await?.get(0);
+            let before_clones = BundleCursor { height, position: clone_start-1, kind: 1, id: vec![255;32] };
+            let first = store.pending_bundles_after(Some(&before_clones), None).await?;
+            ensure!(first.roots == roots[1..65], "first discovery page differs");
+            ensure!(collect(&store, first.after).await? == roots[65..],
+                "later discovery pages lost or repeated a root");
+            let last = BundleCursor { height, position: clone_start+256, kind: 0, id: roots.last().unwrap().0.clone() };
+            ensure!(collect(&store, Some(last)).await?.is_empty(),
                 "discovery repeated its final cursor root");
-            ensure!(store.pending_bundles_after(None, Some((0,0))).await?.is_empty(),
+            let outside = store.pending_bundles_after(None, Some((0,0))).await?;
+            ensure!(outside.roots.is_empty() && outside.after.is_none(),
                 "discovery ignored the height range");
+            store.client.batch_execute("SAVEPOINT rejected_candidates").await?;
+            store.client.execute(
+                "DELETE FROM public.block_transactions bt USING public.objects o
+                 WHERE bt.object_key=o.key AND o.id=ANY($1::bytea[])",
+                &[&&ids[1..257]],
+            ).await?;
+            let skipped = store.pending_bundles_after(Some(&before_clones), None).await?;
+            ensure!(skipped.roots.is_empty() && skipped.after.as_ref().map(|c| &c.id) == Some(&roots[256].0),
+                "rejected candidates did not produce a bounded advancing page");
+            ensure!(collect(&store, skipped.after).await? == roots[257..],
+                "an empty page hid later canonical roots");
+            store.client.batch_execute("ROLLBACK TO SAVEPOINT rejected_candidates").await?;
             store
                 .client
                 .execute(
@@ -2509,7 +2640,7 @@ mod tests {
                 .await?;
             ensure!(
                 store.bundle_complete(&roots[0].0).await?
-                    && !store.pending_bundles_after(None, None).await?.contains(&roots[0]),
+                    && !collect(&store, None).await?.contains(&roots[0]),
                 "a completed root remained eligible for scheduled retrieval"
             );
             store
@@ -2521,7 +2652,7 @@ mod tests {
                 .await?;
             ensure!(
                 !store.bundle_complete(&roots[0].0).await?
-                    && store.pending_bundles_after(None, None).await?.is_empty(),
+                    && collect(&store, None).await?.is_empty(),
                 "bundle completion or discovery survived loss of canonical coverage"
             );
             Ok(())

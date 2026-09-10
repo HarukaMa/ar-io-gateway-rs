@@ -486,7 +486,7 @@ async fn download_pending(
         .as_ref()
         .context("bundle downloads require a database")?;
     let mut downloads = FuturesUnordered::new();
-    let mut cursor: Option<Vec<u8>> = None;
+    let mut cursor: Option<crate::database::BundleCursor> = None;
     let mut pending: Option<(Vec<u8>, u64, u128)> = None;
     let mut candidates = Vec::<(Vec<u8>, u64, u128)>::new().into_iter();
     let mut discovery = None;
@@ -516,9 +516,7 @@ async fn download_pending(
                     .is_some_and(|bytes| bytes <= admission.max_scheduled_bytes),
                 "indexing byte budget cannot hold the streaming working set"
             );
-            if admission.state.lock().ids.contains(&id) {
-                cursor = Some(root_id);
-            } else {
+            if !admission.state.lock().ids.contains(&id) {
                 let spool = if streamed || size <= gateway.config.max_memory_data_size {
                     Ok(None)
                 } else {
@@ -530,7 +528,6 @@ async fn download_pending(
                         .map(|reservation| (reservation, spool))
                 });
                 if let Some((mut reservation, spool)) = reserved {
-                    cursor = Some(root_id);
                     downloads.push(async move {
                         let encoded = URL_SAFE_NO_PAD.encode(id);
                         if streamed {
@@ -583,7 +580,7 @@ async fn download_pending(
                 sleep_until(poll_at).await;
                 timeout(
                     gateway.config.request_timeout,
-                    store.pending_bundles_after(after.as_deref(), range),
+                    store.pending_bundles_after(after.as_ref(), range),
                 )
                 .await
                 .context("discovering pending bundles timed out")?
@@ -607,8 +604,9 @@ async fn download_pending(
             result = async { discovery.as_mut().expect("pending discovery").await }, if discovery.is_some() => {
                 discovery = None;
                 match result {
-                    Ok(roots) if !roots.is_empty() => {
-                        candidates = roots.into_iter();
+                    Ok(page) if page.after.is_some() => {
+                        cursor = page.after;
+                        candidates = page.roots.into_iter();
                         exhausted = false;
                         next_poll = Instant::now();
                     }

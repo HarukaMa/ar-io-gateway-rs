@@ -1427,10 +1427,13 @@ mod bundle_tests {
                 "INSERT INTO public.canonical_placements(object_key,block_height,position,kind,id) VALUES($1,$2,$3,0,$4)",
                 &[&root_key,&height,&position,&&root_id[..]]
             ).await?;
-            let mut cursor = root_id;
-            cursor[31] -= 1;
+            let mut cursor_id = root_id;
+            cursor_id[31] -= 1;
+            let cursor = crate::database::BundleCursor {
+                height, position, kind: 0, id: cursor_id.to_vec(),
+            };
             let discovered = store.pending_bundles_after(Some(&cursor), Some((height as u64, height as u64))).await?
-                .into_iter().next().context("JSON root was not discovered")?;
+                .roots.into_iter().next().context("JSON root was not discovered")?;
             ensure!(discovered.0 == root_id && discovered.2 == bytes.len() as u128, "wrong JSON discovery result");
             store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
             let indexed = store.bundle_location(&leaf_id).await?.context("JSON child has no indexed location")?;
@@ -1441,7 +1444,7 @@ mod bundle_tests {
             ensure!(client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == written, "bundle replay added rows");
             ensure!(store.bundle_complete(&root_id).await?, "JSON root was not completed");
             ensure!(store.pending_bundles_after(Some(&cursor), Some((height as u64, height as u64))).await?
-                .iter().all(|candidate| candidate.0 != root_id), "completed JSON root was rediscovered");
+                .roots.iter().all(|candidate| candidate.0 != root_id), "completed JSON root was rediscovered");
             let mut corrupt = locations.clone();
             corrupt[0].json = false;
             ensure!(store.commit_bundle_batch(&root_id, &objects, &corrupt, true).await.is_err(), "conflicting JSON encoding was accepted");
