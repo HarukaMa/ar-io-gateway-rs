@@ -436,38 +436,55 @@ async fn run(
     range: Option<(u64, u64)>,
 ) -> Result<(u64, u64)> {
     let (sender, mut ready) = mpsc::channel(gateway.config.index_downloads);
+    let mut second_store = store.reconnect().await?;
     let produce = download_pending(gateway, sender, &admission, range);
     let consume = async {
         let mut roots = 0;
         let mut occurrences = 0;
+        let mut stores = vec![store, &mut second_store];
+        let mut indexing = FuturesUnordered::new();
+        let mut downloads_finished = false;
         loop {
+            if downloads_finished && requests.is_none() && indexing.is_empty() {
+                break;
+            }
             let job = tokio::select! {
-                job = async { requests.as_mut().unwrap().recv().await }, if requests.is_some() => {
+                Some((store, id, result)) = indexing.next(), if !indexing.is_empty() => {
+                    stores.push(store);
+                    admission.status.lock().bundles = if indexing.is_empty() { "idle" } else { "indexing" };
+                    match result {
+                        Ok(count) => {
+                            roots += 1;
+                            occurrences += count;
+                        }
+                        Err(error) if range.is_some() => return Err(error),
+                        Err(error) => {
+                            admission.failed("Bundle indexing failed");
+                            eprintln!("indexing bundle {id} failed: {error:#}");
+                        }
+                    }
+                    continue;
+                }
+                job = async { requests.as_mut().unwrap().recv().await }, if requests.is_some() && !stores.is_empty() => {
                     match job {
                         Some(job) => job,
                         None => { requests = None; continue; }
                     }
                 }
-                job = ready.recv() => {
-                    let Some(job) = job else { break; };
-                    job
+                job = ready.recv(), if !downloads_finished && !stores.is_empty() => {
+                    match job {
+                        Some(job) => job,
+                        None => { downloads_finished = true; continue; }
+                    }
                 }
             };
             let id = URL_SAFE_NO_PAD.encode(job.reservation.id);
             admission.status.lock().bundles = "indexing";
-            let result = process_job(gateway, store, job).await;
-            admission.status.lock().bundles = "idle";
-            match result {
-                Ok(count) => {
-                    roots += 1;
-                    occurrences += count;
-                }
-                Err(error) if range.is_some() => return Err(error),
-                Err(error) => {
-                    admission.failed("Bundle indexing failed");
-                    eprintln!("indexing bundle {id} failed: {error:#}");
-                }
-            }
+            let store = stores.pop().expect("available bundle writer");
+            indexing.push(async move {
+                let result = process_job(gateway, store, job).await;
+                (store, id, result)
+            });
         }
         Ok((roots, occurrences))
     };
@@ -695,6 +712,96 @@ mod tests {
     use super::*;
     use crate::content::{ContentWriter, SpoolBudget};
     use crate::{Tag, VerifiedData, content::Content};
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; takes a temporary bundle-progress table lock"]
+    async fn bundle_jobs_overlap_with_bounded_admission_and_cancel_cleanly() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let database: String = client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let source: String = client
+            .query_one(
+                "SELECT source FROM public.block_index_state WHERE singleton",
+                &[],
+            )
+            .await?
+            .get(0);
+        let gateway = Gateway::new(Config::new(
+            &source,
+            "http://127.0.0.1:1",
+            vec!["http://127.0.0.1:1".to_owned()],
+            Duration::from_secs(10),
+            1,
+            1024,
+        )?)?
+        .with_database(&url)
+        .await?;
+        let mut store = BlockStore::connect(&url).await?;
+        let (submitter, receiver) = submitter(1024 * 1024);
+        for id in 0..3 {
+            submitter.submit(&root(id, vec![0; 64].into()));
+        }
+        let admission = Arc::clone(&submitter.admission);
+        assert_eq!(admission.state.lock().ids.len(), 3);
+        drop(submitter);
+        let transaction = client.transaction().await?;
+        transaction.batch_execute(
+            "SET LOCAL lock_timeout='1s'; LOCK TABLE public.bundle_progress IN ACCESS EXCLUSIVE MODE"
+        ).await?;
+        let pid: i32 = transaction
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        let mut running = Box::pin(run(
+            &gateway,
+            &mut store,
+            Some(receiver),
+            Arc::clone(&admission),
+            None,
+        ));
+        let observe = async {
+            let mut settling = None;
+            loop {
+                transaction
+                    .query_one("SELECT pg_stat_clear_snapshot()", &[])
+                    .await?;
+                let count: i64 = transaction
+                    .query_one(
+                        "SELECT count(*) FROM pg_stat_activity
+                     WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%WITH bundle_tags%'",
+                        &[&pid],
+                    )
+                    .await?
+                    .get(0);
+                ensure!(count <= 2, "more than two roots entered indexing");
+                if count == 2 {
+                    let start = settling.get_or_insert_with(Instant::now);
+                    if start.elapsed() >= Duration::from_millis(50) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::select! {
+            result = &mut running => bail!("indexing exited while completion reads were blocked: {result:?}"),
+            result = timeout(Duration::from_secs(3), observe) => result.context("bundle roots did not overlap")??,
+        }
+        assert_eq!(admission.state.lock().ids.len(), 3);
+        drop(running);
+        assert!(admission.state.lock().ids.is_empty());
+        assert_eq!(admission.state.lock().bytes, 0);
+        transaction.rollback().await?;
+        Ok(())
+    }
 
     #[test]
     fn scheduled_roots_keep_request_slots_free_until_they_are_released() {
