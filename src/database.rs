@@ -1790,17 +1790,24 @@ impl BlockStore {
             (table, entries)
         });
         let mut lock_keys = Vec::new();
-        for (_, entries) in &dictionaries {
+        for (table, entries) in &dictionaries {
             for entries in entries.chunks(ROW_BATCH_SIZE) {
                 let digests: Vec<_> = entries
                     .iter()
                     .map(|(_, digest)| digest.as_slice())
                     .collect();
+                let values: Vec<_> = entries.iter().map(|(value, _)| *value).collect();
                 for row in transaction
                     .query(
-                        "SELECT DISTINCT hashtextextended(encode(digest, 'hex'), 0)
-                         FROM unnest($1::bytea[]) AS incoming(digest)",
-                        &[&digests],
+                        &format!(
+                            "SELECT DISTINCT hashtextextended(encode(incoming.digest, 'hex'), 0)
+                             FROM unnest($1::bytea[], $2::bytea[]) AS incoming(digest, value)
+                             WHERE NOT EXISTS (
+                                 SELECT 1 FROM public.{table} stored
+                                 WHERE stored.digest=incoming.digest AND stored.value=incoming.value
+                             )"
+                        ),
+                        &[&digests, &values],
                     )
                     .await?
                 {
@@ -1810,7 +1817,7 @@ impl BlockStore {
         }
         lock_keys.sort_unstable();
         lock_keys.dedup();
-        // Acquire the complete cross-dictionary lock set before any dictionary INSERT.
+        // Acquire the complete cross-dictionary lock set for missing entries before any INSERT.
         // A new read-committed statement then sees entries committed while locks were awaited.
         for locks in lock_keys.chunks(ROW_BATCH_SIZE) {
             transaction
@@ -2941,7 +2948,9 @@ mod tests {
                     o.signature_type, o.format, o.quantity::text, o.reward::text,
                     o.denomination, o.data_root, o.key
              FROM public.objects o JOIN public.owners w ON w.address=o.owner_address
-             WHERE o.metadata_complete AND o.kind=0 ORDER BY o.key LIMIT 1",
+             WHERE o.metadata_complete AND o.kind=0
+               AND EXISTS (SELECT 1 FROM public.object_tags t WHERE t.object_key=o.key)
+             ORDER BY o.key LIMIT 1",
                 &[],
             )
             .await?;
@@ -2994,11 +3003,44 @@ mod tests {
                 &[&object.owner_address],
             )
             .await?;
+        let (name, value) = &object.tags[0];
+        let known_tags = vec![name.as_slice(), value.as_slice()];
+        owner_lock
+            .query(
+                "SELECT pg_advisory_xact_lock(hashtextextended(encode(sha256(value), 'hex'), 0))
+             FROM unnest($1::bytea[]) AS incoming(value)",
+                &[&known_tags],
+            )
+            .await?;
         store
             .client
             .batch_execute("SET lock_timeout='250ms'")
             .await?;
         store.record_objects(std::slice::from_ref(&object)).await?;
+        let missing = format!(
+            "dictionary-lock-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        )
+        .into_bytes();
+        owner_lock.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended(encode(sha256($1::bytea), 'hex'), 0))",
+            &[&missing],
+        ).await?;
+        object.tags.push((missing.clone(), missing));
+        let missing_error = store
+            .record_objects(std::slice::from_ref(&object))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            missing_error
+                .downcast_ref::<tokio_postgres::Error>()
+                .and_then(|error| error.code()),
+            Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+            "missing dictionary entries must still wait for their insertion lock"
+        );
+        object.tags.pop();
         object.owner_public_key.push(0);
         let conflict = store
             .record_objects(std::slice::from_ref(&object))
