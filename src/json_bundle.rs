@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256, Sha384};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::{
-    ItemTag, MAX_DATA_ITEM_TAGS, MAX_JSON_BYTES, VerifiedItem,
+    ItemTag, MAX_DATA_ITEM_TAGS, VerifiedItem,
     content::{Content, ContentReader},
 };
 
@@ -58,8 +58,6 @@ impl JsonBundle {
         tokio::task::spawn_blocking(move || {
             let state = Rc::new(ParseState {
                 position: Cell::new(0),
-                budget: Cell::new(MAX_JSON_BYTES),
-                data_prefix: Cell::new(false),
             });
             let reader = CountedReader {
                 inner: io::BufReader::with_capacity(DECODE_BLOCK, bridge),
@@ -109,8 +107,6 @@ impl Drop for JsonBundle {
 
 struct ParseState {
     position: Cell<usize>,
-    budget: Cell<usize>,
-    data_prefix: Cell<bool>,
 }
 
 struct CountedReader<R> {
@@ -124,22 +120,8 @@ impl<R: Read> Read for CountedReader<R> {
         if self.cancelled.load(Ordering::Relaxed) {
             return Err(io::Error::other("JSON bundle read cancelled"));
         }
-        let limit = bytes.len().min(self.state.budget.get());
-        if limit == 0 && !bytes.is_empty() {
-            return Err(io::Error::other("JSON item metadata exceeds size limit"));
-        }
-        let read = self.inner.read(&mut bytes[..limit])?;
+        let read = self.inner.read(bytes)?;
         self.state.position.set(self.state.position.get() + read);
-        self.state.budget.set(self.state.budget.get() - read);
-        if self.state.data_prefix.get() {
-            if let Some(byte) = bytes[..read].iter().find(|b| !b.is_ascii_whitespace()) {
-                self.state.data_prefix.set(false);
-                if *byte == b'"' {
-                    // IgnoredAny skips this string without buffering its contents.
-                    self.state.budget.set(usize::MAX);
-                }
-            }
-        }
         Ok(read)
     }
 }
@@ -178,7 +160,6 @@ impl<'de> Visitor<'de> for RootSeed<'_> {
                     source: self.source.clone(),
                     sender: self.sender,
                 })?;
-                self.state.budget.set(MAX_JSON_BYTES);
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
@@ -213,7 +194,6 @@ impl<'de> Visitor<'de> for ItemsSeed<'_> {
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(), A::Error> {
         loop {
-            self.state.budget.set(MAX_JSON_BYTES);
             let Some(entry) = seq.next_element_seed(EntrySeed {
                 state: Rc::clone(&self.state),
                 source: self.source.clone(),
@@ -354,12 +334,7 @@ impl<'de> DeserializeSeed<'de> for DataSeed {
         decoder: D,
     ) -> std::result::Result<Self::Value, D::Error> {
         let start = self.state.position.get();
-        let budget = self.state.budget.get();
-        self.state.data_prefix.set(true);
-        let result = IgnoredAny::deserialize(decoder);
-        self.state.budget.set(budget);
-        self.state.data_prefix.set(false);
-        result?;
+        IgnoredAny::deserialize(decoder)?;
         Ok(start..self.state.position.get())
     }
 }
@@ -840,22 +815,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_payload_skipping_keeps_metadata_limit() -> Result<()> {
-        let bytes = format!(
-            "{{\"items\":[{{\"data\":\"{}\"}}]}}",
-            "A".repeat(MAX_JSON_BYTES * 2)
-        )
-        .into_bytes();
-        let mut bundle = JsonBundle::new(bytes.into()).await?;
+    async fn large_json_values_do_not_prevent_valid_items() -> Result<()> {
+        let fixture: serde_json::Value = serde_json::from_slice(FIXTURE)?;
+        let valid = serde_json::to_string(&fixture["items"][0])?;
+        let large = "A".repeat(2 * 1024 * 1024);
+        let whitespace = " ".repeat(2 * 1024 * 1024);
+        let valid = valid.replace("\"tags\":[", &format!("\"tags\":[{whitespace}"));
+        let document = format!(
+            "{{\"extra\":\"{large}\",\"items\":[{{\"data\":[\"{large}\"]}},{whitespace}{valid}]}}"
+        );
+        let mut bundle = JsonBundle::new(document.into_bytes().into()).await?;
         assert!(bundle.next().await?.unwrap().verify().await?.is_none());
+        let item = bundle
+            .next()
+            .await?
+            .unwrap()
+            .verify()
+            .await?
+            .context("valid item rejected")?;
+        assert_eq!(
+            item.body_hash,
+            crate::sha256(&[&crate::decode_b64(
+                fixture["items"][0]["data"].as_str().unwrap(),
+                "fixture data"
+            )?])
+        );
         assert!(bundle.next().await?.is_none());
-        let bytes = format!(
-            "{{\"items\":[{{\"data\":[\"{}\"]}}]}}",
-            "A".repeat(MAX_JSON_BYTES * 2)
-        )
-        .into_bytes();
-        let mut bundle = JsonBundle::new(bytes.into()).await?;
-        assert!(bundle.next().await.is_err());
         Ok(())
     }
 }
