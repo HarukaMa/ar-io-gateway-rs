@@ -149,6 +149,8 @@ pub struct VerifiedData {
     pub block_height: u64,
     #[serde(skip_serializing)]
     block_hash: Option<[u8; 48]>,
+    #[serde(skip_serializing)]
+    stable_anchor: bool,
     pub content_type: String,
     pub content_encoding: Option<String>,
     pub content_length: usize,
@@ -177,6 +179,7 @@ pub(crate) struct AuthenticatedRoot {
     bytes: Content,
     block_height: u64,
     block_hash: [u8; 48],
+    stable_anchor: bool,
     tags: Vec<Tag>,
     content_encoding: Option<String>,
     facts: Option<indexer::RootFacts>,
@@ -599,6 +602,7 @@ impl Gateway {
                         .try_into()
                         .map_err(|_| anyhow::anyhow!("invalid cached block hash"))?,
                 ),
+                stable_anchor: false,
                 content_type: entry.content_type,
                 content_encoding: entry.content_encoding,
                 content_length: entry.length,
@@ -707,13 +711,15 @@ impl Gateway {
     }
 
     async fn current_anchor(&self, data: &VerifiedData) -> Result<bool> {
-        let Some(store) = &self.block_store else {
+        if data.stable_anchor {
             return Ok(true);
-        };
+        }
         let expected = data
             .block_hash
             .context("verified content lacks a block hash")?;
-        if let Some(hash) = store.canonical_hash(data.block_height).await? {
+        if let Some(store) = &self.block_store
+            && let Some(hash) = store.stable_canonical_hash(data.block_height).await?
+        {
             return Ok(hash.as_slice() == expected);
         }
         Ok(self
@@ -1232,22 +1238,25 @@ impl Gateway {
                 },
             )?))
         };
-        let (parent_bytes, block_height, block_hash, cache_hit, tags) = match &parent_root {
-            IndexingRoot::Complete(root) => (
-                &root.data.bytes,
-                root.data.block_height,
-                root.data.block_hash,
-                root.data.cache_hit,
-                &root.tags,
-            ),
-            IndexingRoot::Partial(root) => (
-                &root.bytes,
-                root.block_height,
-                Some(root.block_hash),
-                false,
-                &root.tags,
-            ),
-        };
+        let (parent_bytes, block_height, block_hash, cache_hit, tags, stable_anchor) =
+            match &parent_root {
+                IndexingRoot::Complete(root) => (
+                    &root.data.bytes,
+                    root.data.block_height,
+                    root.data.block_hash,
+                    root.data.cache_hit,
+                    &root.tags,
+                    root.data.stable_anchor,
+                ),
+                IndexingRoot::Partial(root) => (
+                    &root.bytes,
+                    root.block_height,
+                    Some(root.block_hash),
+                    false,
+                    &root.tags,
+                    root.stable_anchor,
+                ),
+            };
         let format = require_bundle_tags(tags)?;
         let item = match &hint {
             BundleHint::Indexed(indexed) => {
@@ -1281,6 +1290,7 @@ impl Gateway {
             id: id.to_owned(),
             block_height,
             block_hash,
+            stable_anchor,
             content_type: item_content_type(&item.tags)?,
             content_encoding,
             etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
@@ -1444,6 +1454,7 @@ impl Gateway {
                 id: root.id,
                 block_height: root.block_height,
                 block_hash: Some(root.block_hash),
+                stable_anchor: root.stable_anchor,
                 content_type: content_type(&root.tags)?,
                 content_encoding: root.content_encoding,
                 etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
@@ -1479,10 +1490,19 @@ impl Gateway {
         decode_fixed::<48>(&status.block_indep_hash, "status block hash")?;
 
         let indexed = match &self.block_store {
-            Some(store) => store.block_pair(status.block_height).await?,
-            None => None,
+            Some(store)
+                if store
+                    .stable_canonical_hash(status.block_height)
+                    .await?
+                    .is_some() =>
+            {
+                store.block_pair(status.block_height).await?
+            }
+            _ => None,
         };
+        let stable_anchor;
         let entries: Vec<BlockIndexEntry> = if let Some((previous, block)) = indexed {
+            stable_anchor = true;
             [block, previous]
                 .into_iter()
                 .map(|entry| BlockIndexEntry {
@@ -1497,9 +1517,10 @@ impl Gateway {
                 .await
                 .context("failed to fetch trusted node height")?;
             ensure!(
-                info.height >= status.block_height.saturating_add(CONSENSUS_DEPTH),
-                "transaction block is inside the trusted node consensus window"
+                info.height >= status.block_height,
+                "transaction block is above the trusted node tip"
             );
+            stable_anchor = info.height - status.block_height >= CONSENSUS_DEPTH;
             let index_path = format!(
                 "block_index/{}/{}",
                 status.block_height.saturating_sub(1),
@@ -1586,6 +1607,7 @@ impl Gateway {
                 bytes: bytes.into(),
                 block_height: status.block_height,
                 block_hash: decode_fixed::<48>(&block.hash, "verified block hash")?,
+                stable_anchor,
                 tags: transaction.tags,
                 content_encoding,
                 facts,
@@ -1641,6 +1663,7 @@ impl Gateway {
             bytes: Content::streamed(streaming::ChunkSource::new(self, geometry), expected_len),
             block_height: status.block_height,
             block_hash: decode_fixed::<48>(&block.hash, "verified block hash")?,
+            stable_anchor,
             tags: transaction.tags,
             content_encoding,
             facts,
@@ -4765,6 +4788,13 @@ mod tests {
         let corrupt = corrupt_chunk.clone();
         let chunk_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&chunk_requests);
+        let anchor_path = format!("/block_index2/{height}/{height}");
+        let mut anchor = decode_b64(&hash, "fixture hash").unwrap();
+        anchor.extend_from_slice(&16u16.to_be_bytes());
+        anchor.extend_from_slice(&(data.len() as u128).to_be_bytes());
+        let encoded_root = decode_b64(&tx_root, "fixture tx root").unwrap();
+        anchor.push(encoded_root.len() as u8);
+        anchor.extend_from_slice(&encoded_root);
         let app = Router::new().fallback(move |uri: axum::http::Uri| {
             let offset = uri
                 .path()
@@ -4779,7 +4809,11 @@ mod tests {
                 .or_else(|| responses.get(uri.path()))
                 .cloned();
             let corrupt = offset.is_some() && corrupt.load(Ordering::SeqCst);
+            let anchor = (uri.path() == anchor_path).then(|| anchor.clone());
             async move {
+                if let Some(anchor) = anchor {
+                    return anchor.into_response();
+                }
                 match response {
                     Some(body) if corrupt => {
                         let mut chunk: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -4808,6 +4842,63 @@ mod tests {
         .unwrap();
         let requested = bundled_item.map_or(id, |(id, _)| id.to_owned());
         (gateway, requested, corrupt_chunk, server, chunk_requests)
+    }
+
+    #[tokio::test]
+    async fn recent_confirmed_content_revalidates_cached_block_after_reorg() -> Result<()> {
+        use axum::{Router, response::IntoResponse};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let payload = b"recent confirmed content";
+        let (mut gateway, id, _, fixture, _) = retrieval_fixture(payload, &[], None).await;
+        let _fixture = tokio_util::task::AbortOnDropHandle::new(fixture);
+        let height = FORK_2_9_HEIGHT + 1;
+        let tip = Arc::new(AtomicU64::new(height - 1));
+        let reorg = Arc::new(AtomicBool::new(false));
+        let source = gateway.config.trusted_node_url.clone();
+        let client = gateway.client.clone();
+        let node_tip = Arc::clone(&tip);
+        let node_reorg = Arc::clone(&reorg);
+        let app = Router::new().fallback(move |uri: axum::http::Uri| {
+            let client = client.clone();
+            let url = endpoint(&source, uri.path().trim_start_matches('/'));
+            let height = node_tip.load(Ordering::SeqCst);
+            let reorg = node_reorg.load(Ordering::SeqCst);
+            async move {
+                if uri.path() == "/info" {
+                    return serde_json::json!({"height": height})
+                        .to_string()
+                        .into_response();
+                }
+                if reorg && uri.path().starts_with("/block_index2/") {
+                    return vec![0u8; 51].into_response();
+                }
+                let response = client.get(url).send().await.unwrap();
+                (response.status(), response.bytes().await.unwrap()).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        gateway.config.trusted_node_url = format!("http://{}", listener.local_addr()?);
+        let _node = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        ensure!(
+            gateway.retrieve(&id).await.is_err(),
+            "accepted an archival claim ahead of the trusted node"
+        );
+        tip.store(height, Ordering::SeqCst);
+        let data = gateway.retrieve(&id).await?;
+        ensure!(data.bytes.read_all(payload.len()).await?.as_ref() == payload);
+        ensure!(
+            gateway.retrieve(&id).await?.cache_hit,
+            "content was not cached"
+        );
+        reorg.store(true, Ordering::SeqCst);
+        ensure!(
+            gateway.retrieve(&id).await.is_err(),
+            "served a cached orphaned block"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -5810,6 +5901,7 @@ mod cache_tests {
             id: id.to_owned(),
             block_height: 1,
             block_hash: None,
+            stable_anchor: true,
             content_type: "text/plain".to_owned(),
             content_encoding: None,
             content_length: 5,

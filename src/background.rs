@@ -926,6 +926,7 @@ mod tests {
                 id: URL_SAFE_NO_PAD.encode([id; 32]),
                 block_height: 1,
                 block_hash: None,
+                stable_anchor: true,
                 content_type: "application/octet-stream".to_owned(),
                 content_encoding: None,
                 etag: String::new(),

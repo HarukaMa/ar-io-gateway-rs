@@ -545,6 +545,21 @@ impl BlockStore {
             .transpose()
     }
 
+    pub(crate) async fn stable_canonical_hash(&self, height: u64) -> Result<Option<Vec<u8>>> {
+        self.client
+            .query_opt(
+                "SELECT c.block_hash FROM public.canonical_blocks c
+                 JOIN public.block_index_state s
+                   ON s.singleton AND c.height <= s.checkpoint_height
+                     AND c.height <= s.imported_through
+                 WHERE c.height=$1",
+                &[&sql_height(height)?],
+            )
+            .await?
+            .map(|row| row.try_get(0).map_err(Into::into))
+            .transpose()
+    }
+
     pub(crate) async fn rewind(
         &mut self,
         ancestor: u64,
@@ -3243,6 +3258,37 @@ mod tests {
             .unwrap();
         store.client.batch_execute("BEGIN").await.unwrap();
         let original = store.state().await.unwrap().unwrap();
+        let height = original.imported_through.unwrap();
+        let hash = store.canonical_hash(height).await.unwrap().unwrap();
+        store
+            .client
+            .execute(
+                "UPDATE public.block_index_state SET checkpoint_height=$1 WHERE singleton",
+                &[&sql_height(height).unwrap()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.stable_canonical_hash(height).await.unwrap(),
+            Some(hash)
+        );
+        store
+            .client
+            .execute(
+                "UPDATE public.block_index_state SET checkpoint_height=$1 WHERE singleton",
+                &[&sql_height(height - 1).unwrap()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.stable_canonical_hash(height).await.unwrap(), None);
+        store
+            .client
+            .execute(
+                "UPDATE public.block_index_state SET checkpoint_height=$1 WHERE singleton",
+                &[&sql_height(original.checkpoint.height).unwrap()],
+            )
+            .await
+            .unwrap();
         let next = Checkpoint {
             height: original.checkpoint.height + 1,
             hash: vec![42; 48],
