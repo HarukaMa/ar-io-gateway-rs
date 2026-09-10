@@ -261,7 +261,8 @@ async fn cpu_work<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
     static HTTP_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-    static BACKGROUND_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    static BACKGROUND_JOBS: tokio::sync::Semaphore =
+        tokio::sync::Semaphore::const_new(background::CPU_JOBS);
     let jobs = if BACKGROUND_CPU.try_with(|()| ()).is_ok() {
         &BACKGROUND_JOBS
     } else {
@@ -5969,7 +5970,7 @@ mod cache_tests {
     async fn cpu_jobs_leave_runtime_responsive_and_keep_permits_until_completion() -> Result<()> {
         let mut jobs = Vec::new();
         let mut releases = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..background::CPU_JOBS {
             let (started, ready) = tokio::sync::oneshot::channel();
             let (release, wait) = std::sync::mpsc::channel();
             jobs.push(tokio::spawn(BACKGROUND_CPU.scope(
@@ -5999,8 +6000,12 @@ mod cache_tests {
         .await;
         releases.remove(0).send(())?;
         assert_eq!(waiting.await?, 42);
-        releases.remove(0).send(())?;
-        jobs.remove(0).await??;
+        for release in releases {
+            release.send(())?;
+        }
+        for job in jobs {
+            job.await??;
+        }
         assert_eq!(http_result??, 7);
         Ok(())
     }

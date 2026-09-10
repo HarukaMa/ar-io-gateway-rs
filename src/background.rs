@@ -23,9 +23,11 @@ use crate::{
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 const MAX_JOBS: usize = 8;
-// Two roots can retain a parser per ancestor plus one being checked at the depth limit.
-// Leave two blocking threads available for verification and file I/O.
-pub(crate) const BLOCKING_THREADS: usize = 2 * (crate::MAX_BUNDLE_DEPTH + 1) + 2;
+pub(crate) const INDEX_WORKERS: usize = 8;
+pub(crate) const CPU_JOBS: usize = 4;
+// Each root can retain an ancestor parser plus one being checked at the depth limit.
+// Keep capacity for verification and file I/O beyond those blocked parsers.
+pub(crate) const BLOCKING_THREADS: usize = INDEX_WORKERS * (crate::MAX_BUNDLE_DEPTH + 1) + CPU_JOBS;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -443,12 +445,17 @@ async fn run(
     range: Option<(u64, u64)>,
 ) -> Result<(u64, u64)> {
     let (sender, mut ready) = mpsc::channel(gateway.config.index_downloads);
-    let mut second_store = store.reconnect().await?;
+    let mut extra_stores = Vec::with_capacity(INDEX_WORKERS - 1);
+    for _ in 1..INDEX_WORKERS {
+        extra_stores.push(store.reconnect().await?);
+    }
     let produce = download_pending(gateway, sender, &admission, range);
     let consume = async {
         let mut roots = 0;
         let mut occurrences = 0;
-        let mut stores = vec![store, &mut second_store];
+        let mut stores = Vec::with_capacity(INDEX_WORKERS);
+        stores.push(store);
+        stores.extend(extra_stores.iter_mut());
         let mut indexing = FuturesUnordered::new();
         let mut downloads_finished = false;
         let mut snapshots = tokio::time::interval(Duration::from_secs(5));
@@ -793,12 +800,16 @@ mod tests {
         .with_database(&url)
         .await?;
         let mut store = BlockStore::connect(&url).await?;
-        let (submitter, receiver) = submitter(1024 * 1024);
-        for id in 0..3 {
+        let (sender, receiver) = mpsc::channel(INDEX_WORKERS + 1);
+        let submitter = BundleSubmitter {
+            sender,
+            admission: Admission::new(1024 * 1024, INDEX_WORKERS + 1, false),
+        };
+        for id in 0..=INDEX_WORKERS as u8 {
             submitter.submit(&root(id, vec![0; 64].into()));
         }
         let admission = Arc::clone(&submitter.admission);
-        assert_eq!(admission.state.lock().ids.len(), 3);
+        assert_eq!(admission.state.lock().ids.len(), INDEX_WORKERS + 1);
         drop(submitter);
         let transaction = client.transaction().await?;
         transaction.batch_execute(
@@ -829,8 +840,11 @@ mod tests {
                     )
                     .await?
                     .get(0);
-                ensure!(count <= 2, "more than two roots entered indexing");
-                if count == 2 {
+                ensure!(
+                    count <= INDEX_WORKERS as i64,
+                    "too many roots entered indexing"
+                );
+                if count == INDEX_WORKERS as i64 {
                     let start = settling.get_or_insert_with(Instant::now);
                     if start.elapsed() >= Duration::from_millis(50) {
                         break;
@@ -844,7 +858,7 @@ mod tests {
             result = &mut running => bail!("indexing exited while completion reads were blocked: {result:?}"),
             result = timeout(Duration::from_secs(3), observe) => result.context("bundle roots did not overlap")??,
         }
-        assert_eq!(admission.state.lock().ids.len(), 3);
+        assert_eq!(admission.state.lock().ids.len(), INDEX_WORKERS + 1);
         drop(running);
         assert!(admission.state.lock().ids.is_empty());
         assert_eq!(admission.state.lock().bytes, 0);

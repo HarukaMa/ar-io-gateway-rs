@@ -710,15 +710,17 @@ mod tests {
             let bytes = serde_json::to_vec(&serde_json::json!({"items": [item, item, item]}))?;
             let work = async {
                 let mut ancestors = Vec::new();
-                for _ in 0..2 * crate::MAX_BUNDLE_DEPTH {
+                for _ in 0..crate::background::INDEX_WORKERS * crate::MAX_BUNDLE_DEPTH {
                     let mut ancestor = JsonBundle::new(bytes.clone().into()).await?;
                     ancestor.next().await?.context("missing ancestor item")?;
                     ancestors.push(ancestor);
                 }
-                let mut first = JsonBundle::new(bytes.clone().into()).await?;
-                let mut second = JsonBundle::new(bytes.into()).await?;
-                let first_entry = first.next().await?.context("missing first root item")?;
-                let second_entry = second.next().await?.context("missing second root item")?;
+                let mut roots = Vec::new();
+                for _ in 0..crate::background::INDEX_WORKERS {
+                    let mut bundle = JsonBundle::new(bytes.clone().into()).await?;
+                    let entry = bundle.next().await?.context("missing root item")?;
+                    roots.push((bundle, entry));
+                }
                 let verify = |mut bundle: JsonBundle, entry: JsonEntry| async move {
                     let mut next = Some(entry);
                     let mut count = 0;
@@ -731,7 +733,12 @@ mod tests {
                     assert_eq!(count, 3);
                     Ok::<_, anyhow::Error>(())
                 };
-                tokio::try_join!(verify(first, first_entry), verify(second, second_entry))?;
+                futures_util::future::try_join_all(
+                    roots
+                        .into_iter()
+                        .map(|(bundle, entry)| verify(bundle, entry)),
+                )
+                .await?;
                 drop(ancestors);
                 Ok::<_, anyhow::Error>(())
             };
