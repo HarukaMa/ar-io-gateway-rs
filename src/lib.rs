@@ -676,6 +676,12 @@ impl Gateway {
             }
         }))
         .await?;
+        // Node's L1 content source returns 404 when there are no data chunks.
+        if data.content_length == 0
+            && matches!(&data.indexing_root, Some(IndexingRoot::Complete(root)) if root.data.id == data.id)
+        {
+            return Err(ContentNotFound.into());
+        }
         if let (Some(indexer), Some(root)) = (&self.bundle_indexer, &data.indexing_root) {
             match root {
                 IndexingRoot::Complete(root) => indexer.submit(root),
@@ -5070,10 +5076,39 @@ mod tests {
             server.abort();
         }
         let (gateway, id, _, server, _) = retrieval_fixture(b"", tags, None).await;
-        let verified = gateway.retrieve(&id).await.unwrap();
+        let verified = gateway.retrieve_direct(&id).await.unwrap();
         assert_eq!(verified.content_encoding.as_deref(), Some("gzip"));
         assert_eq!(verified.content_length, 0);
         assert_eq!(verified.sha256, hex(&sha256(&[b""])));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_l1_content_but_serves_empty_bundle_items() {
+        let (gateway, id, _, server, _) = retrieval_fixture(b"", &[], None).await;
+        for _ in 0..2 {
+            assert!(
+                gateway
+                    .retrieve(&id)
+                    .await
+                    .unwrap_err()
+                    .is::<ContentNotFound>()
+            );
+        }
+        server.abort();
+
+        let (item, item_id) = signed_data_item(b"", &[]);
+        let item_id = URL_SAFE_NO_PAD.encode(item_id);
+        let bundle = encode_bundle(&[&item]);
+        let tags: &[(&[u8], &[u8])] =
+            &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+        let (gateway, id, _, server, _) =
+            retrieval_fixture(&bundle, tags, Some((&item_id, 0))).await;
+        for _ in 0..2 {
+            let data = gateway.retrieve(&id).await.unwrap();
+            assert_eq!(data.content_length, 0);
+            assert_eq!(data.sha256, hex(&sha256(&[b""])));
+        }
         server.abort();
     }
 
