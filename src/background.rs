@@ -23,6 +23,9 @@ use crate::{
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 const MAX_JOBS: usize = 8;
+// Two roots can retain a parser per ancestor plus one being checked at the depth limit.
+// Leave two blocking threads available for verification and file I/O.
+pub(crate) const BLOCKING_THREADS: usize = 2 * (crate::MAX_BUNDLE_DEPTH + 1) + 2;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -335,7 +338,7 @@ pub(crate) async fn start(
             let result = (|| -> Result<()> {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
-                    .max_blocking_threads(2)
+                    .max_blocking_threads(BLOCKING_THREADS)
                     .build()
                     .context("creating bundle worker runtime")?;
                 let result = runtime.block_on(crate::BACKGROUND_CPU.scope((), async move {

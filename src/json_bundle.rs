@@ -696,6 +696,51 @@ mod tests {
     const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/json-bundle-434410.json");
     const ITEM_ID: &str = "Fo4czsdeHnVizyMKi8mqMHfu7vu29IG9GdlXaM9dYfg";
 
+    #[test]
+    fn concurrent_json_roots_leave_blocking_capacity_for_verification() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(crate::background::BLOCKING_THREADS)
+            .build()?;
+        runtime.block_on(crate::BACKGROUND_CPU.scope((), async {
+            let fixture: serde_json::Value = serde_json::from_slice(FIXTURE)?;
+            let item = &fixture["items"][0];
+            let expected = crate::decode_b64(item["data"].as_str().unwrap(), "fixture data")?;
+            let expected_hash = crate::sha256(&[&expected]);
+            let bytes = serde_json::to_vec(&serde_json::json!({"items": [item, item, item]}))?;
+            let work = async {
+                let mut ancestors = Vec::new();
+                for _ in 0..2 * crate::MAX_BUNDLE_DEPTH {
+                    let mut ancestor = JsonBundle::new(bytes.clone().into()).await?;
+                    ancestor.next().await?.context("missing ancestor item")?;
+                    ancestors.push(ancestor);
+                }
+                let mut first = JsonBundle::new(bytes.clone().into()).await?;
+                let mut second = JsonBundle::new(bytes.into()).await?;
+                let first_entry = first.next().await?.context("missing first root item")?;
+                let second_entry = second.next().await?.context("missing second root item")?;
+                let verify = |mut bundle: JsonBundle, entry: JsonEntry| async move {
+                    let mut next = Some(entry);
+                    let mut count = 0;
+                    while let Some(entry) = next {
+                        let item = entry.verify().await?.context("valid item rejected")?;
+                        assert_eq!(item.body_hash, expected_hash);
+                        count += 1;
+                        next = bundle.next().await?;
+                    }
+                    assert_eq!(count, 3);
+                    Ok::<_, anyhow::Error>(())
+                };
+                tokio::try_join!(verify(first, first_entry), verify(second, second_entry))?;
+                drop(ancestors);
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(3), work)
+                .await
+                .context("concurrent JSON parsers blocked verification")?
+        }))
+    }
+
     #[tokio::test]
     async fn historical_json_signature_and_escaped_payload() -> Result<()> {
         let fixture: serde_json::Value = serde_json::from_slice(FIXTURE)?;
