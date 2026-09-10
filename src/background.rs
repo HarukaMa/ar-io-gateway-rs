@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -47,7 +47,7 @@ struct Admission {
 }
 
 struct AdmissionState {
-    ids: HashSet<[u8; 32]>,
+    ids: HashMap<[u8; 32], Arc<crate::profiling::Profile>>,
     bytes: usize,
     scheduled_bytes: usize,
     scheduled_jobs: usize,
@@ -63,7 +63,7 @@ impl Admission {
                 last_failure: None,
             }),
             state: Mutex::new(AdmissionState {
-                ids: HashSet::with_capacity(max_jobs),
+                ids: HashMap::with_capacity(max_jobs),
                 bytes: 0,
                 scheduled_bytes: 0,
                 closed: false,
@@ -100,14 +100,15 @@ impl Admission {
         let mut state = self.state.try_lock()?;
         if state.closed
             || state.ids.len() == self.max_jobs
-            || state.ids.contains(&id)
+            || state.ids.contains_key(&id)
             || bytes > self.max_bytes - state.bytes
             || (scheduled && bytes > self.max_scheduled_bytes - state.scheduled_bytes)
             || (scheduled && state.scheduled_jobs == self.max_scheduled_jobs)
         {
             return None;
         }
-        state.ids.insert(id);
+        let profile = crate::profiling::Profile::new(URL_SAFE_NO_PAD.encode(id));
+        state.ids.insert(id, Arc::clone(&profile));
         state.bytes += bytes;
         if scheduled {
             state.scheduled_bytes += bytes;
@@ -118,6 +119,7 @@ impl Admission {
             id,
             bytes,
             scheduled,
+            profile,
         })
     }
 
@@ -147,6 +149,7 @@ struct Reservation {
     id: [u8; 32],
     bytes: usize,
     scheduled: bool,
+    profile: Arc<crate::profiling::Profile>,
 }
 
 impl Reservation {
@@ -168,6 +171,7 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
+        self.profile.finish("cancelled");
         let mut state = self.admission.state.lock();
         state.ids.remove(&self.id);
         state.bytes -= self.bytes;
@@ -447,11 +451,20 @@ async fn run(
         let mut stores = vec![store, &mut second_store];
         let mut indexing = FuturesUnordered::new();
         let mut downloads_finished = false;
+        let mut snapshots = tokio::time::interval(Duration::from_secs(5));
+        snapshots.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if downloads_finished && requests.is_none() && indexing.is_empty() {
                 break;
             }
             let job = tokio::select! {
+                _ = snapshots.tick() => {
+                    let profiles: Vec<_> = admission.state.lock().ids.values().cloned().collect();
+                    for profile in profiles {
+                        eprintln!("bundle_profile {}", profile.snapshot("sample"));
+                    }
+                    continue;
+                }
                 Some((store, id, result)) = indexing.next(), if !indexing.is_empty() => {
                     stores.push(store);
                     admission.status.lock().bundles = if indexing.is_empty() { "idle" } else { "indexing" };
@@ -536,7 +549,7 @@ async fn download_pending(
                     .is_some_and(|bytes| bytes <= admission.max_scheduled_bytes),
                 "indexing byte budget cannot hold the streaming working set"
             );
-            if !admission.state.lock().ids.contains(&id) {
+            if !admission.state.lock().ids.contains_key(&id) {
                 let spool = if streamed || size <= gateway.config.max_memory_data_size {
                     Ok(None)
                 } else {
@@ -559,24 +572,45 @@ async fn download_pending(
                                 })),
                             );
                         }
-                        let result = crate::content::DOWNLOAD_SPOOL
-                            .scope(std::cell::RefCell::new(spool), async {
-                                let Some(root) =
-                                    fetch_scheduled(gateway, store, &id, &encoded, height).await?
-                                else {
-                                    return Ok(None);
-                                };
-                                ensure!(
-                                    root.data.bytes.len() == size,
-                                    "bundle size changed after admission"
-                                );
-                                reservation.shrink(job_bytes(&root))?;
-                                Ok::<_, anyhow::Error>(Some(Job {
+                        let profile = Arc::clone(&reservation.profile);
+                        profile.phase(1);
+                        let result = crate::profiling::scope(
+                            Some(Arc::clone(&profile)),
+                            crate::content::DOWNLOAD_SPOOL.scope(
+                                std::cell::RefCell::new(spool),
+                                async {
+                                    let root =
+                                        fetch_scheduled(gateway, store, &id, &encoded, height)
+                                            .await?;
+                                    if let Some(root) = &root {
+                                        ensure!(
+                                            root.data.bytes.len() == size,
+                                            "bundle size changed after admission"
+                                        );
+                                        reservation.shrink(job_bytes(root))?;
+                                    }
+                                    Ok::<_, anyhow::Error>(root)
+                                },
+                            ),
+                        )
+                        .await;
+                        let result = match result {
+                            Ok(Some(root)) => {
+                                profile.phase(0);
+                                Ok(Some(Job {
                                     root: JobContent::Complete(root),
                                     reservation,
                                 }))
-                            })
-                            .await;
+                            }
+                            Ok(None) => {
+                                profile.finish("skipped");
+                                Ok(None)
+                            }
+                            Err(error) => {
+                                profile.finish("failed");
+                                Err(error)
+                            }
+                        };
                         (encoded, result)
                     });
                 } else {
@@ -677,37 +711,49 @@ async fn fetch_scheduled(
 
 async fn process_job(gateway: &Gateway, store: &mut BlockStore, job: Job) -> Result<u64> {
     let Job { root, reservation } = job;
-    let root = match root {
-        JobContent::Streamed { height } => {
-            let count =
-                crate::indexer::index_streamed_bundle(gateway, store, &reservation.id, height)
-                    .await?;
+    let profile = Arc::clone(&reservation.profile);
+    profile.phase(1);
+    let result = crate::profiling::scope(Some(Arc::clone(&profile)), async {
+        let root = match root {
+            JobContent::Streamed { height } => {
+                let count =
+                    crate::indexer::index_streamed_bundle(gateway, store, &reservation.id, height)
+                        .await?;
+                reservation.admission.indexed(count);
+                return Ok(count);
+            }
+            JobContent::Partial(root) => {
+                let count =
+                    crate::indexer::index_authenticated_bundle(gateway, store, &root).await?;
+                reservation.admission.indexed(count);
+                return Ok(count);
+            }
+            JobContent::Complete(root) => root,
+        };
+        timeout(gateway.config.retrieval_timeout, async {
+            if timeout(
+                gateway.config.request_timeout,
+                store.bundle_complete(&reservation.id),
+            )
+            .await
+            .context("checking bundle completion timed out")??
+            {
+                return Ok(0);
+            }
+            let count = index_bundle_content(gateway, store, root).await?;
             reservation.admission.indexed(count);
-            return Ok(count);
-        }
-        JobContent::Partial(root) => {
-            let count = crate::indexer::index_authenticated_bundle(gateway, store, &root).await?;
-            reservation.admission.indexed(count);
-            return Ok(count);
-        }
-        JobContent::Complete(root) => root,
-    };
-    timeout(gateway.config.retrieval_timeout, async {
-        if timeout(
-            gateway.config.request_timeout,
-            store.bundle_complete(&reservation.id),
-        )
+            Ok(count)
+        })
         .await
-        .context("checking bundle completion timed out")??
-        {
-            return Ok(0);
-        }
-        let count = index_bundle_content(gateway, store, root).await?;
-        reservation.admission.indexed(count);
-        Ok(count)
+        .context("indexing bundle timed out")?
     })
-    .await
-    .context("indexing bundle timed out")?
+    .await;
+    profile.finish(if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    });
+    result
 }
 
 #[cfg(test)]

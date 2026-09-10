@@ -904,7 +904,7 @@ mod tests {
             let budget = AtomicUsize::new(limit);
             let read = || async {
                 let response = client.get(&url).send().await.unwrap();
-                crate::read_json_response_with_limit::<Value>(response, 14, &budget).await
+                crate::read_json_response_with_limit::<Value>(response, 14, &budget, None).await
             };
             let (left, right) = tokio::join!(read(), read());
             assert_eq!(

@@ -1194,33 +1194,45 @@ async fn persist_bundle(
     reused_facts: bool,
 ) -> Result<u64> {
     let encoded_id = URL_SAFE_NO_PAD.encode(root_id);
+    if let Some(profile) = crate::profiling::current() {
+        profile.phase(2);
+    }
     let mut traversal = BundleTraversal::new(content, root_id, format).await?;
     let mut occurrences = 0;
     let mut verification_time = Duration::ZERO;
     let mut persistence_time = Duration::ZERO;
     loop {
         let started = Instant::now();
-        let mut objects = Vec::with_capacity(256);
-        let mut locations = Vec::with_capacity(256);
-        let mut metadata_bytes = 0usize;
-        let mut complete = false;
-        while locations.len() < 256 && metadata_bytes < crate::MAX_JSON_BYTES {
-            let Some((object, location)) = traversal.next().await? else {
-                complete = true;
-                break;
-            };
-            metadata_bytes = metadata_bytes.saturating_add(object.heap_bytes());
-            objects.push(object);
-            locations.push(location);
-        }
+        let (objects, locations, complete) =
+            crate::profiling::measure(crate::profiling::Stage::Traversal, async {
+                let mut objects = Vec::with_capacity(256);
+                let mut locations = Vec::with_capacity(256);
+                let mut metadata_bytes = 0usize;
+                let mut complete = false;
+                while locations.len() < 256 && metadata_bytes < crate::MAX_JSON_BYTES {
+                    let Some((object, location)) = traversal.next().await? else {
+                        complete = true;
+                        break;
+                    };
+                    metadata_bytes = metadata_bytes.saturating_add(object.heap_bytes());
+                    objects.push(object);
+                    locations.push(location);
+                }
+                Ok((objects, locations, complete))
+            })
+            .await?;
         verification_time += started.elapsed();
         let started = Instant::now();
-        timeout(
-            gateway.config.request_timeout,
-            store.commit_bundle_batch(root_id, &objects, &locations, complete),
-        )
-        .await
-        .context("committing bundle metadata timed out")??;
+        crate::profiling::measure(crate::profiling::Stage::Persistence, async {
+            timeout(
+                gateway.config.request_timeout,
+                store.commit_bundle_batch(root_id, &objects, &locations, complete),
+            )
+            .await
+            .context("committing bundle metadata timed out")??;
+            Ok(())
+        })
+        .await?;
         persistence_time += started.elapsed();
         occurrences += locations.len() as u64;
         if complete {

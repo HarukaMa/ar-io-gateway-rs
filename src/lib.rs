@@ -6,6 +6,7 @@ mod historical;
 pub mod indexer;
 mod json_bundle;
 mod peers;
+mod profiling;
 pub mod server;
 mod streaming;
 mod transactions;
@@ -266,10 +267,23 @@ async fn cpu_work<T: Send + 'static>(
     } else {
         &HTTP_JOBS
     };
-    let permit = jobs.acquire().await?;
+    let permit = profiling::measure(profiling::Stage::CpuAdmission, async {
+        jobs.acquire().await.context("CPU work admission closed")
+    })
+    .await?;
+    let profile = profiling::current();
+    let dispatch = profiling::start(profiling::Stage::CpuDispatch);
     tokio::task::spawn_blocking(move || {
+        if let Some(timer) = dispatch {
+            timer.finish(true, 0);
+        }
         let _permit = permit;
-        work()
+        let timer = profiling::start_for(&profile, profiling::Stage::CpuExecution);
+        let result = work();
+        if let Some(timer) = timer {
+            timer.finish(result.is_ok(), 0);
+        }
+        result
     })
     .await
     .context("CPU verification task failed")?
@@ -1684,7 +1698,8 @@ impl Gateway {
                         "trusted transaction source redirected outside its origin"
                     );
                 }
-                let value = read_json_response_with_limit(response, limit, remaining_bytes).await?;
+                let value =
+                    read_json_response_with_limit(response, limit, remaining_bytes, None).await?;
                 let transaction = transactions::decode_transaction(value)?;
                 ensure!(
                     trusted || !transaction.owner.is_empty(),
@@ -1896,10 +1911,13 @@ impl Gateway {
         source: &str,
         offset: u128,
     ) -> Result<(JsonChunk, Duration, Duration)> {
-        let _permit = CHUNK_FETCHES
-            .acquire()
-            .await
-            .context("chunk fetch admission closed")?;
+        let _permit = profiling::measure(profiling::Stage::ChunkAdmission, async {
+            CHUNK_FETCHES
+                .acquire()
+                .await
+                .context("chunk fetch admission closed")
+        })
+        .await?;
         let url = endpoint(source, &format!("chunk/{offset}"));
         let request = if self
             .config
@@ -1913,14 +1931,17 @@ impl Gateway {
         };
         let started = Instant::now();
         // Reserve time for fallback within the shared chunk deadline.
-        let response = request
-            .timeout((self.config.request_timeout / 4).min(CHUNK_PEER_DEADLINE))
-            .send()
-            .await?
-            .error_for_status()?;
+        let response = profiling::measure(profiling::Stage::ChunkHeaders, async {
+            Ok(request
+                .timeout((self.config.request_timeout / 4).min(CHUNK_PEER_DEADLINE))
+                .send()
+                .await?
+                .error_for_status()?)
+        })
+        .await?;
         let headers = started.elapsed();
         let started = Instant::now();
-        let chunk = read_json_response(response).await?;
+        let chunk = read_chunk_response(response).await?;
         Ok((chunk, headers, started.elapsed()))
     }
 
@@ -1956,13 +1977,25 @@ impl Gateway {
 
 async fn read_json_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {
     let remaining = AtomicUsize::new(MAX_JSON_BYTES);
-    read_json_response_with_limit(response, MAX_JSON_BYTES, &remaining).await
+    read_json_response_with_limit(response, MAX_JSON_BYTES, &remaining, None).await
+}
+
+async fn read_chunk_response(response: reqwest::Response) -> Result<JsonChunk> {
+    let timer = profiling::start(profiling::Stage::ChunkBody);
+    let remaining = AtomicUsize::new(MAX_JSON_BYTES);
+    let result =
+        read_json_response_with_limit(response, MAX_JSON_BYTES, &remaining, timer.as_ref()).await;
+    if let Some(timer) = timer {
+        timer.finish(result.is_ok(), 0);
+    }
+    result
 }
 
 async fn read_json_response_with_limit<T: DeserializeOwned>(
     mut response: reqwest::Response,
     limit: usize,
     remaining_bytes: &AtomicUsize,
+    timer: Option<&profiling::Timer>,
 ) -> Result<T> {
     if let Some(length) = response.content_length() {
         ensure!(
@@ -1973,6 +2006,9 @@ async fn read_json_response_with_limit<T: DeserializeOwned>(
 
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.context("failed to read HTTP body")? {
+        if let Some(timer) = timer {
+            timer.add_bytes(chunk.len() as u64);
+        }
         let remaining = remaining_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                 Some(remaining.saturating_sub(chunk.len()))

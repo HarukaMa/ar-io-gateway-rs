@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::{
-    Geometry, cpu_work, endpoint, peers::PeerState, read_json_response, verify_chunk_range,
+    Geometry, cpu_work, endpoint, peers::PeerState, read_chunk_response, verify_chunk_range,
 };
 
 pub(crate) struct ChunkSource {
@@ -22,6 +22,7 @@ pub(crate) struct ChunkSource {
     timeout: Duration,
     geometry: Geometry,
     cached: Mutex<VecDeque<(usize, Bytes)>>,
+    profile: Option<std::sync::Weak<crate::profiling::Profile>>,
 }
 
 impl std::fmt::Debug for ChunkSource {
@@ -39,6 +40,7 @@ impl ChunkSource {
             timeout: gateway.config.request_timeout.min(crate::CHUNK_DEADLINE),
             geometry,
             cached: Mutex::new(VecDeque::with_capacity(2)),
+            profile: crate::profiling::current().as_ref().map(Arc::downgrade),
         })
     }
 
@@ -126,61 +128,77 @@ impl ChunkSource {
     }
 
     async fn fetch(&self, position: usize) -> Result<(usize, Bytes)> {
-        tokio::time::timeout(self.timeout, async {
-            let absolute = self
-                .geometry
-                .first_offset
-                .checked_add(position as u128)
-                .context("stream chunk offset overflow")?;
-            let sources = self.peers.chunk_candidates(absolute, &self.sources);
-            let mut failures = Vec::new();
-            for source in sources {
-                let mut sample = None;
-                let result = async {
-                    let _permit = crate::CHUNK_FETCHES
-                        .acquire()
-                        .await
-                        .context("chunk fetch admission closed")?;
-                    let path = format!("chunk/{absolute}");
-                    let request = if self.sources.iter().any(|configured| configured == &source) {
-                        self.client.get(endpoint(&source, &path))
-                    } else {
-                        self.peers.get(endpoint(&source, &path))
-                    };
-                    let started = Instant::now();
-                    // Reserve time for fallback within the shared chunk deadline.
-                    let response = request
-                        .timeout((self.timeout / 4).min(crate::CHUNK_PEER_DEADLINE))
-                        .send()
-                        .await?
-                        .error_for_status()?;
-                    let headers = started.elapsed();
-                    let started = Instant::now();
-                    let chunk = read_json_response(response).await?;
-                    let body = started.elapsed();
-                    let geometry = self.geometry;
-                    let proof = cpu_work(move || {
-                        verify_chunk_range(chunk, absolute, position as u128, &geometry)
-                    })
-                    .await?;
-                    sample = Some((headers, body, proof.bytes.len()));
-                    Ok::<_, anyhow::Error>((
-                        usize::try_from(proof.data.start)?,
-                        Bytes::from(proof.bytes),
-                    ))
+        crate::profiling::scope(
+            self.profile.as_ref().and_then(std::sync::Weak::upgrade),
+            tokio::time::timeout(self.timeout, async {
+                let absolute = self
+                    .geometry
+                    .first_offset
+                    .checked_add(position as u128)
+                    .context("stream chunk offset overflow")?;
+                let sources = self.peers.chunk_candidates(absolute, &self.sources);
+                let mut failures = Vec::new();
+                for source in sources {
+                    let mut sample = None;
+                    let result = async {
+                        let _permit = crate::profiling::measure(
+                            crate::profiling::Stage::ChunkAdmission,
+                            async {
+                                crate::CHUNK_FETCHES
+                                    .acquire()
+                                    .await
+                                    .context("chunk fetch admission closed")
+                            },
+                        )
+                        .await?;
+                        let path = format!("chunk/{absolute}");
+                        let request = if self.sources.iter().any(|configured| configured == &source)
+                        {
+                            self.client.get(endpoint(&source, &path))
+                        } else {
+                            self.peers.get(endpoint(&source, &path))
+                        };
+                        let started = Instant::now();
+                        // Reserve time for fallback within the shared chunk deadline.
+                        let response = crate::profiling::measure(
+                            crate::profiling::Stage::ChunkHeaders,
+                            async {
+                                Ok(request
+                                    .timeout((self.timeout / 4).min(crate::CHUNK_PEER_DEADLINE))
+                                    .send()
+                                    .await?
+                                    .error_for_status()?)
+                            },
+                        )
+                        .await?;
+                        let headers = started.elapsed();
+                        let started = Instant::now();
+                        let chunk = read_chunk_response(response).await?;
+                        let body = started.elapsed();
+                        let geometry = self.geometry;
+                        let proof = cpu_work(move || {
+                            verify_chunk_range(chunk, absolute, position as u128, &geometry)
+                        })
+                        .await?;
+                        sample = Some((headers, body, proof.bytes.len()));
+                        Ok::<_, anyhow::Error>((
+                            usize::try_from(proof.data.start)?,
+                            Bytes::from(proof.bytes),
+                        ))
+                    }
+                    .await;
+                    self.peers.record_chunk_result(&source, sample);
+                    match result {
+                        Ok(chunk) => return Ok(chunk),
+                        Err(error) => failures.push(format!("{source}: {error:#}")),
+                    }
                 }
-                .await;
-                self.peers.record_chunk_result(&source, sample);
-                match result {
-                    Ok(chunk) => return Ok(chunk),
-                    Err(error) => failures.push(format!("{source}: {error:#}")),
-                }
-            }
-            anyhow::bail!(
-                "all streaming chunk candidates failed: {}",
-                failures.join("; ")
-            )
-        })
+                anyhow::bail!(
+                    "all streaming chunk candidates failed: {}",
+                    failures.join("; ")
+                )
+            }),
+        )
         .await
         .context("streaming chunk request timed out")?
     }
