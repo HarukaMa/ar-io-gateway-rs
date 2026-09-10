@@ -24,7 +24,7 @@ use crate::{
 use futures_util::{StreamExt, stream::FuturesUnordered};
 const MAX_JOBS: usize = 8;
 pub(crate) const INDEX_WORKERS: usize = 8;
-pub(crate) const CPU_JOBS: usize = 4;
+pub(crate) const CPU_JOBS: usize = 8;
 // Each root can retain an ancestor parser plus one being checked at the depth limit.
 // Keep capacity for verification and file I/O beyond those blocked parsers.
 pub(crate) const BLOCKING_THREADS: usize = INDEX_WORKERS * (crate::MAX_BUNDLE_DEPTH + 1) + CPU_JOBS;
