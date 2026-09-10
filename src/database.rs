@@ -1612,6 +1612,10 @@ impl BlockStore {
             .execute(
                 "INSERT INTO public.owners AS stored (address, public_key)
                  SELECT * FROM unnest($1::bytea[], $2::bytea[]) AS incoming(address, public_key)
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM public.owners existing
+                     WHERE existing.address=incoming.address AND existing.public_key IS NOT NULL
+                 )
                  ORDER BY address
                  ON CONFLICT (address) DO UPDATE SET public_key = EXCLUDED.public_key
                  WHERE stored.public_key IS NULL",
@@ -2982,7 +2986,29 @@ mod tests {
             (SELECT count(*) FROM public.object_tags), (SELECT count(*) FROM public.tag_names),
             (SELECT count(*) FROM public.tag_values)]";
         let before: Vec<i64> = store.client.query_one(counts, &[]).await?.get(0);
+        let mut other = store.reconnect().await?;
+        let owner_lock = other.client.transaction().await?;
+        owner_lock
+            .query_one(
+                "SELECT address FROM public.owners WHERE address=$1 FOR NO KEY UPDATE",
+                &[&object.owner_address],
+            )
+            .await?;
+        store
+            .client
+            .batch_execute("SET lock_timeout='250ms'")
+            .await?;
         store.record_objects(std::slice::from_ref(&object)).await?;
+        object.owner_public_key.push(0);
+        let conflict = store
+            .record_objects(std::slice::from_ref(&object))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            conflict.to_string(),
+            "conflicting immutable owner public key"
+        );
+        object.owner_public_key.pop();
         let original_size = object.data_size;
         object.data_size = original_size
             .checked_add(1)
@@ -3007,6 +3033,24 @@ mod tests {
         );
         object.tags.pop();
         store.record_objects(std::slice::from_ref(&object)).await?;
+        owner_lock.rollback().await?;
+        let transaction = store.client.transaction().await?;
+        transaction
+            .execute(
+                "UPDATE public.owners SET public_key=NULL WHERE address=$1",
+                &[&object.owner_address],
+            )
+            .await?;
+        BlockStore::write_objects(&transaction, std::slice::from_ref(&object)).await?;
+        let key: Vec<u8> = transaction
+            .query_one(
+                "SELECT public_key FROM public.owners WHERE address=$1",
+                &[&object.owner_address],
+            )
+            .await?
+            .get(0);
+        assert_eq!(key, object.owner_public_key);
+        transaction.rollback().await?;
         let after: Vec<i64> = store.client.query_one(counts, &[]).await?.get(0);
         ensure!(before == after, "failed metadata write left rows behind");
         Ok(())
