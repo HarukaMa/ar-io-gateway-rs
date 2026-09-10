@@ -1241,17 +1241,35 @@ impl BlockStore {
             .isolation_level(IsolationLevel::ReadCommitted)
             .start()
             .await?;
-        transaction
+        let checkpoint: i64 = transaction
             .query_one(
-                "SELECT singleton FROM public.block_index_state WHERE singleton FOR SHARE",
+                "SELECT checkpoint_height FROM public.block_index_state WHERE singleton",
                 &[],
             )
-            .await?;
-        Self::lock_bundle_roots(&transaction, &[root_id]).await?;
-        let root = transaction
-            .query_opt(&bundle_lookup_sql(), &[&root_id])
+            .await?
+            .try_get(0)?;
+        let lookup = bundle_lookup_sql();
+        let mut root = transaction
+            .query_opt(&lookup, &[&root_id])
             .await?
             .context("bundle root lacks completed canonical metadata")?;
+        let unstable = root.try_get::<_, i64>(1)? > checkpoint;
+        if unstable {
+            transaction
+                .query_one(
+                    "SELECT singleton FROM public.block_index_state WHERE singleton FOR SHARE",
+                    &[],
+                )
+                .await?;
+        }
+        Self::lock_bundle_roots(&transaction, &[root_id]).await?;
+        if unstable {
+            // A reorg may have completed while we waited for the chain guard.
+            root = transaction
+                .query_opt(&lookup, &[&root_id])
+                .await?
+                .context("bundle root lacks completed canonical metadata")?;
+        }
         let root_key: i64 = root.try_get(5)?;
         let root_size: u128 = root.try_get::<_, String>(2)?.parse()?;
         let root_json: bool = root.try_get(4)?;
@@ -2888,6 +2906,18 @@ mod tests {
             (SELECT count(*) FROM public.canonical_placements), (SELECT count(*) FROM public.bundle_progress)],
             (SELECT complete FROM public.bundle_progress WHERE root_key=$1)";
         let before = store.client.query_one(snapshot, &[&root_key]).await?;
+        let mut checkpoint_writer = store.reconnect().await?;
+        let checkpoint_update = checkpoint_writer.client.transaction().await?;
+        checkpoint_update
+            .query_one(
+                "SELECT singleton FROM public.block_index_state WHERE singleton FOR UPDATE",
+                &[],
+            )
+            .await?;
+        store
+            .client
+            .batch_execute("SET lock_timeout='500ms'")
+            .await?;
         store
             .commit_bundle_batch(
                 &root_id,
@@ -2896,6 +2926,8 @@ mod tests {
                 false,
             )
             .await?;
+        checkpoint_update.rollback().await?;
+        store.client.batch_execute("RESET lock_timeout").await?;
         object.id = sha2::Sha256::digest([b"bundle-rollback-item".as_slice(), &object.id].concat())
             .to_vec();
         object.owner_address =
@@ -2925,6 +2957,111 @@ mod tests {
             "failed bundle batch changed facts, tags, occurrences, placements, or progress"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; run serially, temporarily changes checkpoint and coverage"]
+    async fn bundle_rechecks_unstable_root_after_chain_change() -> Result<()> {
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let original = store
+            .state()
+            .await?
+            .context("requires an initialized index")?;
+        let root = store
+            .client
+            .query_one(
+                &format!(
+                    "{BUNDLE_TAGS} {BUNDLE_CANDIDATES} {CANONICAL_BUNDLES}
+                AND progress.complete ORDER BY p.block_height LIMIT 1"
+                ),
+                &[],
+            )
+            .await?;
+        let root_id: Vec<u8> = root.try_get(0)?;
+        let height: i64 = root.try_get(1)?;
+        ensure!(
+            height > original.start_height as i64 && height <= original.checkpoint.height as i64,
+            "requires a stable bundle inside coverage"
+        );
+        let actor = store.reconnect().await?;
+        let pid: i32 = store
+            .client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        let actor_pid: i32 = actor
+            .client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        let result = async {
+            actor.client.execute(
+                "UPDATE public.block_index_state SET checkpoint_height=$1 WHERE singleton",
+                &[&height],
+            ).await?;
+            actor.client.batch_execute(
+                "BEGIN; SELECT singleton FROM public.block_index_state WHERE singleton FOR UPDATE"
+            ).await?;
+            store.client.batch_execute("SET lock_timeout='500ms'").await?;
+            store.commit_bundle_batch(&root_id, &[], &[], false).await?;
+            actor.client.batch_execute("ROLLBACK").await?;
+            store.client.batch_execute("RESET lock_timeout").await?;
+
+            actor.client.execute(
+                "UPDATE public.block_index_state SET checkpoint_height=$1 WHERE singleton",
+                &[&(height - 1)],
+            ).await?;
+            actor.client.batch_execute(
+                "BEGIN; SELECT singleton FROM public.block_index_state WHERE singleton FOR UPDATE"
+            ).await?;
+            let mut write = Box::pin(store.commit_bundle_batch(&root_id, &[], &[], false));
+            let blocked = async {
+                loop {
+                    let blockers: Vec<i32> = actor.client.query_one(
+                        "SELECT pg_blocking_pids($1)", &[&pid],
+                    ).await?.get(0);
+                    if blockers.contains(&actor_pid) {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut write => anyhow::bail!("unstable bundle bypassed the chain guard: {result:?}"),
+                result = tokio::time::timeout(Duration::from_secs(3), blocked) => {
+                    result.context("bundle did not wait for the chain guard")??;
+                }
+            }
+            actor.client.execute(
+                "UPDATE public.block_index_state SET imported_through=$1 WHERE singleton",
+                &[&(height - 1)],
+            ).await?;
+            actor.client.batch_execute("COMMIT").await?;
+            let error = write.await.err().context("bundle accepted a root outside changed coverage")?;
+            ensure!(error.to_string() == "bundle root lacks completed canonical metadata",
+                "unexpected bundle failure: {error:#}");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        actor.client.batch_execute("ROLLBACK").await?;
+        actor.client.execute(
+            "UPDATE public.block_index_state SET checkpoint_height=$1, imported_through=$2 WHERE singleton",
+            &[&sql_height(original.checkpoint.height)?,
+              &original.imported_through.map(sql_height).transpose()?],
+        ).await?;
+        ensure!(
+            store.state().await? == Some(original),
+            "test did not restore chain state"
+        );
+        result
     }
 
     #[tokio::test]
