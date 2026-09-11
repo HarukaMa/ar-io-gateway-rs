@@ -143,9 +143,7 @@ async fn main() -> Result<()> {
         "transactions" => {
             serde_json::to_string(&import_metadata(&gateway, &mut store, start, end).await?)?
         }
-        "bundles" => {
-            serde_json::to_string(&import_bundles(&gateway, &mut store, start, end).await?)?
-        }
+        "bundles" => serde_json::to_string(&import_bundles(gateway, store, start, end).await?)?,
         _ => unreachable!(),
     };
     println!("{summary}");

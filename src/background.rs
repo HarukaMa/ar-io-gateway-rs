@@ -342,7 +342,9 @@ pub(crate) async fn start(
         .name("bundle-indexer".to_owned())
         .spawn(move || {
             let result = (|| -> Result<()> {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_name("bundle-worker")
                     .enable_all()
                     .max_blocking_threads(BLOCKING_THREADS)
                     .build()
@@ -362,9 +364,9 @@ pub(crate) async fn start(
                         } else {
                             None
                         };
-                        Ok::<_, anyhow::Error>((gateway, store, chain_store))
+                        Ok::<_, anyhow::Error>((Arc::new(gateway), store, chain_store))
                     };
-                    let (gateway, mut store, mut chain_store) = tokio::select! {
+                    let (gateway, store, mut chain_store) = tokio::select! {
                         biased;
                         _ = &mut cancelled => return Ok(()),
                         result = timeout(startup_timeout, initialize) => {
@@ -396,7 +398,7 @@ pub(crate) async fn start(
                     tokio::select! {
                         biased;
                         _ = &mut cancelled => Ok(()),
-                        result = run(&gateway, &mut store, Some(receiver), Arc::clone(&worker_admission), None) => result.map(|_| ()),
+                        result = run(Arc::clone(&gateway), store, Some(receiver), Arc::clone(&worker_admission), None) => result.map(|_| ()),
                         result = follow_chain => result,
                     }
                 }));
@@ -422,8 +424,8 @@ pub(crate) async fn start(
 }
 
 pub(crate) async fn import(
-    gateway: &Gateway,
-    store: &mut BlockStore,
+    gateway: Gateway,
+    store: BlockStore,
     start: u64,
     end: u64,
 ) -> Result<(u64, u64)> {
@@ -433,30 +435,37 @@ pub(crate) async fn import(
         false,
     );
     crate::BACKGROUND_CPU
-        .scope((), run(gateway, store, None, admission, Some((start, end))))
+        .scope(
+            (),
+            run(
+                Arc::new(gateway),
+                store,
+                None,
+                admission,
+                Some((start, end)),
+            ),
+        )
         .await
 }
 
 async fn run(
-    gateway: &Gateway,
-    store: &mut BlockStore,
+    gateway: Arc<Gateway>,
+    store: BlockStore,
     mut requests: Option<mpsc::Receiver<Job>>,
     admission: Arc<Admission>,
     range: Option<(u64, u64)>,
 ) -> Result<(u64, u64)> {
     let (sender, mut ready) = mpsc::channel(gateway.config.index_downloads);
-    let mut extra_stores = Vec::with_capacity(INDEX_WORKERS - 1);
+    let mut stores = Vec::with_capacity(INDEX_WORKERS);
     for _ in 1..INDEX_WORKERS {
-        extra_stores.push(store.reconnect().await?);
+        stores.push(store.reconnect().await?);
     }
-    let produce = download_pending(gateway, sender, &admission, range);
+    stores.push(store);
+    let produce = download_pending(&gateway, sender, &admission, range);
     let consume = async {
         let mut roots = 0;
         let mut occurrences = 0;
-        let mut stores = Vec::with_capacity(INDEX_WORKERS);
-        stores.push(store);
-        stores.extend(extra_stores.iter_mut());
-        let mut indexing = FuturesUnordered::new();
+        let mut indexing = tokio::task::JoinSet::new();
         let mut downloads_finished = false;
         let mut snapshots = tokio::time::interval(Duration::from_secs(5));
         snapshots.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -472,7 +481,8 @@ async fn run(
                     }
                     continue;
                 }
-                Some((store, id, result)) = indexing.next(), if !indexing.is_empty() => {
+                Some(result) = indexing.join_next(), if !indexing.is_empty() => {
+                    let (store, id, result) = result.context("bundle indexing task failed")?;
                     stores.push(store);
                     admission.status.lock().bundles = if indexing.is_empty() { "idle" } else { "indexing" };
                     match result {
@@ -503,11 +513,12 @@ async fn run(
             };
             let id = URL_SAFE_NO_PAD.encode(job.reservation.id);
             admission.status.lock().bundles = "indexing";
-            let store = stores.pop().expect("available bundle writer");
-            indexing.push(async move {
-                let result = process_job(gateway, store, job).await;
+            let mut store = stores.pop().expect("available bundle writer");
+            let gateway = Arc::clone(&gateway);
+            indexing.spawn(crate::BACKGROUND_CPU.scope((), async move {
+                let result = process_job(&gateway, &mut store, job).await;
                 (store, id, result)
-            });
+            }));
         }
         Ok((roots, occurrences))
     };
@@ -775,7 +786,7 @@ mod tests {
     use super::*;
     use crate::content::{ContentWriter, SpoolBudget};
     use crate::{Tag, VerifiedData, content::Content};
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires ar_io_rust_test; takes a temporary bundle-progress table lock"]
     async fn bundle_jobs_overlap_with_bounded_admission_and_cancel_cleanly() -> Result<()> {
         let url = std::env::var("DATABASE_URL")?;
@@ -806,7 +817,7 @@ mod tests {
         )?)?
         .with_database(&url)
         .await?;
-        let mut store = BlockStore::connect(&url).await?;
+        let store = BlockStore::connect(&url).await?;
         let (sender, receiver) = mpsc::channel(INDEX_WORKERS + 1);
         let submitter = BundleSubmitter {
             sender,
@@ -827,8 +838,8 @@ mod tests {
             .await?
             .get(0);
         let mut running = Box::pin(run(
-            &gateway,
-            &mut store,
+            Arc::new(gateway),
+            store,
             Some(receiver),
             Arc::clone(&admission),
             None,
@@ -867,6 +878,13 @@ mod tests {
         }
         assert_eq!(admission.state.lock().ids.len(), INDEX_WORKERS + 1);
         drop(running);
+        timeout(Duration::from_secs(1), async {
+            while !admission.state.lock().ids.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("cancelled indexing jobs retained admission")?;
         assert!(admission.state.lock().ids.is_empty());
         assert_eq!(admission.state.lock().bytes, 0);
         transaction.rollback().await?;

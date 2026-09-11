@@ -1958,17 +1958,18 @@ impl BlockStore {
                 }
             }
         }
-        let mut tags = objects.iter().zip(&keys).flat_map(|(object, key)| {
-            object
-                .tags
-                .iter()
-                .enumerate()
-                .map(move |(ordinal, (name, value))| {
-                    (*key, ordinal as i32, name.as_slice(), value.as_slice())
-                })
-        });
+        let mut tags = objects
+            .iter()
+            .zip(&keys)
+            .flat_map(|(object, key)| object.tags.iter().enumerate().zip(std::iter::repeat(*key)));
         loop {
-            let batch: Vec<_> = tags.by_ref().take(ROW_BATCH_SIZE).collect();
+            let batch: Vec<_> = tags
+                .by_ref()
+                .take(ROW_BATCH_SIZE)
+                .map(|((ordinal, (name, value)), key)| {
+                    (key, ordinal as i32, name.as_slice(), value.as_slice())
+                })
+                .collect();
             if batch.is_empty() {
                 break;
             }

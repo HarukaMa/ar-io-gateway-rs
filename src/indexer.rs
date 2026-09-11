@@ -362,14 +362,14 @@ type TransactionJob = (
 );
 
 fn pending_transaction_jobs<'a, F>(
-    query: &'a impl Fn(Vec<u64>) -> F,
+    query: &'a (impl Fn(Vec<u64>) -> F + Sync),
     start: u64,
     end: u64,
     active: &'a parking_lot::Mutex<std::collections::BTreeSet<u64>>,
     committed: &'a tokio::sync::Notify,
-) -> impl futures_util::Stream<Item = Result<TransactionJob>> + 'a
+) -> impl futures_util::Stream<Item = Result<TransactionJob>> + Send + 'a
 where
-    F: Future<Output = Result<Vec<(Vec<u8>, u64)>>> + 'a,
+    F: Future<Output = Result<Vec<(Vec<u8>, u64)>>> + Send + 'a,
 {
     stream::try_unfold(
         std::collections::VecDeque::new(),
@@ -496,7 +496,8 @@ async fn import_pending_transactions(
                 }
             }
         })
-        .buffer_unordered(32);
+        .buffer_unordered(32)
+        .boxed();
     let (sender, mut ready) = mpsc::channel(1);
     let produce = queue_metadata(fetched, sender);
     let consume = async {
@@ -604,9 +605,14 @@ async fn transaction_metadata(
     let first = fetch(URL_SAFE_NO_PAD.encode(&ids[0])).await?;
     let mut objects = vec![first];
     if objects[0].format != Some(1) || objects[0].denomination != Some(0) {
-        let fetched = stream::iter(ids.iter().skip(1))
-            .map(|id| fetch(URL_SAFE_NO_PAD.encode(id)))
-            .buffer_unordered(32);
+        let fetched = stream::iter(
+            ids.iter()
+                .skip(1)
+                .map(|id: &Vec<u8>| URL_SAFE_NO_PAD.encode(id)),
+        )
+        .boxed()
+        .map(fetch)
+        .buffer_unordered(32);
         tokio::pin!(fetched);
         while let Some(object) = fetched.next().await {
             objects.push(object?);
@@ -728,7 +734,7 @@ fn block_metadata<'a>(
     gateway: &'a Gateway,
     blocks: Vec<IndexBlock>,
     headers: &'a Mutex<HashMap<Vec<u8>, crate::BlockHeader>>,
-) -> impl futures_util::Stream<Item = Result<(IndexBlock, u64, Vec<Vec<u8>>)>> + 'a {
+) -> impl futures_util::Stream<Item = Result<(IndexBlock, u64, Vec<Vec<u8>>)>> + Send + 'a {
     stream::iter(blocks)
         .map(move |block| async move {
             let metadata = timeout(gateway.config.request_timeout, async {
@@ -1117,8 +1123,8 @@ mod metadata_tests {
 }
 
 pub async fn import_bundles(
-    gateway: &Gateway,
-    store: &mut BlockStore,
+    gateway: Gateway,
+    store: BlockStore,
     start: u64,
     end: u64,
 ) -> Result<BundleSummary> {

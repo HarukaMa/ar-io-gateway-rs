@@ -6070,7 +6070,7 @@ mod cache_tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cpu_jobs_leave_runtime_responsive_and_keep_permits_until_completion() -> Result<()> {
         let mut jobs = Vec::new();
         let mut releases = Vec::new();
