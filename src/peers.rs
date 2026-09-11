@@ -36,7 +36,7 @@ const GATEWAY_SIZE: usize = 964;
 const REGISTRY_DISCRIMINATOR: [u8; 8] = [207, 115, 197, 33, 28, 106, 182, 209];
 const GATEWAY_DISCRIMINATOR: [u8; 8] = [210, 132, 162, 254, 10, 224, 45, 86];
 
-pub(crate) const CHUNK_ORIGIN_LIMIT: usize = 16;
+pub(crate) const CHUNK_ORIGIN_LIMIT: usize = 32;
 
 pub(crate) fn chunk_slots(source: &str) -> Result<std::sync::Arc<tokio::sync::Semaphore>> {
     use std::sync::{Arc, LazyLock, Weak};
@@ -53,7 +53,7 @@ pub(crate) fn chunk_slots(source: &str) -> Result<std::sync::Arc<tokio::sync::Se
     Ok(slots)
 }
 
-static CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(96);
+static CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(192);
 static CHUNK_CAPACITY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 struct ChunkPermit {
