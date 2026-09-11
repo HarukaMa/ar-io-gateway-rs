@@ -488,6 +488,13 @@ impl PeerState {
             .map(|url| (url.trim_end_matches('/').to_owned(), None))
             .collect();
         for peer in state.nodes.values() {
+            if !peer
+                .coverage
+                .as_ref()
+                .is_some_and(|coverage| coverage.covers(offset))
+            {
+                continue;
+            }
             pool.insert(
                 peer.url.clone(),
                 peer.coverage.as_ref().map(|coverage| {
@@ -1144,9 +1151,11 @@ mod tests {
         let peers = PeerState::new("http://127.0.0.1:1984")?;
         let configured = vec!["http://unknown.test".to_owned()];
         for (url, share) in [
-            ("http://full.test", 1.0),
-            ("http://partial.test", 0.1),
-            ("http://empty.test", 0.0),
+            ("http://full.test", Some(1.0)),
+            ("http://partial.test", Some(0.1)),
+            ("http://empty.test", Some(0.0)),
+            ("http://unknown.test", None),
+            ("http://unadvertised.test", None),
         ] {
             peers.state.lock().unwrap().nodes.insert(
                 url.to_owned(),
@@ -1155,7 +1164,9 @@ mod tests {
                     blocks: 1,
                     height: 1,
                     last_seen: now_millis(),
-                    coverage: Some(decode_buckets(&bucket_frame(&[(0, share)]))?),
+                    coverage: share
+                        .map(|share| decode_buckets(&bucket_frame(&[(0, share)])))
+                        .transpose()?,
                     weight: 50,
                 },
             );
@@ -1167,7 +1178,6 @@ mod tests {
                 "http://full.test",
                 "http://unknown.test",
                 "http://partial.test",
-                "http://empty.test",
             ]
         );
         {
@@ -1182,14 +1192,26 @@ mod tests {
                 .updated = 0;
         }
         let ranked = peers.chunk_candidates(1, &configured)?;
-        assert!(
-            ranked.iter().position(|url| url == "http://empty.test")
-                < ranked.iter().position(|url| url == "http://partial.test")
+        assert!(!ranked.iter().any(|url| url == "http://empty.test"));
+        assert_eq!(
+            peers.chunk_candidates(DEFAULT_BUCKET_SIZE.into(), &configured)?,
+            configured
+        );
+        assert_eq!(
+            peers
+                .chunk_candidates(1, &["http://empty.test".to_owned()])?
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "http://full.test".to_owned(),
+                "http://partial.test".to_owned(),
+                "http://empty.test".to_owned(),
+            ])
         );
         let explored: BTreeSet<_> = (0..64)
             .map(|_| peers.chunk_candidates(1, &configured).unwrap()[0].clone())
             .collect();
-        assert_eq!(explored.len(), 4);
+        assert_eq!(explored.len(), 3);
         Ok(())
     }
 
@@ -1273,7 +1295,7 @@ mod tests {
                     blocks: 1,
                     height: 1,
                     last_seen: 0,
-                    coverage: None,
+                    coverage: Some(decode_buckets(&bucket_frame(&[(0, 0.5)]))?),
                     weight: 50,
                 },
             );
@@ -1501,6 +1523,7 @@ mod tests {
             ("/trusted/peers", br#"["8.8.8.8:1984"]"#.to_vec()),
             ("/trusted/info", br#"{"height":51}"#.to_vec()),
             ("/info", br#"{"height":51,"blocks":51}"#.to_vec()),
+            ("/sync_buckets", bucket_frame(&[(0, 1.0)])),
             ("/trusted/block_index2/0/0", previous.clone()),
             ("/trusted/block_index2/1/1", current.clone()),
             ("/trusted/block_index2/0/1", [previous, current].concat()),
