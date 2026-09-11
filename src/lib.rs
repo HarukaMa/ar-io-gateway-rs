@@ -364,6 +364,7 @@ impl Drop for ChunkLeader<'_> {
 
 const CHUNK_DEADLINE: Duration = Duration::from_secs(20);
 const CHUNK_PEER_DEADLINE: Duration = Duration::from_secs(3);
+static CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 
 #[derive(Debug)]
 pub(crate) struct ContentNotFound;
@@ -942,7 +943,13 @@ impl Gateway {
         let Some((geometry, height)) = anchor else {
             return Ok(None);
         };
-        let Some(chunk) = self.retrieve_chunk_inner(offset, geometry).await? else {
+        let Some(chunk) = tokio::time::timeout(
+            self.config.request_timeout.min(CHUNK_DEADLINE),
+            self.retrieve_chunk_inner(offset, geometry),
+        )
+        .await
+        .context("chunk peer search timed out")??
+        else {
             return Ok(None);
         };
         ensure!(
@@ -1003,20 +1010,23 @@ impl Gateway {
         geometry: BlockGeometry,
     ) -> Result<Option<VerifiedChunk>> {
         let mut invalid = Vec::new();
-        let request = |source: String| async move { self.fetch_chunk(&source, offset).await };
-        let fetches = peers::hedged_requests(
-            &self.peers,
-            offset,
-            &self.config.chunk_sources,
-            &request,
-            self.config.request_timeout.min(CHUNK_DEADLINE),
-        );
-        tokio::pin!(fetches);
-        while let Some((source, result)) = fetches.next().await {
+        let sources = self
+            .peers
+            .chunk_candidates(offset, &self.config.chunk_sources);
+        let mut pending = sources.iter();
+        let mut fetches = FuturesUnordered::new();
+        loop {
+            while fetches.len() < 3 {
+                let Some(source) = pending.next() else { break };
+                fetches.push(async move { (source, self.fetch_chunk(source, offset).await) });
+            }
+            let Some((source, result)) = fetches.next().await else {
+                break;
+            };
             let (candidate, headers, body) = match result {
                 Ok(candidate) => candidate,
                 Err(error) => {
-                    self.peers.record_chunk_result(&source, None);
+                    self.peers.record_chunk_result(source, None);
                     if error
                         .downcast_ref::<reqwest::Error>()
                         .is_none_or(|error| error.status() != Some(reqwest::StatusCode::NOT_FOUND))
@@ -1030,7 +1040,7 @@ impl Gateway {
                 match cpu_work(move || verify_chunk_proof(candidate, offset, &geometry)).await {
                     Ok(proof) => proof,
                     Err(error) => {
-                        self.peers.record_chunk_result(&source, None);
+                        self.peers.record_chunk_result(source, None);
                         invalid.push(format!("{source}: {error:#}"));
                         continue;
                     }
@@ -1043,13 +1053,13 @@ impl Gateway {
                 .relative_offset
                 .checked_sub(proof.data.start)
                 .context("chunk read offset underflow")?;
-            let source_host = Url::parse(&source)?
+            let source_host = Url::parse(source)?
                 .host_str()
                 .context("chunk source has no host")?
                 .to_owned();
 
             self.peers
-                .record_chunk_result(&source, Some((headers, body, proof.bytes.len())));
+                .record_chunk_result(source, Some((headers, body, proof.bytes.len())));
             return Ok(Some(VerifiedChunk {
                 data_root: URL_SAFE_NO_PAD.encode(proof.transaction.data_root),
                 data_size: proof.transaction.size,
@@ -1941,31 +1951,44 @@ impl Gateway {
         source: &str,
         offset: u128,
     ) -> Result<(JsonChunk, Duration, Duration)> {
-        let url = endpoint(source, &format!("chunk/{offset}"));
-        let request = if self
-            .config
-            .chunk_sources
-            .iter()
-            .any(|configured| configured.trim_end_matches('/') == source.trim_end_matches('/'))
-        {
-            self.client.get(url)
-        } else {
-            self.peers.get(url)
-        };
-        let started = Instant::now();
-        // Reserve time for fallback within the shared chunk deadline.
-        let response = profiling::measure(profiling::Stage::ChunkHeaders, async {
-            Ok(request
-                .timeout((self.config.request_timeout / 4).min(CHUNK_PEER_DEADLINE))
-                .send()
-                .await?
-                .error_for_status()?)
+        let _permit = profiling::measure(profiling::Stage::ChunkGlobalAdmission, async {
+            CHUNK_FETCHES
+                .acquire()
+                .await
+                .context("chunk fetch admission closed")
         })
         .await?;
-        let headers = started.elapsed();
-        let started = Instant::now();
-        let chunk = read_chunk_response(response).await?;
-        Ok((chunk, headers, started.elapsed()))
+        let timer = profiling::start_origin(source);
+        let result = async {
+            let url = endpoint(source, &format!("chunk/{offset}"));
+            let request =
+                if self.config.chunk_sources.iter().any(|configured| {
+                    configured.trim_end_matches('/') == source.trim_end_matches('/')
+                }) {
+                    self.client.get(url)
+                } else {
+                    self.peers.get(url)
+                };
+            let started = Instant::now();
+            // Reserve time for fallback within the shared chunk deadline.
+            let response = profiling::measure(profiling::Stage::ChunkHeaders, async {
+                Ok(request
+                    .timeout((self.config.request_timeout / 4).min(CHUNK_PEER_DEADLINE))
+                    .send()
+                    .await?
+                    .error_for_status()?)
+            })
+            .await?;
+            let headers = started.elapsed();
+            let started = Instant::now();
+            let chunk = read_chunk_response(response).await?;
+            Ok((chunk, headers, started.elapsed()))
+        }
+        .await;
+        if let Some(timer) = timer {
+            timer.finish(result.is_ok(), 0);
+        }
+        result
     }
 
     async fn get_json<T: DeserializeOwned>(&self, base: &str, path: &str) -> Result<T> {
@@ -4341,24 +4364,14 @@ mod tests {
         )
         .unwrap();
         let gateway = &gateway;
-        let results = futures_util::future::join_all((1..=128).map(|offset| async move {
-            let request =
-                |source: String| async move { gateway.fetch_chunk(&source, offset).await };
-            let fetches = peers::hedged_requests(
-                &gateway.peers,
-                offset,
-                &gateway.config.chunk_sources,
-                &request,
-                gateway.config.request_timeout.min(CHUNK_DEADLINE),
-            );
-            tokio::pin!(fetches);
-            fetches.next().await.unwrap().1
-        }))
+        let results = futures_util::future::join_all(
+            (1..=128).map(|offset| gateway.fetch_chunk(&base, offset)),
+        )
         .await;
         for result in results {
             result.unwrap();
         }
-        assert!((2..=peers::CHUNK_ORIGIN_LIMIT).contains(&peak.load(Ordering::SeqCst)));
+        assert!((2..=64).contains(&peak.load(Ordering::SeqCst)));
         server.abort();
     }
 
