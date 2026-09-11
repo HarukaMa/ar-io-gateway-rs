@@ -343,7 +343,7 @@ pub(crate) async fn start(
         .spawn(move || {
             let result = (|| -> Result<()> {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
+                    .worker_threads(4)
                     .thread_name("bundle-worker")
                     .enable_all()
                     .max_blocking_threads(BLOCKING_THREADS)
