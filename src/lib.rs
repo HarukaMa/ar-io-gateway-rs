@@ -2937,7 +2937,7 @@ fn verify_chunk_proof(
 
 fn content_type(tags: &[Tag]) -> Result<String> {
     for tag in tags {
-        if decode_b64(&tag.name, "tag name")? == b"Content-Type" {
+        if decode_b64(&tag.name, "tag name")?.eq_ignore_ascii_case(b"Content-Type") {
             let value = decode_b64(&tag.value, "Content-Type tag")?;
             let value = HeaderValue::from_bytes(&value)
                 .context("invalid Content-Type tag")?
@@ -3482,7 +3482,7 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
 
 fn item_content_type(tags: &[ItemTag]) -> Result<String> {
     for tag in tags {
-        if tag.name.as_ref() == b"Content-Type" {
+        if tag.name.as_ref().eq_ignore_ascii_case(b"Content-Type") {
             let value = HeaderValue::from_bytes(&tag.value)
                 .context("invalid Content-Type tag")?
                 .to_str()
@@ -5164,6 +5164,7 @@ mod tests {
             85, 72, 170, 44, 73, 45, 6, 0, 226, 42, 8, 216, 18, 0, 0, 0,
         ];
         let tags: &[(&[u8], &[u8])] = &[
+            (b"cOnTeNt-TyPe", b"text/plain"),
             (b"Content-Encoding", b"\xff"),
             (b"content-encoding", b"gzip"),
             (b"Content-Encoding", b"br"),
@@ -5181,6 +5182,7 @@ mod tests {
             };
             for cache_hit in [false, true] {
                 let verified = gateway.retrieve(&id).await.unwrap();
+                assert_eq!(verified.content_type, "text/plain");
                 assert_eq!(verified.content_encoding.as_deref(), Some("gzip"));
                 assert_eq!(
                     verified
