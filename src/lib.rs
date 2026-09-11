@@ -78,6 +78,8 @@ pub struct Config {
     pub max_spool_bytes: usize,
     /// Concurrent bundle downloads, configured by AR_IO_INDEX_DOWNLOADS.
     pub index_downloads: usize,
+    /// Inclusive background bundle scan floor, configured by AR_IO_BUNDLE_START_HEIGHT.
+    pub index_bundle_start_height: u64,
     /// Active and queued bundle bytes, configured by AR_IO_INDEX_MAX_BYTES.
     /// The serving worker reserves half for HTTP-discovered bundle handoffs.
     pub index_max_bytes: usize,
@@ -128,6 +130,7 @@ impl Config {
             max_memory_data_size: max_data_size.min(64 * 1024 * 1024),
             max_spool_bytes: 4 * 1024 * 1024 * 1024,
             index_downloads: 32,
+            index_bundle_start_height: 0,
             index_max_bytes: 8 * 1024 * 1024 * 1024,
             index_chain: false,
             retrieval_timeout: Duration::from_secs(30 * 60),
@@ -468,6 +471,10 @@ impl Gateway {
         ensure!(
             (1..=256).contains(&config.index_downloads) && config.index_max_bytes > 0,
             "index downloads must be between 1 and 256 and the byte budget must be positive"
+        );
+        ensure!(
+            config.index_bundle_start_height <= i64::MAX as u64,
+            "bundle start height exceeds database height range"
         );
         ensure!(
             !config.retrieval_timeout.is_zero()

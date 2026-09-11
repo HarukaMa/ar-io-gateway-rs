@@ -36,7 +36,7 @@ const GATEWAY_SIZE: usize = 964;
 const REGISTRY_DISCRIMINATOR: [u8; 8] = [207, 115, 197, 33, 28, 106, 182, 209];
 const GATEWAY_DISCRIMINATOR: [u8; 8] = [210, 132, 162, 254, 10, 224, 45, 86];
 
-pub(crate) const CHUNK_ORIGIN_LIMIT: usize = 8;
+pub(crate) const CHUNK_ORIGIN_LIMIT: usize = 16;
 
 pub(crate) fn chunk_slots(source: &str) -> Result<std::sync::Arc<tokio::sync::Semaphore>> {
     use std::sync::{Arc, LazyLock, Weak};
@@ -1140,7 +1140,7 @@ mod tests {
         let attempted = BTreeSet::new();
         let mut held = Vec::new();
         let mut counts = BTreeMap::new();
-        for _ in 0..16 {
+        for _ in 0..2 * CHUNK_ORIGIN_LIMIT {
             let (source, permit) = timeout(
                 Duration::from_secs(3),
                 admit_chunk(&peers, 1, &sources, &attempted),
@@ -1152,7 +1152,10 @@ mod tests {
         }
         assert_eq!(
             counts,
-            BTreeMap::from([(sources[0].clone(), 8), (sources[1].clone(), 8)])
+            BTreeMap::from([
+                (sources[0].clone(), CHUNK_ORIGIN_LIMIT),
+                (sources[1].clone(), CHUNK_ORIGIN_LIMIT)
+            ])
         );
         {
             let pending = admit_chunk(&peers, 1, &sources, &attempted);
@@ -1165,7 +1168,7 @@ mod tests {
         }
         held.clear();
         for source in &sources {
-            let _all = chunk_slots(source)?.try_acquire_many_owned(8)?;
+            let _all = chunk_slots(source)?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
         }
         Ok(())
     }
@@ -1279,7 +1282,7 @@ mod tests {
             assert_eq!(started.elapsed(), Duration::from_millis(150));
         }
         for source in &sources {
-            let _all = chunk_slots(source)?.try_acquire_many_owned(8)?;
+            let _all = chunk_slots(source)?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
         }
         Ok(())
     }
@@ -1292,8 +1295,8 @@ mod tests {
             "http://budget-first.test".to_owned(),
             "http://budget-second.test".to_owned(),
         ];
-        let first = chunk_slots(&sources[0])?.try_acquire_many_owned(8)?;
-        let second = chunk_slots(&sources[1])?.try_acquire_many_owned(8)?;
+        let first = chunk_slots(&sources[0])?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
+        let second = chunk_slots(&sources[1])?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
         let request = |source: String| async move {
             if source == "http://budget-first.test" {
                 tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1328,7 +1331,7 @@ mod tests {
         }
         assert!(fetches.next().await.is_none());
         for source in &sources {
-            let _all = chunk_slots(source)?.try_acquire_many_owned(8)?;
+            let _all = chunk_slots(source)?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
         }
         Ok(())
     }

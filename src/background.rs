@@ -528,6 +528,10 @@ async fn download_pending(
         .bundle_discovery_reader()
         .await?;
     let store = &discovery_store;
+    let discovery_range = range.or_else(|| {
+        (gateway.config.index_bundle_start_height > 0)
+            .then_some((gateway.config.index_bundle_start_height, i64::MAX as u64))
+    });
     let mut downloads = FuturesUnordered::new();
     let mut cursor: Option<crate::database::BundleCursor> = None;
     let mut pending: Option<(Vec<u8>, u64, u128)> = None;
@@ -644,7 +648,7 @@ async fn download_pending(
                 sleep_until(poll_at).await;
                 timeout(
                     Duration::from_secs(125),
-                    store.pending_bundles_after(after.as_ref(), range),
+                    store.pending_bundles_after(after.as_ref(), discovery_range),
                 )
                 .await
                 .context("discovering pending bundles timed out")?

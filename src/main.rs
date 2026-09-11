@@ -70,6 +70,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| config.index_downloads.to_string())
         .parse()
         .context("invalid AR_IO_INDEX_DOWNLOADS")?;
+    config.index_bundle_start_height = env::var("AR_IO_BUNDLE_START_HEIGHT")
+        .unwrap_or_else(|_| config.index_bundle_start_height.to_string())
+        .parse()
+        .context("invalid AR_IO_BUNDLE_START_HEIGHT")?;
     config.index_max_bytes = env::var("AR_IO_INDEX_MAX_BYTES")
         .unwrap_or_else(|_| config.index_max_bytes.to_string())
         .parse()
