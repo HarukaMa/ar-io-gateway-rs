@@ -4,7 +4,7 @@ use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, time::timeout};
@@ -361,77 +361,110 @@ async fn import_pending_transactions(
     let mut authenticated = (None, HashMap::<Vec<u8>, ObjectMetadata>::new());
     let slots = tokio::sync::Semaphore::new(64);
     loop {
-        let pending = timeout(deadline, store.pending_transactions(start, end, 256))
-            .await
-            .context("pending transaction metadata query timed out")??;
-        if pending.is_empty() {
-            break;
-        }
-        let last_height = pending.last().unwrap().1;
-        let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
-        for (id, height) in pending {
-            groups.entry(height).or_default().push(id);
-        }
-        let mut jobs = Vec::with_capacity(groups.len());
-        for (height, ids) in groups {
-            let cached = if authenticated.0 == Some(height) {
-                std::mem::take(&mut authenticated.1)
-            } else {
-                HashMap::new()
-            };
-            let anchor = timeout(deadline, store.block_pair(height)).await??;
-            let anchor = anchor.map(|(previous, block)| {
-                let header = headers.lock().unwrap().remove(&block.hash);
-                (previous, block, header)
-            });
-            jobs.push((height, ids, anchor, cached));
-        }
-        let (sender, mut ready) = mpsc::channel(1);
-        let fetched = stream::iter(jobs)
-            .map(|(height, ids, anchor, cached)| {
-                let slots = &slots;
-                async move {
-                    timeout(
-                        deadline,
-                        transaction_metadata(gateway, height, ids, anchor, cached, slots),
-                    )
-                    .await
-                    .with_context(|| format!("transaction metadata at height {height} timed out"))?
-                }
-            })
-            // 32 bounded block reconstructions share 64 HTTP fetch slots.
-            .buffer_unordered(32);
-        let produce = queue_metadata(fetched, sender);
-        let consume = async {
-            while let Some(batch) = ready.recv().await {
-                let mut objects = Vec::with_capacity(32);
-                for result in batch {
-                    let (height, ids, mut verified) = result?;
-                    for id in ids {
-                        objects.push(
-                            verified
-                                .remove(&id)
-                                .context("verified transaction is missing")?,
-                        );
-                        if objects.len() == 32 {
-                            timeout(deadline, store.record_objects(&objects)).await??;
-                            imported_transactions += objects.len() as u64;
-                            objects.clear();
+        let profile = crate::profiling::Profile::transaction_window(format!("{start}..={end}"));
+        profile.phase(1);
+        let result = crate::profiling::scope(Some(Arc::clone(&profile)), async {
+            let pending =
+                crate::profiling::measure(crate::profiling::Stage::TransactionPending, async {
+                    timeout(deadline, store.pending_transactions(start, end, 256))
+                        .await
+                        .context("pending transaction metadata query timed out")?
+                })
+                .await?;
+            if pending.is_empty() {
+                return Ok::<_, anyhow::Error>(false);
+            }
+            let last_height = pending.last().unwrap().1;
+            let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
+            for (id, height) in pending {
+                groups.entry(height).or_default().push(id);
+            }
+            let mut jobs = Vec::with_capacity(groups.len());
+            for (height, ids) in groups {
+                let cached = if authenticated.0 == Some(height) {
+                    std::mem::take(&mut authenticated.1)
+                } else {
+                    HashMap::new()
+                };
+                let anchor =
+                    crate::profiling::measure(crate::profiling::Stage::TransactionAnchor, async {
+                        timeout(deadline, store.block_pair(height)).await?
+                    })
+                    .await?;
+                let anchor = anchor.map(|(previous, block)| {
+                    let header = headers.lock().unwrap().remove(&block.hash);
+                    (previous, block, header)
+                });
+                jobs.push((height, ids, anchor, cached));
+            }
+            let (sender, mut ready) = mpsc::channel(1);
+            let fetched = stream::iter(jobs)
+                .map(|(height, ids, anchor, cached)| {
+                    let slots = &slots;
+                    async move {
+                        timeout(
+                            deadline,
+                            transaction_metadata(gateway, height, ids, anchor, cached, slots),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("transaction metadata at height {height} timed out")
+                        })?
+                    }
+                })
+                // 32 bounded block reconstructions share 64 HTTP fetch slots.
+                .buffer_unordered(32);
+            let produce = queue_metadata(fetched, sender);
+            let consume = async {
+                while let Some(batch) = ready.recv().await {
+                    let mut objects = Vec::with_capacity(32);
+                    for result in batch {
+                        let (height, ids, mut verified) = result?;
+                        for id in ids {
+                            objects.push(
+                                verified
+                                    .remove(&id)
+                                    .context("verified transaction is missing")?,
+                            );
+                            if objects.len() == 32 {
+                                crate::profiling::measure(
+                                    crate::profiling::Stage::Persistence,
+                                    async {
+                                        timeout(deadline, store.record_objects(&objects)).await?
+                                    },
+                                )
+                                .await?;
+                                imported_transactions += objects.len() as u64;
+                                objects.clear();
+                            }
+                        }
+                        // Only the last selected height can straddle the 256-row window.
+                        if height == last_height {
+                            authenticated = (Some(height), verified);
                         }
                     }
-                    // Only the last selected height can straddle the 256-row window.
-                    if height == last_height {
-                        authenticated = (Some(height), verified);
+                    if !objects.is_empty() {
+                        crate::profiling::measure(crate::profiling::Stage::Persistence, async {
+                            timeout(deadline, store.record_objects(&objects)).await?
+                        })
+                        .await?;
+                        imported_transactions += objects.len() as u64;
                     }
                 }
-                if !objects.is_empty() {
-                    timeout(deadline, store.record_objects(&objects)).await??;
-                    imported_transactions += objects.len() as u64;
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        };
-        tokio::try_join!(produce, consume)?;
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::try_join!(produce, consume)?;
+            Ok(true)
+        })
+        .await;
+        profile.finish(if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        });
+        if !result? {
+            break;
+        }
     }
     Ok(imported_transactions)
 }
@@ -466,10 +499,14 @@ async fn transaction_metadata(
     let fetch = |id: String| {
         let remaining = &remaining;
         async move {
-            let _permit = slots
-                .acquire()
-                .await
-                .context("metadata fetch admission closed")?;
+            let _permit =
+                crate::profiling::measure(crate::profiling::Stage::TransactionAdmission, async {
+                    slots
+                        .acquire()
+                        .await
+                        .context("metadata fetch admission closed")
+                })
+                .await?;
             let (_, verified) = gateway.fetch_transaction(&id, height, remaining).await?;
             Ok::<_, anyhow::Error>(verified.metadata)
         }
@@ -489,43 +526,47 @@ async fn transaction_metadata(
         .iter()
         .any(|object| object.format == Some(1) && object.denomination == Some(0))
     {
-        let header = if let Some((previous, block, header)) = anchor {
-            transaction_block(gateway, &previous, &block, header).await?
-        } else {
-            let entries = gateway
-                .trusted_block_index(height.saturating_sub(1), height)
-                .await?
-                .context("trusted transaction block index is unavailable")?;
-            let block = entries
-                .last()
-                .context("missing trusted transaction block")?;
-            let entry = crate::BlockIndexEntry {
-                hash: block.hash.clone(),
-                tx_root: block.tx_root.clone(),
-                weave_size: block.weave_size.to_string(),
-            };
-            let encoded_id = URL_SAFE_NO_PAD.encode(&ids[0]);
-            let header = gateway
-                .authenticate_block(&entry, height, Some(&encoded_id))
-                .await?;
-            let previous_size = if height == 0 {
-                0
+        let header = crate::profiling::measure(crate::profiling::Stage::TransactionAnchor, async {
+            let header = if let Some((previous, block, header)) = anchor {
+                transaction_block(gateway, &previous, &block, header).await?
             } else {
-                entries[0].weave_size
-            };
-            ensure!(
-                block.weave_size.checked_sub(previous_size)
-                    == Some(parse_u128(&header.block_size, "block size")?),
-                "block size does not match trusted weave geometry"
-            );
-            if height > 0 {
+                let entries = gateway
+                    .trusted_block_index(height.saturating_sub(1), height)
+                    .await?
+                    .context("trusted transaction block index is unavailable")?;
+                let block = entries
+                    .last()
+                    .context("missing trusted transaction block")?;
+                let entry = crate::BlockIndexEntry {
+                    hash: block.hash.clone(),
+                    tx_root: block.tx_root.clone(),
+                    weave_size: block.weave_size.to_string(),
+                };
+                let encoded_id = URL_SAFE_NO_PAD.encode(&ids[0]);
+                let header = gateway
+                    .authenticate_block(&entry, height, Some(&encoded_id))
+                    .await?;
+                let previous_size = if height == 0 {
+                    0
+                } else {
+                    entries[0].weave_size
+                };
                 ensure!(
-                    header.previous_block == entries[0].hash,
-                    "block predecessor does not match trusted index"
+                    block.weave_size.checked_sub(previous_size)
+                        == Some(parse_u128(&header.block_size, "block size")?),
+                    "block size does not match trusted weave geometry"
                 );
-            }
-            header
-        };
+                if height > 0 {
+                    ensure!(
+                        header.previous_block == entries[0].hash,
+                        "block predecessor does not match trusted index"
+                    );
+                }
+                header
+            };
+            Ok(header)
+        })
+        .await?;
         let fetched_bytes = crate::MAX_BLOCK_TRANSACTION_BYTES
             - remaining.load(std::sync::atomic::Ordering::Relaxed);
         let (_, verified) = gateway
@@ -752,6 +793,8 @@ mod metadata_tests {
         .unwrap();
         let slots = tokio::sync::Semaphore::new(4);
         let remaining = AtomicUsize::new(crate::MAX_BLOCK_TRANSACTION_BYTES);
+        let profile = crate::profiling::Profile::transaction_window("genesis".to_owned());
+        crate::profiling::scope(Some(Arc::clone(&profile)), async {
         timeout(Duration::from_secs(10), async {
             let fetch = gateway.verify_block_transactions(header, seeds.clone(), 0, Some((&slots, &remaining)));
             tokio::pin!(fetch);
@@ -763,6 +806,9 @@ mod metadata_tests {
             }
             gate.notify_one();
             let (header, objects) = fetch.await.unwrap();
+            let sample = profile.snapshot("sample");
+            assert!(sample["stages"]["transaction_fetch"]["peak_active"].as_u64().unwrap() >= 2);
+            assert!(sample["stages"]["cpu_execution"]["completed"].as_u64().unwrap() > 0);
             assert_eq!(count.load(Ordering::Relaxed), header.txs.len() - seeds.len());
             let cached: HashMap<_, _> = objects.into_iter().map(|o| (o.id.clone(), o)).collect();
             let ids = vec![seeds[0].id.clone(), seeds[1].id.clone()];
@@ -774,6 +820,8 @@ mod metadata_tests {
             corrupt.store(true, Ordering::Relaxed);
             assert!(gateway.verify_block_transactions(header, seeds.clone(), 0, Some((&slots, &remaining))).await.is_err());
         }).await.unwrap();
+        }).await;
+        profile.finish("completed");
         server.abort();
     }
 

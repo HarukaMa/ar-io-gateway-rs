@@ -1710,21 +1710,25 @@ impl Gateway {
                 continue;
             }
             let result = async {
-                let response = self
-                    .client
-                    .get(endpoint(source, &format!("tx/{id}")))
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                if trusted {
-                    ensure!(
-                        response.url().origin() == Url::parse(source)?.origin(),
-                        "trusted transaction source redirected outside its origin"
-                    );
-                }
-                let value =
-                    read_json_response_with_limit(response, limit, remaining_bytes, None).await?;
-                let transaction = transactions::decode_transaction(value)?;
+                let transaction = profiling::measure(profiling::Stage::TransactionFetch, async {
+                    let response = self
+                        .client
+                        .get(endpoint(source, &format!("tx/{id}")))
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    if trusted {
+                        ensure!(
+                            response.url().origin() == Url::parse(source)?.origin(),
+                            "trusted transaction source redirected outside its origin"
+                        );
+                    }
+                    let value =
+                        read_json_response_with_limit(response, limit, remaining_bytes, None)
+                            .await?;
+                    transactions::decode_transaction(value)
+                })
+                .await?;
                 ensure!(
                     trusted || !transaction.owner.is_empty(),
                     "ECDSA transactions require trusted node metadata"
@@ -1790,10 +1794,16 @@ impl Gateway {
                         fetches.push(async move {
                             let _permit = match admission {
                                 Some((slots, _)) => Some(
-                                    slots
-                                        .acquire()
-                                        .await
-                                        .context("metadata fetch admission closed")?,
+                                    profiling::measure(
+                                        profiling::Stage::TransactionAdmission,
+                                        async {
+                                            slots
+                                                .acquire()
+                                                .await
+                                                .context("metadata fetch admission closed")
+                                        },
+                                    )
+                                    .await?,
                                 ),
                                 None => None,
                             };

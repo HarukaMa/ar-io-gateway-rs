@@ -18,8 +18,12 @@ pub(crate) enum Stage {
     CpuExecution,
     Traversal,
     Persistence,
+    TransactionPending,
+    TransactionAnchor,
+    TransactionAdmission,
+    TransactionFetch,
 }
-const STAGES: [&str; 8] = [
+const STAGES: [&str; 12] = [
     "chunk_admission",
     "chunk_headers",
     "chunk_body",
@@ -28,6 +32,10 @@ const STAGES: [&str; 8] = [
     "cpu_execution",
     "traversal",
     "persistence",
+    "transaction_pending",
+    "transaction_anchor",
+    "transaction_admission",
+    "transaction_fetch",
 ];
 
 #[derive(Default)]
@@ -38,6 +46,7 @@ struct Counter {
     failed: u64,
     cancelled: u64,
     active: u32,
+    peak_active: u32,
     bytes: u64,
 }
 
@@ -46,13 +55,14 @@ struct State {
     phases: [Duration; 3],
     phase: usize,
     outcome: &'static str,
-    counters: [Counter; 8],
+    counters: [Counter; STAGES.len()],
 }
 
 pub(crate) struct Profile {
     attempt: u64,
     started_at_us: u64,
     root: String,
+    log_prefix: &'static str,
     state: Mutex<State>,
 }
 
@@ -90,6 +100,14 @@ impl State {
 
 impl Profile {
     pub(crate) fn new(root: String) -> Arc<Self> {
+        Self::with_prefix(root, "bundle_profile")
+    }
+
+    pub(crate) fn transaction_window(range: String) -> Arc<Self> {
+        Self::with_prefix(range, "transaction_profile")
+    }
+
+    fn with_prefix(root: String, log_prefix: &'static str) -> Arc<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Arc::new(Self {
             attempt: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -98,6 +116,7 @@ impl Profile {
                 .unwrap_or_default()
                 .as_micros() as u64,
             root,
+            log_prefix,
             state: Mutex::new(State {
                 updated: Instant::now(),
                 phases: [Duration::ZERO; 3],
@@ -133,7 +152,7 @@ impl Profile {
                     (*name).to_owned(),
                     json!({"elapsed_us": c.elapsed.as_micros() as u64,
                 "started": c.started, "completed": c.completed, "failed": c.failed,
-                "cancelled": c.cancelled, "active": c.active, "bytes": c.bytes}),
+                "cancelled": c.cancelled, "active": c.active, "peak_active": c.peak_active, "bytes": c.bytes}),
                 )
             })
             .collect();
@@ -152,7 +171,7 @@ impl Profile {
 impl Drop for Profile {
     fn drop(&mut self) {
         self.finish("cancelled");
-        eprintln!("bundle_profile {}", self.snapshot("finished"));
+        eprintln!("{} {}", self.log_prefix, self.snapshot("finished"));
     }
 }
 
@@ -176,6 +195,7 @@ pub(crate) fn start_for(profile: &Option<Arc<Profile>>, stage: Stage) -> Option<
         let counter = &mut state.counters[stage as usize];
         counter.started += 1;
         counter.active += 1;
+        counter.peak_active = counter.peak_active.max(counter.active);
     }
     Some(Timer {
         profile: Arc::clone(profile),
@@ -291,6 +311,7 @@ mod tests {
         assert_eq!(snapshot["stages"]["chunk_body"]["cancelled"], 1);
         assert_eq!(snapshot["stages"]["chunk_body"]["bytes"], 12);
         assert_eq!(snapshot["stages"]["chunk_body"]["active"], 0);
+        assert_eq!(snapshot["stages"]["chunk_body"]["peak_active"], 2);
         assert_eq!(snapshot["stages"]["chunk_headers"]["failed"], 1);
         assert_eq!(snapshot["stages"]["persistence"]["cancelled"], 1);
         assert_eq!(snapshot["stages"]["cpu_execution"]["completed"], 1);
