@@ -120,6 +120,7 @@ pub(crate) fn hedged_requests<'a, T, F, R>(
     offset: u128,
     configured: &'a [String],
     request: &'a F,
+    budget: Duration,
 ) -> impl futures_util::Stream<Item = (String, Result<T>)> + 'a
 where
     F: Fn(String) -> R + 'a,
@@ -133,15 +134,34 @@ where
             FuturesUnordered::new(),
             Instant::now(),
             false,
+            budget,
+            None::<Instant>,
         ),
-        move |(mut attempted, mut active, mut launch_at, mut exhausted)| async move {
+        move |(
+            mut attempted,
+            mut active,
+            mut launch_at,
+            mut exhausted,
+            mut remaining,
+            mut deadline,
+        )| async move {
             loop {
                 if exhausted && active.is_empty() {
                     return None;
                 }
                 tokio::select! {
+                    _ = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)),
+                        if deadline.is_some() || remaining.is_zero() => {
+                        active.clear();
+                        return Some(((String::new(), Err(anyhow::anyhow!("chunk request timed out"))),
+                            (attempted, active, launch_at, true, Duration::ZERO, None)));
+                    }
                     result = active.next(), if !active.is_empty() => {
-                        return Some((result.unwrap(), (attempted, active, Instant::now(), exhausted)));
+                        let result = result.unwrap();
+                        if active.is_empty() {
+                            remaining = deadline.take().unwrap().saturating_duration_since(Instant::now());
+                        }
+                        return Some((result, (attempted, active, Instant::now(), exhausted, remaining, deadline)));
                     }
                     admission = async {
                         tokio::time::sleep_until(launch_at).await;
@@ -149,6 +169,10 @@ where
                     }, if active.len() < 3 && !exhausted => {
                         match admission {
                             Ok(Some((source, permit))) => {
+                                // Only time with admitted requests consumes the chunk budget.
+                                if active.is_empty() {
+                                    deadline = Some(Instant::now() + remaining);
+                                }
                                 attempted.insert(source.clone());
                                 active.push(async move {
                                     let _permit = permit;
@@ -161,7 +185,7 @@ where
                             }
                             Ok(None) => exhausted = true,
                             Err(error) => return Some(((String::new(), Err(error)),
-                                (attempted, active, launch_at, true))),
+                                (attempted, active, launch_at, true, remaining, deadline))),
                         }
                     }
                 }
@@ -1234,7 +1258,7 @@ mod tests {
             calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         };
-        let fetches = hedged_requests(&peers, 1, &sources, &fast);
+        let fetches = hedged_requests(&peers, 1, &sources, &fast, crate::CHUNK_DEADLINE);
         tokio::pin!(fetches);
         assert!(fetches.next().await.unwrap().1.is_ok());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -1247,13 +1271,62 @@ mod tests {
         };
         let started = Instant::now();
         {
-            let fetches = hedged_requests(&peers, 1, &sources, &slow);
+            let fetches = hedged_requests(&peers, 1, &sources, &slow, crate::CHUNK_DEADLINE);
             tokio::pin!(fetches);
             let (source, result) = fetches.next().await.unwrap();
             result?;
             assert_eq!(source, "http://hedge-backup.test");
             assert_eq!(started.elapsed(), Duration::from_millis(150));
         }
+        for source in &sources {
+            let _all = chunk_slots(source)?.try_acquire_many_owned(8)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn chunk_budget_pauses_during_admission_and_survives_retries() -> Result<()> {
+        use futures_util::StreamExt;
+        let peers = PeerState::new("http://127.0.0.1:1984")?;
+        let sources = vec![
+            "http://budget-first.test".to_owned(),
+            "http://budget-second.test".to_owned(),
+        ];
+        let first = chunk_slots(&sources[0])?.try_acquire_many_owned(8)?;
+        let second = chunk_slots(&sources[1])?.try_acquire_many_owned(8)?;
+        let request = |source: String| async move {
+            if source == "http://budget-first.test" {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                bail!("first request failed");
+            }
+            std::future::pending::<Result<()>>().await
+        };
+        let fetches = hedged_requests(&peers, 1, &sources, &request, Duration::from_secs(10));
+        tokio::pin!(fetches);
+        {
+            let next = fetches.next();
+            tokio::pin!(next);
+            assert!(futures_util::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(30)).await;
+            assert!(futures_util::poll!(next.as_mut()).is_pending());
+            drop(first);
+            let (source, result) = next.await.unwrap();
+            assert_eq!(source, sources[0]);
+            assert_eq!(result.unwrap_err().to_string(), "first request failed");
+        }
+        {
+            let next = fetches.next();
+            tokio::pin!(next);
+            assert!(futures_util::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(30)).await;
+            assert!(futures_util::poll!(next.as_mut()).is_pending());
+            drop(second);
+            let started = Instant::now();
+            let (_, result) = next.await.unwrap();
+            assert_eq!(result.unwrap_err().to_string(), "chunk request timed out");
+            assert_eq!(started.elapsed(), Duration::from_secs(6));
+        }
+        assert!(fetches.next().await.is_none());
         for source in &sources {
             let _all = chunk_slots(source)?.try_acquire_many_owned(8)?;
         }

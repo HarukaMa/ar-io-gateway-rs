@@ -130,7 +130,7 @@ impl ChunkSource {
     async fn fetch(&self, position: usize) -> Result<(usize, Bytes)> {
         crate::profiling::scope(
             self.profile.as_ref().and_then(std::sync::Weak::upgrade),
-            tokio::time::timeout(self.timeout, async {
+            async {
                 let absolute = self
                     .geometry
                     .first_offset
@@ -165,8 +165,13 @@ impl ChunkSource {
                     let offset = usize::try_from(proof.data.start)?;
                     Ok::<_, anyhow::Error>((offset, Bytes::from(proof.bytes), headers, body))
                 };
-                let fetches =
-                    crate::peers::hedged_requests(&self.peers, absolute, &self.sources, &request);
+                let fetches = crate::peers::hedged_requests(
+                    &self.peers,
+                    absolute,
+                    &self.sources,
+                    &request,
+                    self.timeout,
+                );
                 tokio::pin!(fetches);
                 let mut failures = Vec::new();
                 while let Some((source, result)) = fetches.next().await {
@@ -186,9 +191,8 @@ impl ChunkSource {
                     "all streaming chunk candidates failed: {}",
                     failures.join("; ")
                 )
-            }),
+            },
         )
         .await
-        .context("streaming chunk request timed out")?
     }
 }

@@ -935,13 +935,7 @@ impl Gateway {
         let Some((geometry, height)) = anchor else {
             return Ok(None);
         };
-        let Some(chunk) = tokio::time::timeout(
-            self.config.request_timeout.min(CHUNK_DEADLINE),
-            self.retrieve_chunk_inner(offset, geometry),
-        )
-        .await
-        .context("chunk peer search timed out")??
-        else {
+        let Some(chunk) = self.retrieve_chunk_inner(offset, geometry).await? else {
             return Ok(None);
         };
         ensure!(
@@ -1003,8 +997,13 @@ impl Gateway {
     ) -> Result<Option<VerifiedChunk>> {
         let mut invalid = Vec::new();
         let request = |source: String| async move { self.fetch_chunk(&source, offset).await };
-        let fetches =
-            peers::hedged_requests(&self.peers, offset, &self.config.chunk_sources, &request);
+        let fetches = peers::hedged_requests(
+            &self.peers,
+            offset,
+            &self.config.chunk_sources,
+            &request,
+            self.config.request_timeout.min(CHUNK_DEADLINE),
+        );
         tokio::pin!(fetches);
         while let Some((source, result)) = fetches.next().await {
             let (candidate, headers, body) = match result {
@@ -4343,6 +4342,7 @@ mod tests {
                 offset,
                 &gateway.config.chunk_sources,
                 &request,
+                gateway.config.request_timeout.min(CHUNK_DEADLINE),
             );
             tokio::pin!(fetches);
             fetches.next().await.unwrap().1
