@@ -1030,18 +1030,25 @@ impl BlockStore {
         start: u64,
         end: u64,
         limit: usize,
+        excluded_heights: &[u64],
     ) -> Result<Vec<(Vec<u8>, u64)>> {
         ensure!(start <= end, "metadata range is reversed");
         ensure!(
             (1..=METADATA_BATCH_SIZE).contains(&limit),
             "metadata query limit must be between 1 and 256"
         );
+        let excluded_heights = excluded_heights
+            .iter()
+            .copied()
+            .map(sql_height)
+            .collect::<Result<Vec<_>>>()?;
         self.client
             .query(
                 "SELECT o.id, p.block_height
                  FROM public.canonical_placements p
                  JOIN public.objects o ON o.key = p.object_key
-                 WHERE o.kind = 0 AND NOT o.metadata_complete AND EXISTS (
+                 WHERE o.kind = 0 AND NOT o.metadata_complete
+                 AND NOT (p.block_height = ANY($4::bigint[])) AND EXISTS (
                      SELECT 1 FROM public.block_index_state s
                      JOIN public.canonical_blocks c
                        ON c.height >= s.start_height AND c.height <= s.imported_through
@@ -1054,6 +1061,7 @@ impl BlockStore {
                     &sql_height(start)?,
                     &sql_height(end)?,
                     &i64::try_from(limit)?,
+                    &excluded_heights,
                 ],
             )
             .await?
@@ -2032,17 +2040,6 @@ impl BlockStore {
         Ok(keys)
     }
 
-    pub(crate) async fn analyze_metadata(&self) -> Result<()> {
-        self.client
-            .batch_execute(
-                "ANALYZE public.objects;
-                 ANALYZE public.object_tags;
-                 ANALYZE public.canonical_placements;",
-            )
-            .await?;
-        Ok(())
-    }
-
     pub async fn block_pair(&self, height: u64) -> Result<Option<(IndexBlock, IndexBlock)>> {
         if height == 0 {
             return Ok(None);
@@ -2491,16 +2488,18 @@ mod tests {
             ensure!(rows.len() == 2, "requires two indexed L1 fixtures");
             let height: i64 = rows[0].get(2);
             ensure!(rows[1].get::<_, i64>(2) == height, "fixtures must share a block");
-            ensure!(store.pending_transactions(height as u64, height as u64, 256).await?.is_empty(),
+            ensure!(store.pending_transactions(height as u64, height as u64, 256, &[]).await?.is_empty(),
                 "fixture block already has pending transactions");
             let keys: Vec<i64> = rows.iter().map(|row| row.get(0)).collect();
             let expected: Vec<(Vec<u8>, u64)> = rows.iter().map(|row| (row.get(1), height as u64)).collect();
             let original_hash: Vec<u8> = rows[0].get(4);
             store.client.execute("UPDATE public.objects SET metadata_complete = false WHERE key = ANY($1)", &[&keys]).await?;
-            ensure!(store.pending_transactions(height as u64, height as u64, 1).await? == expected[..1],
+            ensure!(store.pending_transactions(height as u64, height as u64, 1, &[]).await? == expected[..1],
                 "pending limit or chronology changed");
-            ensure!(store.pending_transactions(height as u64, height as u64, 256).await? == expected,
+            ensure!(store.pending_transactions(height as u64, height as u64, 256, &[]).await? == expected,
                 "pending canonical members were lost");
+            ensure!(store.pending_transactions(height as u64, height as u64, 256, &[height as u64]).await?.is_empty(),
+                "in-flight block was selected again");
 
             let next = store.client.query_one(
                 "SELECT c.height, c.block_hash FROM public.canonical_blocks c
@@ -2511,13 +2510,13 @@ mod tests {
             ).await?;
             let next_height: i64 = next.get(0);
             let next_hash: Vec<u8> = next.get(1);
-            ensure!(store.pending_transactions(next_height as u64, next_height as u64, 256).await?.is_empty(),
+            ensure!(store.pending_transactions(next_height as u64, next_height as u64, 256, &[]).await?.is_empty(),
                 "empty range returned pending transactions");
             store.client.execute(
                 "INSERT INTO public.block_transactions (block_hash, position, object_key) VALUES ($1, 0, $2)",
                 &[&next_hash, &keys[0]],
             ).await?;
-            ensure!(store.pending_transactions(next_height as u64, next_height as u64, 256).await? == expected[..1],
+            ensure!(store.pending_transactions(next_height as u64, next_height as u64, 256, &[]).await? == expected[..1],
                 "canonical occurrence was confused with preferred placement");
 
             let fork_hash = vec![0xa6u8; 48];
@@ -2530,7 +2529,7 @@ mod tests {
                 "UPDATE public.block_transactions SET block_hash = $1 WHERE block_hash = $2 AND object_key = $3",
                 &[&fork_hash, &original_hash, &keys[1]],
             ).await?;
-            ensure!(store.pending_transactions(height as u64, height as u64, 256).await? == expected[..1],
+            ensure!(store.pending_transactions(height as u64, height as u64, 256, &[]).await? == expected[..1],
                 "noncanonical membership was accepted");
             Ok(())
         }.await;
