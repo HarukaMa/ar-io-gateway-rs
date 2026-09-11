@@ -270,6 +270,19 @@ impl BlockStore {
         })
     }
 
+    pub(crate) async fn bundle_discovery_reader(&self) -> Result<Self> {
+        let reader = self.reconnect().await?;
+        reader
+            .client
+            .batch_execute(
+                "SET default_transaction_read_only=on;
+             SET statement_timeout='120s';
+             SET max_parallel_workers_per_gather=0;",
+            )
+            .await?;
+        Ok(reader)
+    }
+
     async fn status_query(&self, sql: &str) -> Result<serde_json::Value> {
         let mut config = self.connection_config.clone();
         config.options(
@@ -1088,50 +1101,32 @@ impl BlockStore {
         );
         let start = range.map(|(start, _)| sql_height(start)).transpose()?;
         let end = range.map(|(_, end)| sql_height(end)).transpose()?;
-        // Both the coverage bounds and cursor use placement_chronology before the scan limit.
-        let mut rows = self.client.query(
-            "WITH scanned AS MATERIALIZED (
-                SELECT p.object_key,p.block_height,p.position,p.kind,p.id
-                FROM public.block_index_state s JOIN public.canonical_placements p
-                    ON p.block_height>s.start_height AND p.block_height<=s.imported_through
-                WHERE s.singleton
-                    AND ($1::bigint IS NULL OR (p.block_height,p.position,p.kind,p.id)>($1,$2::integer,$3::smallint,$4::bytea))
-                    AND ($5::bigint IS NULL OR p.block_height BETWEEN $5 AND $6)
-                ORDER BY p.block_height,p.position,p.kind,p.id LIMIT 256
-            ), candidates AS MATERIALIZED (
-                SELECT p.id,p.block_height,p.position,p.kind,o.data_size::text AS data_size
-                FROM scanned p JOIN public.objects o ON o.key=p.object_key
-                WHERE p.kind=0 AND o.kind=0 AND o.metadata_complete AND o.is_bundle
-                    AND NOT EXISTS (SELECT 1 FROM public.bundle_progress bp WHERE bp.root_key=o.key AND bp.complete)
-                    AND (SELECT true FROM public.canonical_blocks c
-                        JOIN public.blocks b ON b.hash=c.block_hash AND b.height=c.height
-                        JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
-                        WHERE c.height=p.block_height AND bt.position=p.position
-                            AND bt.object_key=o.key AND b.timestamp IS NOT NULL LIMIT 1) IS TRUE
-                ORDER BY p.block_height,p.position,p.kind,p.id LIMIT 64
-            )
-            SELECT id,block_height,position,kind,data_size,false AS boundary FROM candidates
-            UNION ALL
-            SELECT coalesce(c.id,p.id),coalesce(c.block_height,p.block_height),
-                coalesce(c.position,p.position),coalesce(c.kind,p.kind),NULL,true
-            FROM (VALUES(0)) dummy(n)
-            LEFT JOIN LATERAL (SELECT * FROM scanned ORDER BY block_height DESC,position DESC,kind DESC,id DESC LIMIT 1) p ON true
-            LEFT JOIN LATERAL (SELECT * FROM candidates ORDER BY block_height,position,kind,id OFFSET 63 LIMIT 1) c ON true
-            ORDER BY boundary,block_height,position,kind,id",
+        let rows = self.client.query(
+            "SELECT p.id,p.block_height,p.position,p.kind,o.data_size::text AS data_size
+             FROM public.block_index_state s JOIN public.canonical_placements p
+                 ON p.block_height>s.start_height AND p.block_height<=s.imported_through
+             JOIN public.objects o ON o.key=p.object_key
+             WHERE s.singleton AND p.kind=0 AND o.kind=0 AND o.metadata_complete AND o.is_bundle
+                 AND ($1::bigint IS NULL OR (p.block_height,p.position,p.kind,p.id)>($1,$2::integer,$3::smallint,$4::bytea))
+                 AND ($5::bigint IS NULL OR p.block_height BETWEEN $5 AND $6)
+                 AND NOT EXISTS (SELECT 1 FROM public.bundle_progress bp WHERE bp.root_key=o.key AND bp.complete)
+                 AND (SELECT true FROM public.canonical_blocks c
+                     JOIN public.blocks b ON b.hash=c.block_hash AND b.height=c.height
+                     JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
+                     WHERE c.height=p.block_height AND bt.position=p.position
+                         AND bt.object_key=o.key AND b.timestamp IS NOT NULL LIMIT 1) IS TRUE
+             ORDER BY p.block_height,p.position,p.kind,p.id LIMIT 64",
             &[&after.map(|c| c.height), &after.map(|c| c.position), &after.map(|c| c.kind),
               &after.map(|c| c.id.as_slice()), &start, &end],
         ).await?;
-        let boundary = rows
-            .pop()
-            .context("bundle discovery omitted its scan cursor")?;
-        let after = boundary
-            .try_get::<_, Option<Vec<u8>>>(0)?
-            .map(|id| {
+        let after = rows
+            .last()
+            .map(|row| {
                 Ok::<_, anyhow::Error>(BundleCursor {
-                    height: boundary.try_get(1)?,
-                    position: boundary.try_get(2)?,
-                    kind: boundary.try_get(3)?,
-                    id,
+                    height: row.try_get(1)?,
+                    position: row.try_get(2)?,
+                    kind: row.try_get(3)?,
+                    id: row.try_get(0)?,
                 })
             })
             .transpose()?;
@@ -2637,6 +2632,17 @@ mod tests {
             database == "ar_io_rust_test",
             "requires the dedicated test database"
         );
+        let reader = store.bundle_discovery_reader().await?;
+        let error = reader
+            .client
+            .execute("DELETE FROM public.bundle_progress WHERE false", &[])
+            .await
+            .unwrap_err();
+        ensure!(
+            error.code() == Some(&tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION),
+            "bundle discovery connection allowed writes"
+        );
+        reader.pending_bundles_after(None, Some((0, 0))).await?;
         store.client.batch_execute("BEGIN").await?;
         let result = async {
             let mut roots = store
@@ -2653,7 +2659,7 @@ mod tests {
                 })
                 .collect::<Result<Vec<_>>>()?;
             ensure!(roots.len() == 1, "requires a canonical bundle root");
-            // Cover both the 64-root return limit and the 256-object scan limit.
+            // Cover pagination and long stretches of ineligible placements.
             let clones = store.client.query(
                 "INSERT INTO public.objects OVERRIDING SYSTEM VALUE
                  SELECT copy.* FROM public.objects o CROSS JOIN generate_series(1,257) n
@@ -2720,10 +2726,10 @@ mod tests {
                 &[&&ids[1..257]],
             ).await?;
             let skipped = store.pending_bundles_after(Some(&before_clones), None).await?;
-            ensure!(skipped.roots.is_empty() && skipped.after.as_ref().map(|c| &c.id) == Some(&roots[256].0),
-                "rejected candidates did not produce a bounded advancing page");
-            ensure!(collect(&store, skipped.after).await? == roots[257..],
-                "an empty page hid later canonical roots");
+            ensure!(skipped.roots == roots[257..],
+                "discovery did not skip directly to later canonical roots");
+            ensure!(collect(&store, skipped.after).await?.is_empty(),
+                "discovery repeated the last eligible root");
             store.client.batch_execute("ROLLBACK TO SAVEPOINT rejected_candidates").await?;
             store
                 .client

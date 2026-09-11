@@ -521,10 +521,13 @@ async fn download_pending(
     admission: &Arc<Admission>,
     range: Option<(u64, u64)>,
 ) -> Result<()> {
-    let store = gateway
+    let discovery_store = gateway
         .block_store
         .as_ref()
-        .context("bundle downloads require a database")?;
+        .context("bundle downloads require a database")?
+        .bundle_discovery_reader()
+        .await?;
+    let store = &discovery_store;
     let mut downloads = FuturesUnordered::new();
     let mut cursor: Option<crate::database::BundleCursor> = None;
     let mut pending: Option<(Vec<u8>, u64, u128)> = None;
@@ -640,7 +643,7 @@ async fn download_pending(
             discovery = Some(Box::pin(async move {
                 sleep_until(poll_at).await;
                 timeout(
-                    gateway.config.request_timeout,
+                    Duration::from_secs(125),
                     store.pending_bundles_after(after.as_ref(), range),
                 )
                 .await
