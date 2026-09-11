@@ -1355,6 +1355,7 @@ mod bundle_tests {
         );
         let bytes = include_bytes!("../tests/fixtures/json-binary-nested.json").to_vec();
         let root_id = [0xa7; 32];
+        let earlier_root_id = [0xa8; 32];
         let mut traversal =
             BundleTraversal::new(bytes.clone().into(), &root_id, crate::BundleFormat::Json).await?;
         let mut objects = Vec::new();
@@ -1380,6 +1381,7 @@ mod bundle_tests {
         ];
         let mut ids: Vec<_> = objects.iter().map(|object| object.id.clone()).collect();
         ids.push(root.id.clone());
+        ids.push(earlier_root_id.to_vec());
         ids.sort();
         ids.dedup();
         let occupied: bool = client
@@ -1428,9 +1430,9 @@ mod bundle_tests {
             let height: i64 = block.get(0);
             let hash: Vec<u8> = block.get(1);
             let position: i32 = client.query_one(
-                "SELECT coalesce(max(position),-1)+1 FROM public.block_transactions WHERE block_hash=$1", &[&hash]
+                "SELECT coalesce(max(position),-1)+2 FROM public.block_transactions WHERE block_hash=$1", &[&hash]
             ).await?.get(0);
-            store.record_objects(&[root]).await?;
+            store.record_objects(std::slice::from_ref(&root)).await?;
             let root_key: i64 = client.query_one("SELECT key FROM public.objects WHERE id=$1", &[&&root_id[..]]).await?.get(0);
             client.execute(
                 "INSERT INTO public.block_transactions(block_hash,position,object_key) VALUES($1,$2,$3)", &[&hash,&position,&root_key]
@@ -1452,7 +1454,15 @@ mod bundle_tests {
             let item = verify_indexed_bundle(bytes.clone().into(), crate::BundleFormat::Json, leaf_id.as_slice().try_into()?, &indexed, None).await?;
             ensure!(item.data.read_all(1024).await?.as_ref() == b"JSON to binary nested payload", "indexed JSON child payload differs");
             let written: Vec<i64> = client.query_one(counts, &[]).await?.get(0);
-            store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
+            let placement_lock = client.transaction().await?;
+            placement_lock.query_one(
+                "SELECT object_key FROM public.canonical_placements WHERE id=$1 FOR UPDATE",
+                &[&leaf_id],
+            ).await?;
+            let replay = tokio::time::timeout(Duration::from_secs(1),
+                store.commit_bundle_batch(&root_id, &objects, &locations, true)).await;
+            placement_lock.rollback().await?;
+            replay.context("unchanged replay waited for a placement write lock")??;
             ensure!(client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == written, "bundle replay added rows");
             ensure!(store.bundle_complete(&root_id).await?, "JSON root was not completed");
             ensure!(store.pending_bundles_after(Some(&cursor), Some((height as u64, height as u64))).await?
@@ -1461,6 +1471,50 @@ mod bundle_tests {
             corrupt[0].json = false;
             ensure!(store.commit_bundle_batch(&root_id, &objects, &corrupt, true).await.is_err(), "conflicting JSON encoding was accepted");
             ensure!(client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == written, "rejected bundle write changed rows");
+
+            root.id = earlier_root_id.to_vec();
+            store.record_objects(std::slice::from_ref(&root)).await?;
+            let earlier_key: i64 = client.query_one(
+                "SELECT key FROM public.objects WHERE id=$1", &[&&earlier_root_id[..]],
+            ).await?.get(0);
+            client.execute(
+                "INSERT INTO public.block_transactions(block_hash,position,object_key) VALUES($1,$2,$3)",
+                &[&hash,&(position-1),&earlier_key],
+            ).await?;
+            client.execute(
+                "INSERT INTO public.canonical_placements(object_key,block_height,position,kind,id)
+                 VALUES($1,$2,$3,0,$4)",
+                &[&earlier_key,&height,&(position-1),&&earlier_root_id[..]],
+            ).await?;
+            let mut earlier_locations = locations.clone();
+            for location in &mut earlier_locations {
+                if location.parent_id == root_id {
+                    location.parent_id = earlier_root_id.to_vec();
+                }
+            }
+            store.commit_bundle_batch(&earlier_root_id, &objects, &earlier_locations, true).await?;
+            ensure!(store.bundle_location(&leaf_id).await?.context("missing earlier placement")?.root_id == earlier_root_id,
+                "new earlier occurrence did not replace the old placement");
+            store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
+            ensure!(store.bundle_location(&leaf_id).await?.context("missing replay placement")?.root_id == earlier_root_id,
+                "later replay replaced the earlier placement");
+            client.execute("DELETE FROM public.canonical_placements WHERE id=$1", &[&leaf_id]).await?;
+            store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
+            ensure!(store.bundle_location(&leaf_id).await?.context("missing repaired placement")?.root_id == earlier_root_id,
+                "replay repair did not search all existing roots");
+
+            client.execute("DELETE FROM public.canonical_placements WHERE id=$1", &[&leaf_id]).await?;
+            let (_, block) = store.block_pair(height as u64).await?.context("missing fixture block")?;
+            let timestamp: i64 = client.query_one(
+                "SELECT timestamp FROM public.blocks WHERE hash=$1", &[&hash],
+            ).await?.get(0);
+            let transaction_ids: Vec<Vec<u8>> = client.query(
+                "SELECT o.id FROM public.block_transactions bt JOIN public.objects o ON o.key=bt.object_key
+                 WHERE bt.block_hash=$1 ORDER BY bt.position", &[&hash],
+            ).await?.into_iter().map(|row| row.get(0)).collect();
+            store.record_block_metadata(&block, timestamp as u64, &transaction_ids).await?;
+            ensure!(store.bundle_location(&leaf_id).await?.context("missing membership repair")?.root_id == earlier_root_id,
+                "block membership replay did not restore the earliest placement");
             Ok::<_, anyhow::Error>(())
         }).catch_unwind().await;
 

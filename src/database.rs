@@ -1424,7 +1424,11 @@ impl BlockStore {
         );
         let conflict = transaction.query_opt(BUNDLE_OVERLAP, &[&root_key]).await?;
         ensure!(conflict.is_none(), "overlapping bundle siblings");
-        Self::refresh_item_placements(&transaction, &keys).await?;
+        let new_locations: Vec<i64> = inserted
+            .iter()
+            .map(|row| row.try_get(0))
+            .collect::<std::result::Result<_, _>>()?;
+        Self::refresh_bundle_placements(&transaction, &keys, &new_locations).await?;
         if complete {
             transaction
                 .execute(
@@ -1434,6 +1438,54 @@ impl BlockStore {
                 .await?;
         }
         transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn refresh_bundle_placements(
+        transaction: &Transaction<'_>,
+        keys: &[i64],
+        new_locations: &[i64],
+    ) -> Result<()> {
+        transaction.execute(
+            "WITH candidates AS (
+                 SELECT l.object_key, root.block_height AS height, root.position, l.key, l.path
+                 FROM public.item_locations l
+                 JOIN public.canonical_placements root ON root.object_key=l.root_key
+                 WHERE l.key=ANY($1::bigint[]) AND EXISTS (
+                     SELECT 1 FROM public.canonical_placements p WHERE p.object_key=l.object_key
+                 )
+                 UNION ALL
+                 SELECT l.object_key, cb.height, bt.position, l.key, l.path
+                 FROM public.item_locations l
+                 JOIN public.block_transactions bt ON bt.object_key=l.root_key
+                 JOIN public.blocks b ON b.hash=bt.block_hash AND b.timestamp IS NOT NULL
+                 JOIN public.canonical_blocks cb ON cb.height=b.height AND cb.block_hash=b.hash
+                 JOIN public.block_index_state s
+                   ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
+                 WHERE l.object_key IN (
+                     SELECT k FROM unnest($2::bigint[]) k
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM public.canonical_placements p WHERE p.object_key=k
+                     )
+                 )
+             )
+             INSERT INTO public.canonical_placements AS stored
+                (object_key, block_height, position, location_key, kind, id)
+             SELECT candidate.object_key, candidate.height, candidate.position, candidate.key, o.kind, o.id
+             FROM (
+                 SELECT DISTINCT ON (object_key) object_key, height, position, key
+                 FROM candidates ORDER BY object_key, height, position, path
+             ) candidate JOIN public.objects o ON o.key=candidate.object_key
+             ORDER BY o.id
+             ON CONFLICT (object_key) DO UPDATE SET block_height=EXCLUDED.block_height,
+                 position=EXCLUDED.position, location_key=EXCLUDED.location_key,
+                 kind=EXCLUDED.kind, id=EXCLUDED.id
+             WHERE ROW(EXCLUDED.block_height, EXCLUDED.position,
+                       (SELECT path FROM public.item_locations WHERE key=EXCLUDED.location_key))
+                 < ROW(stored.block_height, stored.position,
+                       (SELECT path FROM public.item_locations WHERE key=stored.location_key))",
+            &[&new_locations, &keys],
+        ).await?;
         Ok(())
     }
 
