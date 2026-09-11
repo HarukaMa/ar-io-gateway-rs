@@ -53,7 +53,7 @@ pub(crate) fn chunk_slots(source: &str) -> Result<std::sync::Arc<tokio::sync::Se
     Ok(slots)
 }
 
-static CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
+static CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(96);
 static CHUNK_CAPACITY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 struct ChunkPermit {
