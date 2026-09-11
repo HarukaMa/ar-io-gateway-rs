@@ -36,6 +36,58 @@ const GATEWAY_SIZE: usize = 964;
 const REGISTRY_DISCRIMINATOR: [u8; 8] = [207, 115, 197, 33, 28, 106, 182, 209];
 const GATEWAY_DISCRIMINATOR: [u8; 8] = [210, 132, 162, 254, 10, 224, 45, 86];
 
+pub(crate) const CHUNK_ORIGIN_LIMIT: usize = 8;
+
+pub(crate) fn chunk_slots(source: &str) -> Result<std::sync::Arc<tokio::sync::Semaphore>> {
+    use std::sync::{Arc, LazyLock, Weak};
+    static LIMITS: LazyLock<parking_lot::Mutex<BTreeMap<String, Weak<tokio::sync::Semaphore>>>> =
+        LazyLock::new(Default::default);
+    let origin = Url::parse(source)?.origin().ascii_serialization();
+    let mut limits = LIMITS.lock();
+    limits.retain(|_, slots| slots.strong_count() > 0);
+    if let Some(slots) = limits.get(&origin).and_then(Weak::upgrade) {
+        return Ok(slots);
+    }
+    let slots = Arc::new(tokio::sync::Semaphore::new(CHUNK_ORIGIN_LIMIT));
+    limits.insert(origin, Arc::downgrade(&slots));
+    Ok(slots)
+}
+
+pub(crate) fn hedged_requests<'a, T, F, R>(
+    sources: &'a [String],
+    request: &'a F,
+) -> impl futures_util::Stream<Item = (&'a str, Result<T>)> + 'a
+where
+    T: 'a,
+    F: Fn(&'a str) -> R + 'a,
+    R: Future<Output = Result<T>> + 'a,
+{
+    use futures_util::{StreamExt, stream::FuturesUnordered};
+    let attempt = move |source: &'a String| async move { (source.as_str(), request(source).await) };
+    futures_util::stream::unfold(
+        (sources.iter(), FuturesUnordered::new()),
+        move |(mut pending, mut active)| async move {
+            if active.len() < 3 {
+                if let Some(source) = pending.next() {
+                    active.push(attempt(source));
+                }
+            }
+            loop {
+                if active.is_empty() {
+                    return None;
+                }
+                tokio::select! {
+                    result = active.next() => return Some((result.unwrap(), (pending, active))),
+                    _ = tokio::time::sleep(Duration::from_millis(150)),
+                        if active.len() < 3 && pending.len() > 0 => {
+                        active.push(attempt(pending.next().unwrap()));
+                    }
+                }
+            }
+        },
+    )
+}
+
 pub(crate) struct PeerState {
     client: Client,
     trusted_node_url: Url,
@@ -321,7 +373,11 @@ impl PeerState {
         json!({ "gateways": state.gateways, "arweaveNodes": nodes })
     }
 
-    pub(crate) fn chunk_candidates(&self, offset: u128, configured: &[String]) -> Vec<String> {
+    pub(crate) fn chunk_candidates(
+        &self,
+        offset: u128,
+        configured: &[String],
+    ) -> Result<Vec<String>> {
         let mut state = self.state.lock().unwrap();
         let mut pool: BTreeMap<String, bool> = configured
             .iter()
@@ -342,33 +398,38 @@ impl PeerState {
                 timing: None,
                 weight: 50,
             });
-            if configured
-                .iter()
-                .any(|source| source.trim_end_matches('/') == url)
-            {
-                continue;
-            }
             let (latency, rate) = stats.timing.unwrap_or((1.0, 262_144.0));
             let cost = (latency + 262_144.0 / rate) * 50.0 / f64::from(stats.weight)
                 + f64::from(50u8.saturating_sub(stats.weight)) / 5.0;
-            ranked.push((cost * if covered { 1.0 } else { 1.25 }, url));
+            let available = chunk_slots(&url)?.available_permits();
+            let load = 1.0 + (CHUNK_ORIGIN_LIMIT - available) as f64 / CHUNK_ORIGIN_LIMIT as f64;
+            ranked.push((
+                available == 0,
+                cost * load * if covered { 1.0 } else { 1.25 },
+                url,
+            ));
         }
-        ranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        ranked.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)));
         let selection = state.chunk_selection;
         state.chunk_selection = selection.wrapping_add(1);
-        if !ranked.is_empty() && selection % 8 == 0 {
-            let probe = ranked.len() - 1 - (selection / 8) % ranked.len();
+        let mut start = 0;
+        while start < ranked.len() {
+            let mut end = start + 1;
+            while end < ranked.len()
+                && (ranked[end].0, ranked[end].1) == (ranked[start].0, ranked[start].1)
+            {
+                end += 1;
+            }
+            ranked[start..end].rotate_left(selection % (end - start));
+            start = end;
+        }
+        let available = ranked.iter().take_while(|candidate| !candidate.0).count();
+        if available > 0 && selection % 8 == 0 {
+            let probe = available - 1 - (selection / 8) % available;
             ranked.swap(0, probe);
         }
-        let mut sources = Vec::with_capacity(configured.len() + ranked.len());
-        for source in configured {
-            let source = source.trim_end_matches('/');
-            if !sources.iter().any(|existing| existing == source) {
-                sources.push(source.to_owned());
-            }
-        }
-        sources.extend(ranked.into_iter().map(|(_, url)| url));
-        sources
+        let sources = ranked.into_iter().map(|(_, _, url)| url).collect();
+        Ok(sources)
     }
 
     pub(crate) fn record_chunk_result(
@@ -873,6 +934,59 @@ fn etf_integer(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn chunk_backups_wait_for_slow_sources() -> Result<()> {
+        use futures_util::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sources = vec!["first".to_owned(), "backup".to_owned()];
+        let calls = AtomicUsize::new(0);
+        let fast = |_| async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        let fetches = hedged_requests(&sources, &fast);
+        tokio::pin!(fetches);
+        assert!(fetches.next().await.unwrap().1.is_ok());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let slow = |source| async move {
+            if source == "first" {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        };
+        let started = Instant::now();
+        let fetches = hedged_requests(&sources, &slow);
+        tokio::pin!(fetches);
+        let (source, result) = fetches.next().await.unwrap();
+        result?;
+        assert_eq!(source, "backup");
+        assert_eq!(started.elapsed(), Duration::from_millis(150));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chunk_origin_limit_covers_url_aliases_and_releases_capacity() -> Result<()> {
+        let slots = chunk_slots("http://origin-limit.test/path-a")?;
+        let held = slots
+            .clone()
+            .try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
+        assert!(
+            chunk_slots("http://origin-limit.test:80/path-b")?
+                .try_acquire_owned()
+                .is_err()
+        );
+        let other = chunk_slots("http://other-origin-limit.test")?.try_acquire_owned()?;
+        drop(held);
+        assert!(
+            slots
+                .try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)
+                .is_ok()
+        );
+        drop(other);
+        Ok(())
+    }
+
     #[test]
     fn chunk_ranking_learns_speed_penalizes_failure_and_explores() -> Result<()> {
         let peers = PeerState::new("http://127.0.0.1:1984")?;
@@ -891,8 +1005,7 @@ mod tests {
                 },
             );
         }
-        let candidates = peers.chunk_candidates(1, &configured);
-        assert_eq!(&candidates[..2], configured.as_slice());
+        let candidates = peers.chunk_candidates(1, &configured)?;
         assert_eq!(
             candidates.into_iter().collect::<BTreeSet<_>>(),
             BTreeSet::from([
@@ -913,11 +1026,11 @@ mod tests {
                 262_144,
             )),
         );
-        assert_eq!(peers.chunk_candidates(1, &[])[0], fast);
+        assert_eq!(peers.chunk_candidates(1, &configured)?[0], fast);
         for _ in 0..4 {
             peers.record_chunk_result(fast, None);
         }
-        assert_ne!(peers.chunk_candidates(1, &[])[0], fast);
+        assert_ne!(peers.chunk_candidates(1, &configured)?[0], fast);
         peers.record_chunk_result(
             fast,
             Some((
@@ -926,16 +1039,12 @@ mod tests {
                 262_144,
             )),
         );
-        assert!((0..32).any(|_| peers.chunk_candidates(1, &[])[0] == "https://new"));
+        assert!(
+            (0..32).any(|_| peers.chunk_candidates(1, &configured).unwrap()[0] == "https://new")
+        );
+        let _saturated = chunk_slots(fast)?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
         for _ in 0..16 {
-            assert_eq!(
-                peers.chunk_candidates(1, &configured),
-                [
-                    configured[0].clone(),
-                    configured[1].clone(),
-                    fast.to_owned(),
-                ]
-            );
+            assert_ne!(peers.chunk_candidates(1, &configured)?[0], fast);
         }
         Ok(())
     }
@@ -1125,15 +1234,12 @@ mod tests {
             ("/chunk/1002", chunk.clone()),
             ("/chunk/1001", chunk),
         ]));
-        let failed_attempts = Arc::new(AtomicUsize::new(0));
-        let attempts = failed_attempts.clone();
         let mode = Arc::new(AtomicUsize::new(0));
         let mode_in = Arc::clone(&mode);
         let chunk_requests = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&chunk_requests);
         let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
             let replies = replies.clone();
-            let attempts = attempts.clone();
             let mode = Arc::clone(&mode_in);
             let counted = Arc::clone(&counted);
             async move {
@@ -1167,9 +1273,6 @@ mod tests {
                     }
                     (axum::http::StatusCode::OK, body)
                 } else {
-                    if request.uri().path().starts_with("/unavailable") {
-                        attempts.fetch_add(1, Ordering::Relaxed);
-                    }
                     (axum::http::StatusCode::NOT_FOUND, Vec::new())
                 }
             }
@@ -1232,7 +1335,6 @@ mod tests {
             2,
             "identical cold requests were duplicated"
         );
-        assert_eq!(failed_attempts.load(Ordering::Relaxed), 6);
         mode.store(5, Ordering::Relaxed);
         let (nearby, hit) = gateway.retrieve_chunk(1002).await.unwrap().unwrap();
         assert!(!hit);

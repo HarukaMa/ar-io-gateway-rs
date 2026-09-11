@@ -363,6 +363,26 @@ const CHUNK_DEADLINE: Duration = Duration::from_secs(20);
 const CHUNK_PEER_DEADLINE: Duration = Duration::from_secs(3);
 static CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 
+async fn admit_chunk(
+    source: &str,
+) -> Result<(
+    tokio::sync::OwnedSemaphorePermit,
+    tokio::sync::SemaphorePermit<'static>,
+)> {
+    profiling::measure(profiling::Stage::ChunkAdmission, async {
+        let origin = peers::chunk_slots(source)?
+            .acquire_owned()
+            .await
+            .context("chunk origin admission closed")?;
+        let global = CHUNK_FETCHES
+            .acquire()
+            .await
+            .context("chunk fetch admission closed")?;
+        Ok((origin, global))
+    })
+    .await
+}
+
 #[derive(Debug)]
 pub(crate) struct ContentNotFound;
 
@@ -1005,18 +1025,12 @@ impl Gateway {
         let mut invalid = Vec::new();
         let sources = self
             .peers
-            .chunk_candidates(offset, &self.config.chunk_sources);
+            .chunk_candidates(offset, &self.config.chunk_sources)?;
 
-        let mut pending = sources.iter();
-        let mut fetches = FuturesUnordered::new();
-        loop {
-            while fetches.len() < 3 {
-                let Some(source) = pending.next() else { break };
-                fetches.push(async move { (source, self.fetch_chunk(source, offset).await) });
-            }
-            let Some((source, result)) = fetches.next().await else {
-                break;
-            };
+        let request = |source| self.fetch_chunk(source, offset);
+        let fetches = peers::hedged_requests(&sources, &request);
+        tokio::pin!(fetches);
+        while let Some((source, result)) = fetches.next().await {
             let (candidate, headers, body) = match result {
                 Ok(candidate) => candidate,
                 Err(error) => {
@@ -1945,13 +1959,7 @@ impl Gateway {
         source: &str,
         offset: u128,
     ) -> Result<(JsonChunk, Duration, Duration)> {
-        let _permit = profiling::measure(profiling::Stage::ChunkAdmission, async {
-            CHUNK_FETCHES
-                .acquire()
-                .await
-                .context("chunk fetch admission closed")
-        })
-        .await?;
+        let (_origin_permit, _permit) = admit_chunk(source).await?;
         let url = endpoint(source, &format!("chunk/{offset}"));
         let request = if self
             .config
@@ -4358,7 +4366,7 @@ mod tests {
         for result in results {
             result.unwrap();
         }
-        assert!((2..=64).contains(&peak.load(Ordering::SeqCst)));
+        assert!((2..=peers::CHUNK_ORIGIN_LIMIT).contains(&peak.load(Ordering::SeqCst)));
         server.abort();
     }
 

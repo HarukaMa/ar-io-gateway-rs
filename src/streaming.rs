@@ -136,61 +136,51 @@ impl ChunkSource {
                     .first_offset
                     .checked_add(position as u128)
                     .context("stream chunk offset overflow")?;
-                let sources = self.peers.chunk_candidates(absolute, &self.sources);
-                let mut failures = Vec::new();
-                for source in sources {
-                    let mut sample = None;
-                    let result = async {
-                        let _permit = crate::profiling::measure(
-                            crate::profiling::Stage::ChunkAdmission,
-                            async {
-                                crate::CHUNK_FETCHES
-                                    .acquire()
-                                    .await
-                                    .context("chunk fetch admission closed")
-                            },
-                        )
-                        .await?;
-                        let path = format!("chunk/{absolute}");
-                        let request = if self.sources.iter().any(|configured| configured == &source)
-                        {
-                            self.client.get(endpoint(&source, &path))
-                        } else {
-                            self.peers.get(endpoint(&source, &path))
-                        };
-                        let started = Instant::now();
-                        // Reserve time for fallback within the shared chunk deadline.
-                        let response = crate::profiling::measure(
-                            crate::profiling::Stage::ChunkHeaders,
-                            async {
-                                Ok(request
-                                    .timeout((self.timeout / 4).min(crate::CHUNK_PEER_DEADLINE))
-                                    .send()
-                                    .await?
-                                    .error_for_status()?)
-                            },
-                        )
-                        .await?;
-                        let headers = started.elapsed();
-                        let started = Instant::now();
-                        let chunk = read_chunk_response(response).await?;
-                        let body = started.elapsed();
-                        let geometry = self.geometry;
-                        let proof = cpu_work(move || {
-                            verify_chunk_range(chunk, absolute, position as u128, &geometry)
+                let sources = self.peers.chunk_candidates(absolute, &self.sources)?;
+                let request = |source| async move {
+                    let (_origin_permit, _permit) = crate::admit_chunk(source).await?;
+                    let path = format!("chunk/{absolute}");
+                    let request = if self.sources.iter().any(|configured| configured == source) {
+                        self.client.get(endpoint(source, &path))
+                    } else {
+                        self.peers.get(endpoint(source, &path))
+                    };
+                    let started = Instant::now();
+                    let response =
+                        crate::profiling::measure(crate::profiling::Stage::ChunkHeaders, async {
+                            Ok(request
+                                .timeout((self.timeout / 4).min(crate::CHUNK_PEER_DEADLINE))
+                                .send()
+                                .await?
+                                .error_for_status()?)
                         })
                         .await?;
-                        sample = Some((headers, body, proof.bytes.len()));
-                        Ok::<_, anyhow::Error>((
-                            usize::try_from(proof.data.start)?,
-                            Bytes::from(proof.bytes),
-                        ))
-                    }
-                    .await;
-                    self.peers.record_chunk_result(&source, sample);
+                    let headers = started.elapsed();
+                    let started = Instant::now();
+                    let chunk = read_chunk_response(response).await?;
+                    let body = started.elapsed();
+                    let geometry = self.geometry;
+                    let proof = cpu_work(move || {
+                        verify_chunk_range(chunk, absolute, position as u128, &geometry)
+                    })
+                    .await?;
+                    let offset = usize::try_from(proof.data.start)?;
+                    Ok::<_, anyhow::Error>((offset, Bytes::from(proof.bytes), headers, body))
+                };
+                let fetches = crate::peers::hedged_requests(&sources, &request);
+                tokio::pin!(fetches);
+                let mut failures = Vec::new();
+                while let Some((source, result)) = fetches.next().await {
                     match result {
-                        Ok(chunk) => return Ok(chunk),
-                        Err(error) => failures.push(format!("{source}: {error:#}")),
+                        Ok((offset, bytes, headers, body)) => {
+                            self.peers
+                                .record_chunk_result(source, Some((headers, body, bytes.len())));
+                            return Ok((offset, bytes));
+                        }
+                        Err(error) => {
+                            self.peers.record_chunk_result(source, None);
+                            failures.push(format!("{source}: {error:#}"));
+                        }
                     }
                 }
                 anyhow::bail!(
