@@ -43,6 +43,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "010_bundle_totals",
         include_str!("../migrations/010_bundle_totals.sql"),
     ),
+    (
+        "011_bundle_scan_cursor",
+        include_str!("../migrations/011_bundle_scan_cursor.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -1081,6 +1085,43 @@ impl BlockStore {
             .iter()
             .map(|row| Ok((row.try_get(0)?, u64::try_from(row.try_get::<_, i64>(1)?)?)))
             .collect()
+    }
+
+    pub(crate) async fn bundle_scan_cursor(&self) -> Result<Option<BundleCursor>> {
+        self.client
+            .query_opt(
+                "SELECT bundle_cursor_height,bundle_cursor_position,bundle_cursor_kind,bundle_cursor_id
+                 FROM public.block_index_state WHERE singleton AND bundle_cursor_height IS NOT NULL",
+                &[],
+            )
+            .await?
+            .map(|row| {
+                Ok(BundleCursor {
+                    height: row.try_get(0)?,
+                    position: row.try_get(1)?,
+                    kind: row.try_get(2)?,
+                    id: row.try_get(3)?,
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) async fn save_bundle_scan_cursor(
+        &self,
+        cursor: Option<&BundleCursor>,
+    ) -> Result<()> {
+        let updated = self.client.execute(
+            "UPDATE public.block_index_state
+             SET bundle_cursor_height=$1,bundle_cursor_position=$2,bundle_cursor_kind=$3,bundle_cursor_id=$4
+             WHERE singleton",
+            &[&cursor.map(|c| c.height), &cursor.map(|c| c.position),
+              &cursor.map(|c| c.kind), &cursor.map(|c| c.id.as_slice())],
+        ).await?;
+        ensure!(
+            updated == 1,
+            "bundle scan progress requires an initialized block index"
+        );
+        Ok(())
     }
 
     pub(crate) async fn pending_bundles_after(
@@ -2249,6 +2290,83 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; cursor migration and fixture changes are rolled back"]
+    async fn bundle_scan_resume_and_wrap_preserve_incomplete_roots() -> Result<()> {
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store
+            .client
+            .batch_execute("BEGIN; SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='15s'")
+            .await?;
+        let result = async {
+            let version: i32 = store
+                .client
+                .query_one(
+                    "SELECT max(version) FROM public.ar_io_schema_migrations",
+                    &[],
+                )
+                .await?
+                .get(0);
+            if version == 10 {
+                store
+                    .client
+                    .batch_execute(include_str!("../migrations/011_bundle_scan_cursor.sql"))
+                    .await?;
+            } else {
+                ensure!(version == 11, "unexpected test schema version");
+            }
+            store
+                .client
+                .execute(
+                    "UPDATE public.bundle_progress SET complete=false WHERE root_key=(
+                    SELECT p.object_key FROM public.canonical_placements p
+                    JOIN public.objects o ON o.key=p.object_key
+                    JOIN public.block_index_state s ON s.singleton
+                    WHERE p.kind=0 AND o.is_bundle AND o.metadata_complete
+                      AND p.block_height>s.start_height AND p.block_height<=s.imported_through
+                    ORDER BY p.block_height,p.position,p.id LIMIT 1)",
+                    &[],
+                )
+                .await?;
+            let page = store.pending_bundles_after(None, None).await?;
+            let first = page
+                .roots
+                .first()
+                .context("test requires a canonical bundle root")?
+                .0
+                .clone();
+            store.save_bundle_scan_cursor(page.after.as_ref()).await?;
+            let resumed = store
+                .pending_bundles_after(store.bundle_scan_cursor().await?.as_ref(), None)
+                .await?;
+            ensure!(
+                resumed.roots.iter().all(|root| root.0 != first),
+                "restart retried an earlier incomplete root"
+            );
+            store.save_bundle_scan_cursor(None).await?;
+            let wrapped = store
+                .pending_bundles_after(store.bundle_scan_cursor().await?.as_ref(), None)
+                .await?;
+            ensure!(
+                wrapped.roots.iter().any(|root| root.0 == first),
+                "wraparound lost an incomplete root"
+            );
+            Ok(())
+        }
+        .await;
+        store.client.batch_execute("ROLLBACK").await?;
+        result
+    }
 
     #[tokio::test]
     #[ignore = "requires schema 010 and a canonical bundle in ar_io_rust_test; all changes roll back"]

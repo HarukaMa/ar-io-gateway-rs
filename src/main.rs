@@ -111,6 +111,10 @@ async fn main() -> Result<()> {
     config.index_chain = index_chain;
     let mut gateway = Gateway::new(config)?;
     if let Ok(url) = env::var("DATABASE_URL") {
+        if command == "serve" && args.len() == 0 {
+            let mut store = ar_io_gateway::database::BlockStore::connect(&url).await?;
+            store.migrate().await?;
+        }
         gateway = gateway.with_database(&url).await?;
     }
     if let Some(path) = env::var_os("AR_IO_DISK_CACHE_DIR") {

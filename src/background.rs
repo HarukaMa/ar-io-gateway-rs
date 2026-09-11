@@ -17,8 +17,11 @@ use tokio::{
 };
 
 use crate::{
-    Config, ContentCache, Gateway, MAX_JSON_BYTES, VerifiedRoot, database::BlockStore,
-    disk_cache::DiskCache, indexer::index_bundle_content, require_bundle_tags,
+    Config, ContentCache, Gateway, MAX_JSON_BYTES, VerifiedRoot,
+    database::{BlockStore, BundleCursor},
+    disk_cache::DiskCache,
+    indexer::index_bundle_content,
+    require_bundle_tags,
 };
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -50,6 +53,7 @@ struct Admission {
 
 struct AdmissionState {
     ids: HashMap<[u8; 32], Arc<crate::profiling::Profile>>,
+    scan_cursors: HashMap<[u8; 32], Option<Arc<BundleCursor>>>,
     bytes: usize,
     scheduled_bytes: usize,
     scheduled_jobs: usize,
@@ -66,6 +70,7 @@ impl Admission {
             }),
             state: Mutex::new(AdmissionState {
                 ids: HashMap::with_capacity(max_jobs),
+                scan_cursors: HashMap::with_capacity(max_jobs),
                 bytes: 0,
                 scheduled_bytes: 0,
                 closed: false,
@@ -130,6 +135,34 @@ impl Admission {
         self.reserve_inner(id, bytes, true)
     }
 
+    fn track_scan(&self, id: [u8; 32], after: Option<Arc<BundleCursor>>) {
+        let mut state = self.state.lock();
+        if state.ids.contains_key(&id) {
+            state
+                .scan_cursors
+                .entry(id)
+                .and_modify(|saved| {
+                    if after < *saved {
+                        *saved = after.clone();
+                    }
+                })
+                .or_insert(after);
+        }
+    }
+
+    fn scan_checkpoint(&self, boundary: Option<&BundleCursor>) -> Option<BundleCursor> {
+        // Replay the page containing the earliest outstanding root after a restart.
+        self.state
+            .lock()
+            .scan_cursors
+            .values()
+            .map(|cursor| cursor.as_deref())
+            .chain(std::iter::once(boundary))
+            .min()
+            .flatten()
+            .cloned()
+    }
+
     fn indexed(&self, count: u64) {
         if count > 0 {
             if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -176,6 +209,7 @@ impl Drop for Reservation {
         self.profile.finish("cancelled");
         let mut state = self.admission.state.lock();
         state.ids.remove(&self.id);
+        state.scan_cursors.remove(&self.id);
         state.bytes -= self.bytes;
         if self.scheduled {
             state.scheduled_bytes -= self.bytes;
@@ -532,25 +566,54 @@ async fn download_pending(
     admission: &Arc<Admission>,
     range: Option<(u64, u64)>,
 ) -> Result<()> {
-    let discovery_store = gateway
+    let checkpoint_store = gateway
         .block_store
         .as_ref()
-        .context("bundle downloads require a database")?
-        .bundle_discovery_reader()
-        .await?;
+        .context("bundle downloads require a database")?;
+    let discovery_store = checkpoint_store.bundle_discovery_reader().await?;
     let store = &discovery_store;
     let discovery_range = range.or_else(|| {
         (gateway.config.index_bundle_start_height > 0)
             .then_some((gateway.config.index_bundle_start_height, i64::MAX as u64))
     });
     let mut downloads = FuturesUnordered::new();
-    let mut cursor: Option<crate::database::BundleCursor> = None;
+    let mut cursor = if range.is_none() {
+        timeout(
+            gateway.config.request_timeout,
+            checkpoint_store.bundle_scan_cursor(),
+        )
+        .await
+        .context("loading bundle scan cursor timed out")??
+    } else {
+        None
+    };
+    let mut page_start = cursor.clone().map(Arc::new);
+    let mut saved_cursor = cursor.clone();
+    let mut checkpoint_at = Instant::now();
     let mut pending: Option<(Vec<u8>, u64, u128)> = None;
     let mut candidates = Vec::<(Vec<u8>, u64, u128)>::new().into_iter();
     let mut discovery = None;
     let mut exhausted = false;
     let mut next_poll = Instant::now();
     loop {
+        if range.is_none() && Instant::now() >= checkpoint_at {
+            let boundary = if pending.is_some() || candidates.len() > 0 {
+                page_start.as_deref()
+            } else {
+                cursor.as_ref()
+            };
+            let checkpoint = admission.scan_checkpoint(boundary);
+            if checkpoint != saved_cursor {
+                timeout(
+                    gateway.config.request_timeout,
+                    checkpoint_store.save_bundle_scan_cursor(checkpoint.as_ref()),
+                )
+                .await
+                .context("saving bundle scan cursor timed out")??;
+                saved_cursor = checkpoint;
+            }
+            checkpoint_at = Instant::now() + POLL_INTERVAL;
+        }
         if pending.is_none() && downloads.len() < gateway.config.index_downloads {
             pending = candidates.next();
         }
@@ -642,6 +705,9 @@ async fn download_pending(
                     pending = Some((root_id, height, data_size));
                 }
             }
+            if range.is_none() {
+                admission.track_scan(id, page_start.clone());
+            }
         }
         if exhausted && downloads.is_empty() && range.is_some() {
             return Ok(());
@@ -684,6 +750,7 @@ async fn download_pending(
                 discovery = None;
                 match result {
                     Ok(page) if page.after.is_some() => {
+                        page_start = cursor.clone().map(Arc::new);
                         cursor = page.after;
                         candidates = page.roots.into_iter();
                         exhausted = false;
@@ -786,6 +853,57 @@ mod tests {
     use super::*;
     use crate::content::{ContentWriter, SpoolBudget};
     use crate::{Tag, VerifiedData, content::Content};
+
+    #[test]
+    fn scan_checkpoint_waits_for_outstanding_pages_and_preserves_wraparound() {
+        let cursor = |height| {
+            Arc::new(BundleCursor {
+                height,
+                position: 0,
+                kind: 0,
+                id: vec![0; 32],
+            })
+        };
+        let first_page = cursor(10);
+        let second_page = cursor(20);
+        let next_page = cursor(30);
+        let admission = Admission::new(1024, 8, false);
+        let first = admission.reserve([1; 32], 0).unwrap();
+        admission.track_scan([1; 32], Some(Arc::clone(&first_page)));
+        let second = admission.reserve([2; 32], 0).unwrap();
+        admission.track_scan([2; 32], Some(Arc::clone(&second_page)));
+        assert_eq!(
+            admission.scan_checkpoint(Some(&next_page)),
+            Some((*first_page).clone())
+        );
+        second.profile.finish("completed");
+        drop(second);
+        assert_eq!(
+            admission.scan_checkpoint(Some(&next_page)),
+            Some((*first_page).clone())
+        );
+        first.profile.finish("failed");
+        drop(first);
+        assert_eq!(
+            admission.scan_checkpoint(Some(&next_page)),
+            Some((*next_page).clone())
+        );
+        // An unadmitted page and a wrap both constrain progress without a reservation.
+        assert_eq!(
+            admission.scan_checkpoint(Some(&second_page)),
+            Some((*second_page).clone())
+        );
+        assert_eq!(admission.scan_checkpoint(None), None);
+        let wrapped = admission.reserve([3; 32], 0).unwrap();
+        admission.track_scan([3; 32], None);
+        assert_eq!(admission.scan_checkpoint(Some(&next_page)), None);
+        drop(wrapped);
+        assert_eq!(
+            admission.scan_checkpoint(Some(&next_page)),
+            Some((*next_page).clone())
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires ar_io_rust_test; takes a temporary bundle-progress table lock"]
     async fn bundle_jobs_overlap_with_bounded_admission_and_cancel_cleanly() -> Result<()> {
