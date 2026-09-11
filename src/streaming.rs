@@ -136,14 +136,12 @@ impl ChunkSource {
                     .first_offset
                     .checked_add(position as u128)
                     .context("stream chunk offset overflow")?;
-                let sources = self.peers.chunk_candidates(absolute, &self.sources)?;
-                let request = |source| async move {
-                    let (_origin_permit, _permit) = crate::admit_chunk(source).await?;
+                let request = |source: String| async move {
                     let path = format!("chunk/{absolute}");
-                    let request = if self.sources.iter().any(|configured| configured == source) {
-                        self.client.get(endpoint(source, &path))
+                    let request = if self.sources.iter().any(|configured| configured == &source) {
+                        self.client.get(endpoint(&source, &path))
                     } else {
-                        self.peers.get(endpoint(source, &path))
+                        self.peers.get(endpoint(&source, &path))
                     };
                     let started = Instant::now();
                     let response =
@@ -167,18 +165,19 @@ impl ChunkSource {
                     let offset = usize::try_from(proof.data.start)?;
                     Ok::<_, anyhow::Error>((offset, Bytes::from(proof.bytes), headers, body))
                 };
-                let fetches = crate::peers::hedged_requests(&sources, &request);
+                let fetches =
+                    crate::peers::hedged_requests(&self.peers, absolute, &self.sources, &request);
                 tokio::pin!(fetches);
                 let mut failures = Vec::new();
                 while let Some((source, result)) = fetches.next().await {
                     match result {
                         Ok((offset, bytes, headers, body)) => {
                             self.peers
-                                .record_chunk_result(source, Some((headers, body, bytes.len())));
+                                .record_chunk_result(&source, Some((headers, body, bytes.len())));
                             return Ok((offset, bytes));
                         }
                         Err(error) => {
-                            self.peers.record_chunk_result(source, None);
+                            self.peers.record_chunk_result(&source, None);
                             failures.push(format!("{source}: {error:#}"));
                         }
                     }

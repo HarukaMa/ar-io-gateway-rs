@@ -53,34 +53,116 @@ pub(crate) fn chunk_slots(source: &str) -> Result<std::sync::Arc<tokio::sync::Se
     Ok(slots)
 }
 
+static CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
+static CHUNK_CAPACITY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+struct ChunkPermit {
+    origin: Option<tokio::sync::OwnedSemaphorePermit>,
+    global: Option<tokio::sync::SemaphorePermit<'static>>,
+}
+
+impl Drop for ChunkPermit {
+    fn drop(&mut self) {
+        self.origin.take();
+        self.global.take();
+        CHUNK_CAPACITY.notify_waiters();
+    }
+}
+
+async fn admit_chunk(
+    peers: &PeerState,
+    offset: u128,
+    configured: &[String],
+    attempted: &BTreeSet<String>,
+) -> Result<Option<(String, ChunkPermit)>> {
+    loop {
+        let changed = CHUNK_CAPACITY.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let global =
+            crate::profiling::measure(crate::profiling::Stage::ChunkGlobalAdmission, async {
+                CHUNK_FETCHES
+                    .acquire()
+                    .await
+                    .context("chunk admission closed")
+            })
+            .await?;
+        let mut remaining = false;
+        for source in peers.chunk_candidates(offset, configured)? {
+            if attempted.contains(&source) {
+                continue;
+            }
+            remaining = true;
+            if let Ok(origin) = chunk_slots(&source)?.try_acquire_owned() {
+                return Ok(Some((
+                    source,
+                    ChunkPermit {
+                        origin: Some(origin),
+                        global: Some(global),
+                    },
+                )));
+            }
+        }
+        drop(global);
+        if !remaining {
+            return Ok(None);
+        }
+        crate::profiling::measure(crate::profiling::Stage::ChunkOriginAdmission, async {
+            changed.await;
+            Ok(())
+        })
+        .await?;
+    }
+}
+
 pub(crate) fn hedged_requests<'a, T, F, R>(
-    sources: &'a [String],
+    peers: &'a PeerState,
+    offset: u128,
+    configured: &'a [String],
     request: &'a F,
-) -> impl futures_util::Stream<Item = (&'a str, Result<T>)> + 'a
+) -> impl futures_util::Stream<Item = (String, Result<T>)> + 'a
 where
-    T: 'a,
-    F: Fn(&'a str) -> R + 'a,
+    F: Fn(String) -> R + 'a,
     R: Future<Output = Result<T>> + 'a,
+    T: 'a,
 {
     use futures_util::{StreamExt, stream::FuturesUnordered};
-    let attempt = move |source: &'a String| async move { (source.as_str(), request(source).await) };
     futures_util::stream::unfold(
-        (sources.iter(), FuturesUnordered::new()),
-        move |(mut pending, mut active)| async move {
-            if active.len() < 3 {
-                if let Some(source) = pending.next() {
-                    active.push(attempt(source));
-                }
-            }
+        (
+            BTreeSet::new(),
+            FuturesUnordered::new(),
+            Instant::now(),
+            false,
+        ),
+        move |(mut attempted, mut active, mut launch_at, mut exhausted)| async move {
             loop {
-                if active.is_empty() {
+                if exhausted && active.is_empty() {
                     return None;
                 }
                 tokio::select! {
-                    result = active.next() => return Some((result.unwrap(), (pending, active))),
-                    _ = tokio::time::sleep(Duration::from_millis(150)),
-                        if active.len() < 3 && pending.len() > 0 => {
-                        active.push(attempt(pending.next().unwrap()));
+                    result = active.next(), if !active.is_empty() => {
+                        return Some((result.unwrap(), (attempted, active, Instant::now(), exhausted)));
+                    }
+                    admission = async {
+                        tokio::time::sleep_until(launch_at).await;
+                        admit_chunk(peers, offset, configured, &attempted).await
+                    }, if active.len() < 3 && !exhausted => {
+                        match admission {
+                            Ok(Some((source, permit))) => {
+                                attempted.insert(source.clone());
+                                active.push(async move {
+                                    let _permit = permit;
+                                    let timer = crate::profiling::start_origin(&source);
+                                    let result = request(source.clone()).await;
+                                    if let Some(timer) = timer { timer.finish(result.is_ok(), 0); }
+                                    (source, result)
+                                });
+                                launch_at = Instant::now() + Duration::from_millis(150);
+                            }
+                            Ok(None) => exhausted = true,
+                            Err(error) => return Some(((String::new(), Err(error)),
+                                (attempted, active, launch_at, true))),
+                        }
                     }
                 }
             }
@@ -127,15 +209,25 @@ struct ArweavePeer {
 
 struct Coverage {
     bucket_size: u64,
-    buckets: Vec<u64>,
+    buckets: Vec<(u64, f64)>,
     bucket_count: usize,
     updated: u64,
 }
 
 impl Coverage {
-    fn covers(&self, offset: u128) -> bool {
+    fn share(&self, offset: u128) -> f64 {
         u64::try_from(offset / u128::from(self.bucket_size))
-            .is_ok_and(|bucket| self.buckets.binary_search(&bucket).is_ok())
+            .ok()
+            .and_then(|bucket| {
+                self.buckets
+                    .binary_search_by_key(&bucket, |entry| entry.0)
+                    .ok()
+            })
+            .map_or(0.0, |index| self.buckets[index].1)
+    }
+
+    fn covers(&self, offset: u128) -> bool {
+        self.share(offset) > 0.0
     }
 }
 
@@ -214,8 +306,20 @@ impl PeerState {
         );
         let mut state = self.state.lock().unwrap();
         for (key, node) in &mut nodes {
-            if let Some(previous) = state.nodes.get(key) {
+            if let Some(previous) = state.nodes.get_mut(key) {
                 node.weight = previous.weight;
+                if node.coverage.is_none() {
+                    node.coverage = previous.coverage.take();
+                }
+            }
+        }
+        // Keep a last-known snapshot for still-advertised peers that missed this refresh.
+        for address in addresses {
+            let key = address.to_string();
+            if !nodes.contains_key(&key) {
+                if let Some(previous) = state.nodes.remove(&key) {
+                    nodes.insert(key, previous);
+                }
             }
         }
         state.nodes = nodes;
@@ -379,21 +483,24 @@ impl PeerState {
         configured: &[String],
     ) -> Result<Vec<String>> {
         let mut state = self.state.lock().unwrap();
-        let mut pool: BTreeMap<String, bool> = configured
+        let mut pool: BTreeMap<String, Option<f64>> = configured
             .iter()
-            .map(|url| (url.trim_end_matches('/').to_owned(), false))
+            .map(|url| (url.trim_end_matches('/').to_owned(), None))
             .collect();
         for peer in state.nodes.values() {
             pool.insert(
                 peer.url.clone(),
-                peer.coverage
-                    .as_ref()
-                    .is_some_and(|coverage| coverage.covers(offset)),
+                peer.coverage.as_ref().map(|coverage| {
+                    // After missed refreshes, converge toward the unknown-coverage prior.
+                    let age = now_millis().saturating_sub(coverage.updated);
+                    let confidence = 1.0 / (1.0 + age.saturating_sub(600_000) as f64 / 600_000.0);
+                    confidence * coverage.share(offset) + (1.0 - confidence) * 0.5
+                }),
             );
         }
         state.chunk_stats.retain(|url, _| pool.contains_key(url));
         let mut ranked = Vec::with_capacity(pool.len());
-        for (url, covered) in pool {
+        for (url, share) in pool {
             let stats = state.chunk_stats.entry(url.clone()).or_insert(ChunkStats {
                 timing: None,
                 weight: 50,
@@ -405,7 +512,7 @@ impl PeerState {
             let load = 1.0 + (CHUNK_ORIGIN_LIMIT - available) as f64 / CHUNK_ORIGIN_LIMIT as f64;
             ranked.push((
                 available == 0,
-                cost * load * if covered { 1.0 } else { 1.25 },
+                cost * load / share.unwrap_or(0.5).max(0.01),
                 url,
             ));
         }
@@ -443,6 +550,7 @@ impl PeerState {
             return;
         };
         if let Some((headers, body, bytes)) = sample {
+            crate::profiling::verified_chunk(url, bytes);
             stats.weight = stats.weight.saturating_add(5).min(100);
             let latency = headers.as_secs_f64();
             let rate = bytes as f64 / body.as_secs_f64().max(0.000_001);
@@ -889,7 +997,7 @@ fn decode_buckets(bytes: &[u8]) -> Result<Coverage> {
             share.is_finite() && (0.0..=1.0).contains(&share),
             "invalid sync bucket share"
         );
-        entries.push((bucket, share > 0.0));
+        entries.push((bucket, share));
     }
     ensure!(cursor == bytes.len(), "trailing sync bucket ETF data");
     entries.sort_unstable_by_key(|entry| entry.0);
@@ -899,10 +1007,7 @@ fn decode_buckets(bytes: &[u8]) -> Result<Coverage> {
     );
     Ok(Coverage {
         bucket_size,
-        buckets: entries
-            .into_iter()
-            .filter_map(|(index, positive)| positive.then_some(index))
-            .collect(),
+        buckets: entries,
         bucket_count: count,
         updated: now_millis(),
     })
@@ -934,34 +1039,202 @@ fn etf_integer(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn coverage_refresh_preserves_failed_snapshot_and_accepts_new_zero() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let mode = Arc::new(AtomicUsize::new(0));
+        let mode_in = Arc::clone(&mode);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let mode = mode_in.load(Ordering::Relaxed);
+            async move {
+                let body = match request.uri().path() {
+                    "/trusted/peers" => br#"["8.8.4.4:1984"]"#.to_vec(),
+                    "/info" => br#"{"height":51,"blocks":51}"#.to_vec(),
+                    "/sync_buckets" if mode == 1 => {
+                        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new());
+                    }
+                    "/sync_buckets" => bucket_frame(&[(0, if mode == 0 { 0.25 } else { 0.0 })]),
+                    _ => return (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+                };
+                (axum::http::StatusCode::OK, body)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let mut peers = PeerState::new(&format!("{base}/trusted"))?;
+        peers.client = Client::builder()
+            .proxy(reqwest::Proxy::all(&base)?)
+            .build()?;
+        peers.refresh_arweave().await?;
+        let initial = {
+            let state = peers.state.lock().unwrap();
+            let coverage = state.nodes["8.8.4.4:1984"].coverage.as_ref().unwrap();
+            assert_eq!(coverage.share(1), 0.25);
+            coverage.updated
+        };
+        mode.store(1, Ordering::Relaxed);
+        peers.refresh_arweave().await?;
+        {
+            let state = peers.state.lock().unwrap();
+            let coverage = state.nodes["8.8.4.4:1984"].coverage.as_ref().unwrap();
+            assert_eq!(coverage.share(1), 0.25);
+            assert_eq!(coverage.updated, initial);
+        }
+        mode.store(2, Ordering::Relaxed);
+        peers.refresh_arweave().await?;
+        assert_eq!(
+            peers.state.lock().unwrap().nodes["8.8.4.4:1984"]
+                .coverage
+                .as_ref()
+                .unwrap()
+                .share(1),
+            0.0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_spreads_work_and_releases_cancelled_capacity() -> Result<()> {
+        let peers = PeerState::new("http://127.0.0.1:1984")?;
+        let sources = vec![
+            "http://dispatch-a.test".to_owned(),
+            "http://dispatch-b.test".to_owned(),
+        ];
+        let attempted = BTreeSet::new();
+        let mut held = Vec::new();
+        let mut counts = BTreeMap::new();
+        for _ in 0..16 {
+            let (source, permit) = timeout(
+                Duration::from_secs(3),
+                admit_chunk(&peers, 1, &sources, &attempted),
+            )
+            .await??
+            .unwrap();
+            *counts.entry(source.clone()).or_insert(0) += 1;
+            held.push((source, permit));
+        }
+        assert_eq!(
+            counts,
+            BTreeMap::from([(sources[0].clone(), 8), (sources[1].clone(), 8)])
+        );
+        {
+            let pending = admit_chunk(&peers, 1, &sources, &attempted);
+            tokio::pin!(pending);
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            let (released, permit) = held.pop().unwrap();
+            drop(permit);
+            let (selected, _permit) = timeout(Duration::from_secs(1), pending).await??.unwrap();
+            assert_eq!(selected, released);
+        }
+        held.clear();
+        for source in &sources {
+            let _all = chunk_slots(source)?.try_acquire_many_owned(8)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_fraction_and_age_affect_ranking() -> Result<()> {
+        let peers = PeerState::new("http://127.0.0.1:1984")?;
+        let configured = vec!["http://unknown.test".to_owned()];
+        for (url, share) in [
+            ("http://full.test", 1.0),
+            ("http://partial.test", 0.1),
+            ("http://empty.test", 0.0),
+        ] {
+            peers.state.lock().unwrap().nodes.insert(
+                url.to_owned(),
+                ArweavePeer {
+                    url: url.to_owned(),
+                    blocks: 1,
+                    height: 1,
+                    last_seen: now_millis(),
+                    coverage: Some(decode_buckets(&bucket_frame(&[(0, share)]))?),
+                    weight: 50,
+                },
+            );
+        }
+        peers.state.lock().unwrap().chunk_selection = 1;
+        assert_eq!(
+            peers.chunk_candidates(1, &configured)?,
+            vec![
+                "http://full.test",
+                "http://unknown.test",
+                "http://partial.test",
+                "http://empty.test",
+            ]
+        );
+        {
+            let mut state = peers.state.lock().unwrap();
+            state
+                .nodes
+                .get_mut("http://empty.test")
+                .unwrap()
+                .coverage
+                .as_mut()
+                .unwrap()
+                .updated = 0;
+        }
+        let ranked = peers.chunk_candidates(1, &configured)?;
+        assert!(
+            ranked.iter().position(|url| url == "http://empty.test")
+                < ranked.iter().position(|url| url == "http://partial.test")
+        );
+        let explored: BTreeSet<_> = (0..64)
+            .map(|_| peers.chunk_candidates(1, &configured).unwrap()[0].clone())
+            .collect();
+        assert_eq!(explored.len(), 4);
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn chunk_backups_wait_for_slow_sources() -> Result<()> {
         use futures_util::StreamExt;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let sources = vec!["first".to_owned(), "backup".to_owned()];
+        let peers = PeerState::new("http://127.0.0.1:1984")?;
+        let sources = vec![
+            "http://hedge-first.test".to_owned(),
+            "http://hedge-backup.test".to_owned(),
+        ];
+        peers.chunk_candidates(1, &sources)?;
+        peers.record_chunk_result(
+            &sources[0],
+            Some((Duration::from_millis(1), Duration::from_millis(1), 262_144)),
+        );
         let calls = AtomicUsize::new(0);
         let fast = |_| async {
             calls.fetch_add(1, Ordering::Relaxed);
             Ok(())
         };
-        let fetches = hedged_requests(&sources, &fast);
+        let fetches = hedged_requests(&peers, 1, &sources, &fast);
         tokio::pin!(fetches);
         assert!(fetches.next().await.unwrap().1.is_ok());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
         let slow = |source| async move {
-            if source == "first" {
+            if source == "http://hedge-first.test" {
                 std::future::pending::<()>().await;
             }
             Ok(())
         };
         let started = Instant::now();
-        let fetches = hedged_requests(&sources, &slow);
-        tokio::pin!(fetches);
-        let (source, result) = fetches.next().await.unwrap();
-        result?;
-        assert_eq!(source, "backup");
-        assert_eq!(started.elapsed(), Duration::from_millis(150));
+        {
+            let fetches = hedged_requests(&peers, 1, &sources, &slow);
+            tokio::pin!(fetches);
+            let (source, result) = fetches.next().await.unwrap();
+            result?;
+            assert_eq!(source, "http://hedge-backup.test");
+            assert_eq!(started.elapsed(), Duration::from_millis(150));
+        }
+        for source in &sources {
+            let _all = chunk_slots(source)?.try_acquire_many_owned(8)?;
+        }
         Ok(())
     }
 

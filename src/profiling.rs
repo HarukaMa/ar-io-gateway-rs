@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 #[derive(Clone, Copy)]
 #[repr(usize)]
 pub(crate) enum Stage {
-    ChunkAdmission,
+    ChunkGlobalAdmission,
+    ChunkOriginAdmission,
     ChunkHeaders,
     ChunkBody,
     CpuAdmission,
@@ -23,8 +24,9 @@ pub(crate) enum Stage {
     TransactionAdmission,
     TransactionFetch,
 }
-const STAGES: [&str; 12] = [
-    "chunk_admission",
+const STAGES: [&str; 13] = [
+    "chunk_global_admission",
+    "chunk_origin_admission",
     "chunk_headers",
     "chunk_body",
     "cpu_admission",
@@ -55,6 +57,7 @@ struct State {
     phases: [Duration; 3],
     phase: usize,
     outcome: &'static str,
+    origins: std::collections::BTreeMap<String, Counter>,
     counters: [Counter; STAGES.len()],
 }
 
@@ -91,7 +94,7 @@ impl State {
         if self.outcome == "running" {
             self.phases[self.phase] += elapsed;
         }
-        for counter in &mut self.counters {
+        for counter in self.counters.iter_mut().chain(self.origins.values_mut()) {
             counter.elapsed += elapsed * counter.active;
         }
         self.updated = now;
@@ -123,6 +126,7 @@ impl Profile {
                 phase: 0,
                 outcome: "running",
                 counters: std::array::from_fn(|_| Counter::default()),
+                origins: Default::default(),
             }),
         })
     }
@@ -147,14 +151,13 @@ impl Profile {
         let stages: serde_json::Map<String, Value> = STAGES
             .iter()
             .zip(&state.counters)
-            .map(|(name, c)| {
-                (
-                    (*name).to_owned(),
-                    json!({"elapsed_us": c.elapsed.as_micros() as u64,
+            .map(|(name, counter)| ((*name).to_owned(), counter))
+            .chain(state.origins.iter().map(|(origin, counter)| (format!("origin:{origin}"), counter)))
+            .map(|(name, c)| (name, json!({
+                "elapsed_us": c.elapsed.as_micros() as u64,
                 "started": c.started, "completed": c.completed, "failed": c.failed,
-                "cancelled": c.cancelled, "active": c.active, "peak_active": c.peak_active, "bytes": c.bytes}),
-                )
-            })
+                "cancelled": c.cancelled, "active": c.active, "peak_active": c.peak_active, "bytes": c.bytes
+            })))
             .collect();
         json!({"attempt": self.attempt, "root": self.root, "event": event,
             "started_at_us": self.started_at_us,
@@ -177,9 +180,44 @@ impl Drop for Profile {
 
 pub(crate) struct Timer {
     profile: Arc<Profile>,
-    stage: Stage,
+    key: CounterKey,
     outcome: Option<bool>,
     bytes: u64,
+}
+
+enum CounterKey {
+    Stage(Stage),
+    Origin(String),
+}
+
+impl State {
+    fn counter(&mut self, key: &CounterKey) -> &mut Counter {
+        match key {
+            CounterKey::Stage(stage) => &mut self.counters[*stage as usize],
+            CounterKey::Origin(origin) => self.origins.entry(origin.clone()).or_default(),
+        }
+    }
+}
+
+pub(crate) fn start_origin(source: &str) -> Option<Timer> {
+    let profile = current()?;
+    let origin = reqwest::Url::parse(source)
+        .ok()?
+        .origin()
+        .ascii_serialization();
+    start_counter(&Some(profile), CounterKey::Origin(origin))
+}
+
+pub(crate) fn verified_chunk(source: &str, bytes: usize) {
+    if let (Some(profile), Ok(url)) = (current(), reqwest::Url::parse(source)) {
+        profile
+            .state
+            .lock()
+            .origins
+            .entry(url.origin().ascii_serialization())
+            .or_default()
+            .bytes += bytes as u64;
+    }
 }
 
 pub(crate) fn start(stage: Stage) -> Option<Timer> {
@@ -188,18 +226,22 @@ pub(crate) fn start(stage: Stage) -> Option<Timer> {
 
 // Already-dispatched blocking work can start after its root is cancelled.
 pub(crate) fn start_for(profile: &Option<Arc<Profile>>, stage: Stage) -> Option<Timer> {
+    start_counter(profile, CounterKey::Stage(stage))
+}
+
+fn start_counter(profile: &Option<Arc<Profile>>, key: CounterKey) -> Option<Timer> {
     let profile = profile.as_ref()?;
     {
         let mut state = profile.state.lock();
         state.update();
-        let counter = &mut state.counters[stage as usize];
+        let counter = state.counter(&key);
         counter.started += 1;
         counter.active += 1;
         counter.peak_active = counter.peak_active.max(counter.active);
     }
     Some(Timer {
         profile: Arc::clone(profile),
-        stage,
+        key,
         outcome: None,
         bytes: 0,
     })
@@ -207,7 +249,7 @@ pub(crate) fn start_for(profile: &Option<Arc<Profile>>, stage: Stage) -> Option<
 
 impl Timer {
     pub(crate) fn add_bytes(&self, bytes: u64) {
-        self.profile.state.lock().counters[self.stage as usize].bytes += bytes;
+        self.profile.state.lock().counter(&self.key).bytes += bytes;
     }
 
     pub(crate) fn finish(mut self, success: bool, bytes: u64) {
@@ -220,7 +262,7 @@ impl Drop for Timer {
     fn drop(&mut self) {
         let mut state = self.profile.state.lock();
         state.update();
-        let counter = &mut state.counters[self.stage as usize];
+        let counter = state.counter(&self.key);
         counter.active -= 1;
         counter.bytes += self.bytes;
         match self.outcome {

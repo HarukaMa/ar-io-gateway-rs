@@ -361,27 +361,6 @@ impl Drop for ChunkLeader<'_> {
 
 const CHUNK_DEADLINE: Duration = Duration::from_secs(20);
 const CHUNK_PEER_DEADLINE: Duration = Duration::from_secs(3);
-static CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
-
-async fn admit_chunk(
-    source: &str,
-) -> Result<(
-    tokio::sync::OwnedSemaphorePermit,
-    tokio::sync::SemaphorePermit<'static>,
-)> {
-    profiling::measure(profiling::Stage::ChunkAdmission, async {
-        let origin = peers::chunk_slots(source)?
-            .acquire_owned()
-            .await
-            .context("chunk origin admission closed")?;
-        let global = CHUNK_FETCHES
-            .acquire()
-            .await
-            .context("chunk fetch admission closed")?;
-        Ok((origin, global))
-    })
-    .await
-}
 
 #[derive(Debug)]
 pub(crate) struct ContentNotFound;
@@ -1023,18 +1002,15 @@ impl Gateway {
         geometry: BlockGeometry,
     ) -> Result<Option<VerifiedChunk>> {
         let mut invalid = Vec::new();
-        let sources = self
-            .peers
-            .chunk_candidates(offset, &self.config.chunk_sources)?;
-
-        let request = |source| self.fetch_chunk(source, offset);
-        let fetches = peers::hedged_requests(&sources, &request);
+        let request = |source: String| async move { self.fetch_chunk(&source, offset).await };
+        let fetches =
+            peers::hedged_requests(&self.peers, offset, &self.config.chunk_sources, &request);
         tokio::pin!(fetches);
         while let Some((source, result)) = fetches.next().await {
             let (candidate, headers, body) = match result {
                 Ok(candidate) => candidate,
                 Err(error) => {
-                    self.peers.record_chunk_result(source, None);
+                    self.peers.record_chunk_result(&source, None);
                     if error
                         .downcast_ref::<reqwest::Error>()
                         .is_none_or(|error| error.status() != Some(reqwest::StatusCode::NOT_FOUND))
@@ -1048,7 +1024,7 @@ impl Gateway {
                 match cpu_work(move || verify_chunk_proof(candidate, offset, &geometry)).await {
                     Ok(proof) => proof,
                     Err(error) => {
-                        self.peers.record_chunk_result(source, None);
+                        self.peers.record_chunk_result(&source, None);
                         invalid.push(format!("{source}: {error:#}"));
                         continue;
                     }
@@ -1061,13 +1037,13 @@ impl Gateway {
                 .relative_offset
                 .checked_sub(proof.data.start)
                 .context("chunk read offset underflow")?;
-            let source_host = Url::parse(source)?
+            let source_host = Url::parse(&source)?
                 .host_str()
                 .context("chunk source has no host")?
                 .to_owned();
 
             self.peers
-                .record_chunk_result(source, Some((headers, body, proof.bytes.len())));
+                .record_chunk_result(&source, Some((headers, body, proof.bytes.len())));
             return Ok(Some(VerifiedChunk {
                 data_root: URL_SAFE_NO_PAD.encode(proof.transaction.data_root),
                 data_size: proof.transaction.size,
@@ -1959,7 +1935,6 @@ impl Gateway {
         source: &str,
         offset: u128,
     ) -> Result<(JsonChunk, Duration, Duration)> {
-        let (_origin_permit, _permit) = admit_chunk(source).await?;
         let url = endpoint(source, &format!("chunk/{offset}"));
         let request = if self
             .config
@@ -4359,9 +4334,19 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let results = futures_util::future::join_all(
-            (1..=128).map(|offset| gateway.fetch_chunk(&base, offset)),
-        )
+        let gateway = &gateway;
+        let results = futures_util::future::join_all((1..=128).map(|offset| async move {
+            let request =
+                |source: String| async move { gateway.fetch_chunk(&source, offset).await };
+            let fetches = peers::hedged_requests(
+                &gateway.peers,
+                offset,
+                &gateway.config.chunk_sources,
+                &request,
+            );
+            tokio::pin!(fetches);
+            fetches.next().await.unwrap().1
+        }))
         .await;
         for result in results {
             result.unwrap();
