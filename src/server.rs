@@ -774,11 +774,8 @@ async fn serve_resolver(State(state): State<Arc<AppState>>, Path(name): Path<Str
     {
         Ok(Ok(Some(resolution))) => resolution,
         Ok(Ok(None)) => return error_response(StatusCode::NOT_FOUND, "Not found"),
-        Ok(Err(error)) => {
-            eprintln!("ArNS resolution failed: {error:#}");
-            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
-        }
-        Err(_) => return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+        Ok(Err(error)) => return upstream_error_response("ArNS resolution failed", error),
+        Err(error) => return upstream_error_response("ArNS resolution failed", error.into()),
     };
     let mut response = json_response(&serde_json::json!({
         "txId": resolution.resolved_id,
@@ -1031,10 +1028,7 @@ async fn serve_chunk_response(
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
             }),
         Ok(None) => error_response(StatusCode::NOT_FOUND, "Not found"),
-        Err(error) => {
-            eprintln!("verified chunk retrieval failed: {error:#}");
-            empty_error_response(StatusCode::BAD_GATEWAY)
-        }
+        Err(error) => upstream_error_response("verified chunk retrieval failed", error),
     }
 }
 
@@ -1196,10 +1190,7 @@ async fn serve_arns_path(
     let resolution = match resolve_arns(state, name).await {
         Ok(Some(resolution)) => resolution,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not found"),
-        Err(error) => {
-            eprintln!("ArNS resolution failed: {error:#}");
-            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
-        }
+        Err(error) => return upstream_error_response("ArNS resolution failed", error),
     };
     if resolution.index > usize::from(resolution.limit) {
         return error_response(StatusCode::PAYMENT_REQUIRED, "Payment Required");
@@ -1265,10 +1256,7 @@ async fn retrieve_response(
     let target = match target {
         Ok(Some(target)) => target,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not found"),
-        Err(error) => {
-            eprintln!("manifest resolution failed: {error:#}");
-            return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
-        }
+        Err(error) => return upstream_error_response("manifest resolution failed", error),
     };
     if add_trailing_slash {
         let mut location = format!("/{}/", verified.id);
@@ -2405,9 +2393,20 @@ fn retrieval_error_response(error: anyhow::Error) -> Response {
     if error.is::<crate::ContentNotFound>() {
         error_response(StatusCode::NOT_FOUND, "Not found")
     } else {
-        eprintln!("verified retrieval failed: {error:#}");
-        error_response(StatusCode::BAD_GATEWAY, "Bad Gateway")
+        upstream_error_response("verified retrieval failed", error)
     }
+}
+
+fn upstream_error_response(context: &str, error: anyhow::Error) -> Response {
+    eprintln!("{context}: {error:#}");
+    let mut response = html_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &format!("{context}: {error:#}"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 fn invalid_id_response(id: &str) -> Response {
@@ -2429,12 +2428,19 @@ fn escape_html(value: &str) -> String {
 }
 
 fn unmatched_response(method: &Method, uri: &Uri) -> Response {
-    let message = escape_html(&format!("Cannot {method} {}", uri.path()));
+    html_error_response(
+        StatusCode::NOT_FOUND,
+        &format!("Cannot {method} {}", uri.path()),
+    )
+}
+
+fn html_error_response(status: StatusCode, message: &str) -> Response {
+    let message = escape_html(message);
     let body = format!(
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Error</title>\n</head>\n<body>\n<pre>{message}</pre>\n</body>\n</html>\n"
     );
     Response::builder()
-        .status(StatusCode::NOT_FOUND)
+        .status(status)
         .header("content-type", "text/html; charset=utf-8")
         .header("content-length", body.len().to_string())
         .body(Body::from(body))
@@ -2981,6 +2987,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn rpc_transport_errors_hide_endpoint_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: Url = format!(
+            "http://user:secret@{}/private-key?api-key=secret",
+            listener.local_addr().unwrap()
+        )
+        .parse()
+        .unwrap();
+        let app = Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let gateway = Gateway::new(stream_limits()).unwrap();
+        let errors = [
+            account_info(&gateway, &url, ARNS_PROGRAM, ARNS_PROGRAM)
+                .await
+                .unwrap_err(),
+            ant_undername(&gateway, &url, ANT_PROGRAM, &[0; 32], "@")
+                .await
+                .err()
+                .unwrap(),
+        ];
+        for error in errors {
+            let response = upstream_error_response("ArNS resolution failed", error);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(body.contains("Solana RPC request failed"));
+            assert!(!body.contains("secret"));
+            assert!(!body.contains("private-key"));
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -3560,8 +3601,8 @@ mod tests {
         server.abort();
     }
 
-    #[test]
-    fn keeps_verification_failures_distinct_from_missing_content() {
+    #[tokio::test]
+    async fn keeps_verification_failures_distinct_from_missing_content() {
         let missing =
             anyhow::Error::new(crate::ContentNotFound).context("retrieving manifest target");
         let response = retrieval_error_response(missing);
@@ -3570,10 +3611,22 @@ mod tests {
             response.headers()[CACHE_CONTROL],
             "public, max-age=60, must-revalidate"
         );
-        let invalid = anyhow::anyhow!("invalid chunk proof");
+        let invalid = anyhow::anyhow!("invalid chunk proof <script>alert('x')</script>")
+            .context("http://127.0.0.1:1984/chunk/123");
         let response = retrieval_error_response(invalid);
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert!(!response.headers().contains_key(CACHE_CONTROL));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("http://127.0.0.1:1984/chunk/123: invalid chunk proof"));
+        assert!(body.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"));
+        assert!(!body.contains("<script>"));
         let unmatched = unmatched_response(&Method::GET, &"/unknown".parse().unwrap());
         assert!(!unmatched.headers().contains_key(CACHE_CONTROL));
     }
