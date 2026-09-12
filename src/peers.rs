@@ -36,7 +36,7 @@ const GATEWAY_SIZE: usize = 964;
 const REGISTRY_DISCRIMINATOR: [u8; 8] = [207, 115, 197, 33, 28, 106, 182, 209];
 const GATEWAY_DISCRIMINATOR: [u8; 8] = [210, 132, 162, 254, 10, 224, 45, 86];
 
-pub(crate) const CHUNK_ORIGIN_LIMIT: usize = 32;
+pub(crate) const CHUNK_ORIGIN_LIMIT: usize = 48;
 
 pub(crate) fn chunk_slots(source: &str) -> Result<std::sync::Arc<tokio::sync::Semaphore>> {
     use std::sync::{Arc, LazyLock, Weak};
