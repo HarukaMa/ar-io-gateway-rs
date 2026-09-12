@@ -1,4 +1,4 @@
-use std::{env, fs, io::Read, time::Duration};
+use std::{env, fs, io::Read};
 
 use anyhow::{Context, Result, bail};
 use ar_io_gateway::{
@@ -16,94 +16,11 @@ async fn main() -> Result<()> {
         bail!("{USAGE}");
     };
 
-    let trusted_node =
-        env::var("ARWEAVE_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:1984".to_owned());
-    let archive =
-        env::var("ARWEAVE_ARCHIVE_URL").unwrap_or_else(|_| "https://arweave.net".to_owned());
-    let sources = env::var("ARWEAVE_CHUNK_SOURCES")
-        .unwrap_or_else(|_| "https://arweave.net,https://tip-4.arweave.xyz".to_owned())
-        .split(',')
-        .filter(|source| !source.is_empty())
-        .map(str::to_owned)
-        .collect();
-    let timeout = env::var("ARWEAVE_REQUEST_TIMEOUT_SECS")
-        .unwrap_or_else(|_| "10".to_owned())
-        .parse()
-        .context("invalid ARWEAVE_REQUEST_TIMEOUT_SECS")?;
-    let max_attempts = env::var("ARWEAVE_MAX_PEER_ATTEMPTS")
-        .unwrap_or_else(|_| "3".to_owned())
-        .parse()
-        .context("invalid ARWEAVE_MAX_PEER_ATTEMPTS")?;
-    let max_data_size = env::var("ARWEAVE_MAX_DATA_SIZE_BYTES")
-        .unwrap_or_else(|_| (1024 * 1024 * 1024).to_string())
-        .parse()
-        .context("invalid ARWEAVE_MAX_DATA_SIZE_BYTES")?;
-    let mut config = Config::new(
-        trusted_node,
-        archive,
-        sources,
-        Duration::from_secs(timeout),
-        max_attempts,
-        max_data_size,
-    )?;
-    config.graphql_sources = env::var("ARWEAVE_GRAPHQL_URLS")
-        .unwrap_or_else(|_| {
-            format!(
-                "{}/graphql,https://turbo-gateway.com/graphql",
-                config.archive_url
-            )
-        })
-        .split(',')
-        .map(str::trim)
-        .filter(|source| !source.is_empty())
-        .map(str::to_owned)
-        .collect();
-    config.max_memory_data_size = env::var("ARWEAVE_MAX_MEMORY_DATA_SIZE_BYTES")
-        .unwrap_or_else(|_| config.max_memory_data_size.to_string())
-        .parse()
-        .context("invalid ARWEAVE_MAX_MEMORY_DATA_SIZE_BYTES")?;
-    config.max_spool_bytes = env::var("ARWEAVE_MAX_SPOOL_BYTES")
-        .unwrap_or_else(|_| config.max_spool_bytes.to_string())
-        .parse()
-        .context("invalid ARWEAVE_MAX_SPOOL_BYTES")?;
-    config.index_downloads = env::var("AR_IO_INDEX_DOWNLOADS")
-        .unwrap_or_else(|_| config.index_downloads.to_string())
-        .parse()
-        .context("invalid AR_IO_INDEX_DOWNLOADS")?;
+    let mut config = Config::from_env()?;
     config.index_bundle_start_height = env::var("AR_IO_BUNDLE_START_HEIGHT")
         .unwrap_or_else(|_| config.index_bundle_start_height.to_string())
         .parse()
         .context("invalid AR_IO_BUNDLE_START_HEIGHT")?;
-    config.index_max_bytes = env::var("AR_IO_INDEX_MAX_BYTES")
-        .unwrap_or_else(|_| config.index_max_bytes.to_string())
-        .parse()
-        .context("invalid AR_IO_INDEX_MAX_BYTES")?;
-    config.retrieval_timeout = Duration::from_secs(
-        env::var("ARWEAVE_RETRIEVAL_TIMEOUT_SECS")
-            .unwrap_or_else(|_| config.retrieval_timeout.as_secs().to_string())
-            .parse()
-            .context("invalid ARWEAVE_RETRIEVAL_TIMEOUT_SECS")?,
-    );
-    config.stream_idle_timeout = Duration::from_secs(
-        env::var("AR_IO_STREAM_IDLE_TIMEOUT_SECS")
-            .unwrap_or_else(|_| config.stream_idle_timeout.as_secs().to_string())
-            .parse()
-            .context("invalid AR_IO_STREAM_IDLE_TIMEOUT_SECS")?,
-    );
-    config.stream_timeout = Duration::from_secs(
-        env::var("AR_IO_STREAM_TIMEOUT_SECS")
-            .unwrap_or_else(|_| config.stream_timeout.as_secs().to_string())
-            .parse()
-            .context("invalid AR_IO_STREAM_TIMEOUT_SECS")?,
-    );
-    config.cache_max_entries = env::var("AR_IO_CACHE_MAX_ENTRIES")
-        .unwrap_or_else(|_| config.cache_max_entries.to_string())
-        .parse()
-        .context("invalid AR_IO_CACHE_MAX_ENTRIES")?;
-    config.cache_max_bytes = env::var("AR_IO_CACHE_MAX_BYTES")
-        .unwrap_or_else(|_| config.cache_max_bytes.to_string())
-        .parse()
-        .context("invalid AR_IO_CACHE_MAX_BYTES")?;
     let index_chain = env::var("AR_IO_INDEX_CHAIN")
         .unwrap_or_else(|_| "false".to_owned())
         .parse::<bool>()

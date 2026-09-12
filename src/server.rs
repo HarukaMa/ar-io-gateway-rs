@@ -44,7 +44,7 @@ use tokio_util::io::ReaderStream;
 use super::{
     Config, Gateway, VerifiedChunk, VerifiedData,
     content::{Content, ContentReader},
-    decode_fixed,
+    decode_fixed, take,
 };
 
 const ARNS_CONFIG_DISCRIMINATOR: [u8; 8] = [117, 20, 158, 16, 49, 85, 82, 24];
@@ -2635,17 +2635,6 @@ fn read_i64(bytes: &[u8], cursor: &mut usize, label: &str) -> Result<i64> {
     Ok(i64::from_le_bytes(
         take(bytes, cursor, 8, label)?.try_into().unwrap(),
     ))
-}
-
-fn take<'a>(bytes: &'a [u8], cursor: &mut usize, length: usize, label: &str) -> Result<&'a [u8]> {
-    let end = cursor
-        .checked_add(length)
-        .with_context(|| format!("{label} offset overflow"))?;
-    let value = bytes
-        .get(*cursor..end)
-        .with_context(|| format!("{label} is truncated"))?;
-    *cursor = end;
-    Ok(value)
 }
 
 #[derive(Deserialize)]
