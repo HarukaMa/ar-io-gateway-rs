@@ -1368,11 +1368,16 @@ impl Gateway {
         if edges.is_empty() {
             return Ok(None);
         }
-        ensure!(
-            edges.len() == 1,
-            "discovery did not return exactly one data item"
-        );
         let node = edges.pop().unwrap().node;
+        ensure!(
+            edges.iter().all(|edge| {
+                edge.node.id == node.id
+                    && edge.node.data.size == node.data.size
+                    && edge.node.bundled_in.as_ref().map(|parent| &parent.id)
+                        == node.bundled_in.as_ref().map(|parent| &parent.id)
+            }),
+            "discovery returned conflicting data item locations"
+        );
         ensure!(node.id == id, "discovery returned the wrong data item");
         decode_fixed::<32>(&node.id, "discovered data item ID")?;
         let Some(parent) = node.bundled_in else {
@@ -5003,6 +5008,12 @@ mod tests {
                          "data": {"size": payload.len().to_string()}}
             }]}}
         });
+        let mut valid = valid;
+        let duplicate = valid["data"]["transactions"]["edges"][0].clone();
+        valid["data"]["transactions"]["edges"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
         let mut wrong = valid.clone();
         wrong["data"]["transactions"]["edges"][0]["node"]["data"]["size"] =
             serde_json::json!((payload.len() + 1).to_string());
@@ -5045,6 +5056,18 @@ mod tests {
                 payload
             );
         }
+
+        let mut conflicting = config.clone();
+        conflicting.graphql_sources = vec![format!("{base}/wrong")];
+        let error = Gateway::new(conflicting)
+            .unwrap()
+            .retrieve_bundled(&id)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("conflicting data item locations"),
+            "{error:#}"
+        );
 
         config
             .graphql_sources
