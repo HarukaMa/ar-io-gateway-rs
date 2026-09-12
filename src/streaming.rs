@@ -82,7 +82,7 @@ impl ChunkSource {
                     .context("stream read-ahead task failed")?
                 }
             })
-            .buffered(8))
+            .buffered(if background { 16 } else { 8 }))
     }
 
     pub(crate) async fn read_at(&self, offset: usize, length: usize) -> Result<Bytes> {

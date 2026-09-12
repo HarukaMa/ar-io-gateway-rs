@@ -4711,6 +4711,20 @@ mod tests {
         assert_eq!(hashes, (sha256(&[&bytes]), sha384(&[&bytes])));
         let peak = requests.peak.load(Ordering::SeqCst);
         assert!((2..=8).contains(&peak), "peak in-flight requests: {peak}");
+        requests.peak.store(0, Ordering::SeqCst);
+        let hashes = tokio::time::timeout(
+            Duration::from_secs(10),
+            BACKGROUND_CPU.scope((), fresh().hashes()),
+        )
+        .await
+        .expect("background read-ahead stalled")
+        .unwrap();
+        assert_eq!(hashes, (sha256(&[&bytes]), sha384(&[&bytes])));
+        let peak = requests.peak.load(Ordering::SeqCst);
+        assert!(
+            (2..=16).contains(&peak),
+            "background peak in-flight requests: {peak}"
+        );
         let (verified, _) =
             verify_bundle_item(fresh(), crate::BundleFormat::Binary, &id, None, None)
                 .await
