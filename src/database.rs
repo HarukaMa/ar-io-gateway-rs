@@ -1059,20 +1059,24 @@ impl BlockStore {
             .copied()
             .map(sql_height)
             .collect::<Result<Vec<_>>>()?;
+        // Keep LIMIT from driving a full placement scan when no transactions are pending.
         self.client
             .query(
-                "SELECT o.id, p.block_height
-                 FROM public.canonical_placements p
-                 JOIN public.objects o ON o.key = p.object_key
-                 WHERE o.kind = 0 AND NOT o.metadata_complete
-                 AND NOT (p.block_height = ANY($4::bigint[])) AND EXISTS (
-                     SELECT 1 FROM public.block_index_state s
+                "WITH pending AS MATERIALIZED (
+                     SELECT key, id FROM public.objects WHERE kind = 0 AND NOT metadata_complete
+                 )
+                 SELECT o.id, p.block_height
+                 FROM pending o
+                 JOIN public.canonical_placements p ON p.object_key = o.key
+                 WHERE NOT (p.block_height = ANY($4::bigint[])) AND (
+                     SELECT true FROM public.block_index_state s
                      JOIN public.canonical_blocks c
                        ON c.height >= s.start_height AND c.height <= s.imported_through
                      JOIN public.blocks b ON b.height = c.height AND b.hash = c.block_hash
                      JOIN public.block_transactions bt ON bt.block_hash = b.hash
                      WHERE s.singleton AND c.height BETWEEN $1 AND $2 AND bt.object_key = o.key
-                 )
+                     LIMIT 1
+                 ) IS TRUE
                  ORDER BY p.block_height, p.position, p.kind, p.id LIMIT $3",
                 &[
                     &sql_height(start)?,
