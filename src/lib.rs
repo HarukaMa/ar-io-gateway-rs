@@ -1800,23 +1800,37 @@ impl Gateway {
             if !trusted && source == &self.config.trusted_node_url {
                 continue;
             }
+            let origin = profiling::start_origin(source);
             let result = async {
                 let transaction = profiling::measure(profiling::Stage::TransactionFetch, async {
-                    let response = self
-                        .client
-                        .get(endpoint(source, &format!("tx/{id}")))
-                        .send()
-                        .await?
-                        .error_for_status()?;
+                    let response =
+                        profiling::measure(profiling::Stage::TransactionHeaders, async {
+                            Ok(self
+                                .client
+                                .get(endpoint(source, &format!("tx/{id}")))
+                                .send()
+                                .await?
+                                .error_for_status()?)
+                        })
+                        .await?;
                     if trusted {
                         ensure!(
                             response.url().origin() == Url::parse(source)?.origin(),
                             "trusted transaction source redirected outside its origin"
                         );
                     }
-                    let value =
-                        read_json_response_with_limit(response, limit, remaining_bytes, None)
-                            .await?;
+                    let body = profiling::start(profiling::Stage::TransactionBody);
+                    let value = read_json_response_with_limit(
+                        response,
+                        limit,
+                        remaining_bytes,
+                        body.as_ref(),
+                    )
+                    .await;
+                    if let Some(body) = body {
+                        body.finish(value.is_ok(), 0);
+                    }
+                    let value = value?;
                     transactions::decode_transaction(value)
                 })
                 .await?;
@@ -1841,6 +1855,9 @@ impl Gateway {
                 Ok::<_, anyhow::Error>((transaction, verified))
             }
             .await;
+            if let Some(origin) = origin {
+                origin.finish(result.is_ok(), 0);
+            }
             match result {
                 Ok(verified) => return Ok(verified),
                 Err(error) => failures.push(format!("{source}: {error:#}")),

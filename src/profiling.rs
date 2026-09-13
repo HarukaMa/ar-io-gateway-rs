@@ -23,8 +23,12 @@ pub(crate) enum Stage {
     TransactionAnchor,
     TransactionAdmission,
     TransactionFetch,
+    TransactionHeaders,
+    TransactionBody,
+    TransactionQueueSend,
+    TransactionQueueWait,
 }
-const STAGES: [&str; 13] = [
+const STAGES: [&str; 17] = [
     "chunk_global_admission",
     "chunk_origin_admission",
     "chunk_headers",
@@ -38,6 +42,10 @@ const STAGES: [&str; 13] = [
     "transaction_anchor",
     "transaction_admission",
     "transaction_fetch",
+    "transaction_headers",
+    "transaction_body",
+    "transaction_queue_send",
+    "transaction_queue_wait",
 ];
 
 #[derive(Default)]

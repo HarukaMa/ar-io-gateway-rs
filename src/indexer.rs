@@ -354,17 +354,10 @@ pub async fn import_metadata(
     })
 }
 
-type TransactionJob = (
-    u64,
-    Vec<Vec<u8>>,
-    Arc<crate::profiling::Profile>,
-    Arc<std::sync::atomic::AtomicUsize>,
-);
+type TransactionJob = (u64, Vec<Vec<u8>>);
 
 fn pending_transaction_jobs<'a, F>(
     query: &'a (impl Fn(Vec<u64>) -> F + Sync),
-    start: u64,
-    end: u64,
     active: &'a parking_lot::Mutex<std::collections::BTreeSet<u64>>,
     committed: &'a tokio::sync::Notify,
 ) -> impl futures_util::Stream<Item = Result<TransactionJob>> + Send + 'a
@@ -383,26 +376,12 @@ where
                     committed.notified().await;
                     continue;
                 }
-                let profile =
-                    crate::profiling::Profile::transaction_window(format!("{start}..{end}"));
-                profile.phase(1);
-                let pending = crate::profiling::scope(
-                    Some(Arc::clone(&profile)),
-                    crate::profiling::measure(
-                        crate::profiling::Stage::TransactionPending,
-                        query(excluded.clone()),
-                    ),
+                let pending = crate::profiling::measure(
+                    crate::profiling::Stage::TransactionPending,
+                    query(excluded.clone()),
                 )
-                .await;
-                let pending = match pending {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        profile.finish("failed");
-                        return Err(error);
-                    }
-                };
+                .await?;
                 if pending.is_empty() {
-                    profile.finish("completed");
                     // A commit during the query may have made an excluded block eligible again.
                     if !active.lock().iter().copied().eq(excluded.iter().copied()) {
                         continue;
@@ -417,14 +396,10 @@ where
                 for (id, height) in pending {
                     groups.entry(height).or_default().push(id);
                 }
-                let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(
-                    groups.len().min(32 - excluded.len()),
-                ));
                 for (height, ids) in groups.into_iter().take(32 - excluded.len()) {
                     active.lock().insert(height);
-                    queued.push_back((height, ids, Arc::clone(&profile), Arc::clone(&remaining)));
+                    queued.push_back((height, ids));
                 }
-                profile.phase(2);
             }
         },
     )
@@ -438,13 +413,14 @@ async fn import_pending_transactions(
     headers: &Mutex<HashMap<Vec<u8>, crate::BlockHeader>>,
 ) -> Result<u64> {
     use std::collections::BTreeSet;
-    use std::sync::atomic::Ordering;
     let deadline = gateway.config.request_timeout;
     let query_store = store.reconnect().await?;
     let active = parking_lot::Mutex::new(BTreeSet::new());
     let committed = tokio::sync::Notify::new();
     let authenticated = parking_lot::Mutex::new((None, HashMap::<Vec<u8>, ObjectMetadata>::new()));
     let slots = tokio::sync::Semaphore::new(64);
+    let profile = crate::profiling::Profile::transaction_window(format!("{start}..{end}"));
+    profile.phase(2);
     let query = |excluded: Vec<u64>| {
         let query_store = &query_store;
         async move {
@@ -456,11 +432,11 @@ async fn import_pending_transactions(
             .context("pending transaction metadata query timed out")?
         }
     };
-    let jobs = pending_transaction_jobs(&query, start, end, &active, &committed);
+    let jobs = pending_transaction_jobs(&query, &active, &committed);
     let fetched = jobs
         .map(|job| async {
-            let (height, ids, profile, remaining) = job?;
-            let result = crate::profiling::scope(Some(Arc::clone(&profile)), async {
+            let (height, ids) = job?;
+            let result = async {
                 let anchor =
                     crate::profiling::measure(crate::profiling::Stage::TransactionAnchor, async {
                         timeout(deadline, query_store.block_pair(height))
@@ -486,14 +462,16 @@ async fn import_pending_transactions(
                 )
                 .await
                 .with_context(|| format!("transaction metadata at height {height} timed out"))?
-            })
+            }
             .await;
             match result {
-                Ok((height, ids, verified)) => Ok((height, ids, verified, profile, remaining)),
-                Err(error) => {
-                    profile.finish("failed");
-                    Err(error)
-                }
+                Ok((height, ids, verified)) => Ok((
+                    height,
+                    ids,
+                    verified,
+                    crate::profiling::start(crate::profiling::Stage::TransactionQueueWait),
+                )),
+                Err(error) => Err(error),
             }
         })
         .buffer_unordered(32)
@@ -504,8 +482,11 @@ async fn import_pending_transactions(
         let mut imported = 0;
         while let Some(batch) = ready.recv().await {
             for result in batch {
-                let (height, ids, mut verified, profile, remaining) = result?;
-                let result = crate::profiling::scope(Some(Arc::clone(&profile)), async {
+                let (height, ids, mut verified, queued) = result?;
+                if let Some(queued) = queued {
+                    queued.finish(true, 0);
+                }
+                let result = async {
                     let mut objects = Vec::with_capacity(32);
                     for id in ids {
                         objects.push(
@@ -537,18 +518,12 @@ async fn import_pending_transactions(
                         imported += objects.len() as u64;
                     }
                     Ok::<_, anyhow::Error>(())
-                })
-                .await;
-                if result.is_err() {
-                    profile.finish("failed");
                 }
+                .await;
                 result?;
                 if !verified.is_empty() {
                     // Retain at most one legacy full-block reconstruction between selections.
                     *authenticated.lock() = (Some(height), verified);
-                }
-                if remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
-                    profile.finish("completed");
                 }
                 active.lock().remove(&height);
                 committed.notify_one();
@@ -556,8 +531,29 @@ async fn import_pending_transactions(
         }
         Ok::<_, anyhow::Error>(imported)
     };
-    let (_, imported) = tokio::try_join!(produce, consume)?;
-    Ok(imported)
+    let work = crate::profiling::scope(Some(Arc::clone(&profile)), async {
+        let (_, imported) = tokio::try_join!(produce, consume)?;
+        Ok::<_, anyhow::Error>(imported)
+    });
+    tokio::pin!(work);
+    let mut samples = tokio::time::interval(Duration::from_secs(5));
+    samples.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let result = loop {
+        tokio::select! {
+            result = &mut work => break result,
+            _ = samples.tick() => {
+                let mut sample = profile.snapshot("sample");
+                sample["fetch_slots_held"] = (64 - slots.available_permits()).into();
+                eprintln!("transaction_profile {sample}");
+            }
+        }
+    };
+    profile.finish(if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    });
+    result
 }
 
 async fn queue_metadata<T>(
@@ -568,7 +564,15 @@ async fn queue_metadata<T>(
     tokio::pin!(batches);
     while let Some(batch) = batches.next().await {
         let failed = batch.iter().any(Result::is_err);
-        if sender.send(batch).await.is_err() || failed {
+        let sent =
+            crate::profiling::measure(crate::profiling::Stage::TransactionQueueSend, async {
+                sender
+                    .send(batch)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("metadata writer stopped"))
+            })
+            .await;
+        if sent.is_err() || failed {
             break;
         }
     }
@@ -765,7 +769,6 @@ mod metadata_tests {
     #[tokio::test]
     async fn transaction_selection_refills_past_a_stalled_window() -> Result<()> {
         use std::collections::BTreeSet;
-        use std::sync::atomic::Ordering;
         let pending = parking_lot::Mutex::new(
             (0u64..334)
                 .map(|id| {
@@ -798,7 +801,7 @@ mod metadata_tests {
                 Ok(selected)
             }
         };
-        let jobs = pending_transaction_jobs(&query, 0, 34, &active, &committed)
+        let jobs = pending_transaction_jobs(&query, &active, &committed)
             .map(|job| async {
                 let job = job?;
                 if job.0 == 0 {
@@ -813,15 +816,12 @@ mod metadata_tests {
             let mut seen = BTreeSet::new();
             while let Some(batch) = ready.recv().await {
                 for result in batch {
-                    let (height, ids, profile, remaining) = result?;
+                    let (height, ids) = result?;
                     assert!(active.lock().len() <= 32);
                     for id in &ids {
                         assert!(seen.insert(id.clone()), "transaction selected twice");
                     }
                     pending.lock().retain(|(id, _)| !ids.contains(id));
-                    if remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
-                        profile.finish("completed");
-                    }
                     active.lock().remove(&height);
                     committed.notify_one();
                     if height == 34 {
@@ -839,6 +839,53 @@ mod metadata_tests {
         })
         .await
         .context("selection waited for the stalled first window")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_queue_profiles_backpressure_and_stops_polling_upstream() -> Result<()> {
+        let profile = crate::profiling::Profile::transaction_window("queue-test".to_owned());
+        let pulled = std::sync::atomic::AtomicUsize::new(0);
+        let entries = stream::iter((0..65).map(Ok)).inspect(|_| {
+            pulled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let (sender, mut ready) = mpsc::channel(1);
+        let produce =
+            crate::profiling::scope(Some(Arc::clone(&profile)), queue_metadata(entries, sender));
+        tokio::pin!(produce);
+        let blocked = async {
+            loop {
+                let sample = profile.snapshot("sample");
+                if sample["stages"]["transaction_queue_send"]["started"] == 2 {
+                    assert_eq!(sample["stages"]["transaction_queue_send"]["active"], 1);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            result = &mut produce => panic!("producer bypassed the full queue: {result:?}"),
+            result = timeout(Duration::from_secs(1), blocked) => result?,
+        }
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::Relaxed), 64);
+        let consume = async {
+            let mut received = Vec::new();
+            while let Some(batch) = ready.recv().await {
+                for entry in batch {
+                    received.push(entry?);
+                }
+            }
+            assert_eq!(received, (0..65).collect::<Vec<_>>());
+            Ok::<_, anyhow::Error>(())
+        };
+        timeout(Duration::from_secs(1), async {
+            tokio::try_join!(produce, consume)
+        })
+        .await??;
+        let sample = profile.snapshot("sample");
+        assert_eq!(sample["stages"]["transaction_queue_send"]["active"], 0);
+        assert_eq!(sample["stages"]["transaction_queue_send"]["completed"], 3);
+        profile.finish("completed");
         Ok(())
     }
 
