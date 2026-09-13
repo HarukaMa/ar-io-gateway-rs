@@ -2976,14 +2976,25 @@ mod tests {
             let content = crate::content::Content::from(b"cached".to_vec());
             drop(cache.store(&content, blob_hash).await?.unwrap());
             let orphan_paths: Vec<_> = (0..130)
-                .map(|byte| directory.path().join(crate::hex(&[byte; 32])))
+                .map(|byte| {
+                    let mut hash = [0xa7; 32];
+                    hash[31] = byte;
+                    if byte == 129 {
+                        hash[0] = 0xa8;
+                    }
+                    directory
+                        .path()
+                        .join(format!("{:02x}", hash[0]))
+                        .join(crate::hex(&hash))
+                })
                 .collect();
             for path in &orphan_paths {
+                std::fs::create_dir_all(path.parent().unwrap())?;
                 std::fs::write(path, b"abandoned")?;
             }
             let (pending, pending_path) = tempfile::Builder::new()
                 .prefix(".pending-")
-                .tempfile_in(directory.path())?
+                .tempfile_in(orphan_paths[0].parent().unwrap())?
                 .keep()?;
             drop(pending);
             let unrelated = directory.path().join("keep.txt");

@@ -6082,8 +6082,9 @@ mod cache_tests {
         base.config.trusted_node_url = source;
         let base = base.with_database(&url).await?;
         let directory = tempfile::tempdir()?;
-        let orphan = directory.path().join(hex(&[0xa7; 32]));
+        let orphan = directory.path().join("a7").join(hex(&[0xa7; 32]));
         let unrelated = directory.path().join("keep.txt");
+        std::fs::create_dir(orphan.parent().unwrap())?;
         std::fs::write(&orphan, b"abandoned")?;
         std::fs::write(&unrelated, b"unrelated")?;
         let transaction = client.transaction().await?;

@@ -90,11 +90,14 @@ impl DiskCache {
     }
 
     pub(crate) async fn load(&self, hash: [u8; 32], size: usize) -> Result<Option<Content>> {
-        let path = self.0.path.join(crate::hex(&hash));
+        let path = blob_path(&self.0.path, hash);
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelWrite(Arc::clone(&cancelled));
         let cache_lock = Arc::clone(&self.0.lock);
         spawn_blocking(move || {
+            if !is_directory(path.parent().expect("cache shard"))? {
+                return Ok(None);
+            }
             verified_file(&path, hash, size, &cancelled)
                 .map(|file| file.map(|file| Content::persistent(file, hash, size, cache_lock)))
         })
@@ -114,7 +117,22 @@ impl DiskCache {
         let _cancel_on_drop = CancelWrite(Arc::clone(&cancelled));
         spawn_blocking(move || {
             ensure!(!cancelled.load(Ordering::Relaxed), "cache write cancelled");
-            let Some(mut pending) = directory.admit(reservation)? else {
+            let path = blob_path(&directory.path, hash);
+            let shard = path.parent().expect("cache shard");
+            match fs::create_dir(shard) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    File::open(&directory.path)?.sync_all()?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    ensure!(
+                        is_directory(shard)?,
+                        "cache shard is not a regular directory"
+                    );
+                }
+                Err(error) => return Err(error).context("creating cache shard"),
+            }
+            let Some(mut pending) = directory.admit(reservation, shard)? else {
                 return Ok(None);
             };
             content.copy_verified_to(pending.temp.as_file_mut(), hash, &cancelled)?;
@@ -128,13 +146,12 @@ impl DiskCache {
             let file =
                 File::open(pending.temp.path()).context("opening completed cached content")?;
             ensure!(!cancelled.load(Ordering::Relaxed), "cache write cancelled");
-            let path = directory.path.join(crate::hex(&hash));
             let PendingWrite { temp, reservation } = pending;
             match temp.persist_noclobber(&path) {
                 Ok(writer) => {
                     drop(writer);
                     #[cfg(unix)]
-                    File::open(&directory.path)?.sync_all()?;
+                    File::open(shard)?.sync_all()?;
                     drop(reservation);
                     Ok(Some(Content::persistent(
                         file,
@@ -161,7 +178,7 @@ impl DiskCache {
                                 .context("repairing cached content")?,
                         );
                         #[cfg(unix)]
-                        File::open(&directory.path)?.sync_all()?;
+                        File::open(shard)?.sync_all()?;
                         file
                     };
                     drop(reservation);
@@ -197,77 +214,88 @@ impl DiskCache {
         let _cancel_on_drop = CancelWrite(Arc::clone(&cancelled));
         ensure!(Instant::now() < deadline, "cache cleanup timed out");
         let directory = Arc::clone(&self.0);
-        let worker_cancelled = Arc::clone(&cancelled);
-        let mut entries = spawn_blocking(move || {
-            ensure!(
-                !worker_cancelled.load(Ordering::Relaxed),
-                "cache cleanup cancelled"
-            );
-            ensure!(Instant::now() < deadline, "cache cleanup timed out");
-            fs::read_dir(&directory.path).context("reading cache directory")
-        })
-        .await??;
         let mut removed = 0;
-        loop {
+        for prefix in 0..=u8::MAX {
+            let shard = directory.path.join(format!("{prefix:02x}"));
             let worker_cancelled = Arc::clone(&cancelled);
-            let (next, seen, batch) = spawn_blocking(move || -> Result<_> {
-                let mut batch = Vec::with_capacity(128);
-                let mut seen = 0;
-                for _ in 0..128 {
-                    ensure!(
-                        !worker_cancelled.load(Ordering::Relaxed),
-                        "cache cleanup cancelled"
-                    );
-                    ensure!(Instant::now() < deadline, "cache cleanup timed out");
-                    let Some(entry) = entries.next() else { break };
-                    seen += 1;
-                    let entry = entry?;
-                    if !entry.file_type()?.is_file() {
-                        continue;
-                    }
-                    let name = entry.file_name();
-                    let Some(name) = name.to_str() else { continue };
-                    let hash = if name.len() == 64
-                        && name
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    {
-                        let mut hash = [0; 32];
-                        for (index, byte) in hash.iter_mut().enumerate() {
-                            *byte = u8::from_str_radix(&name[index * 2..index * 2 + 2], 16)?;
-                        }
-                        Some(hash)
-                    } else if name.strip_prefix(".pending-").is_some_and(|suffix| {
-                        suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
-                    }) {
-                        None
-                    } else {
-                        continue;
-                    };
-                    batch.push((entry.path(), hash));
+            let entries = spawn_blocking(move || -> Result<_> {
+                ensure!(
+                    !worker_cancelled.load(Ordering::Relaxed),
+                    "cache cleanup cancelled"
+                );
+                ensure!(Instant::now() < deadline, "cache cleanup timed out");
+                if !is_directory(&shard)? {
+                    return Ok(None);
                 }
-                Ok((entries, seen, batch))
+                fs::read_dir(shard).map(Some).context("reading cache shard")
             })
             .await??;
-            entries = next;
-            if seen == 0 {
-                return Ok(removed);
+            let Some(mut entries) = entries else { continue };
+            loop {
+                let worker_cancelled = Arc::clone(&cancelled);
+                let (next, seen, batch) = spawn_blocking(move || -> Result<_> {
+                    let mut batch = Vec::with_capacity(128);
+                    let mut seen = 0;
+                    for _ in 0..128 {
+                        ensure!(
+                            !worker_cancelled.load(Ordering::Relaxed),
+                            "cache cleanup cancelled"
+                        );
+                        ensure!(Instant::now() < deadline, "cache cleanup timed out");
+                        let Some(entry) = entries.next() else { break };
+                        seen += 1;
+                        let entry = entry?;
+                        if !entry.file_type()?.is_file() {
+                            continue;
+                        }
+                        let name = entry.file_name();
+                        let Some(name) = name.to_str() else { continue };
+                        let hash = if name.len() == 64
+                            && name
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        {
+                            let mut hash = [0; 32];
+                            for (index, byte) in hash.iter_mut().enumerate() {
+                                *byte = u8::from_str_radix(&name[index * 2..index * 2 + 2], 16)?;
+                            }
+                            if hash[0] != prefix {
+                                continue;
+                            }
+                            Some(hash)
+                        } else if name.strip_prefix(".pending-").is_some_and(|suffix| {
+                            suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+                        }) {
+                            None
+                        } else {
+                            continue;
+                        };
+                        batch.push((entry.path(), hash));
+                    }
+                    Ok((entries, seen, batch))
+                })
+                .await??;
+                entries = next;
+                if seen == 0 {
+                    break;
+                }
+                let hashes: Vec<_> = batch.iter().filter_map(|(_, hash)| *hash).collect();
+                ensure!(Instant::now() < deadline, "cache cleanup timed out");
+                let referenced = store.referenced_cache_blobs(&hashes).await?;
+                let directory = Arc::clone(&self.0);
+                let worker_cancelled = Arc::clone(&cancelled);
+                removed += spawn_blocking(move || -> Result<u64> {
+                    let _directory = directory;
+                    let paths = batch.into_iter().filter_map(|(path, hash)| {
+                        hash.is_none_or(|hash| !referenced.contains(&hash))
+                            .then_some(path)
+                    });
+                    remove_abandoned_files(paths, &worker_cancelled, deadline)
+                })
+                .await??;
             }
-            let hashes: Vec<_> = batch.iter().filter_map(|(_, hash)| *hash).collect();
-            ensure!(Instant::now() < deadline, "cache cleanup timed out");
-            let referenced = store.referenced_cache_blobs(&hashes).await?;
-            let directory = Arc::clone(&self.0);
-            let worker_cancelled = Arc::clone(&cancelled);
-            removed += spawn_blocking(move || -> Result<u64> {
-                let _directory = directory;
-                let paths = batch.into_iter().filter_map(|(path, hash)| {
-                    hash.is_none_or(|hash| !referenced.contains(&hash))
-                        .then_some(path)
-                });
-                remove_abandoned_files(paths, &worker_cancelled, deadline)
-            })
-            .await??;
         }
+        Ok(removed)
     }
 }
 
@@ -287,8 +315,11 @@ impl CacheDirectory {
             bytes,
         })
     }
-
-    fn admit(self: &Arc<Self>, reservation: Reservation) -> Result<Option<PendingWrite>> {
+    fn admit(
+        self: &Arc<Self>,
+        reservation: Reservation,
+        shard: &Path,
+    ) -> Result<Option<PendingWrite>> {
         // Snapshot reservations before querying free space: completion between the two
         // is conservatively double-counted, never omitted from both measurements.
         let total = self.pending_bytes.load(Ordering::Relaxed);
@@ -306,9 +337,22 @@ impl CacheDirectory {
         }
         let temp = tempfile::Builder::new()
             .prefix(".pending-")
-            .tempfile_in(&self.path)
+            .tempfile_in(shard)
             .context("creating content cache temporary file")?;
         Ok(Some(PendingWrite { temp, reservation }))
+    }
+}
+
+fn blob_path(root: &Path, hash: [u8; 32]) -> PathBuf {
+    let name = crate::hex(&hash);
+    root.join(&name[..2]).join(name)
+}
+
+fn is_directory(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -503,7 +547,8 @@ mod tests {
         assert!(cache.load(hash, 4).await?.is_none());
         drop(cache.store(&content, hash).await?.unwrap());
         assert!(cache.load(hash, 3).await?.is_none());
-        let path = root.path().join(crate::hex(&hash));
+        let name = crate::hex(&hash);
+        let path = root.path().join(&name[..2]).join(&name);
         for corrupt in [b"evil".as_slice(), b"dat".as_slice()] {
             fs::write(&path, corrupt)?;
             assert!(cache.load(hash, 4).await?.is_none());
@@ -540,6 +585,24 @@ mod tests {
         fs::create_dir(&path)?;
         assert!(cache.store(&content, hash).await.is_err());
         assert!(path.is_dir());
+        fs::remove_dir(&path)?;
+        let shard = path.parent().unwrap();
+        fs::remove_dir(shard)?;
+        fs::write(shard, b"keep")?;
+        assert!(cache.load(hash, 4).await?.is_none());
+        assert!(cache.store(&content, hash).await.is_err());
+        assert_eq!(fs::read(shard)?, b"keep");
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir()?;
+            let outside_blob = outside.path().join(&name);
+            fs::write(&outside_blob, b"data")?;
+            fs::remove_file(shard)?;
+            std::os::unix::fs::symlink(outside.path(), shard)?;
+            assert!(cache.load(hash, 4).await?.is_none());
+            assert!(cache.store(&content, hash).await.is_err());
+            assert_eq!(fs::read(outside_blob)?, b"data");
+        }
         Ok(())
     }
 

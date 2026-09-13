@@ -4,7 +4,7 @@
 
 - Repository: `HarukaMa/ar-io-gateway-rs`. Primary branch: `slave`.
 - GitHub Issues are the project tracker. Use umbrella #1, the existing phase issues, and detailed sub-issues for the active phase. Check existing issues before creating new ones.
-- Keep implementation scope, acceptance criteria, blockers, and delivery evidence in the relevant GitHub issue. Session todos are temporary execution bookkeeping.
+- Keep implementation scope, acceptance criteria, blockers, and completion evidence in the relevant GitHub issue. Do not post routine deployment logs or use #4 for ongoing updates. Report deployments in chat and local/server logs. Session todos are temporary execution bookkeeping.
 - Verify mutable operational facts before acting.
 - Never publish credentials, private-network addresses, or live deployment identifiers in tracked files or GitHub issues.
 
@@ -42,6 +42,6 @@
 - Run `cargo fmt` and `cargo test` for implementation changes. Exercise the changed command or serving path with the smallest meaningful runtime check. Run database-specific checks explicitly when the normal suite excludes them.
 - Use the dedicated local `ar_io_rust_test` database for indexing verification. It is disposable. Migrations, fixture changes, resets, and cleanup are pre-approved without further confirmation. Leave databases belonging to other projects untouched. Production changes and measurements require a separately approved bounded batch.
 - Deliver coherent issue-sized commits. Each commit must be independently buildable and cryptographically signed with `git commit -S`.
-- Include implementation, verification, signed commit, push, and issue updates in one concrete approval batch when publication is intended. Complete that approved delivery before moving to the next issue.
+- Include implementation, verification, signed commit, and push in one concrete approval batch when publication is intended. Include issue updates only for specific tracked work and its completion. Complete the approved delivery before moving to the next issue.
 - Verify the published commit is remotely reachable before closing its issue. Local implementation, passing checks, or a local commit alone do not satisfy issue closure.
 - Keep unrelated experiments and private operational files out of implementation commits. Published rollback requires separately approved signed reverts and corresponding issue updates.
