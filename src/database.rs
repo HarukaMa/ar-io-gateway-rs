@@ -1100,11 +1100,16 @@ impl BlockStore {
             .query(
                 "WITH pending AS MATERIALIZED (
                      SELECT key, id FROM public.objects WHERE kind = 0 AND NOT metadata_complete
+                 ), candidates AS MATERIALIZED (
+                     SELECT o.key, o.id, p.block_height, p.position, p.kind, p.id AS placement_id
+                     FROM pending o
+                     JOIN public.canonical_placements p ON p.object_key = o.key
+                     WHERE NOT (p.block_height = ANY($4::bigint[]))
+                     ORDER BY p.block_height, p.position, p.kind, p.id
                  )
-                 SELECT o.id, p.block_height
-                 FROM pending o
-                 JOIN public.canonical_placements p ON p.object_key = o.key
-                 WHERE NOT (p.block_height = ANY($4::bigint[])) AND (
+                 SELECT o.id, o.block_height
+                 FROM candidates o
+                 WHERE (
                      SELECT true FROM public.block_index_state s
                      JOIN public.canonical_blocks c
                        ON c.height >= s.start_height AND c.height <= s.imported_through
@@ -1113,7 +1118,7 @@ impl BlockStore {
                      WHERE s.singleton AND c.height BETWEEN $1 AND $2 AND bt.object_key = o.key
                      LIMIT 1
                  ) IS TRUE
-                 ORDER BY p.block_height, p.position, p.kind, p.id LIMIT $3",
+                 ORDER BY o.block_height, o.position, o.kind, o.placement_id LIMIT $3",
                 &[
                     &sql_height(start)?,
                     &sql_height(end)?,
@@ -2672,6 +2677,8 @@ mod tests {
             ).await?;
             ensure!(store.pending_transactions(next_height as u64, next_height as u64, 256, &[]).await? == expected[..1],
                 "canonical occurrence was confused with preferred placement");
+            ensure!(store.pending_transactions(height as u64, next_height as u64, 256, &[]).await? == expected,
+                "multiple canonical occurrences duplicated a pending transaction");
 
             let fork_hash = vec![0xa6u8; 48];
             store.client.execute(
@@ -2681,10 +2688,10 @@ mod tests {
             ).await?;
             store.client.execute(
                 "UPDATE public.block_transactions SET block_hash = $1 WHERE block_hash = $2 AND object_key = $3",
-                &[&fork_hash, &original_hash, &keys[1]],
+                &[&fork_hash, &original_hash, &keys[0]],
             ).await?;
-            ensure!(store.pending_transactions(height as u64, height as u64, 256, &[]).await? == expected[..1],
-                "noncanonical membership was accepted");
+            ensure!(store.pending_transactions(height as u64, height as u64, 1, &[]).await? == expected[1..],
+                "noncanonical first candidate prevented finding the next pending transaction");
             Ok(())
         }.await;
         store.client.batch_execute("ROLLBACK").await?;
