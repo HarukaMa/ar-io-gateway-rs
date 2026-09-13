@@ -41,6 +41,20 @@
 <div><dt>Last observed progress</dt><dd id="progress-at">-</dd></div>
 <div><dt>Recent failure</dt><dd id="failure">-</dd></div>
 </dl></section>
+<section><h2>HTTP disk cache <small id="http-cache-state"></small></h2><dl>
+<div><dt>Lookups</dt><dd id="http-cache-lookups">-</dd></div>
+<div><dt>Hits</dt><dd id="http-cache-hits">-</dd></div>
+<div><dt>Misses</dt><dd id="http-cache-misses">-</dd></div>
+<div><dt>Errors</dt><dd id="http-cache-errors">-</dd></div>
+<div><dt>Lookup hit rate</dt><dd id="http-cache-rate">-</dd></div>
+</dl><p class="note">Completed disk lookups since startup.</p></section>
+<section><h2>Background disk cache <small id="background-cache-state"></small></h2><dl>
+<div><dt>Lookups</dt><dd id="background-cache-lookups">-</dd></div>
+<div><dt>Hits</dt><dd id="background-cache-hits">-</dd></div>
+<div><dt>Misses</dt><dd id="background-cache-misses">-</dd></div>
+<div><dt>Errors</dt><dd id="background-cache-errors">-</dd></div>
+<div><dt>Lookup hit rate</dt><dd id="background-cache-rate">-</dd></div>
+</dl><p class="note">Completed disk lookups since startup.</p></section>
 </main>
 <footer><span id="updated">Waiting for status</span><a href="/ar-io/status.json">JSON status</a></footer>
 <noscript><p>JavaScript is required for live updates. Use the JSON status link to read the snapshot.</p></noscript>
@@ -100,6 +114,14 @@ async function refresh() {
     text('progress-at', date(data.last_progress_at));
     const failure = data.worker?.last_failure;
     text('failure', failure ? `${failure.message} (${date(failure.at)})` : 'None recorded');
+    for (const source of ['http', 'background']) {
+      const cache = data.disk_cache?.[source];
+      text(`${source}-cache-state`, data.disk_cache == null ? 'Disabled' : '');
+      for (const field of ['lookups', 'hits', 'misses', 'errors']) {
+        text(`${source}-cache-${field}`, number(cache?.[field]));
+      }
+      text(`${source}-cache-rate`, cache?.hit_rate == null ? '-' : `${number(cache.hit_rate * 100)}%`);
+    }
     text('updated', data.sampled_at == null ? 'No snapshot available' : `Snapshot: ${date(data.sampled_at)}`);
   } catch {
     text('state', 'Connection unavailable'); element('state').classList.add('warning');

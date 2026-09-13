@@ -11,6 +11,10 @@ pub mod server;
 mod streaming;
 mod transactions;
 
+tokio::task_local! {
+    static HTTP_CACHE_LOOKUP: ();
+}
+
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
@@ -704,53 +708,58 @@ impl Gateway {
         let (Some(cache), Some(store)) = (&self.disk_cache, &self.block_store) else {
             return Ok(None);
         };
-        let key = decode_fixed::<32>(id, "data ID")?;
-        let Some((metadata, block_hash)) = store.cached_content(&key).await? else {
-            return Ok(None);
-        };
-        let entry: CachedContent =
-            serde_json::from_str(&metadata).context("invalid authenticated cache metadata")?;
-        ensure!(entry.id == id, "cached content identity mismatch");
-        ensure!(
-            entry.length <= self.config.max_data_size,
-            "cached content exceeds size limit"
-        );
-        let end = entry
-            .offset
-            .checked_add(entry.length)
-            .context("cached content offset overflow")?;
-        ensure!(end <= entry.blob_size, "cached content exceeds parent file");
-        let Some(blob) = cache.load(entry.blob_hash, entry.blob_size).await? else {
-            return Ok(None);
-        };
-        let bytes = blob.slice(entry.offset..end)?;
-        let digest = if entry.offset == 0 && entry.length == entry.blob_size {
-            entry.blob_hash
-        } else {
-            bytes.hashes().await?.0
-        };
-        ensure!(digest == entry.digest, "cached content digest mismatch");
-        Ok(Some((
-            VerifiedData {
-                bytes,
-                id: entry.id,
-                block_height: entry.block_height,
-                block_hash: Some(
-                    block_hash
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("invalid cached block hash"))?,
-                ),
-                stable_anchor: false,
-                content_type: entry.content_type,
-                content_encoding: entry.content_encoding,
-                content_length: entry.length,
-                etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
-                sha256: hex(&digest),
-                cache_hit: true,
-                indexing_root: None,
-            },
-            entry.tags,
-        )))
+        let result = async {
+            let key = decode_fixed::<32>(id, "data ID")?;
+            let Some((metadata, block_hash)) = store.cached_content(&key).await? else {
+                return Ok(None);
+            };
+            let entry: CachedContent =
+                serde_json::from_str(&metadata).context("invalid authenticated cache metadata")?;
+            ensure!(entry.id == id, "cached content identity mismatch");
+            ensure!(
+                entry.length <= self.config.max_data_size,
+                "cached content exceeds size limit"
+            );
+            let end = entry
+                .offset
+                .checked_add(entry.length)
+                .context("cached content offset overflow")?;
+            ensure!(end <= entry.blob_size, "cached content exceeds parent file");
+            let Some(blob) = cache.load(entry.blob_hash, entry.blob_size).await? else {
+                return Ok(None);
+            };
+            let bytes = blob.slice(entry.offset..end)?;
+            let digest = if entry.offset == 0 && entry.length == entry.blob_size {
+                entry.blob_hash
+            } else {
+                bytes.hashes().await?.0
+            };
+            ensure!(digest == entry.digest, "cached content digest mismatch");
+            Ok(Some((
+                VerifiedData {
+                    bytes,
+                    id: entry.id,
+                    block_height: entry.block_height,
+                    block_hash: Some(
+                        block_hash
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("invalid cached block hash"))?,
+                    ),
+                    stable_anchor: false,
+                    content_type: entry.content_type,
+                    content_encoding: entry.content_encoding,
+                    content_length: entry.length,
+                    etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
+                    sha256: hex(&digest),
+                    cache_hit: true,
+                    indexing_root: None,
+                },
+                entry.tags,
+            )))
+        }
+        .await;
+        cache.record_lookup(HTTP_CACHE_LOOKUP.try_with(|_| ()).is_ok(), &result);
+        result
     }
 
     async fn save_content_cache(
@@ -6094,6 +6103,59 @@ mod tests {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test"]
+    async fn disk_lookup_stats_separate_http_and_background_tasks() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let row = client
+            .query_one(
+                "SELECT current_database(), source FROM public.block_index_state WHERE singleton",
+                &[],
+            )
+            .await?;
+        ensure!(
+            row.get::<_, String>(0) == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let mut base = gateway();
+        base.config.trusted_node_url = row.get(1);
+        let directory = tempfile::tempdir()?;
+        let gateway = Arc::new(
+            base.with_database(&url)
+                .await?
+                .with_disk_cache(directory.path().into(), 0)
+                .await?,
+        );
+        let id = URL_SAFE_NO_PAD.encode(sha256(&[directory.path().to_string_lossy().as_bytes()]));
+        let cache = gateway.disk_cache.as_ref().unwrap();
+        ensure!(cache.stats()["http"]["hit_rate"].is_null());
+        HTTP_CACHE_LOOKUP
+            .scope((), async {
+                tokio::task::yield_now().await;
+                ensure!(gateway.load_content_cache(&id).await?.is_none());
+                ensure!(gateway.load_content_cache("invalid").await.is_err());
+                let worker = gateway.clone();
+                tokio::spawn(async move {
+                    ensure!(worker.load_content_cache(&id).await?.is_none());
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await??;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+        let stats = cache.stats();
+        ensure!(stats["http"]["lookups"] == 2);
+        ensure!(stats["http"]["misses"] == 1);
+        ensure!(stats["http"]["errors"] == 1);
+        ensure!(stats["background"]["lookups"] == 1);
+        ensure!(stats["background"]["misses"] == 1);
+        ensure!(stats["background"]["errors"] == 0);
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires ar_io_rust_test; briefly locks content_cache"]
     async fn cache_startup_skips_sweep_and_cleanup_remains_exclusive() -> Result<()> {

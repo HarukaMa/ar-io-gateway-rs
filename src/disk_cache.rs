@@ -29,6 +29,27 @@ struct CacheDirectory {
     max_pending_bytes: usize,
     pending_bytes: AtomicUsize,
     publication: Arc<tokio::sync::RwLock<()>>,
+    lookups: parking_lot::Mutex<[LookupStats; 2]>,
+}
+
+#[derive(Debug, Default)]
+struct LookupStats {
+    hits: u64,
+    misses: u64,
+    errors: u64,
+}
+
+impl LookupStats {
+    fn snapshot(&self) -> serde_json::Value {
+        let lookups = self.hits + self.misses + self.errors;
+        serde_json::json!({
+            "lookups": lookups,
+            "hits": self.hits,
+            "misses": self.misses,
+            "errors": self.errors,
+            "hit_rate": (lookups != 0).then(|| self.hits as f64 / lookups as f64),
+        })
+    }
 }
 
 struct PendingWrite {
@@ -59,6 +80,24 @@ impl Drop for CancelWrite {
 }
 
 impl DiskCache {
+    pub(crate) fn record_lookup<T>(&self, http: bool, result: &Result<Option<T>>) {
+        let mut lookups = self.0.lookups.lock();
+        let stats = &mut lookups[usize::from(!http)];
+        match result {
+            Ok(Some(_)) => stats.hits += 1,
+            Ok(None) => stats.misses += 1,
+            Err(_) => stats.errors += 1,
+        }
+    }
+
+    pub(crate) fn stats(&self) -> serde_json::Value {
+        let lookups = self.0.lookups.lock();
+        serde_json::json!({
+            "http": lookups[0].snapshot(),
+            "background": lookups[1].snapshot(),
+        })
+    }
+
     pub(crate) fn publication_guard(&self) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
         self.0.publication.clone().try_read_owned().ok()
     }
@@ -89,6 +128,7 @@ impl DiskCache {
                 max_pending_bytes,
                 pending_bytes: AtomicUsize::new(0),
                 publication: Arc::new(tokio::sync::RwLock::new(())),
+                lookups: Default::default(),
             })))
         })
         .await

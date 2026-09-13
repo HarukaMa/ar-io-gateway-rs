@@ -438,6 +438,9 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .route("/{*path}", get(serve_path))
         .layer(middleware::from_fn_with_state(state.clone(), sign_response))
         .layer(middleware::from_fn(cors_response))
+        .layer(middleware::from_fn(|request, next: Next| async move {
+            crate::HTTP_CACHE_LOOKUP.scope((), next.run(request)).await
+        }))
         .with_state(state);
     let result = axum::serve(listener, app)
         .await
@@ -749,6 +752,11 @@ async fn serve_indexing_status(State(state): State<Arc<AppState>>) -> Response {
         .bundle_indexer
         .as_ref()
         .map_or(serde_json::Value::Null, |worker| worker.status());
+    snapshot["disk_cache"] = state
+        .gateway
+        .disk_cache
+        .as_ref()
+        .map_or(serde_json::Value::Null, |cache| cache.stats());
     let mut response = json_response(&snapshot);
     response
         .headers_mut()
