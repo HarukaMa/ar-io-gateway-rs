@@ -356,6 +356,13 @@ pub async fn import_metadata(
 
 type TransactionJob = (u64, Vec<Vec<u8>>);
 
+type VerifiedTransactionJob = (
+    u64,
+    Vec<Vec<u8>>,
+    HashMap<Vec<u8>, ObjectMetadata>,
+    Option<crate::profiling::Timer>,
+);
+
 fn pending_transaction_jobs<'a, F>(
     query: &'a (impl Fn(Vec<u64>) -> F + Sync),
     active: &'a parking_lot::Mutex<std::collections::BTreeSet<u64>>,
@@ -478,59 +485,15 @@ async fn import_pending_transactions(
         .boxed();
     let (sender, mut ready) = mpsc::channel(1);
     let produce = queue_metadata(fetched, sender);
-    let consume = async {
-        let mut imported = 0;
-        while let Some(batch) = ready.recv().await {
-            for result in batch {
-                let (height, ids, mut verified, queued) = result?;
-                if let Some(queued) = queued {
-                    queued.finish(true, 0);
-                }
-                let result = async {
-                    let mut objects = Vec::with_capacity(32);
-                    for id in ids {
-                        objects.push(
-                            verified
-                                .remove(&id)
-                                .context("verified transaction is missing")?,
-                        );
-                        if objects.len() == 32 {
-                            crate::profiling::measure(
-                                crate::profiling::Stage::Persistence,
-                                async {
-                                    timeout(deadline, store.record_objects(&objects))
-                                        .await
-                                        .context("transaction persistence timed out")?
-                                },
-                            )
-                            .await?;
-                            imported += objects.len() as u64;
-                            objects.clear();
-                        }
-                    }
-                    if !objects.is_empty() {
-                        crate::profiling::measure(crate::profiling::Stage::Persistence, async {
-                            timeout(deadline, store.record_objects(&objects))
-                                .await
-                                .context("transaction persistence timed out")?
-                        })
-                        .await?;
-                        imported += objects.len() as u64;
-                    }
-                    Ok::<_, anyhow::Error>(())
-                }
-                .await;
-                result?;
-                if !verified.is_empty() {
-                    // Retain at most one legacy full-block reconstruction between selections.
-                    *authenticated.lock() = (Some(height), verified);
-                }
-                active.lock().remove(&height);
-                committed.notify_one();
-            }
-        }
-        Ok::<_, anyhow::Error>(imported)
-    };
+    let consume = persist_transaction_metadata(
+        store,
+        &mut ready,
+        &active,
+        &committed,
+        &authenticated,
+        deadline,
+        256,
+    );
     let work = crate::profiling::scope(Some(Arc::clone(&profile)), async {
         let (_, imported) = tokio::try_join!(produce, consume)?;
         Ok::<_, anyhow::Error>(imported)
@@ -554,6 +517,79 @@ async fn import_pending_transactions(
         "failed"
     });
     result
+}
+
+async fn persist_transaction_metadata(
+    store: &mut BlockStore,
+    ready: &mut mpsc::Receiver<Vec<Result<VerifiedTransactionJob>>>,
+    active: &parking_lot::Mutex<std::collections::BTreeSet<u64>>,
+    committed: &tokio::sync::Notify,
+    authenticated: &parking_lot::Mutex<(Option<u64>, HashMap<Vec<u8>, ObjectMetadata>)>,
+    deadline: Duration,
+    batch_size: usize,
+) -> Result<u64> {
+    ensure!(
+        (1..=256).contains(&batch_size),
+        "invalid metadata batch size"
+    );
+    let mut imported = 0;
+    let mut objects = Vec::with_capacity(batch_size);
+    let mut completed = Vec::with_capacity(32);
+    while let Some(batch) = ready.recv().await {
+        for result in batch {
+            let (height, ids, mut verified, queued) = result?;
+            if let Some(queued) = queued {
+                queued.finish(true, 0);
+            }
+            for id in ids {
+                objects.push(
+                    verified
+                        .remove(&id)
+                        .context("verified transaction is missing")?,
+                );
+                if objects.len() == batch_size {
+                    crate::profiling::measure(crate::profiling::Stage::Persistence, async {
+                        timeout(deadline, store.record_objects(&objects))
+                            .await
+                            .context("transaction persistence timed out")?
+                    })
+                    .await?;
+                    imported += objects.len() as u64;
+                    objects.clear();
+                    for height in completed.drain(..) {
+                        active.lock().remove(&height);
+                    }
+                    committed.notify_one();
+                }
+            }
+            if !verified.is_empty() {
+                // Retain at most one legacy full-block reconstruction between selections.
+                *authenticated.lock() = (Some(height), verified);
+            }
+            if objects.is_empty() {
+                active.lock().remove(&height);
+                committed.notify_one();
+            } else {
+                completed.push(height);
+            }
+        }
+        // Flush a partial ready batch without waiting for more network work.
+        if !objects.is_empty() {
+            crate::profiling::measure(crate::profiling::Stage::Persistence, async {
+                timeout(deadline, store.record_objects(&objects))
+                    .await
+                    .context("transaction persistence timed out")?
+            })
+            .await?;
+            imported += objects.len() as u64;
+            objects.clear();
+        }
+        for height in completed.drain(..) {
+            active.lock().remove(&height);
+        }
+        committed.notify_one();
+    }
+    Ok(imported)
 }
 
 async fn queue_metadata<T>(
@@ -766,6 +802,80 @@ fn block_metadata<'a>(
 
 #[cfg(test)]
 mod metadata_tests {
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; verifies cross-block batch rollback"]
+    async fn failed_metadata_batch_keeps_heights_pending() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let database: String = client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let fixture: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/mainnet-genesis-transactions.json"
+        ))?;
+        let tx = crate::transactions::decode_transaction(fixture.into_iter().next().unwrap())?;
+        let object = crate::transactions::verify_transaction(&tx, &tx.id, 0)?.metadata;
+        let id = object.id.clone();
+        let before: i64 = client
+            .query_one("SELECT count(*) FROM public.objects WHERE id=$1", &[&id])
+            .await?
+            .get(0);
+        let mut conflicting = object.clone();
+        conflicting.signature.push(0);
+        let (sender, mut ready) = mpsc::channel(1);
+        sender
+            .send(vec![
+                Ok((
+                    10,
+                    vec![id.clone()],
+                    HashMap::from([(id.clone(), object)]),
+                    None,
+                )),
+                Ok((
+                    11,
+                    vec![id.clone()],
+                    HashMap::from([(id.clone(), conflicting)]),
+                    None,
+                )),
+            ])
+            .await
+            .map_err(|_| anyhow::anyhow!("metadata queue closed"))?;
+        drop(sender);
+        let pending = std::collections::BTreeSet::from([10, 11]);
+        let active = parking_lot::Mutex::new(pending.clone());
+        let committed = tokio::sync::Notify::new();
+        let authenticated = parking_lot::Mutex::new((None, HashMap::new()));
+        let mut store = BlockStore::connect(&url).await?;
+        let error = persist_transaction_metadata(
+            &mut store,
+            &mut ready,
+            &active,
+            &committed,
+            &authenticated,
+            Duration::from_secs(5),
+            256,
+        )
+        .await
+        .unwrap_err();
+        ensure!(
+            error.to_string().contains("conflicting immutable object"),
+            "{error:#}"
+        );
+        assert_eq!(*active.lock(), pending);
+        let after: i64 = client
+            .query_one("SELECT count(*) FROM public.objects WHERE id=$1", &[&id])
+            .await?
+            .get(0);
+        assert_eq!(before, after);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn transaction_selection_refills_past_a_stalled_window() -> Result<()> {
         use std::collections::BTreeSet;
