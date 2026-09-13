@@ -597,6 +597,7 @@ async fn download_pending(
     let mut next_poll = Instant::now();
     loop {
         if range.is_none() && Instant::now() >= checkpoint_at {
+            checkpoint_at = Instant::now() + POLL_INTERVAL;
             let boundary = if pending.is_some() || candidates.len() > 0 {
                 page_start.as_deref()
             } else {
@@ -604,15 +605,22 @@ async fn download_pending(
             };
             let checkpoint = admission.scan_checkpoint(boundary);
             if checkpoint != saved_cursor {
-                timeout(
+                match timeout(
                     gateway.config.request_timeout,
                     checkpoint_store.save_bundle_scan_cursor(checkpoint.as_ref()),
                 )
                 .await
-                .context("saving bundle scan cursor timed out")??;
-                saved_cursor = checkpoint;
+                .context("saving bundle scan cursor timed out")
+                .and_then(|result| result)
+                {
+                    Ok(()) => saved_cursor = checkpoint,
+                    Err(error) => {
+                        eprintln!("saving bundle scan cursor failed: {error:#}");
+                        admission.failed("Bundle checkpoint failed");
+                        checkpoint_at = Instant::now() + RETRY_INTERVAL;
+                    }
+                }
             }
-            checkpoint_at = Instant::now() + POLL_INTERVAL;
         }
         if pending.is_none() && downloads.len() < gateway.config.index_downloads {
             pending = candidates.next();
@@ -902,6 +910,94 @@ mod tests {
             admission.scan_checkpoint(Some(&next_page)),
             Some((*next_page).clone())
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ar_io_rust_test schema 11; temporarily changes and locks its bundle cursor"]
+    async fn bundle_checkpoint_retries_after_row_lock_timeout() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let database: String = client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let source: String = client
+            .query_one(
+                "SELECT source FROM public.block_index_state WHERE singleton",
+                &[],
+            )
+            .await?
+            .get(0);
+        let mut config = Config::new(
+            &source,
+            "http://127.0.0.1:1",
+            vec!["http://127.0.0.1:1".to_owned()],
+            Duration::from_secs(10),
+            1,
+            1024,
+        )?;
+        // Keep discovery outside the test index so no content is fetched.
+        config.index_bundle_start_height = i64::MAX as u64;
+        let gateway = Gateway::new(config)?.with_database(&url).await?;
+        let store = gateway.block_store.as_ref().unwrap();
+        let original = store.bundle_scan_cursor().await?;
+        let initial = BundleCursor {
+            height: 0,
+            position: 0,
+            kind: 0,
+            id: vec![0; 32],
+        };
+        store.save_bundle_scan_cursor(Some(&initial)).await?;
+        let result = async {
+            let transaction = client.transaction().await?;
+            transaction.batch_execute(
+                "SET LOCAL lock_timeout='1s';
+                 SELECT singleton FROM public.block_index_state WHERE singleton FOR UPDATE"
+            ).await?;
+            let admission = Admission::new(1024, 1, false);
+            let _reservation = admission.reserve([1; 32], 0).unwrap();
+            admission.track_scan([1; 32], None);
+            let (sender, _receiver) = mpsc::channel(1);
+            let mut running = Box::pin(download_pending(&gateway, sender, &admission, None));
+            let failed = async {
+                loop {
+                    if admission.status.lock().last_failure.is_some() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut running => bail!("scheduler exited on checkpoint timeout: {result:?}"),
+                result = timeout(Duration::from_secs(12), failed) => result.context("checkpoint did not time out")?,
+            }
+            ensure!(store.bundle_scan_cursor().await? == Some(initial), "failed checkpoint advanced progress");
+            transaction.rollback().await?;
+            let persisted = async {
+                loop {
+                    if store.bundle_scan_cursor().await?.is_none() {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut running => bail!("scheduler exited before checkpoint retry: {result:?}"),
+                result = timeout(RETRY_INTERVAL + Duration::from_secs(5), persisted) => result.context("checkpoint was not retried after unlocking")??,
+            }
+            Ok(())
+        }.await;
+        store.save_bundle_scan_cursor(original.as_ref()).await?;
+        ensure!(
+            store.bundle_scan_cursor().await? == original,
+            "test cursor was not restored"
+        );
+        result
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

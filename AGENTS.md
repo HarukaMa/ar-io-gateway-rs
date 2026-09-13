@@ -40,7 +40,7 @@
 
 - Reuse existing code and dependencies, enabling only required features. Keep code, comments, and documentation ASCII-only.
 - Run `cargo fmt` and `cargo test` for implementation changes. Exercise the changed command or serving path with the smallest meaningful runtime check. Run database-specific checks explicitly when the normal suite excludes them.
-- Use the dedicated local `ar_io_rust_test` database for indexing verification. Preserve existing data and leave databases belonging to other projects untouched. Production measurements require a separately approved bounded batch.
+- Use the dedicated local `ar_io_rust_test` database for indexing verification. It is disposable. Migrations, fixture changes, resets, and cleanup are pre-approved without further confirmation. Leave databases belonging to other projects untouched. Production changes and measurements require a separately approved bounded batch.
 - Deliver coherent issue-sized commits. Each commit must be independently buildable and cryptographically signed with `git commit -S`.
 - Include implementation, verification, signed commit, push, and issue updates in one concrete approval batch when publication is intended. Complete that approved delivery before moving to the next issue.
 - Verify the published commit is remotely reachable before closing its issue. Local implementation, passing checks, or a local commit alone do not satisfy issue closure.
