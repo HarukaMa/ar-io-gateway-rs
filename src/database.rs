@@ -274,6 +274,42 @@ impl BlockStore {
         })
     }
 
+    pub(crate) async fn cache_maintenance_connection(&self) -> Result<Self> {
+        let store = self.reconnect().await?;
+        store
+            .client
+            .batch_execute("SET statement_timeout='3s'; SET lock_timeout='500ms'")
+            .await?;
+        Ok(store)
+    }
+
+    pub(crate) async fn cache_publication_barrier(&self) -> Result<()> {
+        self.client.batch_execute("SELECT 1").await?;
+        Ok(())
+    }
+
+    pub(crate) async fn remove_cache_mappings(&self, hashes: &[[u8; 32]]) -> Result<u64> {
+        ensure!(hashes.len() <= 64, "cache eviction batch exceeds 64 blobs");
+        let hashes = hashes
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self
+            .client
+            .execute(
+                "WITH victims AS (
+               SELECT id FROM public.content_cache
+               WHERE metadata::jsonb -> 'blob_hash' IN
+                 (SELECT value::jsonb FROM unnest($1::text[]) AS value)
+               LIMIT 256
+             )
+             DELETE FROM public.content_cache AS cache USING victims
+             WHERE cache.id=victims.id",
+                &[&hashes],
+            )
+            .await?)
+    }
+
     pub(crate) async fn bundle_discovery_reader(&self) -> Result<Self> {
         let reader = self.reconnect().await?;
         reader
@@ -2879,6 +2915,107 @@ mod tests {
                     && collect(&store, None).await?.is_empty(),
                 "bundle completion or discovery survived loss of canonical coverage"
             );
+            Ok(())
+        }
+        .await;
+        store.client.batch_execute("ROLLBACK").await?;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires imported blocks in ar_io_rust_test"]
+    async fn eviction_preserves_active_views_and_removes_shared_mappings() -> Result<()> {
+        use crate::{
+            content::Content,
+            disk_cache::{DiskCache, EvictionCursor},
+        };
+        use sha2::{Digest, Sha256};
+        use std::fs::{File, FileTimes};
+        use std::time::SystemTime;
+
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store.client.batch_execute("BEGIN").await?;
+        let result = async {
+            let row = store
+                .client
+                .query_one(
+                    "SELECT c.height, c.block_hash FROM public.canonical_blocks c
+                 JOIN public.block_index_state s ON s.singleton
+                 WHERE c.height > s.start_height AND c.height <= s.imported_through
+                 ORDER BY c.height LIMIT 1",
+                    &[],
+                )
+                .await?;
+            let height = u64::try_from(row.get::<_, i64>(0))?;
+            let block_hash: Vec<u8> = row.get(1);
+            let directory = tempfile::tempdir()?;
+            let cache = DiskCache::new(directory.path().into(), 0, 1024).await?;
+            let mut hashes = Vec::new();
+            let mut paths = Vec::new();
+            for index in 0_u16..66 {
+                let content = Content::from(index.to_le_bytes().to_vec());
+                let hash: [u8; 32] = Sha256::digest(index.to_le_bytes()).into();
+                drop(cache.store(&content, hash).await?.unwrap());
+                let name = crate::hex(&hash);
+                let path = directory.path().join(&name[..2]).join(name);
+                File::options().write(true).open(&path)?.set_times(
+                    FileTimes::new().set_accessed(
+                        SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(index) + 1),
+                    ),
+                )?;
+                hashes.push(hash);
+                paths.push(path);
+            }
+            let metadata = serde_json::to_string(&serde_json::json!({"blob_hash": hashes[1]}))?;
+            let ids: [[u8; 32]; 2] = [
+                Sha256::digest(b"eviction-parent-regression").into(),
+                Sha256::digest(b"eviction-child-regression").into(),
+            ];
+            for id in &ids {
+                ensure!(
+                    store.cached_content(id).await?.is_none(),
+                    "fixture already exists"
+                );
+                ensure!(
+                    store
+                        .cache_content(id, height, &block_hash, &metadata)
+                        .await?
+                );
+            }
+            drop(cache);
+            let cache = DiskCache::new(directory.path().into(), u64::MAX, 1024).await?;
+            let parent = cache.load(hashes[0], 2).await?.unwrap();
+            let view = parent.slice(0..1)?;
+            drop(parent);
+            let mut cursor = EvictionCursor::default();
+            cache.reclaim(&store, &store, &mut cursor).await?;
+            ensure!(paths[0].exists(), "active parent was evicted");
+            ensure!(paths[65].exists(), "newest sampled blob was evicted");
+            ensure!(paths[1..65].iter().all(|path| !path.exists()));
+            ensure!(view.read_all(1).await? == [0][..], "active view changed");
+            for id in &ids {
+                ensure!(
+                    store.cached_content(id).await?.is_none(),
+                    "shared mapping survived eviction"
+                );
+            }
+            drop(view);
+            cache.reclaim(&store, &store, &mut cursor).await?;
+            ensure!(paths.iter().all(|path| !path.exists()));
+            drop(cache);
+            let cache = DiskCache::new(directory.path().into(), 0, 1024).await?;
+            let content = Content::from(1_u16.to_le_bytes().to_vec());
+            drop(cache.store(&content, hashes[1]).await?.unwrap());
+            ensure!(cache.load(hashes[1], 2).await?.unwrap().read_all(2).await? == [1, 0][..]);
             Ok(())
         }
         .await;

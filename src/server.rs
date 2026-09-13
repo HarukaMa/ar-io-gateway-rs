@@ -416,6 +416,12 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         refresh_tasks.spawn(refresh_indexing_status(Arc::clone(&state)));
         refresh_tasks.spawn(refresh_bundle_totals(Arc::clone(&state)));
     }
+    if state.gateway.disk_cache.is_some() {
+        let cache_state = state.clone();
+        refresh_tasks.spawn(async move {
+            cache_state.gateway.maintain_content_cache().await;
+        });
+    }
     let app = Router::new()
         .route("/ar-io/info", get(serve_info))
         .route("/ar-io/healthcheck", get(serve_healthcheck))

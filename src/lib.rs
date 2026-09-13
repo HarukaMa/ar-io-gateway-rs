@@ -643,6 +643,40 @@ impl Gateway {
             .context("content cache cleanup timed out")?
     }
 
+    async fn maintain_content_cache(&self) {
+        let (Some(cache), Some(publisher)) = (&self.disk_cache, &self.block_store) else {
+            return;
+        };
+        let mut cursor = disk_cache::EvictionCursor::default();
+        let mut connection = None;
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if connection.is_none() {
+                match publisher.cache_maintenance_connection().await {
+                    Ok(store) => connection = Some(store),
+                    Err(error) => {
+                        eprintln!("Cache maintenance connection failed: {error:#}");
+                        continue;
+                    }
+                }
+            }
+            loop {
+                match cache
+                    .reclaim(publisher, connection.as_ref().unwrap(), &mut cursor)
+                    .await
+                {
+                    Ok(true) => tokio::task::yield_now().await,
+                    Ok(false) => break,
+                    Err(error) => {
+                        eprintln!("Cache eviction failed: {error:#}");
+                        connection = None;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn with_bundle_indexing(
         mut self,
         database_url: &str,
@@ -725,6 +759,9 @@ impl Gateway {
         tags: Option<Vec<Tag>>,
     ) -> Result<()> {
         let (Some(cache), Some(store)) = (&self.disk_cache, &self.block_store) else {
+            return Ok(());
+        };
+        let Some(_publication) = cache.publication_guard() else {
             return Ok(());
         };
         let Some((_, block)) = store.block_pair(data.block_height).await? else {

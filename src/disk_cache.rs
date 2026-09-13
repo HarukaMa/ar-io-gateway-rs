@@ -6,7 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -28,6 +28,7 @@ struct CacheDirectory {
     min_free_bytes: u64,
     max_pending_bytes: usize,
     pending_bytes: AtomicUsize,
+    publication: Arc<tokio::sync::RwLock<()>>,
 }
 
 struct PendingWrite {
@@ -58,6 +59,10 @@ impl Drop for CancelWrite {
 }
 
 impl DiskCache {
+    pub(crate) fn publication_guard(&self) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        self.0.publication.clone().try_read_owned().ok()
+    }
+
     pub(crate) async fn new(
         path: PathBuf,
         min_free_bytes: u64,
@@ -83,6 +88,7 @@ impl DiskCache {
                 min_free_bytes,
                 max_pending_bytes,
                 pending_bytes: AtomicUsize::new(0),
+                publication: Arc::new(tokio::sync::RwLock::new(())),
             })))
         })
         .await
@@ -107,6 +113,9 @@ impl DiskCache {
     }
 
     pub(crate) async fn store(&self, content: &Content, hash: [u8; 32]) -> Result<Option<Content>> {
+        let Some(publication) = self.publication_guard() else {
+            return Ok(None);
+        };
         // Reserve before queueing any work or retaining another copy of the source.
         let Some(reservation) = self.0.reserve(content.len()) else {
             return Ok(None);
@@ -116,6 +125,7 @@ impl DiskCache {
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelWrite(Arc::clone(&cancelled));
         spawn_blocking(move || {
+            let _publication = publication;
             ensure!(!cancelled.load(Ordering::Relaxed), "cache write cancelled");
             let path = blob_path(&directory.path, hash);
             let shard = path.parent().expect("cache shard");
@@ -145,6 +155,8 @@ impl DiskCache {
             // this verified inode even if an external actor later replaces its path.
             let file =
                 File::open(pending.temp.path()).context("opening completed cached content")?;
+            file.lock_shared()
+                .context("pinning published cache content")?;
             ensure!(!cancelled.load(Ordering::Relaxed), "cache write cancelled");
             let PendingWrite { temp, reservation } = pending;
             match temp.persist_noclobber(&path) {
@@ -299,6 +311,162 @@ impl DiskCache {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct EvictionCursor {
+    prefix: u8,
+    entries: Option<fs::ReadDir>,
+    reclaiming: bool,
+}
+
+struct EvictionCandidate {
+    path: PathBuf,
+    hash: [u8; 32],
+    accessed: SystemTime,
+}
+
+impl DiskCache {
+    pub(crate) async fn reclaim(
+        &self,
+        publisher: &crate::database::BlockStore,
+        store: &crate::database::BlockStore,
+        cursor: &mut EvictionCursor,
+    ) -> Result<bool> {
+        let directory = self.0.clone();
+        let mut next = std::mem::take(cursor);
+        let (next, candidates) = spawn_blocking(move || {
+            let total = fs4::total_space(&directory.path)?;
+            let available = fs4::available_space(&directory.path)?;
+            let reserve = directory
+                .min_free_bytes
+                .saturating_add(directory.max_pending_bytes as u64);
+            let trigger = (total / 10).max(reserve);
+            let target = (total / 5).max(reserve.saturating_add(total / 20));
+            next.reclaiming = available < if next.reclaiming { target } else { trigger };
+            let candidates = if next.reclaiming {
+                next.sample(&directory.path)?
+            } else {
+                Vec::new()
+            };
+            Ok::<_, anyhow::Error>((next, candidates))
+        })
+        .await??;
+        *cursor = next;
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+
+        let guard = self.0.publication.clone().write_owned().await;
+        // Drain already-enqueued publications, including queries whose caller cancelled.
+        publisher.cache_publication_barrier().await?;
+        let pinned = spawn_blocking(move || -> Result<_> {
+            let mut pinned = Vec::new();
+            for candidate in candidates {
+                let Ok(file) = File::open(&candidate.path) else {
+                    continue;
+                };
+                if file.try_lock().is_err() {
+                    continue;
+                }
+                let metadata = file.metadata()?;
+                if !metadata.is_file() || metadata.accessed()? > candidate.accessed {
+                    continue;
+                }
+                pinned.push((candidate, file));
+                if pinned.len() == 64 {
+                    break;
+                }
+            }
+            Ok(pinned)
+        })
+        .await??;
+        if pinned.is_empty() {
+            return Ok(false);
+        }
+        let hashes: Vec<_> = pinned.iter().map(|(candidate, _)| candidate.hash).collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.remove_cache_mappings(&hashes).await? != 0 {
+            // Leave the files in place if metadata cleanup needs another pass.
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+        }
+        let removed = spawn_blocking(move || -> Result<u64> {
+            let _guard = guard;
+            let mut removed = 0;
+            for (candidate, _pin) in pinned {
+                match fs::remove_file(&candidate.path) {
+                    Ok(()) => removed += 1,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("evicting cached blob"),
+                }
+            }
+            Ok(removed)
+        })
+        .await??;
+        if removed != 0 {
+            eprintln!("Evicted {removed} cached blobs");
+        }
+        Ok(true)
+    }
+}
+
+impl EvictionCursor {
+    fn sample(&mut self, root: &Path) -> Result<Vec<EvictionCandidate>> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut candidates = Vec::new();
+        let mut visited = 0;
+        let mut seen = 0;
+        while seen < 512 && visited < 256 && Instant::now() < deadline {
+            if self.entries.is_none() {
+                let shard = root.join(format!("{:02x}", self.prefix));
+                if !is_directory(&shard)? {
+                    self.prefix = self.prefix.wrapping_add(1);
+                    visited += 1;
+                    continue;
+                }
+                self.entries = Some(fs::read_dir(shard)?);
+            }
+            let Some(entry) = self.entries.as_mut().unwrap().next() else {
+                self.entries = None;
+                self.prefix = self.prefix.wrapping_add(1);
+                visited += 1;
+                continue;
+            };
+            seen += 1;
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.len() != 64
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                continue;
+            }
+            let hash = std::array::from_fn(|index| {
+                u8::from_str_radix(&name[index * 2..index * 2 + 2], 16).unwrap()
+            });
+            if hash[0] != self.prefix {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.file_type().is_file() {
+                candidates.push(EvictionCandidate {
+                    path: entry.path(),
+                    hash,
+                    accessed: metadata.accessed()?,
+                });
+            }
+        }
+        candidates.sort_unstable_by_key(|candidate| candidate.accessed);
+        Ok(candidates)
+    }
+}
+
 impl CacheDirectory {
     fn reserve(self: &Arc<Self>, size: usize) -> Option<Reservation> {
         // Charge empty blobs too, so zero-byte writes cannot form an unbounded queue.
@@ -395,6 +563,9 @@ fn verified_file(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("opening cached content"),
     };
+    if file.try_lock_shared().is_err() {
+        return Ok(None);
+    }
     let expected_size = u64::try_from(size).context("cached content size exceeds file limits")?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() != expected_size {
