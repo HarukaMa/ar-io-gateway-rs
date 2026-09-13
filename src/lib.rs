@@ -622,17 +622,25 @@ impl Gateway {
             .as_ref()
             .context("persistent caching requires DATABASE_URL and an initialized block index")?;
         store.require_content_cache().await?;
-        let mut cache =
-            disk_cache::DiskCache::new(path, min_free_bytes, self.config.max_spool_bytes).await?;
-        let deadline = Instant::now() + self.config.retrieval_timeout;
-        let removed = tokio::time::timeout_at(deadline.into(), cache.cleanup(store, deadline))
-            .await
-            .context("content cache startup cleanup timed out")??;
-        if removed > 0 {
-            eprintln!("removed {removed} abandoned content cache files");
-        }
-        self.disk_cache = Some(cache);
+        self.disk_cache = Some(
+            disk_cache::DiskCache::new(path, min_free_bytes, self.config.max_spool_bytes).await?,
+        );
         Ok(self)
+    }
+
+    pub async fn cleanup_content_cache(&mut self) -> Result<u64> {
+        let store = self
+            .block_store
+            .as_ref()
+            .context("cache cleanup requires an initialized database")?;
+        let cache = self
+            .disk_cache
+            .as_mut()
+            .context("cache cleanup requires AR_IO_DISK_CACHE_DIR")?;
+        let deadline = Instant::now() + self.config.retrieval_timeout;
+        tokio::time::timeout_at(deadline.into(), cache.cleanup(store, deadline))
+            .await
+            .context("content cache cleanup timed out")?
     }
 
     pub async fn with_bundle_indexing(
@@ -6049,6 +6057,61 @@ mod tests {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; briefly locks content_cache"]
+    async fn cache_startup_skips_sweep_and_cleanup_remains_exclusive() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let database: String = client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let source: String = client
+            .query_one(
+                "SELECT source FROM public.block_index_state WHERE singleton",
+                &[],
+            )
+            .await?
+            .get(0);
+        let mut base = gateway();
+        base.config.trusted_node_url = source;
+        let base = base.with_database(&url).await?;
+        let directory = tempfile::tempdir()?;
+        let orphan = directory.path().join(hex(&[0xa7; 32]));
+        let unrelated = directory.path().join("keep.txt");
+        std::fs::write(&orphan, b"abandoned")?;
+        std::fs::write(&unrelated, b"unrelated")?;
+        let transaction = client.transaction().await?;
+        transaction.batch_execute(
+            "SET LOCAL lock_timeout='1s'; LOCK TABLE public.content_cache IN ACCESS EXCLUSIVE MODE"
+        ).await?;
+        let mut opened = tokio::time::timeout(
+            Duration::from_secs(1),
+            base.with_disk_cache(directory.path().to_path_buf(), 0),
+        )
+        .await
+        .context("cache startup waited for orphan-reference queries")??;
+        ensure!(
+            orphan.exists() && unrelated.exists(),
+            "startup removed cache files"
+        );
+        transaction.rollback().await?;
+        ensure!(
+            disk_cache::DiskCache::new(directory.path().to_path_buf(), 0, 1024)
+                .await
+                .is_err(),
+            "cache startup did not retain its exclusive lock"
+        );
+        assert_eq!(opened.cleanup_content_cache().await?, 1);
+        ensure!(!orphan.exists(), "explicit cleanup left the orphan");
+        assert_eq!(std::fs::read(unrelated)?, b"unrelated");
+        Ok(())
+    }
 
     fn data(id: &str) -> VerifiedData {
         VerifiedData {

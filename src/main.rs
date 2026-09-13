@@ -6,8 +6,7 @@ use ar_io_gateway::{
     server::{self, ServerConfig},
 };
 
-const USAGE: &str =
-    "usage: ar-io-gateway serve\n       ar-io-gateway <fetch|fetch-bundled> <id> <output-file>";
+const USAGE: &str = "usage: ar-io-gateway serve\n       ar-io-gateway cache-cleanup\n       ar-io-gateway <fetch|fetch-bundled> <id> <output-file>";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -15,6 +14,9 @@ async fn main() -> Result<()> {
     let Some(command) = args.next() else {
         bail!("{USAGE}");
     };
+    if command == "cache-cleanup" && args.len() != 0 {
+        bail!("{USAGE}");
+    }
 
     let mut config = Config::from_env()?;
     config.index_bundle_start_height = env::var("AR_IO_BUNDLE_START_HEIGHT")
@@ -40,6 +42,11 @@ async fn main() -> Result<()> {
             .parse()
             .context("invalid AR_IO_DISK_CACHE_MIN_FREE_BYTES")?;
         gateway = gateway.with_disk_cache(path.into(), min_free_bytes).await?;
+    }
+    if command == "cache-cleanup" {
+        let removed = gateway.cleanup_content_cache().await?;
+        println!("removed {removed} abandoned content cache files");
+        return Ok(());
     }
 
     if command == "serve" {

@@ -191,7 +191,7 @@ impl DiskCache {
     ) -> Result<u64> {
         ensure!(
             Arc::strong_count(&self.0) == 1 && Arc::strong_count(&self.0.lock) == 1,
-            "cache cleanup requires exclusive startup ownership"
+            "cache cleanup requires exclusive ownership without active readers or writers"
         );
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelWrite(Arc::clone(&cancelled));
