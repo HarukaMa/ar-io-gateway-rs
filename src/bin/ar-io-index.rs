@@ -32,15 +32,9 @@ async fn main() -> Result<()> {
 
     let database_url = env::var("DATABASE_URL").context("DATABASE_URL is required")?;
     let config = Config::from_env()?;
-    let timeout = config.request_timeout;
     let mut gateway = Gateway::new(config)?;
-    let mut store = tokio::time::timeout(timeout, async {
-        let mut store = BlockStore::connect(&database_url).await?;
-        store.migrate().await?;
-        Ok::<_, anyhow::Error>(store)
-    })
-    .await
-    .context("database initialization timed out")??;
+    let mut store = BlockStore::connect(&database_url).await?;
+    store.migrate().await?;
     if command == "bundles" {
         gateway = gateway.with_database(&database_url).await?;
         if let Err(error) = gateway.refresh_peers().await {

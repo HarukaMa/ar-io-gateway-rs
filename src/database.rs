@@ -47,6 +47,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "011_bundle_scan_cursor",
         include_str!("../migrations/011_bundle_scan_cursor.sql"),
     ),
+    (
+        "012_tag_digest_expressions",
+        include_str!("../migrations/012_tag_digest_expressions.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -67,13 +71,13 @@ const BUNDLE_TAGS: &str = "
                vn.key AS version_name, vv.key AS version_value, formats.json
         FROM (VALUES ('binary', '2.0.0', false), ('json', '1.0.0', true))
             AS formats(format, version, json)
-        JOIN public.tag_names fn ON fn.digest=sha256('Bundle-Format'::bytea)
+        JOIN public.tag_names fn ON sha256(fn.value)=sha256('Bundle-Format'::bytea)
             AND fn.value='Bundle-Format'::bytea
-        JOIN public.tag_values fv ON fv.digest=sha256(convert_to(formats.format, 'UTF8'))
+        JOIN public.tag_values fv ON sha256(fv.value)=sha256(convert_to(formats.format, 'UTF8'))
             AND fv.value=convert_to(formats.format, 'UTF8')
-        JOIN public.tag_names vn ON vn.digest=sha256('Bundle-Version'::bytea)
+        JOIN public.tag_names vn ON sha256(vn.value)=sha256('Bundle-Version'::bytea)
             AND vn.value='Bundle-Version'::bytea
-        JOIN public.tag_values vv ON vv.digest=sha256(convert_to(formats.version, 'UTF8'))
+        JOIN public.tag_values vv ON sha256(vv.value)=sha256(convert_to(formats.version, 'UTF8'))
             AND vv.value=convert_to(formats.version, 'UTF8')
     )";
 
@@ -390,6 +394,9 @@ impl BlockStore {
             .start()
             .await?;
         transaction
+            .batch_execute("SET LOCAL statement_timeout=0; SET LOCAL lock_timeout=0")
+            .await?;
+        transaction
             .query_one(
                 "SELECT pg_advisory_xact_lock(hashtextextended('ar-io-gateway:block-index:migrate', 0))",
                 &[],
@@ -445,7 +452,7 @@ impl BlockStore {
             .client
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
-                    WHERE version = 10 AND name = '010_bundle_totals')
+                    WHERE version = 12 AND name = '012_tag_digest_expressions')
                     AND to_regclass('public.bundle_progress') IS NOT NULL
                     AND to_regclass('public.item_locations') IS NOT NULL
                     AND to_regclass('public.canonical_placements') IS NOT NULL
@@ -456,7 +463,7 @@ impl BlockStore {
             .try_get(0)?;
         ensure!(
             installed,
-            "bundle indexing requires schema migration 010_bundle_totals"
+            "bundle indexing requires schema migration 012_tag_digest_expressions"
         );
         Ok(())
     }
@@ -1978,7 +1985,7 @@ impl BlockStore {
                              FROM unnest($1::bytea[], $2::bytea[]) AS incoming(digest, value)
                              WHERE NOT EXISTS (
                                  SELECT 1 FROM public.{table} stored
-                                 WHERE stored.digest=incoming.digest AND stored.value=incoming.value
+                                 WHERE sha256(stored.value)=incoming.digest AND stored.value=incoming.value
                              )"
                         ),
                         &[&digests, &values],
@@ -2009,19 +2016,19 @@ impl BlockStore {
         ];
         for ((table, entries), keys) in dictionaries.iter().zip(&mut dictionary_keys) {
             let insert = format!(
-                "INSERT INTO public.{table} (digest, value)
-                 SELECT digest, value
+                "INSERT INTO public.{table} (value)
+                 SELECT value
                  FROM unnest($1::bytea[], $2::bytea[]) AS incoming(digest, value)
                  WHERE NOT EXISTS (
                      SELECT 1 FROM public.{table} stored
-                     WHERE stored.digest = incoming.digest AND stored.value = incoming.value
+                     WHERE sha256(stored.value) = incoming.digest AND stored.value = incoming.value
                  )"
             );
             let lookup = format!(
                 "SELECT stored.key, incoming.ordinality
                  FROM unnest($1::bytea[], $2::bytea[]) WITH ORDINALITY AS incoming(digest, value, ordinality)
                  JOIN public.{table} stored
-                   ON stored.digest = incoming.digest AND stored.value = incoming.value"
+                   ON sha256(stored.value) = incoming.digest AND stored.value = incoming.value"
             );
             for entries in entries.chunks(ROW_BATCH_SIZE) {
                 let digests: Vec<_> = entries
@@ -2368,7 +2375,7 @@ mod tests {
                     .batch_execute(include_str!("../migrations/011_bundle_scan_cursor.sql"))
                     .await?;
             } else {
-                ensure!(version == 11, "unexpected test schema version");
+                ensure!(matches!(version, 11 | 12), "unexpected test schema version");
             }
             store
                 .client
