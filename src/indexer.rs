@@ -15,6 +15,9 @@ use crate::{
     decode_b64, endpoint, parse_u128, require_bundle_tags,
 };
 
+// The 32-height admission window includes queued results until they are committed.
+const TRANSACTION_READY_BATCHES: usize = 32;
+
 #[derive(Debug, Serialize)]
 pub struct ImportSummary {
     pub start_height: u64,
@@ -86,7 +89,7 @@ pub(crate) async fn follow_chain_step(gateway: &Gateway, store: &mut BlockStore)
         let through = through.unwrap();
         let mut metadata_store = store.reconnect().await?;
         let end = through.max(height.saturating_add(511)).min(info.height);
-        tokio::try_join!(
+        let (anchors, metadata) = tokio::join!(
             import_range(gateway, store, 0, end),
             import_metadata(
                 gateway,
@@ -94,7 +97,9 @@ pub(crate) async fn follow_chain_step(gateway: &Gateway, store: &mut BlockStore)
                 height,
                 height.saturating_add(255).min(through)
             ),
-        )?;
+        );
+        anchors.context("importing block anchors")?;
+        metadata.context("importing transaction metadata")?;
         return Ok(true);
     }
     let end = through
@@ -483,7 +488,7 @@ async fn import_pending_transactions(
         })
         .buffer_unordered(32)
         .boxed();
-    let (sender, mut ready) = mpsc::channel(1);
+    let (sender, mut ready) = mpsc::channel(TRANSACTION_READY_BATCHES);
     let produce = queue_metadata(fetched, sender);
     let consume = persist_transaction_metadata(
         store,
@@ -873,6 +878,81 @@ mod metadata_tests {
             .await?
             .get(0);
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transaction_fetches_finish_while_writer_is_blocked() -> Result<()> {
+        use std::collections::BTreeSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pending = parking_lot::Mutex::new(
+            (0u64..33)
+                .map(|height| (height.to_le_bytes().to_vec(), height))
+                .collect::<Vec<_>>(),
+        );
+        let active = parking_lot::Mutex::new(BTreeSet::new());
+        let committed = tokio::sync::Notify::new();
+        let releases = (0..32)
+            .map(|_| tokio::sync::Notify::new())
+            .collect::<Vec<_>>();
+        let finished = tokio::sync::Notify::new();
+        let started = AtomicUsize::new(0);
+        let query = |excluded: Vec<u64>| {
+            let pending = &pending;
+            async move {
+                Ok(pending
+                    .lock()
+                    .iter()
+                    .filter(|(_, height)| !excluded.contains(height))
+                    .cloned()
+                    .collect())
+            }
+        };
+        let jobs = pending_transaction_jobs(&query, &active, &committed)
+            .map(|job| {
+                let releases = &releases;
+                let finished = &finished;
+                let started = &started;
+                async move {
+                    let job = job?;
+                    started.fetch_add(1, Ordering::Relaxed);
+                    if job.0 < 32 {
+                        releases[job.0 as usize].notified().await;
+                        finished.notify_one();
+                    }
+                    Ok(job)
+                }
+            })
+            .buffer_unordered(32);
+        let (sender, mut ready) = mpsc::channel(TRANSACTION_READY_BATCHES);
+        let produce = queue_metadata(jobs, sender);
+        let consume = async {
+            // Hold every commit while admitted fetches complete one at a time.
+            for release in &releases {
+                release.notify_one();
+                timeout(Duration::from_secs(1), finished.notified())
+                    .await
+                    .context("full writer queue stopped an admitted fetch")?;
+            }
+            assert_eq!(
+                started.load(Ordering::Relaxed),
+                32,
+                "admitted more work before a commit"
+            );
+            let mut persisted = BTreeSet::new();
+            while let Some(batch) = ready.recv().await {
+                for job in batch {
+                    let (height, _) = job?;
+                    assert!(persisted.insert(height), "persisted a height twice");
+                    pending.lock().retain(|(_, candidate)| *candidate != height);
+                    active.lock().remove(&height);
+                    committed.notify_one();
+                }
+            }
+            assert_eq!(persisted, (0u64..33).collect());
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::try_join!(produce, consume)?;
         Ok(())
     }
 
