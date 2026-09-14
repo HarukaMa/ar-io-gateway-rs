@@ -1907,7 +1907,12 @@ impl BlockStore {
                             content_type, content_encoding, signature_type, format, quantity::numeric,
                             reward::numeric, denomination, data_root, true,
                             extract(epoch FROM statement_timestamp())::bigint
-                     FROM {INPUT} ORDER BY id
+                     FROM {INPUT}
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM public.objects existing
+                         WHERE existing.id=incoming.id AND existing.metadata_complete
+                     )
+                     ORDER BY id
                      ON CONFLICT (id) DO UPDATE
                      SET signature = EXCLUDED.signature, anchor = EXCLUDED.anchor,
                          owner_address = EXCLUDED.owner_address, target = EXCLUDED.target,
@@ -3664,6 +3669,14 @@ mod tests {
                 &[&object.owner_address],
             )
             .await?;
+        let mut object_actor = store.reconnect().await?;
+        let object_lock = object_actor.client.transaction().await?;
+        object_lock
+            .query_one(
+                "SELECT key FROM public.objects WHERE id=$1 FOR NO KEY UPDATE",
+                &[&object.id],
+            )
+            .await?;
         let (name, value) = &object.tags[0];
         let known_tags = vec![name.as_slice(), value.as_slice()];
         owner_lock
@@ -3678,6 +3691,7 @@ mod tests {
             .batch_execute("SET lock_timeout='250ms'")
             .await?;
         store.record_objects(std::slice::from_ref(&object)).await?;
+        object_lock.rollback().await?;
         let block_row = store
             .client
             .query_one(
