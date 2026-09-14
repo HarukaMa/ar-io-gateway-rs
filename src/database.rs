@@ -1734,17 +1734,24 @@ impl BlockStore {
     }
 
     pub(crate) async fn record_objects(&mut self, objects: &[ObjectMetadata]) -> Result<()> {
+        let ids: Vec<_> = objects.iter().map(|object| object.id.as_slice()).collect();
         let transaction = self
             .client
             .build_transaction()
             .isolation_level(IsolationLevel::ReadCommitted)
             .start()
             .await?;
-        // Keep canonical membership stable while metadata completion changes its counters.
+        // Stable placements cannot be removed by a reorg. Guard only unknown or unstable membership.
         transaction
             .query_opt(
-                "SELECT singleton FROM public.block_index_state WHERE singleton FOR SHARE",
-                &[],
+                "SELECT s.singleton FROM public.block_index_state s
+                 WHERE s.singleton AND EXISTS (
+                     SELECT 1 FROM unnest($1::bytea[]) AS incoming(id)
+                     LEFT JOIN public.objects o ON o.id=incoming.id
+                     LEFT JOIN public.canonical_placements p ON p.object_key=o.key
+                     WHERE p.block_height IS NULL OR p.block_height>s.checkpoint_height
+                 ) FOR SHARE OF s",
+                &[&ids],
             )
             .await?;
         Self::write_objects(&transaction, objects).await?;
@@ -1948,30 +1955,35 @@ impl BlockStore {
             .map(|row| row.try_get(0))
             .collect::<std::result::Result<_, _>>()?;
 
-        let dictionaries = [("tag_names", false), ("tag_values", true)].map(|(table, values)| {
-            let bytes: std::collections::BTreeSet<_> = objects
-                .iter()
-                .flat_map(|object| {
-                    object.tags.iter().map(|(name, value)| {
-                        if values {
-                            value.as_slice()
-                        } else {
-                            name.as_slice()
-                        }
+        let mut dictionaries =
+            [("tag_names", false), ("tag_values", true)].map(|(table, values)| {
+                let bytes: std::collections::BTreeSet<_> = objects
+                    .iter()
+                    .flat_map(|object| {
+                        object.tags.iter().map(|(name, value)| {
+                            if values {
+                                value.as_slice()
+                            } else {
+                                name.as_slice()
+                            }
+                        })
                     })
-                })
-                .collect();
-            let entries: Vec<_> = bytes
-                .into_iter()
-                .map(|value| {
-                    let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(value).into();
-                    (value, digest)
-                })
-                .collect();
-            (table, entries)
-        });
+                    .collect();
+                let entries: Vec<_> = bytes
+                    .into_iter()
+                    .map(|value| {
+                        let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(value).into();
+                        (value, digest)
+                    })
+                    .collect();
+                (table, entries)
+            });
+        let mut dictionary_keys = [
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+        ];
         let mut lock_keys = Vec::new();
-        for (table, entries) in &dictionaries {
+        for ((table, entries), keys) in dictionaries.iter_mut().zip(&mut dictionary_keys) {
             for entries in entries.chunks(ROW_BATCH_SIZE) {
                 let digests: Vec<_> = entries
                     .iter()
@@ -1981,20 +1993,29 @@ impl BlockStore {
                 for row in transaction
                     .query(
                         &format!(
-                            "SELECT DISTINCT hashtextextended(encode(incoming.digest, 'hex'), 0)
-                             FROM unnest($1::bytea[], $2::bytea[]) AS incoming(digest, value)
-                             WHERE NOT EXISTS (
-                                 SELECT 1 FROM public.{table} stored
-                                 WHERE sha256(stored.value)=incoming.digest AND stored.value=incoming.value
-                             )"
+                            "SELECT stored.key, incoming.ordinality,
+                                    CASE WHEN stored.key IS NULL
+                                         THEN hashtextextended(encode(incoming.digest, 'hex'), 0) END
+                             FROM unnest($1::bytea[], $2::bytea[]) WITH ORDINALITY AS incoming(digest, value, ordinality)
+                             LEFT JOIN public.{table} stored
+                               ON sha256(stored.value)=incoming.digest AND stored.value=incoming.value"
                         ),
                         &[&digests, &values],
                     )
                     .await?
                 {
-                    lock_keys.push(row.try_get::<_, i64>(0)?);
+                    let index = usize::try_from(row.try_get::<_, i64>(1)? - 1)?;
+                    let (value, _) = entries
+                        .get(index)
+                        .context("invalid tag dictionary ordinal")?;
+                    if let Some(key) = row.try_get::<_, Option<i64>>(0)? {
+                        keys.insert(*value, key);
+                    } else {
+                        lock_keys.push(row.try_get::<_, i64>(2)?);
+                    }
                 }
             }
+            entries.retain(|(value, _)| !keys.contains_key(value));
         }
         lock_keys.sort_unstable();
         lock_keys.dedup();
@@ -2010,10 +2031,6 @@ impl BlockStore {
                 )
                 .await?;
         }
-        let mut dictionary_keys = [
-            std::collections::BTreeMap::new(),
-            std::collections::BTreeMap::new(),
-        ];
         for ((table, entries), keys) in dictionaries.iter().zip(&mut dictionary_keys) {
             let insert = format!(
                 "INSERT INTO public.{table} (value)
@@ -2156,20 +2173,25 @@ impl BlockStore {
         if offset == 0 {
             return Ok(None);
         }
+        // Keep canonical checks inside the lateral lookup so LIMIT can walk blocks_weave in order.
         let row = self
             .client
             .query_opt(
                 "SELECT p.height, p.hash, p.previous_hash, p.tx_root, p.weave_size::text,
                         b.height, b.hash, b.previous_hash, b.tx_root, b.weave_size::text
-                 FROM public.block_index_state s
-                 JOIN public.canonical_blocks c
-                   ON c.height > s.start_height AND c.height <= s.imported_through
-                 JOIN public.blocks b ON b.height = c.height AND b.hash = c.block_hash
-                 JOIN public.canonical_blocks pc ON pc.height = c.height - 1
-                 JOIN public.blocks p ON p.height = pc.height AND p.hash = pc.block_hash
-                 WHERE s.singleton AND b.previous_hash = p.hash
-                   AND p.weave_size < $1::text::numeric AND b.weave_size >= $1::text::numeric
-                 ORDER BY b.weave_size, c.height LIMIT 1",
+                 FROM public.blocks b
+                 JOIN LATERAL (
+                     SELECT p.height,p.hash,p.previous_hash,p.tx_root,p.weave_size
+                     FROM public.block_index_state s
+                     JOIN public.canonical_blocks c ON c.height=b.height AND c.block_hash=b.hash
+                     JOIN public.canonical_blocks pc ON pc.height=c.height-1
+                     JOIN public.blocks p ON p.height=pc.height AND p.hash=pc.block_hash
+                     WHERE s.singleton AND c.height>s.start_height AND c.height<=s.imported_through
+                       AND b.previous_hash=p.hash AND p.weave_size<$1::text::numeric
+                     OFFSET 0
+                 ) p ON true
+                 WHERE b.weave_size >= $1::text::numeric
+                 ORDER BY b.weave_size, b.height LIMIT 1",
                 &[&offset.to_string()],
             )
             .await?;
@@ -3422,6 +3444,92 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; offset fixtures are rolled back"]
+    async fn offset_lookup_preserves_canonical_geometry() -> Result<()> {
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store.client.batch_execute("BEGIN").await?;
+        let result =
+            async {
+                let base = 2_000_000_000_i64;
+                for (i, height, previous, size, canonical) in [
+                    (200_u8, base, 199_u8, 100_u64, true),
+                    (201, base + 1, 200, 200, true),
+                    (202, base + 2, 201, 200, true),
+                    (203, base + 3, 202, 300, true),
+                    (204, base + 1, 200, 150, false),
+                    (205, base + 4, 201, 400, true),
+                ] {
+                    let hash = vec![i; 48];
+                    store.client.execute(
+                    "INSERT INTO public.blocks (height,hash,previous_hash,tx_root,weave_size)
+                     VALUES ($1,$2,$3,$4,$5::text::numeric)",
+                    &[&height, &hash, &vec![previous; 48], &vec![0_u8; 32], &size.to_string()],
+                ).await?;
+                    if canonical {
+                        store.client.execute(
+                        "INSERT INTO public.canonical_blocks (height,block_hash) VALUES ($1,$2)",
+                        &[&height, &hash],
+                    ).await?;
+                    }
+                }
+                store
+                    .client
+                    .execute(
+                        "UPDATE public.block_index_state
+                 SET start_height=$1,checkpoint_height=$2,imported_through=$3 WHERE singleton",
+                        &[&base, &(base + 4), &(base + 3)],
+                    )
+                    .await?;
+                for offset in [0, 100, 301] {
+                    ensure!(
+                        store.block_for_offset(offset).await?.is_none(),
+                        "accepted offset outside coverage"
+                    );
+                }
+                for (offset, previous, height) in [
+                    (101, base, base + 1),
+                    (150, base, base + 1),
+                    (200, base, base + 1),
+                    (201, base + 2, base + 3),
+                    (300, base + 2, base + 3),
+                ] {
+                    let pair = store
+                        .block_for_offset(offset)
+                        .await?
+                        .context("missing canonical offset")?;
+                    assert_eq!(
+                        (pair.0.height, pair.1.height),
+                        (previous as u64, height as u64)
+                    );
+                }
+                store
+                    .client
+                    .execute(
+                        "UPDATE public.block_index_state SET imported_through=$1 WHERE singleton",
+                        &[&(base + 4)],
+                    )
+                    .await?;
+                ensure!(
+                    store.block_for_offset(301).await?.is_none(),
+                    "accepted mismatched predecessor"
+                );
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+        store.client.batch_execute("ROLLBACK").await?;
+        result
+    }
+
+    #[tokio::test]
     #[ignore = "requires indexed transaction metadata in ar_io_rust_test"]
     async fn metadata_conflicts_roll_back_facts_and_ordered_tags() -> Result<()> {
         let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
@@ -3443,6 +3551,9 @@ mod tests {
                     o.denomination, o.data_root, o.key
              FROM public.objects o JOIN public.owners w ON w.address=o.owner_address
              WHERE o.metadata_complete AND o.kind=0
+               AND EXISTS (SELECT 1 FROM public.canonical_placements p
+                           JOIN public.block_index_state s ON s.singleton
+                           WHERE p.object_key=o.key AND p.block_height<=s.checkpoint_height)
                AND EXISTS (SELECT 1 FROM public.object_tags t WHERE t.object_key=o.key)
              ORDER BY o.key LIMIT 1",
                 &[],
@@ -3491,6 +3602,12 @@ mod tests {
         let before: Vec<i64> = store.client.query_one(counts, &[]).await?.get(0);
         let mut other = store.reconnect().await?;
         let owner_lock = other.client.transaction().await?;
+        owner_lock
+            .query_one(
+                "SELECT singleton FROM public.block_index_state WHERE singleton FOR UPDATE",
+                &[],
+            )
+            .await?;
         owner_lock
             .query_one(
                 "SELECT address FROM public.owners WHERE address=$1 FOR NO KEY UPDATE",
