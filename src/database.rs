@@ -912,7 +912,7 @@ impl BlockStore {
             .await?;
         let stored_source: String = transaction
             .query_opt(
-                "SELECT source FROM public.block_index_state WHERE singleton FOR SHARE",
+                "SELECT source FROM public.block_index_state WHERE singleton",
                 &[],
             )
             .await?
@@ -934,13 +934,14 @@ impl BlockStore {
         timestamp: u64,
         transaction_ids: &[Vec<u8>],
     ) -> Result<()> {
+        let height = sql_height(block.height)?;
         transaction
-            .query_one(
-                "SELECT singleton FROM public.block_index_state WHERE singleton FOR SHARE",
-                &[],
+            .query_opt(
+                "SELECT singleton FROM public.block_index_state
+                 WHERE singleton AND checkpoint_height<$1 FOR SHARE",
+                &[&height],
             )
             .await?;
-        let height = sql_height(block.height)?;
         let timestamp = i64::try_from(timestamp).context("timestamp exceeds PostgreSQL bigint")?;
         let count = i32::try_from(transaction_ids.len()).context("too many block transactions")?;
         ensure!(
@@ -3444,7 +3445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires ar_io_rust_test; offset fixtures are rolled back"]
+    #[ignore = "requires ar_io_rust_test; run serially, failed offset fixtures are preserved"]
     async fn offset_lookup_preserves_canonical_geometry() -> Result<()> {
         let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
         let database: String = store
@@ -3456,10 +3457,29 @@ mod tests {
             database == "ar_io_rust_test",
             "requires the dedicated test database"
         );
-        store.client.batch_execute("BEGIN").await?;
+        let original = store
+            .state()
+            .await?
+            .context("requires an initialized index")?;
+        let base = 2_000_000_000_i64;
+        let existing: bool = store
+            .client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM public.blocks WHERE height BETWEEN $1 AND $2)",
+                &[&base, &(base + 4)],
+            )
+            .await?
+            .get(0);
+        ensure!(
+            !existing,
+            "offset fixtures already exist; preserve and inspect them before rerunning"
+        );
+        eprintln!(
+            "Offset fixtures use public.blocks/public.canonical_blocks heights {base}..{}. Original chain state: {original:?}",
+            base + 4
+        );
         let result =
             async {
-                let base = 2_000_000_000_i64;
                 for (i, height, previous, size, canonical) in [
                     (200_u8, base, 199_u8, 100_u64, true),
                     (201, base + 1, 200, 200, true),
@@ -3506,9 +3526,9 @@ mod tests {
                         .block_for_offset(offset)
                         .await?
                         .context("missing canonical offset")?;
-                    assert_eq!(
-                        (pair.0.height, pair.1.height),
-                        (previous as u64, height as u64)
+                    ensure!(
+                        (pair.0.height, pair.1.height) == (previous as u64, height as u64),
+                        "offset lookup returned incorrect canonical geometry"
                     );
                 }
                 store
@@ -3525,8 +3545,38 @@ mod tests {
                 Ok::<_, anyhow::Error>(())
             }
             .await;
-        store.client.batch_execute("ROLLBACK").await?;
-        result
+        result.context(
+            "offset check failed; fixtures and current chain state remain in ar_io_rust_test",
+        )?;
+        store.client.batch_execute("BEGIN").await?;
+        store
+            .client
+            .execute(
+                "UPDATE public.block_index_state
+             SET start_height=$1,checkpoint_height=$2,imported_through=$3 WHERE singleton",
+                &[
+                    &sql_height(original.start_height)?,
+                    &sql_height(original.checkpoint.height)?,
+                    &original.imported_through.map(sql_height).transpose()?,
+                ],
+            )
+            .await?;
+        store
+            .client
+            .execute(
+                "DELETE FROM public.canonical_blocks WHERE height BETWEEN $1 AND $2",
+                &[&base, &(base + 4)],
+            )
+            .await?;
+        store
+            .client
+            .execute(
+                "DELETE FROM public.blocks WHERE height BETWEEN $1 AND $2",
+                &[&base, &(base + 4)],
+            )
+            .await?;
+        store.client.batch_execute("COMMIT").await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -3628,6 +3678,53 @@ mod tests {
             .batch_execute("SET lock_timeout='250ms'")
             .await?;
         store.record_objects(std::slice::from_ref(&object)).await?;
+        let block_row = store
+            .client
+            .query_one(
+                "SELECT b.height,b.hash,b.previous_hash,b.tx_root,b.weave_size::text,b.timestamp
+             FROM public.canonical_placements p
+             JOIN public.canonical_blocks c ON c.height=p.block_height
+             JOIN public.blocks b ON b.height=c.height AND b.hash=c.block_hash
+             WHERE p.object_key=$1",
+                &[&key],
+            )
+            .await?;
+        let mut block = block_from_row(&block_row, 0)?;
+        let timestamp = u64::try_from(block_row.try_get::<_, i64>(5)?)?;
+        let transaction_ids: Vec<Vec<u8>> = store
+            .client
+            .query(
+                "SELECT o.id FROM public.block_transactions bt
+             JOIN public.objects o ON o.key=bt.object_key
+             WHERE bt.block_hash=$1 ORDER BY bt.position",
+                &[&block.hash],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let state = store
+            .state()
+            .await?
+            .context("requires an initialized index")?;
+        store
+            .record_block_metadata(&block, timestamp, &transaction_ids)
+            .await?;
+        store
+            .record_bundle_root(&block, timestamp, &transaction_ids, &object, &state.source)
+            .await?;
+        block.height = state.checkpoint.height + 1;
+        let unstable = store
+            .record_block_metadata(&block, timestamp, &transaction_ids)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unstable
+                .downcast_ref::<tokio_postgres::Error>()
+                .and_then(|error| error.code()),
+            Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+            "unstable block metadata must still wait for the chain guard"
+        );
         let missing = format!(
             "dictionary-lock-{}",
             std::time::SystemTime::now()
