@@ -1347,36 +1347,61 @@ impl Gateway {
 
     async fn retrieve_bundled_with_hint(&self, id: &str, hint: BundleHint) -> Result<VerifiedData> {
         let expected_id = decode_fixed::<32>(id, "data item ID")?;
-        let (parent_id, size) = match &hint {
+        let (mut parent_id, size) = match &hint {
             BundleHint::Indexed(indexed) => {
                 (URL_SAFE_NO_PAD.encode(&indexed.root_id), indexed.data_size)
             }
             BundleHint::External {
                 parent_id,
                 data_size,
+                ..
             } => (
                 parent_id.clone(),
                 parse_u128(data_size, "discovered data item size")?,
             ),
         };
         let hinted_size = checked_data_size(size, self.config.max_data_size)?;
-        let cached = self.load_content_cache(&parent_id).await?;
-        let parent_root = if let Some((data, Some(tags))) = cached {
-            IndexingRoot::Complete(Arc::new(VerifiedRoot {
-                data,
-                tags,
-                facts: None,
-            }))
-        } else {
-            IndexingRoot::Partial(Arc::new(self.authenticate_root(&parent_id).await.map_err(
-                |error| {
-                    if error.is::<ContentNotFound>() {
-                        anyhow::anyhow!("bundle parent transaction {parent_id} was not found")
-                    } else {
-                        error
+        let source = match &hint {
+            BundleHint::External { source, .. } => Some(source),
+            BundleHint::Indexed(_) => None,
+        };
+        let mut ancestors = Vec::new();
+        let parent_root = loop {
+            let parent = decode_fixed::<32>(&parent_id, "bundle parent ID")?;
+            ensure!(
+                parent != expected_id && !ancestors.iter().any(|(id, _)| *id == parent),
+                "cyclic bundle ancestry"
+            );
+            if let Some((data, Some(tags))) = self.load_content_cache(&parent_id).await? {
+                break IndexingRoot::Complete(Arc::new(VerifiedRoot {
+                    data,
+                    tags,
+                    facts: None,
+                }));
+            }
+            match self.authenticate_root(&parent_id).await {
+                Ok(root) => break IndexingRoot::Partial(Arc::new(root)),
+                Err(error) if error.is::<ContentNotFound>() => {
+                    if let Some(source) = source
+                        && let Some(BundleHint::External {
+                            parent_id: next_parent,
+                            data_size,
+                            ..
+                        }) = self.discover_from(&parent_id, source).await?
+                    {
+                        ensure!(
+                            ancestors.len() + 1 < MAX_BUNDLE_DEPTH,
+                            "nested bundle exceeds maximum depth {MAX_BUNDLE_DEPTH}"
+                        );
+                        ancestors
+                            .push((parent, parse_u128(&data_size, "discovered ancestor size")?));
+                        parent_id = next_parent;
+                        continue;
                     }
-                },
-            )?))
+                    bail!("bundle parent transaction {parent_id} was not found");
+                }
+                Err(error) => return Err(error),
+            }
         };
         let (parent_bytes, block_height, block_hash, cache_hit, tags, stable_anchor) =
             match &parent_root {
@@ -1410,7 +1435,21 @@ impl Gateway {
                 .await?
             }
             BundleHint::External { .. } => {
-                verify_bundle_item(parent_bytes.clone(), format, &expected_id, None, Some(self))
+                let mut bytes = parent_bytes.clone();
+                let mut format = format;
+                for (ancestor_id, size) in ancestors.iter().rev() {
+                    let (ancestor, _) =
+                        verify_bundle_item(bytes, format, ancestor_id, None, None).await?;
+                    ensure!(
+                        ancestor.data.len() as u128 == *size,
+                        "discovered ancestor size does not match verified payload"
+                    );
+                    format = ancestor
+                        .bundle_format()
+                        .context("discovered ancestor is not a supported bundle")?;
+                    bytes = ancestor.data;
+                }
+                verify_bundle_item(bytes, format, &expected_id, None, Some(self))
                     .await?
                     .0
             }
@@ -1469,8 +1508,8 @@ impl Gateway {
                 Some(result) = discoveries.next(), if !discoveries.is_empty() => {
                     match result {
                         Ok(Some(hint)) => {
-                            if let BundleHint::External { parent_id, data_size } = &hint
-                                && !seen.insert((parent_id.clone(), data_size.clone()))
+                            if let BundleHint::External { parent_id, data_size, source } = &hint
+                                && !seen.insert((parent_id.clone(), data_size.clone(), source.clone()))
                             {
                                 continue;
                             }
@@ -1533,6 +1572,7 @@ impl Gateway {
         Ok(Some(BundleHint::External {
             parent_id,
             data_size: node.data.size,
+            source: source.to_owned(),
         }))
     }
 
@@ -2953,6 +2993,7 @@ enum BundleHint {
     External {
         parent_id: String,
         data_size: String,
+        source: String,
     },
 }
 
@@ -5163,6 +5204,114 @@ mod tests {
         config.max_data_size = invalid.len();
         assert!(Gateway::new(config).unwrap().retrieve(&id).await.is_err());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn external_nested_bundle_ancestry_requires_verified_layers() {
+        use axum::{Router, body::Bytes};
+        use std::sync::atomic::Ordering;
+
+        let payload = b"verified nested discovery";
+        let tags: &[(&[u8], &[u8])] =
+            &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+        let (leaf, leaf_id) = signed_data_item(payload, &[]);
+        let inner_data = encode_bundle(&[&leaf]);
+        let inner_size = inner_data.len();
+        let (inner, inner_id) = signed_data_item(&inner_data, tags);
+        let root = encode_bundle(&[&inner]);
+        let leaf_id = URL_SAFE_NO_PAD.encode(leaf_id);
+        let inner_id = URL_SAFE_NO_PAD.encode(inner_id);
+        let (fixture, root_id, corrupt, server, _) = retrieval_fixture(&root, tags, None).await;
+        let _server = tokio_util::task::AbortOnDropHandle::new(server);
+        let mut forged_inner = inner.clone();
+        *forged_inner.last_mut().unwrap() ^= 1;
+        let forged_root = encode_bundle(&[&forged_inner]);
+        let (forged_fixture, forged_root_id, _, forged_server, _) =
+            retrieval_fixture(&forged_root, tags, None).await;
+        let _forged_server = tokio_util::task::AbortOnDropHandle::new(forged_server);
+        let requested_id = leaf_id.clone();
+        let app =
+            Router::new().fallback(move |uri: axum::http::Uri, body: Bytes| {
+                let query: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let requested = query["variables"]["ids"][0].as_str().unwrap();
+                let location = if requested == leaf_id {
+                    Some((inner_id.clone(), payload.len()))
+                } else if requested == inner_id {
+                    Some((
+                        if uri.path() == "/cycle" {
+                            leaf_id.clone()
+                        } else if uri.path() == "/corrupt-parent" {
+                            forged_root_id.clone()
+                        } else {
+                            root_id.clone()
+                        },
+                        inner_size + usize::from(uri.path() == "/wrong-size"),
+                    ))
+                } else {
+                    None
+                };
+                let edges = location
+                    .map(|(parent, size)| {
+                        vec![serde_json::json!({
+                            "node": {"id": requested, "bundledIn": {"id": parent},
+                                "data": {"size": size.to_string()}}
+                        })]
+                    })
+                    .unwrap_or_default();
+                async move {
+                    serde_json::json!({"data": {"transactions": {"edges": edges}}}).to_string()
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = format!("http://{}", listener.local_addr().unwrap());
+        let _discovery = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let mut config = fixture.config.clone();
+        config.max_data_size = root.len();
+        for (path, expected_error) in [
+            ("/cycle", "cyclic bundle ancestry"),
+            ("/wrong-size", "discovered ancestor size"),
+        ] {
+            config.graphql_sources = vec![format!("{source}{path}")];
+            let error = Gateway::new(config.clone())
+                .unwrap()
+                .retrieve_bundled(&requested_id)
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(expected_error), "{error:#}");
+        }
+        config.graphql_sources = vec![format!("{source}/cycle"), format!("{source}/valid")];
+        for bundled_only in [false, true] {
+            let gateway = Gateway::new(config.clone()).unwrap();
+            let result = if bundled_only {
+                gateway.retrieve_bundled(&requested_id).await
+            } else {
+                gateway.retrieve(&requested_id).await
+            }
+            .unwrap();
+            assert_eq!(
+                result.bytes.read_all(payload.len()).await.unwrap().as_ref(),
+                payload
+            );
+            assert_eq!(result.sha256, hex(&sha256(&[payload])));
+        }
+        let mut forged_config = forged_fixture.config.clone();
+        forged_config.graphql_sources = vec![format!("{source}/corrupt-parent")];
+        let error = Gateway::new(forged_config)
+            .unwrap()
+            .retrieve_bundled(&requested_id)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("signature"), "{error:#}");
+        corrupt.store(true, Ordering::SeqCst);
+        assert!(
+            Gateway::new(config)
+                .unwrap()
+                .retrieve_bundled(&requested_id)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
