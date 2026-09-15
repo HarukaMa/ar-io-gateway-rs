@@ -1774,10 +1774,7 @@ fn decode_arns_record(bytes: &[u8]) -> Result<ArnsRecord<'_>> {
         take(bytes, &mut cursor, 3, "ArNS schema version")? == [1, 0, 0],
         "unsupported ArNS schema version"
     );
-    ensure!(
-        bytes[cursor..].iter().all(|byte| *byte == 0),
-        "ArNS account contains trailing data"
-    );
+    // Anchor updates leave unused bytes from the previous serialization intact.
     Ok(ArnsRecord {
         name,
         ant,
@@ -2758,6 +2755,15 @@ mod tests {
             decode_arns_record(&lease_bytes).unwrap().end_timestamp,
             Some(100)
         );
+
+        let mut padded_bytes = arns_bytes.clone();
+        *padded_bytes.last_mut().unwrap() = 0xff;
+        let padded = decode_arns_record(&padded_bytes).unwrap();
+        assert_eq!(padded.name, arns.name);
+        assert_eq!(padded.ant, arns.ant);
+        assert_eq!(padded.undername_limit, arns.undername_limit);
+        assert_eq!(padded.end_timestamp, arns.end_timestamp);
+        assert_eq!(padded.bump, arns.bump);
 
         let ant_bytes = STANDARD.decode(ANT_ACCOUNT).unwrap();
         let ant = decode_ant_record(&ant_bytes, &arns.ant).unwrap();
