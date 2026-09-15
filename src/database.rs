@@ -379,6 +379,7 @@ impl BlockStore {
             FROM public.bundle_totals t LEFT JOIN public.block_index_state s ON s.singleton
         )
         SELECT json_build_object('discovered_roots',roots,'complete_roots',completed,
+            'discovered_bytes',bytes::text,'completed_bytes',completed_bytes::text,
             'pending_roots',roots-completed,'pending_bytes',(bytes-completed_bytes)::text,
             'nested_bundles',nested)::text FROM totals";
 
@@ -2499,6 +2500,8 @@ mod tests {
                     SELECT json_build_object(
                         'discovered_roots',count(*) FILTER (WHERE root),
                         'complete_roots',count(*) FILTER (WHERE root AND complete),
+                        'discovered_bytes',coalesce(sum(data_size) FILTER (WHERE root),0)::text,
+                        'completed_bytes',coalesce(sum(data_size) FILTER (WHERE root AND complete),0)::text,
                         'pending_roots',count(*) FILTER (WHERE root AND NOT complete),
                         'pending_bytes',coalesce(sum(data_size) FILTER (WHERE root AND NOT complete),0)::text,
                         'nested_bundles',count(*) FILTER (WHERE kind=1)
