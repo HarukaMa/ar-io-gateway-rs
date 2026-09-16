@@ -80,6 +80,10 @@ impl Drop for CancelWrite {
 }
 
 impl DiskCache {
+    pub(crate) fn directory(&self) -> &Path {
+        &self.0.path
+    }
+
     pub(crate) fn record_lookup<T>(&self, http: bool, result: &Result<Option<T>>) {
         let mut lookups = self.0.lookups.lock();
         let stats = &mut lookups[usize::from(!http)];
@@ -551,7 +555,7 @@ impl CacheDirectory {
     }
 }
 
-fn blob_path(root: &Path, hash: [u8; 32]) -> PathBuf {
+pub(crate) fn blob_path(root: &Path, hash: [u8; 32]) -> PathBuf {
     let name = crate::hex(&hash);
     root.join(&name[..2]).join(name)
 }

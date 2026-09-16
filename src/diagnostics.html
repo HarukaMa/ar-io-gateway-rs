@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Diagnostics - AR.IO</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101719;color:#e6edef}*{box-sizing:border-box}body{max-width:1080px;margin:auto;padding:36px 24px}header{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:28px}h1{font-size:28px;margin:0 0 6px}h2{font-size:18px;margin:0 0 18px}p{color:#a5b6bb;line-height:1.6}a{color:#8bdbc6}section,form{background:#192326;border:1px solid #304044;border-radius:12px;padding:24px;margin-bottom:18px}label{display:block;margin-bottom:10px;font-weight:600}.input-row{display:flex;gap:12px}input{min-width:0;flex:1;background:#101719;color:inherit;border:1px solid #60777c;border-radius:6px;padding:12px;font:inherit}button,.download{background:#8bdbc6;color:#10221d;border:0;border-radius:6px;padding:12px 18px;font:inherit;font-weight:600;cursor:pointer}button:disabled{opacity:.55;cursor:wait}:focus-visible{outline:3px solid #b5eedd;outline-offset:3px}.note{font-size:13px;margin-bottom:0}#status{display:block;line-height:1.6;margin-top:16px}.failed{color:#f3b3a6}.passed{color:#a2e8d1}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}dl{margin:0}dt{color:#a5b6bb;font-size:13px;margin-top:14px}dd{margin:4px 0 0;overflow-wrap:anywhere}ol{padding-left:24px}li{margin-bottom:18px;overflow-wrap:anywhere}code{font-size:13px;overflow-wrap:anywhere}.stage{display:flex;justify-content:space-between;gap:16px}.stage span:last-child{white-space:nowrap}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.6}details{margin-top:18px}summary{cursor:pointer}.result-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:28px 0 18px}.result-head h2{margin:0}.download{text-decoration:none;font-size:14px}[hidden]{display:none!important}@media(max-width:620px){body{padding:24px 16px}.grid{grid-template-columns:1fr;gap:0}.input-row{flex-direction:column}section,form{padding:18px}header{align-items:flex-start}header a{font-size:14px}.stage{flex-wrap:wrap}}
+</style>
+</head>
+<body>
+<header><div><h1>Diagnostics</h1><p>AR.IO gateway</p></div><a href="/ar-io/status">Indexing status</a></header>
+<main>
+<form id="form">
+<label for="input">ArNS name or data ID</label>
+<div class="input-row"><input id="input" name="input" required maxlength="255" autocomplete="off" spellcheck="false" placeholder="legend or a transaction ID"><button id="run" type="submit">Run diagnostic</button></div>
+<p class="note">Fresh retrieval, up to 64 MiB. Preparation and retrieval each have a one-minute limit. One diagnostic can run at a time.</p>
+<output id="status" aria-live="polite"></output>
+</form>
+<div id="results" hidden>
+<div class="result-head"><h2>Diagnostic report</h2><a id="download" class="download" download="diagnostic.json">Download JSON</a></div>
+<div class="grid"><section><h2>Resolution</h2><dl id="resolution"></dl></section><section><h2>Local state</h2><dl id="local"></dl><p class="note">Cache presence checks file type and size. Retrieval runs fresh verification.</p></section></div>
+<section><h2>Bundle ancestry</h2><ol id="ancestry"></ol><p id="no-ancestry">No bundle locations discovered.</p></section>
+<section><h2>Verification stages</h2><ol id="steps"></ol><p id="truncated" hidden>Stage limit reached. This trace is incomplete.</p></section>
+<section id="content-section" hidden><h2>Verified content</h2><dl id="content"></dl></section>
+<details><summary>Raw JSON</summary><pre id="json"></pre></details>
+</div>
+</main>
+<noscript><p>JavaScript is required to run a diagnostic.</p></noscript>
+<script>
+const element = id => document.getElementById(id);
+const label = value => String(value).replaceAll('_', ' ');
+let downloadUrl;
+function field(list, name, value) {
+  const term = document.createElement('dt');
+  const description = document.createElement('dd');
+  term.textContent = name;
+  description.textContent = value == null ? '-' : String(value);
+  list.append(term, description);
+}
+function render(report) {
+  element('status').textContent = report.status === 'passed' ? 'Verification passed.' : report.error;
+  element('status').className = report.status;
+  for (const id of ['resolution', 'local', 'ancestry', 'steps', 'content']) element(id).replaceChildren();
+  field(element('resolution'), 'Input', report.input);
+  field(element('resolution'), 'Resolved ID', report.resolved_id);
+  if (report.resolution) {
+    field(element('resolution'), 'ANT', report.resolution.ant_id);
+    field(element('resolution'), 'Record', report.resolution.record);
+    field(element('resolution'), 'TTL (seconds)', report.resolution.ttl);
+  }
+  field(element('local'), 'Index', label(report.index.state));
+  field(element('local'), 'Cache', label(report.cache.state));
+  if (report.index.kind != null) field(element('local'), 'Object kind', report.index.kind);
+  let edges = 0;
+  for (const step of report.steps) {
+    const item = document.createElement('li');
+    const heading = document.createElement('div');
+    heading.className = 'stage';
+    const name = document.createElement('span');
+    name.textContent = label(step.stage);
+    const status = document.createElement('span');
+    status.textContent = step.status;
+    status.className = step.status;
+    heading.append(name, status);
+    const id = document.createElement('code');
+    id.textContent = step.id;
+    item.append(heading, id);
+    if (step.error) {
+      const error = document.createElement('p');
+      error.textContent = step.error;
+      item.append(error);
+    }
+    element('steps').append(item);
+    if (step.parent_id) {
+      const edge = document.createElement('li');
+      edge.textContent = step.id + ' inside ' + step.parent_id + ' (' + step.source + ' location)';
+      element('ancestry').append(edge);
+      edges++;
+    }
+  }
+  element('no-ancestry').hidden = edges > 0;
+  element('truncated').hidden = !report.trace_truncated;
+  element('content-section').hidden = !report.content;
+  if (report.content) for (const [name, value] of Object.entries(report.content)) field(element('content'), label(name), value);
+  const json = JSON.stringify(report, null, 2);
+  element('json').textContent = json;
+  if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+  downloadUrl = URL.createObjectURL(new Blob([json], {type: 'application/json'}));
+  element('download').href = downloadUrl;
+  element('results').hidden = false;
+}
+element('form').addEventListener('submit', async event => {
+  event.preventDefault();
+  element('run').disabled = true;
+  element('results').hidden = true;
+  element('status').className = '';
+  element('status').textContent = 'Running diagnostic...';
+  try {
+    const response = await fetch('/ar-io/diagnostics/run', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({input: element('input').value.trim()})
+    });
+    if (!response.ok) throw new Error(response.status === 429 ? 'A diagnostic is already running. Try again later.' : response.status === 400 || response.status === 422 ? 'Enter a valid ArNS name or data ID.' : response.status === 403 ? 'Content is blocked.' : 'Diagnostic unavailable. Try again later.');
+    render(await response.json());
+  } catch (error) {
+    element('status').className = 'failed';
+    element('status').textContent = error.message;
+  } finally {
+    element('run').disabled = false;
+  }
+});
+</script>
+</body>
+</html>

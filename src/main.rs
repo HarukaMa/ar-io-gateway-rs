@@ -6,7 +6,7 @@ use ar_io_gateway::{
     server::{self, ServerConfig},
 };
 
-const USAGE: &str = "usage: ar-io-gateway serve\n       ar-io-gateway cache-cleanup\n       ar-io-gateway <fetch|fetch-bundled> <id> <output-file>";
+const USAGE: &str = "usage: ar-io-gateway serve\n       ar-io-gateway cache-cleanup\n       ar-io-gateway diagnose <arns-name|id>\n       ar-io-gateway <fetch|fetch-bundled> <id> <output-file>";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -19,6 +19,33 @@ async fn main() -> Result<()> {
     }
 
     let mut config = Config::from_env()?;
+    if command == "diagnose" {
+        let input = args.next().context(USAGE)?;
+        if args.next().is_some() {
+            bail!("{USAGE}");
+        }
+        let database_url = env::var("DATABASE_URL").ok();
+        let cache_directory = env::var_os("AR_IO_DISK_CACHE_DIR").map(std::path::PathBuf::from);
+        let resolver = resolver_config(1)?;
+        // Poll separately from the CLI's serving and indexing state machine.
+        let report = tokio::spawn(async move {
+            ar_io_gateway::diagnostics::diagnose(
+                config,
+                resolver,
+                &input,
+                database_url.as_deref(),
+                cache_directory.as_deref(),
+            )
+            .await
+        })
+        .await
+        .context("diagnostic task failed")?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if report["status"] != "passed" {
+            bail!("diagnostic failed");
+        }
+        return Ok(());
+    }
     config.index_bundle_start_height = env::var("AR_IO_BUNDLE_START_HEIGHT")
         .unwrap_or_else(|_| config.index_bundle_start_height.to_string())
         .parse()
@@ -78,17 +105,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| "128".to_owned())
             .parse()
             .context("invalid AR_IO_MAX_CONCURRENT_REQUESTS")?;
-        let mut config = ServerConfig::new(
-            &env::var("AR_IO_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_owned()),
-            &env::var("ARNS_ROOT_HOST").unwrap_or_else(|_| "ar.mrx.im".to_owned()),
-            &env::var("SOLANA_RPC_URL")
-                .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_owned()),
-            &env::var("ARIO_ARNS_PROGRAM_ID")
-                .unwrap_or_else(|_| "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ".to_owned()),
-            &env::var("ARIO_ANT_PROGRAM_ID")
-                .unwrap_or_else(|_| "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5".to_owned()),
-            max_concurrent_requests,
-        )?;
+        let mut config = resolver_config(max_concurrent_requests)?;
         config = config.with_routing(
             env::var("APEX_TX_ID")
                 .ok()
@@ -213,4 +230,18 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to write verified data to {output}"))?;
     println!("{}", serde_json::to_string(&verified)?);
     Ok(())
+}
+
+fn resolver_config(max_concurrent_requests: usize) -> Result<ServerConfig> {
+    ServerConfig::new(
+        &env::var("AR_IO_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_owned()),
+        &env::var("ARNS_ROOT_HOST").unwrap_or_else(|_| "ar.mrx.im".to_owned()),
+        &env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_owned()),
+        &env::var("ARIO_ARNS_PROGRAM_ID")
+            .unwrap_or_else(|_| "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ".to_owned()),
+        &env::var("ARIO_ANT_PROGRAM_ID")
+            .unwrap_or_else(|_| "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5".to_owned()),
+        max_concurrent_requests,
+    )
 }

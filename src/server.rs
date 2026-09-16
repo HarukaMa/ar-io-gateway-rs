@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Router,
     body::Body,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{
         HeaderMap, HeaderValue, Method, Request, StatusCode, Uri,
         header::{CACHE_CONTROL, HOST},
@@ -21,7 +21,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use base64::{
     Engine as _,
@@ -101,6 +101,11 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub(crate) fn diagnostic_allowed(&self, input: &str) -> bool {
+        !self.blocklist.ids.contains(input)
+            && !self.blocklist.names.contains(&input.to_ascii_lowercase())
+    }
+
     pub fn new(
         listen_addr: &str,
         arns_root_host: &str,
@@ -309,15 +314,17 @@ struct AppState {
     config: ServerConfig,
     request_permits: Arc<Semaphore>,
     chunk_permits: Arc<Semaphore>,
+    diagnostic_permits: Semaphore,
     started_at: Instant,
     indexing_status: Mutex<serde_json::Value>,
 }
 
-struct Resolution {
+#[derive(Serialize)]
+pub(crate) struct Resolution {
     name: String,
     basename: String,
     record: String,
-    resolved_id: String,
+    pub(crate) resolved_id: String,
     ttl: u32,
     ant_id: String,
     limit: u16,
@@ -375,6 +382,7 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     let state = Arc::new(AppState {
         request_permits: Arc::new(Semaphore::new(config.max_concurrent_requests)),
         chunk_permits: Arc::new(Semaphore::new((config.max_concurrent_requests / 2).max(1))),
+        diagnostic_permits: Semaphore::new(1),
         started_at: Instant::now(),
         indexing_status: Mutex::new(serde_json::Value::Null),
         gateway,
@@ -427,6 +435,11 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .route("/ar-io/healthcheck", get(serve_healthcheck))
         .route("/ar-io/status", get(serve_indexing_page))
         .route("/ar-io/status.json", get(serve_indexing_status))
+        .route("/ar-io/diagnostics", get(serve_diagnostic_page))
+        .route(
+            "/ar-io/diagnostics/run",
+            post(serve_diagnostic).layer(DefaultBodyLimit::max(1024)),
+        )
         .route("/ar-io/peers", get(serve_peers))
         .route("/ar-io/resolver/{name}", get(serve_resolver))
         .route("/ar-io/offsets/{id}", get(serve_offsets))
@@ -772,6 +785,73 @@ async fn serve_indexing_page() -> Response {
     response
 }
 
+async fn serve_diagnostic_page() -> Response {
+    let mut response = axum::response::Html(include_str!("diagnostics.html")).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiagnosticRequest {
+    input: String,
+}
+
+async fn serve_diagnostic(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<DiagnosticRequest>,
+) -> Response {
+    let input = request.input.trim();
+    if input.len() > 255
+        || (decode_fixed::<32>(input, "data ID").is_err()
+            && split_arns_name(&input.to_ascii_lowercase()).is_err())
+    {
+        return error_response(StatusCode::BAD_REQUEST, "Enter an ArNS name or data ID");
+    }
+    if !state.config.diagnostic_allowed(input) {
+        return error_response(StatusCode::FORBIDDEN, "Content is blocked");
+    }
+    let _diagnostic = match state.diagnostic_permits.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "A diagnostic is already running. Try again later.",
+            );
+        }
+    };
+    let _request = match request_permit(&state.request_permits) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let task_state = state.clone();
+    let input = input.to_owned();
+    // Keep the retrieval future off the HTTP connection's polling stack.
+    let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        crate::diagnostics::diagnose_public(&task_state.gateway, &task_state.config, &input).await
+    }));
+    let report = match task.await {
+        Ok(report) => report,
+        Err(error) => return upstream_error_response("Diagnostic failed", error.into()),
+    };
+    if report["content"]["etag"].as_str().is_some_and(|etag| {
+        state
+            .config
+            .blocklist
+            .hashes
+            .contains(etag.trim_matches('"'))
+    }) {
+        return error_response(StatusCode::FORBIDDEN, "Content is blocked");
+    }
+    let mut response = json_response(&report);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 async fn serve_resolver(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     if split_arns_name(&name).is_err() {
         return error_response(StatusCode::NOT_FOUND, "Not found");
@@ -782,7 +862,7 @@ async fn serve_resolver(State(state): State<Arc<AppState>>, Path(name): Path<Str
     };
     let resolution = match tokio::time::timeout(
         state.gateway.config.retrieval_timeout,
-        resolve_arns(&state, name),
+        resolve_arns(&state.gateway, &state.config, name),
     )
     .await
     {
@@ -1201,7 +1281,7 @@ async fn serve_arns_path(
     if state.config.blocklist.names.contains(&name) {
         return blocked_response(&name);
     }
-    let resolution = match resolve_arns(state, name).await {
+    let resolution = match resolve_arns(&state.gateway, &state.config, name).await {
         Ok(Some(resolution)) => resolution,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not found"),
         Err(error) => return upstream_error_response("ArNS resolution failed", error),
@@ -1500,20 +1580,24 @@ fn redirect_content_type(headers: &HeaderMap) -> Option<&'static str> {
     selected.map(|(_, offer)| offer)
 }
 
-async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolution>> {
+pub(crate) async fn resolve_arns(
+    gateway: &Gateway,
+    config: &ServerConfig,
+    name: String,
+) -> Result<Option<Resolution>> {
     let (basename, undername) = split_arns_name(&name)?;
 
     let name_hash: [u8; 32] = Sha256::digest(basename.as_bytes()).into();
     let (arns_address, arns_bump) = derive_pda(
-        &state.config.arns_program_id,
+        &config.arns_program_id,
         &[ARNS_RECORD_SEED, name_hash.as_slice()],
         "ArNS record",
     )?;
     let Some(arns_bytes) = account_info(
-        &state.gateway,
-        &state.config.solana_rpc_url,
+        gateway,
+        &config.solana_rpc_url,
         &arns_address,
-        &state.config.arns_program_id,
+        &config.arns_program_id,
     )
     .await?
     else {
@@ -1529,7 +1613,7 @@ async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolutio
     if let Some(end_timestamp) = arns.end_timestamp
         && !arns_is_active(
             end_timestamp,
-            arns_grace_period(state).await?,
+            arns_grace_period(gateway, config).await?,
             now.as_secs(),
         )?
     {
@@ -1539,7 +1623,7 @@ async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolutio
     let (index, record) = if undername == "@" {
         let undername_hash: [u8; 32] = Sha256::digest(b"@").into();
         let (ant_address, ant_bump) = derive_pda(
-            &state.config.ant_program_id,
+            &config.ant_program_id,
             &[
                 ANT_RECORD_SEED,
                 arns.ant.as_slice(),
@@ -1548,10 +1632,10 @@ async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolutio
             "ANT record",
         )?;
         let Some(ant_bytes) = account_info(
-            &state.gateway,
-            &state.config.solana_rpc_url,
+            gateway,
+            &config.solana_rpc_url,
             &ant_address,
-            &state.config.ant_program_id,
+            &config.ant_program_id,
         )
         .await?
         else {
@@ -1563,9 +1647,9 @@ async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolutio
         (0, record)
     } else {
         let Some(selected) = ant_undername(
-            &state.gateway,
-            &state.config.solana_rpc_url,
-            &state.config.ant_program_id,
+            gateway,
+            &config.solana_rpc_url,
+            &config.ant_program_id,
             &arns.ant,
             &undername,
         )
@@ -1594,17 +1678,14 @@ async fn resolve_arns(state: &AppState, name: String) -> Result<Option<Resolutio
     }))
 }
 
-async fn arns_grace_period(state: &AppState) -> Result<i64> {
-    let (address, expected_bump) = derive_pda(
-        &state.config.arns_program_id,
-        &[ARNS_CONFIG_SEED],
-        "ArNS config",
-    )?;
+async fn arns_grace_period(gateway: &Gateway, config: &ServerConfig) -> Result<i64> {
+    let (address, expected_bump) =
+        derive_pda(&config.arns_program_id, &[ARNS_CONFIG_SEED], "ArNS config")?;
     let bytes = account_info(
-        &state.gateway,
-        &state.config.solana_rpc_url,
+        gateway,
+        &config.solana_rpc_url,
         &address,
-        &state.config.arns_program_id,
+        &config.arns_program_id,
     )
     .await?
     .context("ArNS config account is missing")?;
@@ -2711,6 +2792,86 @@ mod tests {
     const ARNS_PROGRAM: &str = "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ";
     const ANT_PROGRAM: &str = "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5";
 
+    #[tokio::test]
+    async fn public_diagnostics_bound_concurrency_and_hide_upstream_details() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc = format!("http://{}/private-rpc-key", listener.local_addr().unwrap());
+        let app = Router::new().fallback({
+            let entered = entered.clone();
+            let release = release.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    (StatusCode::INTERNAL_SERVER_ERROR, "private upstream detail")
+                }
+            }
+        });
+        let _upstream = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let state = Arc::new(AppState {
+            gateway: Gateway::new(stream_limits()).unwrap(),
+            config: ServerConfig::new(
+                "127.0.0.1:0",
+                "example.com",
+                &rpc,
+                ARNS_PROGRAM,
+                ANT_PROGRAM,
+                2,
+            )
+            .unwrap(),
+            request_permits: Arc::new(Semaphore::new(2)),
+            chunk_permits: Arc::new(Semaphore::new(1)),
+            diagnostic_permits: Semaphore::new(1),
+            started_at: Instant::now(),
+            indexing_status: Mutex::new(serde_json::Value::Null),
+        });
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            serve_diagnostic(
+                State(first_state),
+                axum::Json(DiagnosticRequest {
+                    input: "example".into(),
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let busy = serve_diagnostic(
+            State(state),
+            axum::Json(DiagnosticRequest {
+                input: "example".into(),
+            }),
+        )
+        .await;
+        assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+        release.notify_one();
+        let response = first.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(!text.contains("127.0.0.1") && !text.contains("private"));
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["status"], "failed");
+        assert!(report["content"].is_null());
+        assert!(
+            report["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["stage"] == "name_resolution" && step["status"] == "failed")
+        );
+    }
+
     #[test]
     fn formats_utc_milliseconds_across_leap_year_boundaries() {
         for (millis, expected) in [
@@ -3133,6 +3294,7 @@ mod tests {
             .unwrap(),
             request_permits: Arc::new(Semaphore::new(8)),
             chunk_permits: Arc::new(Semaphore::new(4)),
+            diagnostic_permits: Semaphore::new(1),
             started_at: Instant::now(),
             indexing_status: Mutex::new(serde_json::Value::Null),
         };
@@ -3297,6 +3459,7 @@ mod tests {
             config,
             request_permits: Arc::new(Semaphore::new(2)),
             chunk_permits: Arc::new(Semaphore::new(1)),
+            diagnostic_permits: Semaphore::new(1),
             started_at: Instant::now(),
             indexing_status: Mutex::new(serde_json::Value::Null),
         });
@@ -3493,6 +3656,7 @@ mod tests {
             .unwrap(),
             request_permits: Arc::new(Semaphore::new(1)),
             chunk_permits: Arc::new(Semaphore::new(1)),
+            diagnostic_permits: Semaphore::new(1),
             started_at: Instant::now(),
             indexing_status: Mutex::new(serde_json::Value::Null),
         });

@@ -1,6 +1,7 @@
 pub mod background;
 pub mod content;
 pub mod database;
+pub mod diagnostics;
 mod disk_cache;
 mod historical;
 pub mod indexer;
@@ -917,10 +918,14 @@ impl Gateway {
         if let Some(mut leader) = leader {
             let result = tokio::time::timeout(self.config.retrieval_timeout, async {
                 let data = retrieve.await?;
-                ensure!(
-                    self.current_anchor(&data).await?,
-                    "content block changed during retrieval"
-                );
+                diagnostics::check("canonical_anchor", id, async {
+                    ensure!(
+                        self.current_anchor(&data).await?,
+                        "content block changed during retrieval"
+                    );
+                    Ok(())
+                })
+                .await?;
                 Ok(data)
             })
             .await
@@ -1489,7 +1494,13 @@ impl Gateway {
     async fn retrieve_discovered(&self, id: &str) -> Result<Option<VerifiedData>> {
         if let Some(store) = &self.block_store {
             let item_id = decode_fixed::<32>(id, "data ID")?;
-            if let Some(indexed) = store.bundle_location(&item_id).await? {
+            if let Some(indexed) =
+                diagnostics::check("indexed_bundle_lookup", id, store.bundle_location(&item_id))
+                    .await?
+            {
+                for location in &indexed.locations {
+                    diagnostics::indexed_location(&location.id, &location.parent_id);
+                }
                 return self
                     .retrieve_bundled_with_hint(id, BundleHint::Indexed(indexed))
                     .await
@@ -1536,6 +1547,7 @@ impl Gateway {
     }
 
     async fn discover_from(&self, id: &str, source: &str) -> Result<Option<BundleHint>> {
+        diagnostics::check("bundle_discovery", id, async {
         let response: GraphQlResponse = self
             .request_json(
                 self.client
@@ -1569,11 +1581,13 @@ impl Gateway {
         let parent_id = parent.id;
         decode_fixed::<32>(&parent_id, "discovered parent ID")?;
         ensure!(parent_id != id, "data item cannot be its own parent");
+        diagnostics::location(id, &parent_id, source);
         Ok(Some(BundleHint::External {
             parent_id,
             data_size: node.data.size,
             source: source.to_owned(),
         }))
+        }).await
     }
 
     pub async fn refresh_peers(&self) -> Result<()> {
@@ -1624,13 +1638,15 @@ impl Gateway {
     ) -> Result<(VerifiedData, Vec<Tag>, Option<indexer::RootFacts>)> {
         let root = self.authenticate_root(id).await?;
         checked_data_size(root.bytes.len() as u128, self.config.max_data_size)?;
-        let (bytes, body_hash) = root
-            .bytes
-            .materialize(
+        let (bytes, body_hash) = diagnostics::check(
+            "content_proofs_and_hash",
+            id,
+            root.bytes.materialize(
                 self.config.max_memory_data_size,
                 Arc::clone(&self.spool_budget),
-            )
-            .await?;
+            ),
+        )
+        .await?;
         Ok((
             VerifiedData {
                 content_length: bytes.len(),
@@ -1652,207 +1668,216 @@ impl Gateway {
     }
 
     async fn authenticate_root(&self, id: &str) -> Result<AuthenticatedRoot> {
-        decode_fixed::<32>(id, "transaction ID")?;
+        diagnostics::check("transaction_authentication", id, async {
+            decode_fixed::<32>(id, "transaction ID")?;
 
-        let status_url = endpoint(&self.config.archive_url, &format!("tx/{id}/status"));
-        let response = self
-            .client
-            .get(&status_url)
-            .send()
-            .await
-            .context("failed to fetch transaction status")?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND
-            && response.url().as_str() == status_url
-        {
-            return Err(ContentNotFound.into());
-        }
-        let status: TxStatus = read_json_response(
-            response
-                .error_for_status()
-                .context("transaction status source rejected request")?,
-        )
-        .await?;
-        decode_fixed::<48>(&status.block_indep_hash, "status block hash")?;
-
-        let indexed = match &self.block_store {
-            Some(store)
-                if store
-                    .stable_canonical_hash(status.block_height)
-                    .await?
-                    .is_some() =>
-            {
-                store.block_pair(status.block_height).await?
-            }
-            _ => None,
-        };
-        let stable_anchor;
-        let entries: Vec<BlockIndexEntry> = if let Some((previous, block)) = indexed {
-            stable_anchor = true;
-            [block, previous]
-                .into_iter()
-                .map(|entry| BlockIndexEntry {
-                    hash: URL_SAFE_NO_PAD.encode(&entry.hash),
-                    tx_root: URL_SAFE_NO_PAD.encode(&entry.tx_root),
-                    weave_size: entry.weave_size.to_string(),
-                })
-                .collect()
-        } else {
-            let info: NodeInfo = self
-                .get_json(&self.config.trusted_node_url, "info")
+            let status_url = endpoint(&self.config.archive_url, &format!("tx/{id}/status"));
+            let response = self
+                .client
+                .get(&status_url)
+                .send()
                 .await
-                .context("failed to fetch trusted node height")?;
-            ensure!(
-                info.height >= status.block_height,
-                "transaction block is above the trusted node tip"
-            );
-            stable_anchor = info.height - status.block_height >= CONSENSUS_DEPTH;
-            let index_path = format!(
-                "block_index/{}/{}",
-                status.block_height.saturating_sub(1),
-                status.block_height
-            );
-            self.request_json(
-                self.client
-                    .get(endpoint(&self.config.trusted_node_url, &index_path))
-                    .header("x-block-format", "1"),
+                .context("failed to fetch transaction status")?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND
+                && response.url().as_str() == status_url
+            {
+                return Err(ContentNotFound.into());
+            }
+            let status: TxStatus = read_json_response(
+                response
+                    .error_for_status()
+                    .context("transaction status source rejected request")?,
             )
-            .await
-            .context("failed to fetch trusted block index")?
-        };
-        ensure!(
-            entries.len() == if status.block_height == 0 { 1 } else { 2 },
-            "trusted block index returned incomplete geometry"
-        );
-        let block = &entries[0];
-        let previous_block = entries.get(1);
-        ensure!(
-            block.hash == status.block_indep_hash,
-            "archival status does not match the trusted block index"
-        );
-        let mut header = self
-            .authenticate_block(block, status.block_height, Some(id))
+            .await?;
+            decode_fixed::<48>(&status.block_indep_hash, "status block hash")?;
+
+            let indexed = match &self.block_store {
+                Some(store)
+                    if store
+                        .stable_canonical_hash(status.block_height)
+                        .await?
+                        .is_some() =>
+                {
+                    store.block_pair(status.block_height).await?
+                }
+                _ => None,
+            };
+            let stable_anchor;
+            let entries: Vec<BlockIndexEntry> = if let Some((previous, block)) = indexed {
+                stable_anchor = true;
+                [block, previous]
+                    .into_iter()
+                    .map(|entry| BlockIndexEntry {
+                        hash: URL_SAFE_NO_PAD.encode(&entry.hash),
+                        tx_root: URL_SAFE_NO_PAD.encode(&entry.tx_root),
+                        weave_size: entry.weave_size.to_string(),
+                    })
+                    .collect()
+            } else {
+                let info: NodeInfo = self
+                    .get_json(&self.config.trusted_node_url, "info")
+                    .await
+                    .context("failed to fetch trusted node height")?;
+                ensure!(
+                    info.height >= status.block_height,
+                    "transaction block is above the trusted node tip"
+                );
+                stable_anchor = info.height - status.block_height >= CONSENSUS_DEPTH;
+                let index_path = format!(
+                    "block_index/{}/{}",
+                    status.block_height.saturating_sub(1),
+                    status.block_height
+                );
+                self.request_json(
+                    self.client
+                        .get(endpoint(&self.config.trusted_node_url, &index_path))
+                        .header("x-block-format", "1"),
+                )
+                .await
+                .context("failed to fetch trusted block index")?
+            };
+            ensure!(
+                entries.len() == if status.block_height == 0 { 1 } else { 2 },
+                "trusted block index returned incomplete geometry"
+            );
+            let block = &entries[0];
+            let previous_block = entries.get(1);
+            ensure!(
+                block.hash == status.block_indep_hash,
+                "archival status does not match the trusted block index"
+            );
+            let mut header = diagnostics::check(
+                "block_authentication",
+                id,
+                self.authenticate_block(block, status.block_height, Some(id)),
+            )
             .await?;
 
-        let remaining = AtomicUsize::new(usize::MAX);
-        let (transaction, mut verified) = self
-            .fetch_transaction(id, status.block_height, &remaining)
+            let remaining = AtomicUsize::new(usize::MAX);
+            let (transaction, mut verified) = diagnostics::check(
+                "transaction_signature",
+                id,
+                self.fetch_transaction(id, status.block_height, &remaining),
+            )
             .await?;
-        let root_metadata = (self.bundle_indexer.is_some()
-            && require_bundle_tags(&transaction.tags).is_ok())
-        .then(|| verified.metadata.clone());
-        let data_size = verified.metadata.data_size;
-        let content_encoding =
-            response_content_encoding(verified.metadata.content_encoding.take())?;
-        if transaction.format == 1 && transaction.denomination == 0 {
-            let previous_size = previous_block
+            let root_metadata = (self.bundle_indexer.is_some()
+                && require_bundle_tags(&transaction.tags).is_ok())
+            .then(|| verified.metadata.clone());
+            let data_size = verified.metadata.data_size;
+            let content_encoding =
+                response_content_encoding(verified.metadata.content_encoding.take())?;
+            if transaction.format == 1 && transaction.denomination == 0 {
+                let previous_size = previous_block
+                    .map(|previous| parse_u128(&previous.weave_size, "previous block weave size"))
+                    .transpose()?
+                    .unwrap_or(0);
+                ensure!(
+                    parse_u128(&block.weave_size, "block weave size")?.checked_sub(previous_size)
+                        == Some(parse_u128(&header.block_size, "block size")?),
+                    "block size does not match trusted weave geometry"
+                );
+                if let Some(previous) = previous_block {
+                    ensure!(
+                        header.previous_block == previous.hash,
+                        "block predecessor does not match trusted index"
+                    );
+                }
+                // Legacy signatures bind concatenated fields, not the data boundary.
+                // Authenticate the ID-to-payload association before returning inline bytes.
+                (header, _) = self
+                    .verify_block_transactions(
+                        header,
+                        vec![verified.metadata],
+                        usize::MAX - remaining.load(Ordering::Relaxed),
+                        None,
+                    )
+                    .await?;
+            }
+            let facts = root_metadata
+                .map(|object| {
+                    Ok::<_, anyhow::Error>(indexer::RootFacts {
+                        block_hash: decode_fixed::<48>(&block.hash, "bundle block hash")?,
+                        timestamp: header.timestamp,
+                        transaction_ids: header
+                            .txs
+                            .iter()
+                            .map(|id| {
+                                decode_fixed::<32>(id, "block transaction ID").map(|id| id.to_vec())
+                            })
+                            .collect::<Result<_>>()?,
+                        object,
+                    })
+                })
+                .transpose()?;
+            if let Some(bytes) = verified.inline_data {
+                return Ok(AuthenticatedRoot {
+                    id: id.to_owned(),
+                    bytes: bytes.into(),
+                    block_height: status.block_height,
+                    block_hash: decode_fixed::<48>(&block.hash, "verified block hash")?,
+                    stable_anchor,
+                    tags: transaction.tags,
+                    content_encoding,
+                    facts,
+                });
+            }
+
+            let offset: TxOffset = self
+                .get_json(&self.config.archive_url, &format!("tx/{id}/offset"))
+                .await
+                .context("failed to fetch transaction offset")?;
+            let offset_size = parse_u128(&offset.size, "offset data size")?;
+            let end_offset = parse_u128(&offset.offset, "transaction end offset")?;
+            ensure!(
+                offset_size == data_size,
+                "transaction size and offset size differ"
+            );
+
+            let block_weave_size = parse_u128(&block.weave_size, "block weave size")?;
+            let previous_weave_size = previous_block
                 .map(|previous| parse_u128(&previous.weave_size, "previous block weave size"))
                 .transpose()?
                 .unwrap_or(0);
             ensure!(
-                parse_u128(&block.weave_size, "block weave size")?.checked_sub(previous_size)
-                    == Some(parse_u128(&header.block_size, "block size")?),
-                "block size does not match trusted weave geometry"
+                block_weave_size > previous_weave_size,
+                "invalid block weave geometry"
             );
-            if let Some(previous) = previous_block {
-                ensure!(
-                    header.previous_block == previous.hash,
-                    "block predecessor does not match trusted index"
-                );
-            }
-            // Legacy signatures bind concatenated fields, not the data boundary.
-            // Authenticate the ID-to-payload association before returning inline bytes.
-            (header, _) = self
-                .verify_block_transactions(
-                    header,
-                    vec![verified.metadata],
-                    usize::MAX - remaining.load(Ordering::Relaxed),
-                    None,
-                )
-                .await?;
-        }
-        let facts = root_metadata
-            .map(|object| {
-                Ok::<_, anyhow::Error>(indexer::RootFacts {
-                    block_hash: decode_fixed::<48>(&block.hash, "bundle block hash")?,
-                    timestamp: header.timestamp,
-                    transaction_ids: header
-                        .txs
-                        .iter()
-                        .map(|id| {
-                            decode_fixed::<32>(id, "block transaction ID").map(|id| id.to_vec())
-                        })
-                        .collect::<Result<_>>()?,
-                    object,
-                })
-            })
-            .transpose()?;
-        if let Some(bytes) = verified.inline_data {
-            return Ok(AuthenticatedRoot {
+            let first_offset = end_offset
+                .checked_sub(data_size - 1)
+                .context("transaction offset underflow")?;
+            ensure!(
+                first_offset > previous_weave_size,
+                "transaction starts before its block"
+            );
+            ensure!(
+                end_offset <= block_weave_size,
+                "transaction ends after its block"
+            );
+
+            let geometry = Geometry {
+                tx_root: decode_fixed(&block.tx_root, "block tx_root")?,
+                data_root: decode_fixed(&transaction.data_root, "transaction data root")?,
+                block_weave_size,
+                previous_weave_size,
+                first_offset,
+                end_offset,
+                data_size,
+            };
+
+            let expected_len =
+                usize::try_from(data_size).context("parent size exceeds addressable range")?;
+            Ok(AuthenticatedRoot {
                 id: id.to_owned(),
-                bytes: bytes.into(),
+                bytes: Content::streamed(streaming::ChunkSource::new(self, geometry), expected_len),
                 block_height: status.block_height,
                 block_hash: decode_fixed::<48>(&block.hash, "verified block hash")?,
                 stable_anchor,
                 tags: transaction.tags,
                 content_encoding,
                 facts,
-            });
-        }
-
-        let offset: TxOffset = self
-            .get_json(&self.config.archive_url, &format!("tx/{id}/offset"))
-            .await
-            .context("failed to fetch transaction offset")?;
-        let offset_size = parse_u128(&offset.size, "offset data size")?;
-        let end_offset = parse_u128(&offset.offset, "transaction end offset")?;
-        ensure!(
-            offset_size == data_size,
-            "transaction size and offset size differ"
-        );
-
-        let block_weave_size = parse_u128(&block.weave_size, "block weave size")?;
-        let previous_weave_size = previous_block
-            .map(|previous| parse_u128(&previous.weave_size, "previous block weave size"))
-            .transpose()?
-            .unwrap_or(0);
-        ensure!(
-            block_weave_size > previous_weave_size,
-            "invalid block weave geometry"
-        );
-        let first_offset = end_offset
-            .checked_sub(data_size - 1)
-            .context("transaction offset underflow")?;
-        ensure!(
-            first_offset > previous_weave_size,
-            "transaction starts before its block"
-        );
-        ensure!(
-            end_offset <= block_weave_size,
-            "transaction ends after its block"
-        );
-
-        let geometry = Geometry {
-            tx_root: decode_fixed(&block.tx_root, "block tx_root")?,
-            data_root: decode_fixed(&transaction.data_root, "transaction data root")?,
-            block_weave_size,
-            previous_weave_size,
-            first_offset,
-            end_offset,
-            data_size,
-        };
-
-        let expected_len =
-            usize::try_from(data_size).context("parent size exceeds addressable range")?;
-        Ok(AuthenticatedRoot {
-            id: id.to_owned(),
-            bytes: Content::streamed(streaming::ChunkSource::new(self, geometry), expected_len),
-            block_height: status.block_height,
-            block_hash: decode_fixed::<48>(&block.hash, "verified block hash")?,
-            stable_anchor,
-            tags: transaction.tags,
-            content_encoding,
-            facts,
+            })
         })
+        .await
     }
 
     async fn verified_block(&self, block: &database::IndexBlock) -> Result<BlockHeader> {
@@ -3496,24 +3521,27 @@ async fn verify_bundle_item(
     expected_offset: Option<u128>,
     materialize: Option<&Gateway>,
 ) -> Result<(VerifiedItem, usize)> {
-    let mut entries = BundleItems::new(bundle, format).await?;
-    let mut found = None;
-    let mut scanned = 0;
-    while let Some(entry) = entries.next().await? {
-        let offset = entry.offset();
-        if entry.id() == Some(expected_id)
-            && expected_offset.is_none_or(|expected| expected == offset as u128)
-            && found.is_none()
-        {
-            // Invalid JSON occurrences do not hide a later valid copy of the same ID.
-            found = entry.verify(materialize).await?.map(|item| (item, offset));
+    diagnostics::check_item(expected_id, async {
+        let mut entries = BundleItems::new(bundle, format).await?;
+        let mut found = None;
+        let mut scanned = 0;
+        while let Some(entry) = entries.next().await? {
+            let offset = entry.offset();
+            if entry.id() == Some(expected_id)
+                && expected_offset.is_none_or(|expected| expected == offset as u128)
+                && found.is_none()
+            {
+                // Invalid JSON occurrences do not hide a later valid copy of the same ID.
+                found = entry.verify(materialize).await?.map(|item| (item, offset));
+            }
+            scanned += 1;
+            if scanned % 256 == 0 {
+                tokio::task::yield_now().await;
+            }
         }
-        scanned += 1;
-        if scanned % 256 == 0 {
-            tokio::task::yield_now().await;
-        }
-    }
-    found.context("valid data item is absent from verified parent at the expected offset")
+        found.context("valid data item is absent from verified parent at the expected offset")
+    })
+    .await
 }
 
 async fn verify_indexed_bundle(
@@ -5073,6 +5101,68 @@ mod tests {
         .unwrap();
         let requested = bundled_item.map_or(id, |(id, _)| id.to_owned());
         (gateway, requested, corrupt_chunk, server, chunk_requests)
+    }
+
+    #[tokio::test]
+    async fn diagnostics_report_item_signature_failure_without_claiming_verified_content() {
+        let payload = b"diagnostic signature boundary";
+        let (mut item, item_id) = signed_data_item(payload, &[]);
+        let id = URL_SAFE_NO_PAD.encode(item_id);
+        let tags: &[(&[u8], &[u8])] =
+            &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+        for corrupt in [false, true] {
+            if corrupt {
+                *item.last_mut().unwrap() ^= 1;
+            }
+            let bundle = encode_bundle(&[&item]);
+            let (fixture, _, _, server, _) =
+                retrieval_fixture(&bundle, tags, Some((&id, payload.len()))).await;
+            let _server = tokio_util::task::AbortOnDropHandle::new(server);
+            let resolver = server::ServerConfig::new(
+                "127.0.0.1:0",
+                "example.com",
+                &fixture.config.trusted_node_url,
+                "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ",
+                "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5",
+                1,
+            )
+            .unwrap();
+            let report = diagnostics::diagnose(fixture.config, resolver, &id, None, None).await;
+            let steps = report["steps"].as_array().unwrap();
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step["stage"] == "transaction_signature"
+                        && step["status"] == "passed"),
+                "{report}"
+            );
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step["stage"] == "bundle_location" && step["id"] == id),
+                "{report}"
+            );
+            let verification = steps
+                .iter()
+                .find(|step| step["stage"] == "bundle_item_verification" && step["id"] == id)
+                .unwrap();
+            if corrupt {
+                assert_eq!(report["status"], "failed", "{report}");
+                assert!(report["content"].is_null(), "{report}");
+                assert_eq!(verification["status"], "failed", "{report}");
+                assert!(
+                    verification["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("signature"),
+                    "{report}"
+                );
+            } else {
+                assert_eq!(report["status"], "passed", "{report}");
+                assert_eq!(report["content"]["sha256"], hex(&sha256(&[payload])));
+                assert_eq!(verification["status"], "passed", "{report}");
+            }
+        }
     }
 
     #[tokio::test]

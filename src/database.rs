@@ -525,6 +525,37 @@ impl BlockStore {
             .collect()
     }
 
+    pub(crate) async fn diagnostic_object(&self, id: &[u8; 32]) -> Result<serde_json::Value> {
+        let installed: bool = self
+            .client
+            .query_one("SELECT to_regclass('public.objects') IS NOT NULL", &[])
+            .await?
+            .get(0);
+        if !installed {
+            return Ok(serde_json::json!({"state": "schema_unavailable"}));
+        }
+        let rows = self
+            .client
+            .query(
+                "SELECT kind, metadata_complete FROM public.objects WHERE id=$1 ORDER BY kind",
+                &[&id.as_slice()],
+            )
+            .await?;
+        let objects: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "kind": if row.get::<_, i16>(0) == 0 { "transaction" } else { "item" },
+                    "metadata_complete": row.get::<_, bool>(1),
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "state": if objects.is_empty() { "absent" } else { "present" },
+            "objects": objects,
+        }))
+    }
+
     pub(crate) async fn cached_content(&self, id: &[u8; 32]) -> Result<Option<(String, Vec<u8>)>> {
         self.client
             .query_opt(
