@@ -20,6 +20,124 @@ struct Trace {
     public_errors: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct FailureDetail {
+    label: &'static str,
+    value: String,
+    monospace: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct Failure {
+    context: &'static str,
+    message: &'static str,
+    details: Vec<FailureDetail>,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.context)?;
+        for detail in &self.details {
+            write!(formatter, ": {} = {}", detail.label, detail.value)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Failure {}
+
+fn id_detail(label: &'static str, id: &str) -> FailureDetail {
+    FailureDetail {
+        label,
+        value: decode_fixed::<32>(id, "ID")
+            .map(|id| URL_SAFE_NO_PAD.encode(id))
+            .unwrap_or_else(|_| "Invalid ID in discovery response".to_owned()),
+        monospace: true,
+    }
+}
+
+fn size_detail(label: &'static str, size: u128) -> FailureDetail {
+    FailureDetail {
+        label,
+        value: format!("{size} bytes"),
+        monospace: false,
+    }
+}
+
+pub(crate) fn wrong_item(expected: &str, received: &str) -> Failure {
+    Failure {
+        context: "discovery returned the wrong data item",
+        message: "The discovery response returned a different item from the one requested.",
+        details: vec![
+            id_detail("Requested item ID", expected),
+            id_detail("Returned item ID", received),
+        ],
+    }
+}
+
+pub(crate) fn size_mismatch(
+    context: &'static str,
+    id: &[u8; 32],
+    reported: u128,
+    verified: u128,
+) -> Failure {
+    Failure {
+        context,
+        message: "The payload size reported by discovery differs from the verified item size.",
+        details: vec![
+            id_detail("Item ID", &URL_SAFE_NO_PAD.encode(id)),
+            size_detail("Reported payload size", reported),
+            size_detail("Verified payload size", verified),
+        ],
+    }
+}
+
+pub(crate) fn size_limit(size: u128, limit: usize) -> Failure {
+    Failure {
+        context: "transaction exceeds configured data size limit",
+        message: "The content size exceeds this gateway's retrieval limit.",
+        details: vec![
+            size_detail("Content size", size),
+            size_detail("Retrieval limit", limit as u128),
+        ],
+    }
+}
+
+fn error_details(error: &anyhow::Error) -> Vec<FailureDetail> {
+    fn collect(error: &anyhow::Error, details: &mut Vec<FailureDetail>) {
+        for cause in error.chain() {
+            if let Some(failure) = cause.downcast_ref::<Failure>() {
+                for detail in &failure.details {
+                    if details.len() > 32 {
+                        return;
+                    }
+                    if !details.contains(detail) {
+                        details.push(detail.clone());
+                    }
+                }
+            } else if let Some(attempts) = cause.downcast_ref::<crate::AttemptFailures>() {
+                for error in &attempts.errors {
+                    if details.len() > 32 {
+                        return;
+                    }
+                    collect(error, details);
+                }
+            }
+        }
+    }
+    let mut details = Vec::new();
+    collect(error, &mut details);
+    if details.len() > 32 {
+        details.truncate(32);
+        details.push(FailureDetail {
+            label: "Additional details",
+            value: "Further failure details were omitted to keep this report bounded.".to_owned(),
+            monospace: false,
+        });
+    }
+    details
+}
+
 fn error_text(error: &anyhow::Error, public: bool) -> String {
     if !public {
         return format!("{error:#}");
@@ -59,7 +177,9 @@ fn error_text(error: &anyhow::Error, public: bool) -> String {
         "block predecessor does not match trusted block index",
         "content block changed during retrieval",
         "cyclic bundle ancestry",
-        "discovery returned conflicting data item locations",
+        "bundle discovery path limit exceeded",
+        "discovery response exceeds location limit",
+        "discovered ancestor is not a supported bundle",
         "discovery returned the wrong data item",
         "a data item cannot be its own parent",
         "bundle item table exceeds parent bounds",
@@ -100,6 +220,16 @@ fn error_text(error: &anyhow::Error, public: bool) -> String {
         }
     };
     for cause in error.chain() {
+        if let Some(attempts) = cause.downcast_ref::<crate::AttemptFailures>() {
+            for error in &attempts.errors {
+                add(error_text(error, true));
+            }
+            continue;
+        }
+        if let Some(failure) = cause.downcast_ref::<Failure>() {
+            add(failure.message.to_owned());
+            continue;
+        }
         if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
             if let Some(status) = http.status() {
                 add(format!("Upstream returned HTTP {status}"));
@@ -157,6 +287,8 @@ struct Step {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    details: Vec<FailureDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,6 +324,7 @@ where
                 id: id.to_owned(),
                 status: "incomplete",
                 error: None,
+                details: Vec::new(),
                 message: None,
                 parent_id: None,
                 source: None,
@@ -208,6 +341,7 @@ where
                 let error = result.as_ref().err();
                 step.status = if error.is_none() { "passed" } else { "failed" };
                 step.error = error.map(|error| error_text(error, public_errors));
+                step.details = error.map(error_details).unwrap_or_default();
                 if stage == "transaction_authentication"
                     && error.is_some_and(|error| error.is::<crate::ContentNotFound>())
                 {
@@ -239,6 +373,7 @@ pub(crate) fn location(id: &str, parent: &str, source: &str) {
             id: id.to_owned(),
             status: "discovered",
             error: None,
+            details: Vec::new(),
             message: None,
             parent_id: Some(parent.to_owned()),
             source: Some(source.to_owned()),
@@ -442,6 +577,32 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn failure_details_are_safe_deduplicated_and_bounded() {
+        let error: anyhow::Error = wrong_item(
+            &URL_SAFE_NO_PAD.encode([7; 32]),
+            "https://user:secret@private.invalid/path",
+        )
+        .into();
+        let details = serde_json::to_string(&error_details(&error)).unwrap();
+        assert!(!details.contains("secret") && !details.contains("private.invalid"));
+        assert!(details.contains("Invalid ID in discovery response"));
+        let repeated: anyhow::Error = crate::AttemptFailures {
+            context: "repeated attempts",
+            errors: (0..100).map(|_| size_limit(100, 1).into()).collect(),
+        }
+        .into();
+        assert_eq!(error_details(&repeated).len(), 2);
+        let distinct: anyhow::Error = crate::AttemptFailures {
+            context: "distinct attempts",
+            errors: (100..200).map(|size| size_limit(size, 1).into()).collect(),
+        }
+        .into();
+        let details = error_details(&distinct);
+        assert_eq!(details.len(), 33);
+        assert_eq!(details.last().unwrap().label, "Additional details");
+    }
+
+    #[test]
     fn public_errors_preserve_verifier_causes_without_exposing_private_context() {
         let error = anyhow::anyhow!("data item signature verification failed")
             .context("https://user:password@private.invalid/rpc?api-key=secret")
@@ -479,8 +640,13 @@ mod tests {
             .unwrap()
             .error_for_status()
             .unwrap_err();
+        let error: anyhow::Error = crate::AttemptFailures {
+            context: "all upstream attempts failed",
+            errors: vec![anyhow::Error::from(error).context("https://private.invalid/secret")],
+        }
+        .into();
         assert_eq!(
-            error_text(&error.into(), true),
+            error_text(&error, true),
             "Upstream returned HTTP 429 Too Many Requests"
         );
     }

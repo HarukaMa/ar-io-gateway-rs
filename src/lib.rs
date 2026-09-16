@@ -17,7 +17,7 @@ tokio::task_local! {
 }
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::Write as _,
     path::PathBuf,
     sync::{
@@ -56,6 +56,8 @@ const LEAF_SIZE: usize = HASH_SIZE + NOTE_SIZE;
 const MAX_CHUNK_SIZE: u128 = 256 * 1024;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
 const MAX_GRAPHQL_SOURCES: usize = 4;
+const MAX_DISCOVERY_LOCATIONS: usize = 2;
+const MAX_DISCOVERY_PATHS: usize = 64;
 const MAX_PROOF_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_INDEX_BYTES: usize = 256 * 99;
 const MAX_BLOCK_TRANSACTIONS: usize = 1000;
@@ -470,6 +472,24 @@ impl std::fmt::Display for ContentNotFound {
 }
 
 impl std::error::Error for ContentNotFound {}
+
+#[derive(Debug)]
+pub(crate) struct AttemptFailures {
+    context: &'static str,
+    errors: Vec<anyhow::Error>,
+}
+
+impl std::fmt::Display for AttemptFailures {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:", self.context)?;
+        for error in &self.errors {
+            write!(formatter, " {error:#};")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for AttemptFailures {}
 
 #[derive(Clone)]
 enum RetrievalFailure {
@@ -1352,7 +1372,7 @@ impl Gateway {
 
     async fn retrieve_bundled_with_hint(&self, id: &str, hint: BundleHint) -> Result<VerifiedData> {
         let expected_id = decode_fixed::<32>(id, "data item ID")?;
-        let (mut parent_id, size) = match &hint {
+        let (parent_id, size) = match &hint {
             BundleHint::Indexed(indexed) => {
                 (URL_SAFE_NO_PAD.encode(&indexed.root_id), indexed.data_size)
             }
@@ -1370,126 +1390,171 @@ impl Gateway {
             BundleHint::External { source, .. } => Some(source),
             BundleHint::Indexed(_) => None,
         };
-        let mut ancestors = Vec::new();
-        let parent_root = loop {
-            let parent = decode_fixed::<32>(&parent_id, "bundle parent ID")?;
-            ensure!(
-                parent != expected_id && !ancestors.iter().any(|(id, _)| *id == parent),
-                "cyclic bundle ancestry"
-            );
-            if let Some((data, Some(tags))) = self.load_content_cache(&parent_id).await? {
-                break IndexingRoot::Complete(Arc::new(VerifiedRoot {
-                    data,
-                    tags,
-                    facts: None,
-                }));
-            }
-            match self.authenticate_root(&parent_id).await {
-                Ok(root) => break IndexingRoot::Partial(Arc::new(root)),
-                Err(error) if error.is::<ContentNotFound>() => {
-                    if let Some(source) = source
-                        && let Some(BundleHint::External {
-                            parent_id: next_parent,
-                            data_size,
-                            ..
-                        }) = self.discover_from(&parent_id, source).await?
-                    {
-                        ensure!(
-                            ancestors.len() + 1 < MAX_BUNDLE_DEPTH,
-                            "nested bundle exceeds maximum depth {MAX_BUNDLE_DEPTH}"
-                        );
-                        ancestors
-                            .push((parent, parse_u128(&data_size, "discovered ancestor size")?));
-                        diagnostics::bundle_parent_fallback(&parent_id);
-                        parent_id = next_parent;
-                        continue;
+        let mut pending = VecDeque::from([(parent_id, Vec::new())]);
+        let mut scheduled = 1;
+        let mut failures = Vec::new();
+        while let Some((parent_id, ancestors)) = pending.pop_front() {
+            let attempt = async {
+                let parent = decode_fixed::<32>(&parent_id, "bundle parent ID")?;
+                ensure!(
+                    parent != expected_id && !ancestors.iter().any(|(id, _)| *id == parent),
+                    "cyclic bundle ancestry"
+                );
+                let parent_root =
+                    if let Some((data, Some(tags))) = self.load_content_cache(&parent_id).await? {
+                        IndexingRoot::Complete(Arc::new(VerifiedRoot {
+                            data,
+                            tags,
+                            facts: None,
+                        }))
+                    } else {
+                        match self.authenticate_root(&parent_id).await {
+                            Ok(root) => IndexingRoot::Partial(Arc::new(root)),
+                            Err(error) if error.is::<ContentNotFound>() => {
+                                let Some(source) = source else {
+                                    bail!("bundle parent transaction {parent_id} was not found");
+                                };
+                                let hints = self.discover_from(&parent_id, source).await?;
+                                ensure!(
+                                    !hints.is_empty(),
+                                    "bundle parent transaction {parent_id} was not found"
+                                );
+                                ensure!(
+                                    ancestors.len() + 1 < MAX_BUNDLE_DEPTH,
+                                    "nested bundle exceeds maximum depth {MAX_BUNDLE_DEPTH}"
+                                );
+                                diagnostics::bundle_parent_fallback(&parent_id);
+                                for next in hints {
+                                    let BundleHint::External {
+                                        parent_id: next_parent,
+                                        data_size,
+                                        ..
+                                    } = next
+                                    else {
+                                        unreachable!("external discovery returned an indexed path");
+                                    };
+                                    ensure!(
+                                        scheduled < MAX_DISCOVERY_PATHS,
+                                        "bundle discovery path limit exceeded"
+                                    );
+                                    let mut path = ancestors.clone();
+                                    path.push((
+                                        parent,
+                                        parse_u128(&data_size, "discovered ancestor size")?,
+                                    ));
+                                    pending.push_back((next_parent, path));
+                                    scheduled += 1;
+                                }
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    };
+                let (parent_bytes, block_height, block_hash, cache_hit, tags, stable_anchor) =
+                    match &parent_root {
+                        IndexingRoot::Complete(root) => (
+                            &root.data.bytes,
+                            root.data.block_height,
+                            root.data.block_hash,
+                            root.data.cache_hit,
+                            &root.tags,
+                            root.data.stable_anchor,
+                        ),
+                        IndexingRoot::Partial(root) => (
+                            &root.bytes,
+                            root.block_height,
+                            Some(root.block_hash),
+                            false,
+                            &root.tags,
+                            root.stable_anchor,
+                        ),
+                    };
+                let format = require_bundle_tags(tags)?;
+                let item = match &hint {
+                    BundleHint::Indexed(indexed) => {
+                        verify_indexed_bundle(
+                            parent_bytes.clone(),
+                            format,
+                            &expected_id,
+                            indexed,
+                            Some(self),
+                        )
+                        .await?
                     }
-                    bail!("bundle parent transaction {parent_id} was not found");
+                    BundleHint::External { .. } => {
+                        let mut bytes = parent_bytes.clone();
+                        let mut format = format;
+                        for (ancestor_id, size) in ancestors.iter().rev() {
+                            let (ancestor, _) =
+                                verify_bundle_item(bytes, format, ancestor_id, None, None).await?;
+                            if ancestor.data.len() as u128 != *size {
+                                return Err(diagnostics::size_mismatch(
+                                    "discovered ancestor size does not match verified payload",
+                                    ancestor_id,
+                                    *size,
+                                    ancestor.data.len() as u128,
+                                )
+                                .into());
+                            }
+                            format = ancestor
+                                .bundle_format()
+                                .context("discovered ancestor is not a supported bundle")?;
+                            bytes = ancestor.data;
+                        }
+                        verify_bundle_item(bytes, format, &expected_id, None, Some(self))
+                            .await?
+                            .0
+                    }
+                };
+                if item.data.len() != hinted_size {
+                    return Err(diagnostics::size_mismatch(
+                        "discovered data item size does not match verified payload",
+                        &expected_id,
+                        hinted_size as u128,
+                        item.data.len() as u128,
+                    )
+                    .into());
                 }
-                Err(error) => return Err(error),
-            }
-        };
-        let (parent_bytes, block_height, block_hash, cache_hit, tags, stable_anchor) =
-            match &parent_root {
-                IndexingRoot::Complete(root) => (
-                    &root.data.bytes,
-                    root.data.block_height,
-                    root.data.block_hash,
-                    root.data.cache_hit,
-                    &root.tags,
-                    root.data.stable_anchor,
-                ),
-                IndexingRoot::Partial(root) => (
-                    &root.bytes,
-                    root.block_height,
-                    Some(root.block_hash),
-                    false,
-                    &root.tags,
-                    root.stable_anchor,
-                ),
-            };
-        let format = require_bundle_tags(tags)?;
-        let item = match &hint {
-            BundleHint::Indexed(indexed) => {
-                verify_indexed_bundle(
-                    parent_bytes.clone(),
-                    format,
-                    &expected_id,
-                    indexed,
-                    Some(self),
-                )
-                .await?
-            }
-            BundleHint::External { .. } => {
-                let mut bytes = parent_bytes.clone();
-                let mut format = format;
-                for (ancestor_id, size) in ancestors.iter().rev() {
-                    let (ancestor, _) =
-                        verify_bundle_item(bytes, format, ancestor_id, None, None).await?;
-                    ensure!(
-                        ancestor.data.len() as u128 == *size,
-                        "discovered ancestor size does not match verified payload"
-                    );
-                    format = ancestor
-                        .bundle_format()
-                        .context("discovered ancestor is not a supported bundle")?;
-                    bytes = ancestor.data;
-                }
-                verify_bundle_item(bytes, format, &expected_id, None, Some(self))
-                    .await?
-                    .0
-            }
-        };
-        ensure!(
-            item.data.len() == hinted_size,
-            "discovered data item size does not match verified payload"
-        );
 
-        let content_encoding = response_content_encoding(item.text_tag(b"Content-Encoding"))?;
-        let bytes = item.data;
-        let body_hash = item.body_hash;
-        let mut data = VerifiedData {
-            content_length: bytes.len(),
-            bytes,
-            cache_hit,
-            id: id.to_owned(),
-            block_height,
-            block_hash,
-            stable_anchor,
-            content_type: item_content_type(&item.tags)?,
-            content_encoding,
-            etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
-            sha256: hex(&body_hash),
-            indexing_root: Some(parent_root),
-        };
-        if let Err(error) = self.save_content_cache(&mut data, None).await {
-            eprintln!("content cache admission failed: {error:#}");
+                let content_encoding =
+                    response_content_encoding(item.text_tag(b"Content-Encoding"))?;
+                let bytes = item.data;
+                let body_hash = item.body_hash;
+                let mut data = VerifiedData {
+                    content_length: bytes.len(),
+                    bytes,
+                    cache_hit,
+                    id: id.to_owned(),
+                    block_height,
+                    block_hash,
+                    stable_anchor,
+                    content_type: item_content_type(&item.tags)?,
+                    content_encoding,
+                    etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(body_hash)),
+                    sha256: hex(&body_hash),
+                    indexing_root: Some(parent_root),
+                };
+                if let Err(error) = self.save_content_cache(&mut data, None).await {
+                    eprintln!("content cache admission failed: {error:#}");
+                }
+                ensure!(
+                    self.current_anchor(&data).await?,
+                    "bundle block changed during retrieval"
+                );
+                Ok(Some(data))
+            }
+            .await;
+            match attempt {
+                Ok(Some(data)) => return Ok(data),
+                Ok(None) => {}
+                Err(error) => failures.push(error),
+            }
         }
-        ensure!(
-            self.current_anchor(&data).await?,
-            "bundle block changed during retrieval"
-        );
-        Ok(data)
+        Err(AttemptFailures {
+            context: "all discovered bundle paths failed",
+            errors: failures,
+        }
+        .into())
     }
 
     async fn retrieve_discovered(&self, id: &str) -> Result<Option<VerifiedData>> {
@@ -1519,75 +1584,78 @@ impl Gateway {
             tokio::select! {
                 Some(result) = discoveries.next(), if !discoveries.is_empty() => {
                     match result {
-                        Ok(Some(hint)) => {
-                            if let BundleHint::External { parent_id, data_size, source } = &hint
-                                && !seen.insert((parent_id.clone(), data_size.clone(), source.clone()))
-                            {
-                                continue;
+                        Ok(hints) => {
+                            for hint in hints {
+                                if let BundleHint::External { parent_id, data_size, source } = &hint
+                                    && !seen.insert((parent_id.clone(), data_size.clone(), source.clone()))
+                                {
+                                    continue;
+                                }
+                                candidates.push(self.retrieve_bundled_with_hint(id, hint));
                             }
-                            candidates.push(self.retrieve_bundled_with_hint(id, hint));
                         }
-                        Ok(None) => {}
-                        Err(error) => failures.push(format!("{error:#}")),
+                        Err(error) => failures.push(error),
                     }
                 }
                 Some(result) = candidates.next(), if !candidates.is_empty() => {
                     match result {
                         Ok(data) => return Ok(Some(data)),
-                        Err(error) => failures.push(format!("{error:#}")),
+                        Err(error) => failures.push(error),
                     }
                 }
             }
         }
-        ensure!(
-            failures.is_empty(),
-            "bundle discovery failed: {}",
-            failures.join("; ")
-        );
+        if !failures.is_empty() {
+            return Err(AttemptFailures {
+                context: "bundle discovery failed",
+                errors: failures,
+            }
+            .into());
+        }
         Ok(None)
     }
 
-    async fn discover_from(&self, id: &str, source: &str) -> Result<Option<BundleHint>> {
+    async fn discover_from(&self, id: &str, source: &str) -> Result<Vec<BundleHint>> {
         diagnostics::check("bundle_discovery", id, async {
         let response: GraphQlResponse = self
             .request_json(
                 self.client
                     .post(source)
                     .json(&serde_json::json!({
-                        "query": "query($ids: [ID!]!) { transactions(ids: $ids, first: 2) { edges { node { id bundledIn { id } data { size } } } } }",
-                        "variables": { "ids": [id] }
+                        "query": "query($ids: [ID!]!, $limit: Int!) { transactions(ids: $ids, first: $limit) { edges { node { id bundledIn { id } data { size } } } } }",
+                        "variables": { "ids": [id], "limit": MAX_DISCOVERY_LOCATIONS }
                     })),
             )
             .await
             .context("failed to discover data location")?;
-        let mut edges = response.data.transactions.edges;
-        if edges.is_empty() {
-            return Ok(None);
+        let edges = response.data.transactions.edges;
+        ensure!(edges.len() <= MAX_DISCOVERY_LOCATIONS, "discovery response exceeds location limit");
+        let mut hints = Vec::with_capacity(edges.len());
+        let mut seen = HashSet::new();
+        for edge in edges {
+            let node = edge.node;
+            if node.id != id {
+                return Err(diagnostics::wrong_item(id, &node.id).into());
+            }
+            decode_fixed::<32>(&node.id, "discovered data item ID")?;
+            let Some(parent) = node.bundled_in else {
+                continue;
+            };
+            let parent_id = parent.id;
+            decode_fixed::<32>(&parent_id, "discovered parent ID")?;
+            ensure!(parent_id != id, "data item cannot be its own parent");
+            let size = parse_u128(&node.data.size, "discovered data item size")?;
+            if !seen.insert((parent_id.clone(), size)) {
+                continue;
+            }
+            diagnostics::location(id, &parent_id, source);
+            hints.push(BundleHint::External {
+                parent_id,
+                data_size: size.to_string(),
+                source: source.to_owned(),
+            });
         }
-        let node = edges.pop().unwrap().node;
-        ensure!(
-            edges.iter().all(|edge| {
-                edge.node.id == node.id
-                    && edge.node.data.size == node.data.size
-                    && edge.node.bundled_in.as_ref().map(|parent| &parent.id)
-                        == node.bundled_in.as_ref().map(|parent| &parent.id)
-            }),
-            "discovery returned conflicting data item locations"
-        );
-        ensure!(node.id == id, "discovery returned the wrong data item");
-        decode_fixed::<32>(&node.id, "discovered data item ID")?;
-        let Some(parent) = node.bundled_in else {
-            return Ok(None);
-        };
-        let parent_id = parent.id;
-        decode_fixed::<32>(&parent_id, "discovered parent ID")?;
-        ensure!(parent_id != id, "data item cannot be its own parent");
-        diagnostics::location(id, &parent_id, source);
-        Ok(Some(BundleHint::External {
-            parent_id,
-            data_size: node.data.size,
-            source: source.to_owned(),
-        }))
+        Ok(hints)
         }).await
     }
 
@@ -1980,10 +2048,14 @@ impl Gateway {
             }
             match result {
                 Ok(verified) => return Ok(verified),
-                Err(error) => failures.push(format!("{source}: {error:#}")),
+                Err(error) => failures.push(error.context(source.to_owned())),
             }
         }
-        bail!("transaction metadata unavailable: {}", failures.join("; "))
+        Err(AttemptFailures {
+            context: "transaction metadata unavailable",
+            errors: failures,
+        }
+        .into())
     }
 
     async fn verify_block_transactions(
@@ -2073,7 +2145,7 @@ impl Gateway {
             .await
         {
             Ok(block) => return Ok(block),
-            Err(error) => failures.push(format!("{}: {error:#}", self.config.trusted_node_url)),
+            Err(error) => failures.push(error.context(self.config.trusted_node_url.clone())),
         }
 
         let mut attempted = HashSet::new();
@@ -2115,15 +2187,16 @@ impl Gateway {
                 }
                 Err(error) => {
                     self.peers.record_result(source, false);
-                    failures.push(format!("{source}: {error:#}"));
+                    failures.push(error.context(source.clone()));
                 }
             }
         }
 
-        bail!(
-            "all bounded block header attempts failed: {}",
-            failures.join("; ")
-        )
+        Err(AttemptFailures {
+            context: "all bounded block header attempts failed",
+            errors: failures,
+        }
+        .into())
     }
 
     async fn fetch_and_authenticate_block(
@@ -2936,10 +3009,9 @@ fn deep_hash_b64_list(values: &[String], label: &str) -> Result<[u8; 48]> {
 }
 
 fn checked_data_size(data_size: u128, maximum: usize) -> Result<usize> {
-    ensure!(
-        data_size <= maximum as u128,
-        "transaction exceeds configured data size limit"
-    );
+    if data_size > maximum as u128 {
+        return Err(diagnostics::size_limit(data_size, maximum).into());
+    }
     usize::try_from(data_size).context("transaction is too large")
 }
 
@@ -5357,7 +5429,7 @@ mod tests {
                 } else {
                     None
                 };
-                let edges = location
+                let mut edges = location
                     .map(|(parent, size)| {
                         vec![serde_json::json!({
                             "node": {"id": requested, "bundledIn": {"id": parent},
@@ -5365,6 +5437,17 @@ mod tests {
                         })]
                     })
                     .unwrap_or_default();
+                if uri.path() == "/multi" && !edges.is_empty() {
+                    let alternate = if requested == leaf_id {
+                        URL_SAFE_NO_PAD.encode([99; 32])
+                    } else {
+                        leaf_id.clone()
+                    };
+                    let size = edges[0]["node"]["data"]["size"].clone();
+                    edges.insert(0, serde_json::json!({
+                        "node": {"id": requested, "bundledIn": {"id": alternate}, "data": {"size": size}}
+                    }));
+                }
                 async move {
                     serde_json::json!({"data": {"transactions": {"edges": edges}}}).to_string()
                 }
@@ -5388,7 +5471,7 @@ mod tests {
                 .unwrap_err();
             assert!(format!("{error:#}").contains(expected_error), "{error:#}");
         }
-        config.graphql_sources = vec![format!("{source}/cycle"), format!("{source}/valid")];
+        config.graphql_sources = vec![format!("{source}/multi")];
         for bundled_only in [false, true] {
             let gateway = Gateway::new(config.clone()).unwrap();
             let result = if bundled_only {
@@ -5414,7 +5497,7 @@ mod tests {
         .unwrap();
         for (path, status, probe_status, message) in [
             (
-                "/valid",
+                "/multi",
                 "passed",
                 "fallback",
                 "No L1 transaction was found. Continuing through the discovered bundle parent.",
@@ -5424,6 +5507,12 @@ mod tests {
                 "failed",
                 "not_found",
                 "No L1 transaction was found for this ID.",
+            ),
+            (
+                "/wrong-size",
+                "failed",
+                "fallback",
+                "No L1 transaction was found. Continuing through the discovered bundle parent.",
             ),
         ] {
             let mut diagnostic_config = config.clone();
@@ -5448,6 +5537,29 @@ mod tests {
             } else {
                 assert!(report["content"].is_null(), "{report}");
             }
+            if path == "/wrong-size" {
+                let retrieval = report["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|step| step["stage"] == "verified_retrieval")
+                    .unwrap();
+                let details = retrieval["details"].as_array().unwrap();
+                assert!(
+                    details
+                        .iter()
+                        .any(|detail| detail["label"] == "Reported payload size"
+                            && detail["value"] == format!("{} bytes", inner_size + 1)),
+                    "{report}"
+                );
+                assert!(
+                    details
+                        .iter()
+                        .any(|detail| detail["label"] == "Verified payload size"
+                            && detail["value"] == format!("{inner_size} bytes")),
+                    "{report}"
+                );
+            }
         }
         let mut forged_config = forged_fixture.config.clone();
         forged_config.graphql_sources = vec![format!("{source}/corrupt-parent")];
@@ -5465,6 +5577,62 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn branching_discovery_stops_at_the_path_budget() {
+        use axum::{Router, body::Bytes, http::StatusCode, response::IntoResponse};
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let count = lookups.clone();
+        let app =
+            Router::new().fallback(move |uri: axum::http::Uri, body: Bytes| {
+                let count = count.clone();
+                async move {
+                    if uri.path().starts_with("/tx/") {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    let query: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let requested = query["variables"]["ids"][0].as_str().unwrap();
+                    let id = decode_fixed::<32>(requested, "test ID").unwrap();
+                    let number = u64::from_be_bytes(id[..8].try_into().unwrap());
+                    let edges: Vec<_> = (0..if number == 0 { 1 } else { 2 }).map(|branch| {
+                    let mut parent = [0; 32];
+                    parent[..8].copy_from_slice(&(number * 2 + branch + 1).to_be_bytes());
+                    serde_json::json!({"node": {
+                        "id": requested, "bundledIn": {"id": URL_SAFE_NO_PAD.encode(parent)},
+                        "data": {"size": "1"}
+                    }})
+                }).collect();
+                    serde_json::json!({"data": {"transactions": {"edges": edges}}})
+                        .to_string()
+                        .into_response()
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = format!("http://{}", listener.local_addr().unwrap());
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let config = Config::new(
+            &source,
+            &source,
+            vec![source.clone()],
+            Duration::from_secs(1),
+            1,
+            1024,
+        )
+        .unwrap();
+        let error = Gateway::new(config)
+            .unwrap()
+            .retrieve_bundled(&URL_SAFE_NO_PAD.encode([0; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("bundle discovery path limit exceeded"),
+            "{error:#}"
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), MAX_DISCOVERY_PATHS);
     }
 
     #[tokio::test]
@@ -5534,17 +5702,14 @@ mod tests {
             );
         }
 
-        let mut conflicting = config.clone();
-        conflicting.graphql_sources = vec![format!("{base}/wrong")];
-        let error = Gateway::new(conflicting)
+        let mut multiple_sizes = config.clone();
+        multiple_sizes.graphql_sources = vec![format!("{base}/wrong")];
+        let data = Gateway::new(multiple_sizes)
             .unwrap()
             .retrieve_bundled(&id)
             .await
-            .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("conflicting data item locations"),
-            "{error:#}"
-        );
+            .unwrap();
+        assert_eq!(data.sha256, hex(&sha256(&[payload])));
 
         config
             .graphql_sources

@@ -183,14 +183,15 @@ impl ChunkSource {
                         }
                         Err(error) => {
                             self.peers.record_chunk_result(&source, None);
-                            failures.push(format!("{source}: {error:#}"));
+                            failures.push(error.context(source));
                         }
                     }
                 }
-                anyhow::bail!(
-                    "all streaming chunk candidates failed: {}",
-                    failures.join("; ")
-                )
+                Err(crate::AttemptFailures {
+                    context: "all streaming chunk candidates failed",
+                    errors: failures,
+                }
+                .into())
             },
         )
         .await
