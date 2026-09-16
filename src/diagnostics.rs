@@ -157,6 +157,7 @@ fn error_text(error: &anyhow::Error, public: bool) -> String {
         "data item exceeds configured data size limit",
         "JSON item exceeds configured data size limit",
         "unsupported transaction format",
+        "unsupported or ambiguous bundle format/version",
         "transaction ID mismatch",
         "transaction ID is not the signature hash",
         "transaction signature verification failed",

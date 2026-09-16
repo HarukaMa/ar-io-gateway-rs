@@ -51,6 +51,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "012_tag_digest_expressions",
         include_str!("../migrations/012_tag_digest_expressions.sql"),
     ),
+    (
+        "013_bundle_tag_casing",
+        include_str!("../migrations/013_bundle_tag_casing.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -71,24 +75,27 @@ const BUNDLE_TAGS: &str = "
                vn.key AS version_name, vv.key AS version_value, formats.json
         FROM (VALUES ('binary', '2.0.0', false), ('json', '1.0.0', true))
             AS formats(format, version, json)
-        JOIN public.tag_names fn ON sha256(fn.value)=sha256('Bundle-Format'::bytea)
-            AND fn.value='Bundle-Format'::bytea
+        JOIN public.tag_names fn ON translate(encode(fn.value,'escape'),
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='bundle-format'
         JOIN public.tag_values fv ON sha256(fv.value)=sha256(convert_to(formats.format, 'UTF8'))
             AND fv.value=convert_to(formats.format, 'UTF8')
-        JOIN public.tag_names vn ON sha256(vn.value)=sha256('Bundle-Version'::bytea)
-            AND vn.value='Bundle-Version'::bytea
+        JOIN public.tag_names vn ON translate(encode(vn.value,'escape'),
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='bundle-version'
         JOIN public.tag_values vv ON sha256(vv.value)=sha256(convert_to(formats.version, 'UTF8'))
             AND vv.value=convert_to(formats.version, 'UTF8')
     )";
 
 #[cfg(test)]
 const BUNDLE_CANDIDATES: &str = "
-    , bundle_candidates AS MATERIALIZED (
+    , matched_bundles AS MATERIALIZED (
         SELECT f.object_key, criteria.json FROM bundle_tags criteria
         JOIN public.object_tags f ON f.name_key=criteria.format_name AND f.value_key=criteria.format_value
         INTERSECT
         SELECT v.object_key, criteria.json FROM bundle_tags criteria
         JOIN public.object_tags v ON v.name_key=criteria.version_name AND v.value_key=criteria.version_value
+    ), bundle_candidates AS MATERIALIZED (
+        SELECT object_key, bool_or(json) AS json FROM matched_bundles
+        GROUP BY object_key HAVING count(*)=1
     )";
 
 const CANONICAL_BUNDLES: &str = "
@@ -115,9 +122,10 @@ const BUNDLE_FORMAT_MATCH: &str = "
 fn bundle_lookup_sql() -> String {
     format!(
         "{BUNDLE_TAGS}, bundle_candidates AS (
-        SELECT requested.key AS object_key, criteria.json
+        SELECT requested.key AS object_key, bool_or(criteria.json) AS json
         FROM public.objects requested CROSS JOIN bundle_tags criteria
         WHERE requested.id=$1 AND {BUNDLE_FORMAT_MATCH}
+        GROUP BY requested.key HAVING count(DISTINCT criteria.json)=1
     ) {CANONICAL_BUNDLES} AND o.id=$1"
     )
 }
@@ -453,7 +461,7 @@ impl BlockStore {
             .client
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
-                    WHERE version = 12 AND name = '012_tag_digest_expressions')
+                    WHERE version = 13 AND name = '013_bundle_tag_casing')
                     AND to_regclass('public.bundle_progress') IS NOT NULL
                     AND to_regclass('public.item_locations') IS NOT NULL
                     AND to_regclass('public.canonical_placements') IS NOT NULL
@@ -464,7 +472,7 @@ impl BlockStore {
             .try_get(0)?;
         ensure!(
             installed,
-            "bundle indexing requires schema migration 012_tag_digest_expressions"
+            "bundle indexing requires schema migration 013_bundle_tag_casing"
         );
         Ok(())
     }
@@ -1535,7 +1543,7 @@ impl BlockStore {
              LEFT JOIN public.item_locations p ON p.root_key=l.root_key AND p.path=l.parent_path
              JOIN public.objects requested ON requested.key=l.parent_key
              LEFT JOIN LATERAL (
-                 SELECT count(*) AS matches, bool_or(criteria.json) AS json
+                 SELECT count(DISTINCT criteria.json) AS matches, bool_or(criteria.json) AS json
                  FROM bundle_tags criteria WHERE {BUNDLE_FORMAT_MATCH}
              ) format ON true
              WHERE l.root_key=$1 AND (
@@ -2435,7 +2443,10 @@ mod tests {
                     .batch_execute(include_str!("../migrations/011_bundle_scan_cursor.sql"))
                     .await?;
             } else {
-                ensure!(matches!(version, 11 | 12), "unexpected test schema version");
+                ensure!(
+                    matches!(version, 11 | 12 | 13),
+                    "unexpected test schema version"
+                );
             }
             store
                 .client

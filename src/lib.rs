@@ -3301,10 +3301,13 @@ impl BundleFormat {
     fn from_pairs<'a>(tags: impl Iterator<Item = (&'a [u8], &'a [u8])>) -> Result<Self> {
         let (mut binary, mut json, mut v1, mut v2) = (false, false, false, false);
         for (name, value) in tags {
-            binary |= name == b"Bundle-Format" && value == b"binary";
-            json |= name == b"Bundle-Format" && value == b"json";
-            v1 |= name == b"Bundle-Version" && value == b"1.0.0";
-            v2 |= name == b"Bundle-Version" && value == b"2.0.0";
+            if name.eq_ignore_ascii_case(b"Bundle-Format") {
+                binary |= value == b"binary";
+                json |= value == b"json";
+            } else if name.eq_ignore_ascii_case(b"Bundle-Version") {
+                v1 |= value == b"1.0.0";
+                v2 |= value == b"2.0.0";
+            }
         }
         match (binary && v2, json && v1) {
             (true, false) => Ok(Self::Binary),
@@ -5384,6 +5387,33 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn bundle_tag_names_ignore_ascii_case_without_changing_value_or_ambiguity_rules() {
+        let binary: &[(&[u8], &[u8])] = &[
+            (b"bundle-format", b"binary"),
+            (b"BUNDLE-VERSION", b"2.0.0"),
+            (b"Bundle-Format", b"binary"),
+            (b"bundle-version", b"2.0.0"),
+            (b"\xffBundle-Format", b"json"),
+        ];
+        assert_eq!(
+            BundleFormat::from_pairs(binary.iter().copied()).unwrap(),
+            BundleFormat::Binary
+        );
+        let json: &[(&[u8], &[u8])] = &[(b"BuNdLe-FoRmAt", b"json"), (b"bundle-version", b"1.0.0")];
+        assert_eq!(
+            BundleFormat::from_pairs(json.iter().copied()).unwrap(),
+            BundleFormat::Json
+        );
+        assert!(BundleFormat::from_pairs(binary.iter().chain(json).copied()).is_err());
+        let cross_pair: &[(&[u8], &[u8])] =
+            &[(b"bundle-format", b"binary"), (b"bundle-version", b"1.0.0")];
+        assert!(BundleFormat::from_pairs(cross_pair.iter().copied()).is_err());
+        let changed_value: &[(&[u8], &[u8])] =
+            &[(b"bundle-format", b"BINARY"), (b"bundle-version", b"2.0.0")];
+        assert!(BundleFormat::from_pairs(changed_value.iter().copied()).is_err());
+    }
+
     #[tokio::test]
     async fn external_nested_bundle_ancestry_requires_verified_layers() {
         use axum::{Router, body::Bytes};
@@ -5391,7 +5421,7 @@ mod tests {
 
         let payload = b"verified nested discovery";
         let tags: &[(&[u8], &[u8])] =
-            &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+            &[(b"bundle-format", b"binary"), (b"bundle-version", b"2.0.0")];
         let (leaf, leaf_id) = signed_data_item(payload, &[]);
         let inner_data = encode_bundle(&[&leaf]);
         let inner_size = inner_data.len();
