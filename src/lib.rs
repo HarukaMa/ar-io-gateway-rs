@@ -1484,9 +1484,13 @@ impl Gateway {
                     BundleHint::External { .. } => {
                         let mut bytes = parent_bytes.clone();
                         let mut format = format;
+                        let mut item_parent = parent;
                         for (ancestor_id, size) in ancestors.iter().rev() {
-                            let (ancestor, _) =
-                                verify_bundle_item(bytes, format, ancestor_id, None, None).await?;
+                            let (ancestor, _) = diagnostics::in_bundle(
+                                &item_parent,
+                                verify_bundle_item(bytes, format, ancestor_id, None, None),
+                            )
+                            .await?;
                             if ancestor.data.len() as u128 != *size {
                                 return Err(diagnostics::size_mismatch(
                                     "discovered ancestor size does not match verified payload",
@@ -1500,10 +1504,14 @@ impl Gateway {
                                 .bundle_format()
                                 .context("discovered ancestor is not a supported bundle")?;
                             bytes = ancestor.data;
+                            item_parent = *ancestor_id;
                         }
-                        verify_bundle_item(bytes, format, &expected_id, None, Some(self))
-                            .await?
-                            .0
+                        diagnostics::in_bundle(
+                            &item_parent,
+                            verify_bundle_item(bytes, format, &expected_id, None, Some(self)),
+                        )
+                        .await?
+                        .0
                     }
                 };
                 if item.data.len() != hinted_size {
@@ -3644,12 +3652,15 @@ async fn verify_indexed_bundle(
             .as_slice()
             .try_into()
             .context("invalid indexed item ID")?;
-        let (item, offset) = verify_bundle_item(
-            parent,
-            format,
-            id,
-            Some(location.item_offset),
-            materialize.filter(|_| depth + 1 == indexed.locations.len()),
+        let (item, offset) = diagnostics::in_bundle(
+            parent_id,
+            verify_bundle_item(
+                parent,
+                format,
+                id,
+                Some(location.item_offset),
+                materialize.filter(|_| depth + 1 == indexed.locations.len()),
+            ),
         )
         .await?;
         path.push(offset as u128);

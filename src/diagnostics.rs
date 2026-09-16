@@ -10,6 +10,7 @@ use crate::{Config, Gateway, decode_fixed, server};
 
 tokio::task_local! {
     static TRACE: RefCell<Trace>;
+    static ATTEMPT_PARENT: String;
 }
 
 #[derive(Default, Serialize)]
@@ -296,6 +297,8 @@ struct Step {
     parent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt_parent_id: Option<String>,
 }
 
 impl Trace {
@@ -308,6 +311,27 @@ impl Trace {
         self.steps.push(step);
         Some(index)
     }
+}
+
+pub(crate) async fn in_bundle<T>(parent: &[u8], operation: impl Future<Output = T>) -> T {
+    if TRACE.try_with(|_| ()).is_err() {
+        return operation.await;
+    }
+    ATTEMPT_PARENT
+        .scope(URL_SAFE_NO_PAD.encode(parent), operation)
+        .await
+}
+
+fn retrieval_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+            http.is_status() || http.is_connect() || http.is_timeout() || http.is_body()
+        } else if let Some(attempts) = cause.downcast_ref::<crate::AttemptFailures>() {
+            !attempts.errors.is_empty() && attempts.errors.iter().all(retrieval_unavailable)
+        } else {
+            cause.is::<tokio::time::error::Elapsed>()
+        }
+    })
 }
 
 pub(crate) fn check<T, F>(
@@ -329,6 +353,7 @@ where
                 message: None,
                 parent_id: None,
                 source: None,
+                attempt_parent_id: ATTEMPT_PARENT.try_with(Clone::clone).ok(),
             })
         })
         .ok()
@@ -343,6 +368,9 @@ where
                 step.status = if error.is_none() { "passed" } else { "failed" };
                 step.error = error.map(|error| error_text(error, public_errors));
                 step.details = error.map(error_details).unwrap_or_default();
+                if stage == "bundle_item_verification" && error.is_some_and(retrieval_unavailable) {
+                    step.status = "unavailable";
+                }
                 if stage == "transaction_authentication"
                     && error.is_some_and(|error| error.is::<crate::ContentNotFound>())
                 {
@@ -378,6 +406,7 @@ pub(crate) fn location(id: &str, parent: &str, source: &str) {
             message: None,
             parent_id: Some(parent.to_owned()),
             source: Some(source.to_owned()),
+            attempt_parent_id: None,
         });
     });
 }
@@ -576,6 +605,60 @@ async fn inspect_cache(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn concurrent_bundle_attempts_distinguish_unavailable_data_from_invalid_content() {
+        TRACE
+            .scope(
+                RefCell::new(Trace {
+                    public_errors: true,
+                    ..Trace::default()
+                }),
+                async {
+                    let unavailable = in_bundle(&[1; 32], async {
+                        check_item(&[3; 32], async {
+                            tokio::task::yield_now().await;
+                            let response = reqwest::Response::from(
+                                axum::http::Response::builder()
+                                    .status(404)
+                                    .body("")
+                                    .unwrap(),
+                            );
+                            response.error_for_status()?;
+                            Ok(())
+                        })
+                        .await
+                    });
+                    let invalid = in_bundle(&[2; 32], async {
+                        tokio::task::yield_now().await;
+                        check_item(&[3; 32], async {
+                            anyhow::bail!("data item signature verification failed")
+                        })
+                        .await
+                    });
+                    let (unavailable, invalid): (Result<()>, Result<()>) =
+                        tokio::join!(unavailable, invalid);
+                    assert!(unavailable.is_err() && invalid.is_err());
+                    let steps =
+                        TRACE.with(|trace| serde_json::to_value(&trace.borrow().steps).unwrap());
+                    let steps = steps.as_array().unwrap();
+                    let missing = steps
+                        .iter()
+                        .find(|step| step["attempt_parent_id"] == URL_SAFE_NO_PAD.encode([1; 32]))
+                        .unwrap();
+                    assert_eq!(missing["status"], "unavailable");
+                    assert_eq!(missing["error"], "Upstream returned HTTP 404 Not Found");
+                    let rejected = steps
+                        .iter()
+                        .find(|step| step["attempt_parent_id"] == URL_SAFE_NO_PAD.encode([2; 32]))
+                        .unwrap();
+                    assert_eq!(rejected["status"], "failed");
+                    assert_eq!(rejected["error"], "data item signature verification failed");
+                    assert!(steps.iter().all(|step| step.get("parent_id").is_none()));
+                },
+            )
+            .await;
+    }
 
     #[test]
     fn failure_details_are_safe_deduplicated_and_bounded() {

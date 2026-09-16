@@ -10,6 +10,7 @@
 code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:14px;overflow-wrap:anywhere}
 .stage-tooltip{white-space:normal}
 .failure-details{margin:12px 0 0;padding-left:12px;border-left:2px solid #60777c}.failure-details dt{margin-top:10px}.failure-details dd{font-size:14px}
+.unavailable{color:#edc879}.relationship-graph{overflow-x:auto;padding-bottom:8px}.relationship-graph svg{display:block}.relationship-graph text{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;fill:#e6edef}.relationship-graph .link-label{font:12px system-ui,sans-serif}
 </style>
 </head>
 <body>
@@ -24,8 +25,8 @@ code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono"
 <div id="results" hidden>
 <div class="result-head"><h2>Diagnostic report</h2><a id="download" class="download" download="diagnostic.json">Download JSON</a></div>
 <div class="grid"><section><h2>Resolution</h2><dl id="resolution"></dl></section><section><h2>Local state</h2><dl id="local"></dl><p class="note">Cache presence checks file type and size. Retrieval runs fresh verification.</p></section></div>
-<section><h2>Bundle ancestry</h2><ol id="ancestry"></ol><p id="no-ancestry">No bundle locations discovered.</p></section>
-<section><h2>Verification stages</h2><ol id="steps"></ol><p id="truncated" hidden>Stage limit reached. This trace is incomplete.</p></section>
+<section><h2>Bundle relationships</h2><p class="note">Arrows point from an item to a possible parent bundle. Verified links passed item verification.</p><div id="ancestry" class="relationship-graph" role="region" aria-label="Bundle relationship graph" tabindex="0"></div><p id="no-ancestry">No bundle locations discovered.</p></section>
+<section><h2>Retrieval and verification</h2><p class="note">Stages appear in start order. Alternative paths can run concurrently.</p><ol id="steps"></ol><p id="truncated" hidden>Stage limit reached. This trace is incomplete.</p></section>
 <section id="content-section" hidden><h2>Verified content</h2><dl id="content"></dl></section>
 <details><summary>Raw JSON</summary><pre id="json"></pre></details>
 </div>
@@ -65,8 +66,84 @@ function field(list, name, value, monospace = false) {
   description.textContent = value == null ? '-' : String(value);
   list.append(term, description);
 }
+function renderRelationships(report) {
+  const links = new Map();
+  for (const step of report.steps) {
+    const parent = step.attempt_parent_id || step.parent_id;
+    if (!parent || (step.stage !== 'bundle_location' && step.stage !== 'bundle_item_verification')) continue;
+    const key = step.id + ':' + parent;
+    const link = links.get(key) || {child: step.id, parent, status: 'discovered'};
+    const rank = {discovered: 0, incomplete: 1, unavailable: 2, failed: 3, passed: 4};
+    if (rank[step.status] > rank[link.status]) link.status = step.status;
+    links.set(key, link);
+  }
+  element('no-ancestry').hidden = links.size > 0;
+  if (!links.size) return;
+  const nodes = new Map();
+  const add = (id, depth) => {
+    if (!nodes.has(id)) nodes.set(id, {id, depth});
+  };
+  add(report.resolved_id || report.input, 0);
+  for (const node of nodes.values()) {
+    for (const link of links.values()) {
+      if (link.child === node.id) add(link.parent, node.depth + 1);
+    }
+  }
+  for (const link of links.values()) {
+    add(link.child, 0);
+    add(link.parent, nodes.get(link.child).depth + 1);
+  }
+  const rows = [];
+  for (const node of nodes.values()) {
+    const row = rows[node.depth] || 0;
+    rows[node.depth] = row + 1;
+    node.x = 16 + node.depth * 500;
+    node.y = 16 + row * 90;
+  }
+  const svg = (tag, attributes = {}, text) => {
+    const item = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const [name, value] of Object.entries(attributes)) item.setAttribute(name, value);
+    if (text != null) item.textContent = text;
+    return item;
+  };
+  const graph = svg('svg', {
+    width: rows.length * 500 - 100, height: Math.max(...rows) * 90,
+    role: 'img', 'aria-label': 'Item to parent bundle relationships'
+  });
+  graph.append(svg('desc', {}, [...links.values()].map(link =>
+    `${link.child} to ${link.parent}: ${link.status === 'passed' ? 'verified' : link.status}`
+  ).join('. ')));
+  const defs = svg('defs');
+  const arrow = svg('marker', {id: 'relationship-arrow', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse'});
+  arrow.append(svg('path', {d: 'M 0 0 L 10 5 L 0 10 z', fill: '#a5b6bb'}));
+  defs.append(arrow);
+  graph.append(defs);
+  for (const link of links.values()) {
+    const child = nodes.get(link.child), parent = nodes.get(link.parent);
+    const x = child.x + 370, y = child.y + 26, endY = parent.y + 26;
+    const color = {passed: '#8bdbc6', failed: '#f19b9b', unavailable: '#edc879'}[link.status] || '#a5b6bb';
+    const status = link.status === 'passed' ? 'verified' : link.status;
+    const path = svg('path', {
+      d: `M ${x} ${y} C ${x + 60} ${y}, ${parent.x - 60} ${endY}, ${parent.x - 4} ${endY}`,
+      fill: 'none', stroke: color, 'stroke-width': 2,
+      'stroke-dasharray': link.status === 'passed' ? 'none' : '5 4', 'marker-end': 'url(#relationship-arrow)'
+    });
+    path.append(svg('title', {}, `${link.child} to ${link.parent}: ${status}`));
+    graph.append(path, svg('text', {x: x + 10, y: (y + endY) / 2 - 10, class: 'link-label', style: `fill:${color}`}, status));
+  }
+  for (const node of nodes.values()) {
+    graph.append(
+      svg('rect', {x: node.x, y: node.y, width: 370, height: 52, rx: 6, fill: '#101719', stroke: '#60777c'}),
+      svg('text', {x: node.x + 12, y: node.y + 31}, node.id)
+    );
+  }
+  element('ancestry').append(graph);
+}
 function render(report) {
-  element('status').textContent = report.status === 'passed' ? 'Verification passed.' : report.error;
+  const alternateFailure = report.steps.some(step => step.stage === 'bundle_item_verification' && ['failed', 'unavailable'].includes(step.status));
+  element('status').textContent = report.status === 'passed'
+    ? 'Verification passed.' + (alternateFailure ? ' Some alternative bundle attempts failed or were unavailable.' : '')
+    : report.error;
   element('status').className = report.status;
   for (const id of ['resolution', 'local', 'ancestry', 'steps', 'content']) element(id).replaceChildren();
   field(element('resolution'), 'Input', report.input, /^[A-Za-z0-9_-]{43}$/.test(report.input));
@@ -79,14 +156,14 @@ function render(report) {
   field(element('local'), 'Index', label(report.index.state));
   field(element('local'), 'Cache', label(report.cache.state));
   if (report.index.kind != null) field(element('local'), 'Object kind', report.index.kind);
-  let edges = 0;
+  renderRelationships(report);
   for (const step of report.steps) {
     const item = document.createElement('li');
     const heading = document.createElement('div');
     heading.className = 'stage';
     const name = document.createElement('div');
     name.className = 'stage-name';
-    name.textContent = label(step.stage);
+    name.textContent = step.stage === 'bundle_item_verification' ? 'Bundle item retrieval and verification' : label(step.stage);
     const status = document.createElement('span');
     status.textContent = step.status;
     status.className = step.status;
@@ -137,25 +214,15 @@ function render(report) {
       error.textContent = step.message || step.error;
       item.append(error);
     }
-    if (step.details?.length) {
+    if (step.attempt_parent_id || step.details?.length) {
       const details = document.createElement('dl');
       details.className = 'failure-details';
-      for (const detail of step.details) field(details, detail.label, detail.value, detail.monospace);
+      if (step.attempt_parent_id) field(details, 'Attempted parent ID', step.attempt_parent_id, true);
+      for (const detail of step.details || []) field(details, detail.label, detail.value, detail.monospace);
       item.append(details);
     }
     element('steps').append(item);
-    if (step.parent_id) {
-      const edge = document.createElement('li');
-      const child = document.createElement('code');
-      child.textContent = step.id;
-      const parent = document.createElement('code');
-      parent.textContent = step.parent_id;
-      edge.append(child, ' inside ', parent, ' (' + step.source + ' location)');
-      element('ancestry').append(edge);
-      edges++;
-    }
   }
-  element('no-ancestry').hidden = edges > 0;
   element('truncated').hidden = !report.trace_truncated;
   element('content-section').hidden = !report.content;
   if (report.content) for (const [name, value] of Object.entries(report.content)) field(element('content'), label(name), value, name === 'id');
