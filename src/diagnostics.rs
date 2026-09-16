@@ -16,6 +16,138 @@ tokio::task_local! {
 struct Trace {
     steps: Vec<Step>,
     truncated: bool,
+    #[serde(skip)]
+    public_errors: bool,
+}
+
+fn error_text(error: &anyhow::Error, public: bool) -> String {
+    if !public {
+        return format!("{error:#}");
+    }
+    // Emit only known verifier messages and typed error fields. Raw causes can contain secrets.
+    const SAFE_REASONS: &[&str] = &[
+        "ArNS name is missing or inactive",
+        "ArNS config account is missing",
+        "Content is blocked",
+        "diagnostic preparation timed out",
+        "verified retrieval timed out",
+        "verified bundle retrieval timed out",
+        "chunk request timed out",
+        "content spool budget exhausted",
+        "transaction exceeds configured data size limit",
+        "transaction exceeds configured size limit",
+        "data item exceeds configured data size limit",
+        "JSON item exceeds configured data size limit",
+        "unsupported transaction format",
+        "transaction ID mismatch",
+        "transaction ID is not the signature hash",
+        "transaction signature verification failed",
+        "data item signature verification failed",
+        "data item ID is not the signature hash",
+        "JSON item signature hash differs from ID",
+        "transaction data size and root disagree",
+        "transaction status and verified size differ",
+        "transaction block is above the trusted node tip",
+        "archival status does not match the trusted block index",
+        "trusted block index returned incomplete geometry",
+        "transaction ID is absent from authenticated block",
+        "block header height mismatch",
+        "block header identifier mismatch",
+        "block indep_hash verification failed",
+        "block tx_root does not match trusted index",
+        "block size does not match trusted weave geometry",
+        "block predecessor does not match trusted block index",
+        "content block changed during retrieval",
+        "cyclic bundle ancestry",
+        "discovery returned conflicting data item locations",
+        "discovery returned the wrong data item",
+        "a data item cannot be its own parent",
+        "bundle item table exceeds parent bounds",
+        "bundle item exceeds parent bounds",
+        "valid data item is absent from verified parent at the expected offset",
+        "tx_path data root mismatch",
+        "tx_path is too short",
+        "tx_path length is malformed",
+        "chunk length does not match data_path",
+        "chunk hash does not match data_path",
+        "chunk exceeds protocol limit",
+        "data_path exceeds size limit",
+        "tx_path exceeds size limit",
+        "invalid Content-Type tag",
+        "invalid Content-Encoding tag",
+        "invalid Solana account base64",
+        "Solana account size mismatch",
+        "Solana account exceeds size limit",
+        "ANT record bump mismatch",
+        "ANT root record mismatch",
+        "ArNS config bump mismatch",
+        "Solana RPC request failed",
+        "Solana account owner mismatch",
+        "Solana data account is executable",
+        "unexpected Solana account encoding",
+        "ArNS account name mismatch",
+        "ArNS record bump mismatch",
+        "ArNS name hash mismatch",
+        "ANT mint mismatch",
+        "ANT record PDA mismatch",
+        "duplicate ANT record",
+        "block index has not been initialized",
+    ];
+    let mut details = Vec::new();
+    let mut add = |detail: String| {
+        if details.len() < 6 && !details.contains(&detail) {
+            details.push(detail);
+        }
+    };
+    for cause in error.chain() {
+        if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+            if let Some(status) = http.status() {
+                add(format!("Upstream returned HTTP {status}"));
+            } else if http.is_timeout() {
+                add("Upstream request timed out".to_owned());
+            } else if http.is_connect() {
+                add("Could not connect to the upstream service".to_owned());
+            } else if http.is_body() || http.is_decode() {
+                add("Could not read the upstream response body".to_owned());
+            }
+        } else if cause.is::<tokio::time::error::Elapsed>() {
+            add("The operation exceeded its time limit".to_owned());
+        } else if let Some(json) = cause.downcast_ref::<serde_json::Error>() {
+            add(format!(
+                "Invalid JSON ({:?}, line {}, column {})",
+                json.classify(),
+                json.line(),
+                json.column()
+            ));
+        } else if let Some(database) = cause.downcast_ref::<tokio_postgres::Error>() {
+            add(match database.as_db_error() {
+                Some(error) => {
+                    format!("Database request failed (SQLSTATE {})", error.code().code())
+                }
+                None => "Database connection or communication failed".to_owned(),
+            });
+        } else if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            add(format!("I/O operation failed ({:?})", io.kind()));
+        } else if cause.is::<crate::ContentNotFound>() {
+            add("No L1 transaction was found for this ID".to_owned());
+        }
+        // Some retrieval paths aggregate attempt errors into a single context string.
+        for part in cause.to_string().split([':', ';']).map(str::trim) {
+            if SAFE_REASONS.contains(&part) {
+                add(part.to_owned());
+            } else if part.starts_with("unsupported ANS-104 signature type ") {
+                add("The data item's signature type is unsupported".to_owned());
+            } else if part.starts_with("nested bundle exceeds maximum depth ") {
+                add("Bundle nesting exceeds the supported depth".to_owned());
+            }
+        }
+    }
+    if details.is_empty() {
+        "The operation failed. Further details are available in the local CLI diagnostic."
+            .to_owned()
+    } else {
+        details.join(". ")
+    }
 }
 
 #[derive(Serialize)]
@@ -71,10 +203,11 @@ where
         if let Some(index) = index {
             let _ = TRACE.try_with(|trace| {
                 let mut trace = trace.borrow_mut();
+                let public_errors = trace.public_errors;
                 let step = &mut trace.steps[index];
                 let error = result.as_ref().err();
                 step.status = if error.is_none() { "passed" } else { "failed" };
-                step.error = error.map(|error| format!("{error:#}"));
+                step.error = error.map(|error| error_text(error, public_errors));
                 if stage == "transaction_authentication"
                     && error.is_some_and(|error| error.is::<crate::ContentNotFound>())
                 {
@@ -156,7 +289,7 @@ pub async fn diagnose(
         }
         Ok(gateway)
     };
-    run(setup, &resolver, input, cache_directory, deadline).await
+    run(setup, &resolver, input, cache_directory, deadline, false).await
 }
 
 pub(crate) async fn diagnose_public(
@@ -189,24 +322,13 @@ pub(crate) async fn diagnose_public(
         input,
         serving.disk_cache.as_ref().map(|cache| cache.directory()),
         deadline,
+        true,
     )
     .await;
-    // Public reports never include chained errors or configured upstream locations.
-    if !report["error"].is_null() {
-        report["error"] = json!("Diagnostic could not be completed. Check the stages below.");
-    }
-    for field in ["index", "cache"] {
-        if let Some(error) = report[field].get_mut("error") {
-            *error = json!("Inspection failed");
-        }
-    }
     if let Some(steps) = report["steps"].as_array_mut() {
         for step in steps {
-            if step.get("error").is_some() {
-                step["error"] = step
-                    .get("message")
-                    .cloned()
-                    .unwrap_or_else(|| json!("Stage failed"));
+            if let Some(message) = step.get("message").cloned() {
+                step["error"] = message;
             }
             if step.get("source").is_some_and(|source| source != "index") {
                 step["source"] = json!("external");
@@ -222,8 +344,9 @@ async fn run(
     input: &str,
     cache_directory: Option<&Path>,
     deadline: std::time::Duration,
+    public_errors: bool,
 ) -> Value {
-    TRACE.scope(RefCell::new(Trace::default()), async {
+    TRACE.scope(RefCell::new(Trace { public_errors, ..Trace::default() }), async {
         let mut report = json!({
             "input": input,
             "resolved_id": null,
@@ -253,12 +376,12 @@ async fn run(
             if let Some(store) = &gateway.block_store {
                 match check("index_inspection", &id, store.diagnostic_object(&key)).await {
                     Ok(value) => report["index"] = value,
-                    Err(error) => report["index"] = json!({"state": "error", "error": format!("{error:#}")}),
+                    Err(error) => report["index"] = json!({"state": "error", "error": error_text(&error, public_errors)}),
                 }
                 if let Some(directory) = cache_directory {
                     match check("cache_inspection", &id, inspect_cache(store, directory, &key)).await {
                         Ok(value) => report["cache"] = value,
-                        Err(error) => report["cache"] = json!({"state": "error", "integrity_checked": false, "error": format!("{error:#}")}),
+                        Err(error) => report["cache"] = json!({"state": "error", "integrity_checked": false, "error": error_text(&error, public_errors)}),
                     }
                 } else {
                     report["cache"]["state"] = json!("not_configured");
@@ -284,7 +407,7 @@ async fn run(
             Err(error) => Err(error),
         };
         report["status"] = json!(if result.is_ok() { "passed" } else { "failed" });
-        report["error"] = json!(result.err().map(|error| format!("{error:#}")));
+        report["error"] = json!(result.err().map(|error| error_text(&error, public_errors)));
         TRACE.with(|trace| {
             let trace = trace.borrow();
             report["steps"] = json!(trace.steps);
@@ -317,6 +440,50 @@ async fn inspect_cache(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn public_errors_preserve_verifier_causes_without_exposing_private_context() {
+        let error = anyhow::anyhow!("data item signature verification failed")
+            .context("https://user:password@private.invalid/rpc?api-key=secret")
+            .context("reading C:\\private\\cache\\content");
+        assert_eq!(
+            error_text(&error, true),
+            "data item signature verification failed"
+        );
+        assert!(error_text(&error, false).contains("api-key=secret"));
+        let aggregate = anyhow::anyhow!(
+            "transaction metadata unavailable: https://private.invalid/key: transaction ID mismatch; https://private.invalid/other: transaction ID mismatch"
+        );
+        assert_eq!(error_text(&aggregate, true), "transaction ID mismatch");
+        let unknown = anyhow::anyhow!("password=secret at /private/storage/file");
+        let public = error_text(&unknown, true);
+        assert!(!public.contains("secret") && !public.contains("/private"));
+        assert!(public.contains("local CLI"));
+    }
+
+    #[tokio::test]
+    async fn public_errors_explain_http_status_without_exposing_the_request_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/private-key", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "private response body",
+            )
+        });
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let error = reqwest::get(url)
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap_err();
+        assert_eq!(
+            error_text(&error.into(), true),
+            "Upstream returned HTTP 429 Too Many Requests"
+        );
+    }
 
     #[tokio::test]
     async fn timeout_preserves_incomplete_resolution_without_claiming_a_missing_name() {

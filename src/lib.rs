@@ -5128,6 +5128,21 @@ mod tests {
                 1,
             )
             .unwrap();
+            if corrupt {
+                let public = diagnostics::diagnose_public(&fixture, &resolver, &id).await;
+                assert_eq!(public["status"], "failed", "{public}");
+                assert!(public["content"].is_null(), "{public}");
+                let failure = public["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|step| step["stage"] == "bundle_item_verification" && step["id"] == id)
+                    .unwrap();
+                assert_eq!(
+                    failure["error"], "data item signature verification failed",
+                    "{public}"
+                );
+            }
             let report = diagnostics::diagnose(fixture.config, resolver, &id, None, None).await;
             let steps = report["steps"].as_array().unwrap();
             assert!(

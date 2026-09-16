@@ -6,6 +6,7 @@
 <title>Diagnostics - AR.IO</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101719;color:#e6edef}*{box-sizing:border-box}body{max-width:1080px;margin:auto;padding:36px 24px}header{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:28px}h1{font-size:28px;margin:0 0 6px}h2{font-size:18px;margin:0 0 18px}p{color:#a5b6bb;line-height:1.6}a{color:#8bdbc6}section,form{background:#192326;border:1px solid #304044;border-radius:12px;padding:24px;margin-bottom:18px}label{display:block;margin-bottom:10px;font-weight:600}.input-row{display:flex;gap:12px}input{min-width:0;flex:1;background:#101719;color:inherit;border:1px solid #60777c;border-radius:6px;padding:12px;font:inherit}button,.download{background:#8bdbc6;color:#10221d;border:0;border-radius:6px;padding:12px 18px;font:inherit;font-weight:600;cursor:pointer}button:disabled{opacity:.55;cursor:wait}:focus-visible{outline:3px solid #b5eedd;outline-offset:3px}.note{font-size:13px;margin-bottom:0}#status{display:block;line-height:1.6;margin-top:16px}.failed{color:#f3b3a6}.passed{color:#a2e8d1}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}dl{margin:0}dt{color:#a5b6bb;font-size:13px;margin-top:14px}dd{margin:4px 0 0;overflow-wrap:anywhere}ol{padding-left:24px}li{margin-bottom:18px;overflow-wrap:anywhere}code{font-size:13px;overflow-wrap:anywhere}.stage{display:flex;justify-content:space-between;gap:16px}.stage span:last-child{white-space:nowrap}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.6}details{margin-top:18px}summary{cursor:pointer}.result-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:28px 0 18px}.result-head h2{margin:0}.download{text-decoration:none;font-size:14px}[hidden]{display:none!important}@media(max-width:620px){body{padding:24px 16px}.grid{grid-template-columns:1fr;gap:0}.input-row{flex-direction:column}section,form{padding:18px}header{align-items:flex-start}header a{font-size:14px}.stage{flex-wrap:wrap}}
+.stage-help{margin-top:6px}.stage-help summary{font-size:13px;color:#a5b6bb}.stage-help p{margin:8px 0}
 </style>
 </head>
 <body>
@@ -30,6 +31,22 @@
 <script>
 const element = id => document.getElementById(id);
 const label = value => String(value).replaceAll('_', ' ');
+const stageDescriptions = {
+  database_connection: 'Connects to the local index database for metadata lookups.',
+  name_resolution: 'Resolves the ArNS name to a content ID using its ArNS and ANT records.',
+  index_inspection: 'Checks whether this ID has locally indexed metadata and whether that metadata is complete.',
+  cache_inspection: 'Checks for a cached file and compares its type and size with the cache record. Cached bytes are not authenticated here.',
+  verified_retrieval: 'Retrieves the requested content and runs the required authentication checks, including any bundle ancestors.',
+  indexed_bundle_lookup: 'Looks for a locally indexed bundle location. A successful lookup can have no matching record.',
+  bundle_discovery: 'Asks an external index for a possible parent bundle. A successful query can find no parent.',
+  bundle_location: 'Records a possible child-to-parent bundle link. Later checks authenticate the bundle and item.',
+  transaction_authentication: 'Looks up this ID as an L1 transaction and checks its chain placement and data boundaries. Bundled items can continue through parent discovery.',
+  block_authentication: 'Authenticates the block against the trusted chain index and checks that it contains the transaction.',
+  transaction_signature: 'Fetches the transaction metadata and verifies its ID, signature, and signed fields.',
+  content_proofs_and_hash: 'Reads the content, verifies its chunk proofs, and computes its SHA-256 hash.',
+  bundle_item_verification: 'Finds the item inside its parent bundle and verifies its ID, signature, metadata, and payload.',
+  canonical_anchor: 'Rechecks the content against the current canonical chain before returning it.'
+};
 let downloadUrl;
 function field(list, name, value) {
   const term = document.createElement('dt');
@@ -66,6 +83,17 @@ function render(report) {
     const id = document.createElement('code');
     id.textContent = step.id;
     item.append(heading, id);
+    if (stageDescriptions[step.stage]) {
+      const help = document.createElement('details');
+      help.className = 'stage-help';
+      const summary = document.createElement('summary');
+      summary.textContent = 'About this stage';
+      const description = document.createElement('p');
+      description.className = 'note';
+      description.textContent = stageDescriptions[step.stage];
+      help.append(summary, description);
+      item.append(help);
+    }
     if (step.message || step.error) {
       const error = document.createElement('p');
       error.textContent = step.message || step.error;
