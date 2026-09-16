@@ -29,13 +29,13 @@ async fn main() -> Result<()> {
         let resolver = resolver_config(1)?;
         // Poll separately from the CLI's serving and indexing state machine.
         let report = tokio::spawn(async move {
-            ar_io_gateway::diagnostics::diagnose(
+            Box::pin(ar_io_gateway::diagnostics::diagnose(
                 config,
                 resolver,
                 &input,
                 database_url.as_deref(),
                 cache_directory.as_deref(),
-            )
+            ))
             .await
         })
         .await

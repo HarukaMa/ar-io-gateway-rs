@@ -13,7 +13,7 @@
 <main>
 <form id="form">
 <label for="input">ArNS name or data ID</label>
-<div class="input-row"><input id="input" name="input" required maxlength="255" autocomplete="off" spellcheck="false" placeholder="legend or a transaction ID"><button id="run" type="submit">Run diagnostic</button></div>
+<div class="input-row"><input id="input" name="input" required maxlength="255" autocomplete="off" spellcheck="false" placeholder="Enter an ArNS name or data ID"><button id="run" type="submit">Run diagnostic</button></div>
 <p class="note">Fresh retrieval, up to 64 MiB. Preparation and retrieval each have a one-minute limit. One diagnostic can run at a time.</p>
 <output id="status" aria-live="polite"></output>
 </form>
@@ -66,9 +66,9 @@ function render(report) {
     const id = document.createElement('code');
     id.textContent = step.id;
     item.append(heading, id);
-    if (step.error) {
+    if (step.message || step.error) {
       const error = document.createElement('p');
-      error.textContent = step.error;
+      error.textContent = step.message || step.error;
       item.append(error);
     }
     element('steps').append(item);

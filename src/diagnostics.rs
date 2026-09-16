@@ -26,6 +26,8 @@ struct Step {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
@@ -58,6 +60,7 @@ where
                 id: id.to_owned(),
                 status: "incomplete",
                 error: None,
+                message: None,
                 parent_id: None,
                 source: None,
             })
@@ -69,8 +72,15 @@ where
             let _ = TRACE.try_with(|trace| {
                 let mut trace = trace.borrow_mut();
                 let step = &mut trace.steps[index];
-                step.status = if result.is_ok() { "passed" } else { "failed" };
-                step.error = result.as_ref().err().map(|error| format!("{error:#}"));
+                let error = result.as_ref().err();
+                step.status = if error.is_none() { "passed" } else { "failed" };
+                step.error = error.map(|error| format!("{error:#}"));
+                if stage == "transaction_authentication"
+                    && error.is_some_and(|error| error.is::<crate::ContentNotFound>())
+                {
+                    step.status = "not_found";
+                    step.message = Some("No L1 transaction was found for this ID.");
+                }
             });
         }
     })
@@ -96,6 +106,7 @@ pub(crate) fn location(id: &str, parent: &str, source: &str) {
             id: id.to_owned(),
             status: "discovered",
             error: None,
+            message: None,
             parent_id: Some(parent.to_owned()),
             source: Some(source.to_owned()),
         });
@@ -109,6 +120,21 @@ pub(crate) fn indexed_location(id: &[u8], parent: &[u8]) {
             &URL_SAFE_NO_PAD.encode(parent),
             "index",
         );
+    });
+}
+
+pub(crate) fn bundle_parent_fallback(id: &str) {
+    let _ = TRACE.try_with(|trace| {
+        if let Some(step) = trace.borrow_mut().steps.iter_mut().rev().find(|step| {
+            step.stage == "transaction_authentication"
+                && step.id == id
+                && step.status == "not_found"
+        }) {
+            step.status = "fallback";
+            step.message = Some(
+                "No L1 transaction was found. Continuing through the discovered bundle parent.",
+            );
+        }
     });
 }
 
@@ -176,8 +202,11 @@ pub(crate) async fn diagnose_public(
     }
     if let Some(steps) = report["steps"].as_array_mut() {
         for step in steps {
-            if let Some(error) = step.get_mut("error") {
-                *error = json!("Stage failed");
+            if step.get("error").is_some() {
+                step["error"] = step
+                    .get("message")
+                    .cloned()
+                    .unwrap_or_else(|| json!("Stage failed"));
             }
             if step.get("source").is_some_and(|source| source != "index") {
                 step["source"] = json!("external");

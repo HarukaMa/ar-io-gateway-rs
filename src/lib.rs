@@ -1400,6 +1400,7 @@ impl Gateway {
                         );
                         ancestors
                             .push((parent, parse_u128(&data_size, "discovered ancestor size")?));
+                        diagnostics::bundle_parent_fallback(&parent_id);
                         parent_id = next_parent;
                         continue;
                     }
@@ -5320,13 +5321,14 @@ mod tests {
             retrieval_fixture(&forged_root, tags, None).await;
         let _forged_server = tokio_util::task::AbortOnDropHandle::new(forged_server);
         let requested_id = leaf_id.clone();
+        let nested_id = inner_id.clone();
         let app =
             Router::new().fallback(move |uri: axum::http::Uri, body: Bytes| {
                 let query: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 let requested = query["variables"]["ids"][0].as_str().unwrap();
                 let location = if requested == leaf_id {
                     Some((inner_id.clone(), payload.len()))
-                } else if requested == inner_id {
+                } else if requested == inner_id && uri.path() != "/missing-parent" {
                     Some((
                         if uri.path() == "/cycle" {
                             leaf_id.clone()
@@ -5385,6 +5387,52 @@ mod tests {
                 payload
             );
             assert_eq!(result.sha256, hex(&sha256(&[payload])));
+        }
+        let resolver = server::ServerConfig::new(
+            "127.0.0.1:0",
+            "example.com",
+            &fixture.config.trusted_node_url,
+            "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ",
+            "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5",
+            1,
+        )
+        .unwrap();
+        for (path, status, probe_status, message) in [
+            (
+                "/valid",
+                "passed",
+                "fallback",
+                "No L1 transaction was found. Continuing through the discovered bundle parent.",
+            ),
+            (
+                "/missing-parent",
+                "failed",
+                "not_found",
+                "No L1 transaction was found for this ID.",
+            ),
+        ] {
+            let mut diagnostic_config = config.clone();
+            diagnostic_config.graphql_sources = vec![format!("{source}{path}")];
+            let gateway = Gateway::new(diagnostic_config).unwrap();
+            let report = diagnostics::diagnose_public(&gateway, &resolver, &requested_id).await;
+            assert_eq!(report["status"], status, "{report}");
+            let probe = report["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| {
+                    step["stage"] == "transaction_authentication" && step["id"] == nested_id
+                })
+                .unwrap();
+            assert_eq!(probe["status"], probe_status, "{report}");
+            assert_eq!(probe["message"], message, "{report}");
+            assert_eq!(probe["error"], message, "{report}");
+            assert!(!report.to_string().contains(&source), "{report}");
+            if status == "passed" {
+                assert_eq!(report["content"]["sha256"], hex(&sha256(&[payload])));
+            } else {
+                assert!(report["content"].is_null(), "{report}");
+            }
         }
         let mut forged_config = forged_fixture.config.clone();
         forged_config.graphql_sources = vec![format!("{source}/corrupt-parent")];
