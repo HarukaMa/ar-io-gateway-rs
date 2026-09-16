@@ -6,7 +6,9 @@
 <title>Diagnostics - AR.IO</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#101719;color:#e6edef}*{box-sizing:border-box}body{max-width:1080px;margin:auto;padding:36px 24px}header{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:28px}h1{font-size:28px;margin:0 0 6px}h2{font-size:18px;margin:0 0 18px}p{color:#a5b6bb;line-height:1.6}a{color:#8bdbc6}section,form{background:#192326;border:1px solid #304044;border-radius:12px;padding:24px;margin-bottom:18px}label{display:block;margin-bottom:10px;font-weight:600}.input-row{display:flex;gap:12px}input{min-width:0;flex:1;background:#101719;color:inherit;border:1px solid #60777c;border-radius:6px;padding:12px;font:inherit}button,.download{background:#8bdbc6;color:#10221d;border:0;border-radius:6px;padding:12px 18px;font:inherit;font-weight:600;cursor:pointer}button:disabled{opacity:.55;cursor:wait}:focus-visible{outline:3px solid #b5eedd;outline-offset:3px}.note{font-size:13px;margin-bottom:0}#status{display:block;line-height:1.6;margin-top:16px}.failed{color:#f3b3a6}.passed{color:#a2e8d1}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}dl{margin:0}dt{color:#a5b6bb;font-size:13px;margin-top:14px}dd{margin:4px 0 0;overflow-wrap:anywhere}ol{padding-left:24px}li{margin-bottom:18px;overflow-wrap:anywhere}code{font-size:13px;overflow-wrap:anywhere}.stage{display:flex;justify-content:space-between;gap:16px}.stage span:last-child{white-space:nowrap}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.6}details{margin-top:18px}summary{cursor:pointer}.result-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:28px 0 18px}.result-head h2{margin:0}.download{text-decoration:none;font-size:14px}[hidden]{display:none!important}@media(max-width:620px){body{padding:24px 16px}.grid{grid-template-columns:1fr;gap:0}.input-row{flex-direction:column}section,form{padding:18px}header{align-items:flex-start}header a{font-size:14px}.stage{flex-wrap:wrap}}
-.stage-help{margin-top:6px}.stage-help summary{font-size:13px;color:#a5b6bb}.stage-help p{margin:8px 0}
+.stage-name{display:flex;align-items:center;gap:6px;min-width:0}.stage-help{display:inline-flex;flex-shrink:0}.stage-help button{width:26px;height:26px;padding:0;border:1px solid #60777c;border-radius:50%;background:transparent;color:#a5b6bb;font-size:13px}.stage-tooltip{position:fixed;inset:auto;margin:0;width:min(350px,calc(100vw - 32px));padding:12px;border:1px solid #60777c;border-radius:8px;background:#192326;color:#e6edef;font:13px/1.6 system-ui,sans-serif;box-shadow:0 6px 20px #0008}
+code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:14px;overflow-wrap:anywhere}
+.stage-tooltip{white-space:normal}
 </style>
 </head>
 <body>
@@ -47,10 +49,17 @@ const stageDescriptions = {
   bundle_item_verification: 'Finds the item inside its parent bundle and verifies its ID, signature, metadata, and payload.',
   canonical_anchor: 'Rechecks the content against the current canonical chain before returning it.'
 };
+element('input').addEventListener('input', event => {
+  event.target.classList.toggle('data-id', /^[A-Za-z0-9_-]{43}$/.test(event.target.value.trim()));
+});
 let downloadUrl;
-function field(list, name, value) {
+window.addEventListener('scroll', () => {
+  document.querySelectorAll('.stage-tooltip:popover-open').forEach(tooltip => tooltip.hidePopover());
+}, true);
+function field(list, name, value, monospace = false) {
   const term = document.createElement('dt');
   const description = document.createElement('dd');
+  if (monospace) description.className = 'data-id';
   term.textContent = name;
   description.textContent = value == null ? '-' : String(value);
   list.append(term, description);
@@ -59,10 +68,10 @@ function render(report) {
   element('status').textContent = report.status === 'passed' ? 'Verification passed.' : report.error;
   element('status').className = report.status;
   for (const id of ['resolution', 'local', 'ancestry', 'steps', 'content']) element(id).replaceChildren();
-  field(element('resolution'), 'Input', report.input);
-  field(element('resolution'), 'Resolved ID', report.resolved_id);
+  field(element('resolution'), 'Input', report.input, /^[A-Za-z0-9_-]{43}$/.test(report.input));
+  field(element('resolution'), 'Resolved ID', report.resolved_id, true);
   if (report.resolution) {
-    field(element('resolution'), 'ANT', report.resolution.ant_id);
+    field(element('resolution'), 'ANT', report.resolution.ant_id, true);
     field(element('resolution'), 'Record', report.resolution.record);
     field(element('resolution'), 'TTL (seconds)', report.resolution.ttl);
   }
@@ -74,7 +83,8 @@ function render(report) {
     const item = document.createElement('li');
     const heading = document.createElement('div');
     heading.className = 'stage';
-    const name = document.createElement('span');
+    const name = document.createElement('div');
+    name.className = 'stage-name';
     name.textContent = label(step.stage);
     const status = document.createElement('span');
     status.textContent = step.status;
@@ -84,15 +94,42 @@ function render(report) {
     id.textContent = step.id;
     item.append(heading, id);
     if (stageDescriptions[step.stage]) {
-      const help = document.createElement('details');
+      const help = document.createElement('span');
       help.className = 'stage-help';
-      const summary = document.createElement('summary');
-      summary.textContent = 'About this stage';
-      const description = document.createElement('p');
-      description.className = 'note';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = '?';
+      button.setAttribute('aria-label', 'About ' + label(step.stage));
+      const description = document.createElement('div');
+      description.className = 'stage-tooltip';
+      description.id = 'stage-help-' + element('steps').children.length;
+      description.setAttribute('role', 'tooltip');
+      description.popover = 'auto';
       description.textContent = stageDescriptions[step.stage];
-      help.append(summary, description);
-      item.append(help);
+      button.setAttribute('aria-describedby', description.id);
+      button.popoverTargetElement = description;
+      button.popoverTargetAction = 'show';
+      const show = () => {
+        description.showPopover();
+        const anchor = button.getBoundingClientRect();
+        const bounds = description.getBoundingClientRect();
+        description.style.left = Math.max(16, Math.min(anchor.left, innerWidth - bounds.width - 16)) + 'px';
+        description.style.top = Math.max(8, anchor.bottom + bounds.height < innerHeight - 8
+          ? anchor.bottom : anchor.top - bounds.height) + 'px';
+      };
+      button.addEventListener('pointerenter', event => {
+        if (event.pointerType === 'mouse') show();
+      });
+      button.addEventListener('focus', show);
+      button.addEventListener('click', show);
+      help.addEventListener('pointerleave', () => {
+        if (document.activeElement !== button) description.hidePopover();
+      });
+      button.addEventListener('blur', () => {
+        if (!help.matches(':hover')) description.hidePopover();
+      });
+      help.append(button, description);
+      name.append(help);
     }
     if (step.message || step.error) {
       const error = document.createElement('p');
@@ -102,7 +139,11 @@ function render(report) {
     element('steps').append(item);
     if (step.parent_id) {
       const edge = document.createElement('li');
-      edge.textContent = step.id + ' inside ' + step.parent_id + ' (' + step.source + ' location)';
+      const child = document.createElement('code');
+      child.textContent = step.id;
+      const parent = document.createElement('code');
+      parent.textContent = step.parent_id;
+      edge.append(child, ' inside ', parent, ' (' + step.source + ' location)');
       element('ancestry').append(edge);
       edges++;
     }
@@ -110,7 +151,7 @@ function render(report) {
   element('no-ancestry').hidden = edges > 0;
   element('truncated').hidden = !report.trace_truncated;
   element('content-section').hidden = !report.content;
-  if (report.content) for (const [name, value] of Object.entries(report.content)) field(element('content'), label(name), value);
+  if (report.content) for (const [name, value] of Object.entries(report.content)) field(element('content'), label(name), value, name === 'id');
   const json = JSON.stringify(report, null, 2);
   element('json').textContent = json;
   if (downloadUrl) URL.revokeObjectURL(downloadUrl);
