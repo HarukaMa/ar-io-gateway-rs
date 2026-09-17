@@ -2795,7 +2795,7 @@ fn post_2_6_signed_hash(block: &BlockHeader) -> Result<[u8; 32]> {
     )?;
     append_fixed_decimal(&mut segment, &block.denomination, 3, "denomination")?;
     append_u64(&mut segment, block.redenomination_height, 1)?;
-    append_double_signing_proof(&mut segment, &block.double_signing_proof)?;
+    append_double_signing_proof(&mut segment, &block.double_signing_proof, block.height)?;
     append_decimal(
         &mut segment,
         &block.previous_cumulative_diff,
@@ -2973,11 +2973,51 @@ fn append_hashes(output: &mut Vec<u8>, values: &[String], label: &str) -> Result
     Ok(())
 }
 
-fn append_double_signing_proof(output: &mut Vec<u8>, proof: &serde_json::Value) -> Result<()> {
-    match proof {
-        serde_json::Value::Null => output.push(0),
-        serde_json::Value::Object(fields) if fields.is_empty() => output.push(0),
-        _ => bail!("non-empty double-signing proofs are unsupported"),
+fn append_double_signing_proof(
+    output: &mut Vec<u8>,
+    proof: &serde_json::Value,
+    height: u64,
+) -> Result<()> {
+    if proof.is_null() || proof.as_object().is_some_and(|fields| fields.is_empty()) {
+        output.push(0);
+        return Ok(());
+    }
+    let field = |name: &str| {
+        proof
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("invalid double-signing proof field {name}"))
+    };
+    let key = decode_b64(field("pub_key")?, "double-signing public key")?;
+    let length_prefixed = height >= FORK_2_9_HEIGHT;
+    let signature_size = match key.len() {
+        512 => 512,
+        33 if length_prefixed => 65,
+        _ => bail!("invalid double-signing public key length"),
+    };
+    output.push(1);
+    if length_prefixed {
+        append_bytes(output, &key, 2)?;
+    } else {
+        output.extend_from_slice(&key);
+    }
+    for (signature, difficulty, previous_difficulty, preimage) in [
+        ("sig1", "cdiff1", "prev_cdiff1", "preimage1"),
+        ("sig2", "cdiff2", "prev_cdiff2", "preimage2"),
+    ] {
+        let signature = decode_b64(field(signature)?, "double-signing signature")?;
+        ensure!(
+            signature.len() == signature_size,
+            "invalid double-signing signature length"
+        );
+        if length_prefixed {
+            append_bytes(output, &signature, 2)?;
+        } else {
+            output.extend_from_slice(&signature);
+        }
+        append_decimal(output, field(difficulty)?, 2, difficulty)?;
+        append_decimal(output, field(previous_difficulty)?, 2, previous_difficulty)?;
+        append_fixed_b64(output, field(preimage)?, 64, preimage)?;
     }
     Ok(())
 }
@@ -6311,6 +6351,88 @@ mod tests {
 
         block.txs[0] = absent_id;
         assert!(verify_block_header(&block, &entry, block.height, Some(&transaction_id)).is_err());
+    }
+
+    #[test]
+    fn authenticates_block_with_double_signing_proof() {
+        // Mainnet block 1374310, with PoA chunk bytes omitted from the fixture.
+        let mut block = historical::decode_header(
+            serde_json::from_str(include_str!(
+                "../tests/fixtures/block-double-signing-1374310.json"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let entry = BlockIndexEntry {
+            hash: "PuwNxxNZyU-5CEK7kwPjaPmQG8QKvk45-AcjS9NbGRuKAvBOWvEYC9dLoXgf03-a".into(),
+            tx_root: block.tx_root.clone(),
+            weave_size: block.weave_size.clone(),
+        };
+        verify_block_header(&block, &entry, 1_374_310, None).unwrap();
+        block.double_signing_proof["cdiff1"] = serde_json::json!("1");
+        assert!(verify_block_header(&block, &entry, 1_374_310, None).is_err());
+    }
+
+    #[test]
+    fn double_signing_proof_encoding_respects_fork_2_9() {
+        // ar_serialize:encode_double_signing_proof/2 canonical byte vectors.
+        for (height, key_size, signature_size, expected) in [
+            (
+                FORK_2_9_HEIGHT - 1,
+                512,
+                512,
+                "7fd9581012a97fa4a62773176e1a3fa663ecfda19dd4b4cebba1c8e9f8f22989",
+            ),
+            (
+                FORK_2_9_HEIGHT,
+                512,
+                512,
+                "8c0bf8cb1496e990b644f6aef6553f8ea7aca8948d3b36f165f047314752c7ca",
+            ),
+            (
+                FORK_2_9_HEIGHT,
+                33,
+                65,
+                "597ac72f299458c1f341d9cd464a628505e387382d20a758cc118069cf7327fc",
+            ),
+        ] {
+            let proof = serde_json::json!({
+                "pub_key": URL_SAFE_NO_PAD.encode(vec![1; key_size]),
+                "sig1": URL_SAFE_NO_PAD.encode(vec![2; signature_size]),
+                "cdiff1": "256", "prev_cdiff1": "255",
+                "preimage1": URL_SAFE_NO_PAD.encode([4; 64]),
+                "sig2": URL_SAFE_NO_PAD.encode(vec![3; signature_size]),
+                "cdiff2": "65536", "prev_cdiff2": "65535",
+                "preimage2": URL_SAFE_NO_PAD.encode([5; 64]),
+            });
+            let mut encoded = Vec::new();
+            append_double_signing_proof(&mut encoded, &proof, height).unwrap();
+            assert_eq!(hex(&sha256(&[&encoded])), expected);
+            if key_size == 33 {
+                assert!(append_double_signing_proof(&mut Vec::new(), &proof, height - 1).is_err());
+            }
+            for (field, value) in [
+                ("sig2", serde_json::json!(URL_SAFE_NO_PAD.encode([3; 64]))),
+                (
+                    "preimage1",
+                    serde_json::json!(URL_SAFE_NO_PAD.encode([4; 63])),
+                ),
+                ("prev_cdiff2", serde_json::Value::Null),
+                ("cdiff1", serde_json::json!("-1")),
+            ] {
+                let mut malformed = proof.clone();
+                malformed[field] = value;
+                assert!(
+                    append_double_signing_proof(&mut Vec::new(), &malformed, height).is_err(),
+                    "{field}"
+                );
+            }
+        }
+        for proof in [serde_json::Value::Null, serde_json::json!({})] {
+            let mut encoded = Vec::new();
+            append_double_signing_proof(&mut encoded, &proof, FORK_2_9_HEIGHT).unwrap();
+            assert_eq!(encoded, [0]);
+        }
     }
 
     #[tokio::test]
