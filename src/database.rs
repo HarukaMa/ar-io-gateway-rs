@@ -55,6 +55,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "013_bundle_tag_casing",
         include_str!("../migrations/013_bundle_tag_casing.sql"),
     ),
+    (
+        "014_bundle_classification_jit",
+        include_str!("../migrations/014_bundle_classification_jit.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -1097,26 +1101,39 @@ impl BlockStore {
                 )
                 .await?;
             // A root can first be observed in a later block, then gain an earlier placement.
+            let has_children: bool = transaction
+                .query_one(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM public.block_transactions bt
+                         JOIN public.item_locations l ON l.root_key=bt.object_key
+                         WHERE bt.block_hash=$1
+                     )",
+                    &[&block.hash],
+                )
+                .await?
+                .try_get(0)?;
             let mut after = 0_i64;
-            loop {
-                let keys = transaction
-                    .query(
-                        "SELECT DISTINCT l.object_key
+            if has_children {
+                loop {
+                    let keys = transaction
+                        .query(
+                            "SELECT DISTINCT l.object_key
                      FROM public.block_transactions bt
                      JOIN public.item_locations l ON l.root_key=bt.object_key
                      WHERE bt.block_hash=$1 AND l.object_key>$2
                      ORDER BY l.object_key LIMIT 256",
-                        &[&block.hash, &after],
-                    )
-                    .await?
-                    .iter()
-                    .map(|row| row.try_get(0))
-                    .collect::<std::result::Result<Vec<i64>, _>>()?;
-                let Some(&last) = keys.last() else {
-                    break;
-                };
-                Self::refresh_item_placements(transaction, &keys).await?;
-                after = last;
+                            &[&block.hash, &after],
+                        )
+                        .await?
+                        .iter()
+                        .map(|row| row.try_get(0))
+                        .collect::<std::result::Result<Vec<i64>, _>>()?;
+                    let Some(&last) = keys.last() else {
+                        break;
+                    };
+                    Self::refresh_item_placements(transaction, &keys).await?;
+                    after = last;
+                }
             }
         }
         transaction.execute(
@@ -2684,6 +2701,86 @@ mod tests {
             result.imported_blocks == 0 && result.imported_transactions == 0,
             "completed range was reimported"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires indexed bundle children in ar_io_rust_test"]
+    async fn block_metadata_replay_restores_child_placements() -> Result<()> {
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let transaction = store.client.transaction().await?;
+        let row = transaction
+            .query_one(
+                "SELECT b.height,b.hash,b.previous_hash,b.tx_root,b.weave_size::text,b.timestamp
+             FROM public.canonical_blocks c JOIN public.blocks b ON b.hash=c.block_hash
+             WHERE EXISTS (
+                 SELECT 1 FROM public.block_transactions bt
+                 JOIN public.item_locations l ON l.root_key=bt.object_key
+                 WHERE bt.block_hash=b.hash
+             ) ORDER BY b.height LIMIT 1",
+                &[],
+            )
+            .await?;
+        let block = block_from_row(&row, 0)?;
+        let timestamp = u64::try_from(row.try_get::<_, i64>(5)?)?;
+        let ids: Vec<Vec<u8>> = transaction
+            .query(
+                "SELECT o.id FROM public.block_transactions bt
+             JOIN public.objects o ON o.key=bt.object_key
+             WHERE bt.block_hash=$1 ORDER BY bt.position",
+                &[&block.hash],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        transaction
+            .execute(
+                "CREATE TEMP TABLE saved_child_placements ON COMMIT DROP AS
+             SELECT p.* FROM public.canonical_placements p WHERE p.object_key IN (
+                 SELECT l.object_key FROM public.block_transactions bt
+                 JOIN public.item_locations l ON l.root_key=bt.object_key
+                 WHERE bt.block_hash=$1
+             )",
+                &[&block.hash],
+            )
+            .await?;
+        let removed = transaction
+            .execute(
+                "DELETE FROM public.canonical_placements p USING saved_child_placements saved
+             WHERE p.object_key=saved.object_key",
+                &[],
+            )
+            .await?;
+        ensure!(
+            removed > 256,
+            "requires enough indexed children to exercise repair pagination"
+        );
+        BlockStore::write_block_metadata(&transaction, &block, timestamp, &ids).await?;
+        let restored: bool = transaction
+            .query_one(
+                "SELECT NOT EXISTS (
+                 SELECT * FROM saved_child_placements
+                 EXCEPT SELECT * FROM public.canonical_placements
+             )",
+                &[],
+            )
+            .await?
+            .get(0);
+        ensure!(
+            restored,
+            "block replay did not restore the original child placements"
+        );
+        transaction.rollback().await?;
         Ok(())
     }
 

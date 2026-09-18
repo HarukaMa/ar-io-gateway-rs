@@ -388,17 +388,18 @@ where
     F: Future<Output = Result<Vec<(Vec<u8>, u64)>>> + Send + 'a,
 {
     stream::try_unfold(
-        std::collections::VecDeque::new(),
+        std::collections::VecDeque::<TransactionJob>::new(),
         move |mut queued| async move {
             loop {
-                if let Some(job) = queued.pop_front() {
-                    return Ok(Some((job, queued)));
-                }
-                let excluded: Vec<u64> = active.lock().iter().copied().collect();
-                if excluded.len() == 32 {
+                if active.lock().len() == 32 {
                     committed.notified().await;
                     continue;
                 }
+                if let Some(job) = queued.pop_front() {
+                    active.lock().insert(job.0);
+                    return Ok(Some((job, queued)));
+                }
+                let excluded: Vec<u64> = active.lock().iter().copied().collect();
                 let pending = crate::profiling::measure(
                     crate::profiling::Stage::TransactionPending,
                     query(excluded.clone()),
@@ -419,10 +420,7 @@ where
                 for (id, height) in pending {
                     groups.entry(height).or_default().push(id);
                 }
-                for (height, ids) in groups.into_iter().take(32 - excluded.len()) {
-                    active.lock().insert(height);
-                    queued.push_back((height, ids));
-                }
+                queued.extend(groups);
             }
         },
     )
@@ -1003,8 +1001,10 @@ mod metadata_tests {
         let active = parking_lot::Mutex::new(BTreeSet::new());
         let committed = tokio::sync::Notify::new();
         let release = tokio::sync::Notify::new();
+        let selected_ids = std::sync::atomic::AtomicUsize::new(0);
         let query = |excluded: Vec<u64>| {
             let pending = &pending;
+            let selected_ids = &selected_ids;
             async move {
                 assert!(excluded.len() < 32);
                 let selected = pending
@@ -1013,7 +1013,8 @@ mod metadata_tests {
                     .filter(|(_, height)| !excluded.contains(height))
                     .take(256)
                     .cloned()
-                    .collect();
+                    .collect::<Vec<_>>();
+                selected_ids.fetch_add(selected.len(), std::sync::atomic::Ordering::Relaxed);
                 tokio::task::yield_now().await;
                 Ok(selected)
             }
@@ -1056,6 +1057,7 @@ mod metadata_tests {
         })
         .await
         .context("selection waited for the stalled first window")??;
+        assert_eq!(selected_ids.load(std::sync::atomic::Ordering::Relaxed), 334);
         Ok(())
     }
 
