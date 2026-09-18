@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -48,6 +48,7 @@ struct Admission {
     max_scheduled_bytes: usize,
     changed: tokio::sync::Notify,
     last_indexed_at: AtomicU64,
+    paused: AtomicBool,
     status: Mutex<WorkerStatus>,
 }
 
@@ -90,6 +91,7 @@ impl Admission {
             },
             changed: tokio::sync::Notify::new(),
             last_indexed_at: AtomicU64::new(0),
+            paused: AtomicBool::new(false),
         })
     }
 
@@ -105,7 +107,8 @@ impl Admission {
     ) -> Option<Reservation> {
         // Contention is backpressure too: HTTP never waits for the worker.
         let mut state = self.state.try_lock()?;
-        if state.closed
+        if self.paused.load(Ordering::Relaxed)
+            || state.closed
             || state.ids.len() == self.max_jobs
             || state.ids.contains_key(&id)
             || bytes > self.max_bytes - state.bytes
@@ -298,7 +301,9 @@ impl BundleSubmitter {
         serde_json::json!({
             "running": !self.is_closed(),
             "chain": status.chain,
-            "bundles": if status.bundles == "idle" && !self.admission.state.lock().ids.is_empty() {
+            "bundles": if self.admission.paused.load(Ordering::Relaxed) {
+                "waiting for chain"
+            } else if status.bundles == "idle" && !self.admission.state.lock().ids.is_empty() {
                 "fetching or queued"
             } else { status.bundles },
             "last_failure": status.last_failure,
@@ -367,6 +372,9 @@ pub(crate) async fn start(
     } else {
         "disabled"
     };
+    admission
+        .paused
+        .store(config.index_chain, Ordering::Relaxed);
     let (sender, receiver) = mpsc::channel(MAX_JOBS);
     let (cancel, mut cancelled) = oneshot::channel();
     let (ready, readiness) = oneshot::channel();
@@ -416,11 +424,15 @@ pub(crate) async fn start(
                         };
                         loop {
                             worker_admission.status.lock().chain = "indexing";
-                            match crate::indexer::follow_chain_step(&gateway, store).await {
+                            let result = crate::indexer::follow_chain_step(&gateway, store, |caught_up| {
+                                worker_admission.paused.store(!caught_up, Ordering::Relaxed);
+                            }).await;
+                            match result {
                                 Ok(true) => tokio::task::yield_now().await,
                                 result => {
                                     worker_admission.status.lock().chain = if result.is_err() { "retrying" } else { "waiting" };
                                     if let Err(error) = result {
+                                        worker_admission.paused.store(true, Ordering::Relaxed);
                                         eprintln!("following chain failed: {error:#}");
                                         worker_admission.failed("Chain indexing failed");
                                     }
@@ -508,6 +520,9 @@ async fn run(
                 break;
             }
             let job = tokio::select! {
+                _ = tokio::time::sleep(POLL_INTERVAL), if admission.paused.load(Ordering::Relaxed) => {
+                    continue;
+                }
                 _ = snapshots.tick() => {
                     let profiles: Vec<_> = admission.state.lock().ids.values().cloned().collect();
                     for profile in profiles {
@@ -532,13 +547,15 @@ async fn run(
                     }
                     continue;
                 }
-                job = async { requests.as_mut().unwrap().recv().await }, if requests.is_some() && !stores.is_empty() => {
+                job = async { requests.as_mut().unwrap().recv().await }, if requests.is_some() && !stores.is_empty()
+                    && !admission.paused.load(Ordering::Relaxed) => {
                     match job {
                         Some(job) => job,
                         None => { requests = None; continue; }
                     }
                 }
-                job = ready.recv(), if !downloads_finished && !stores.is_empty() => {
+                job = ready.recv(), if !downloads_finished && !stores.is_empty()
+                    && !admission.paused.load(Ordering::Relaxed) => {
                     match job {
                         Some(job) => job,
                         None => { downloads_finished = true; continue; }
@@ -596,6 +613,11 @@ async fn download_pending(
     let mut exhausted = false;
     let mut next_poll = Instant::now();
     loop {
+        let paused = admission.paused.load(Ordering::Relaxed);
+        if paused && downloads.is_empty() && discovery.is_none() {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
         if range.is_none() && Instant::now() >= checkpoint_at {
             checkpoint_at = Instant::now() + POLL_INTERVAL;
             let boundary = if pending.is_some() || candidates.len() > 0 {
@@ -625,7 +647,7 @@ async fn download_pending(
         if pending.is_none() && downloads.len() < gateway.config.index_downloads {
             pending = candidates.next();
         }
-        if let Some((root_id, height, data_size)) = pending.take() {
+        if !paused && let Some((root_id, height, data_size)) = pending.take() {
             let id: [u8; 32] = root_id
                 .as_slice()
                 .try_into()
@@ -720,7 +742,8 @@ async fn download_pending(
         if exhausted && downloads.is_empty() && range.is_some() {
             return Ok(());
         }
-        if discovery.is_none()
+        if !paused
+            && discovery.is_none()
             && pending.is_none()
             && candidates.len() == 0
             && downloads.len() < gateway.config.index_downloads
@@ -777,7 +800,7 @@ async fn download_pending(
                     }
                 }
             }
-            _ = std::future::ready(()), if pending.is_none()
+            _ = std::future::ready(()), if !paused && pending.is_none()
                 && candidates.len() > 0 && downloads.len() < gateway.config.index_downloads => {}
             _ = tokio::time::sleep(POLL_INTERVAL), if pending.is_some() => {}
         }
@@ -1058,6 +1081,21 @@ mod tests {
             Arc::clone(&admission),
             None,
         ));
+        admission.paused.store(true, Ordering::Relaxed);
+        tokio::select! {
+            result = &mut running => bail!("paused bundle worker exited: {result:?}"),
+            _ = tokio::time::sleep(POLL_INTERVAL * 2) => {}
+        }
+        let blocked: i64 = transaction
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%WITH bundle_tags%'",
+                &[&pid],
+            )
+            .await?
+            .get(0);
+        assert_eq!(blocked, 0, "paused worker started queued bundle jobs");
+        admission.paused.store(false, Ordering::Relaxed);
         let observe = async {
             let mut settling = None;
             loop {
@@ -1241,6 +1279,30 @@ mod tests {
         );
         server.abort();
         Ok(())
+    }
+
+    #[test]
+    fn chain_pause_rejects_new_bundles_and_preserves_active_jobs() {
+        let (submitter, mut receiver) = submitter(4 * MAX_JSON_BYTES);
+        let first = root(0, vec![0].into());
+        let second = root(1, vec![0].into());
+        submitter.submit(&first);
+        let active = receiver.try_recv().unwrap();
+
+        submitter.admission.paused.store(true, Ordering::Relaxed);
+        submitter.submit(&second);
+        assert!(receiver.try_recv().is_err());
+        assert!(submitter.admission.reserve_scheduled([2; 32], 1).is_none());
+
+        submitter.admission.paused.store(false, Ordering::Relaxed);
+        submitter.submit(&first);
+        assert!(receiver.try_recv().is_err());
+        submitter.submit(&second);
+        assert_eq!(receiver.try_recv().unwrap().reservation.id, [1; 32]);
+        drop(active);
+        submitter.submit(&first);
+        assert_eq!(receiver.try_recv().unwrap().reservation.id, [0; 32]);
+        assert!(submitter.admission.reserve_scheduled([2; 32], 1).is_some());
     }
 
     #[test]

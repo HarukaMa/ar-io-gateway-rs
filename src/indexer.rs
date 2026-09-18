@@ -63,7 +63,17 @@ impl RootFacts {
     }
 }
 
-pub(crate) async fn follow_chain_step(gateway: &Gateway, store: &mut BlockStore) -> Result<bool> {
+fn chain_caught_up(through: Option<u64>, pending: Option<u64>, tip: u64) -> bool {
+    tip.checked_sub(CONSENSUS_DEPTH).is_some_and(|safe| {
+        through.is_some_and(|height| height >= safe) && pending.is_none_or(|height| height > safe)
+    })
+}
+
+pub(crate) async fn follow_chain_step(
+    gateway: &Gateway,
+    store: &mut BlockStore,
+    on_caught_up: impl FnOnce(bool),
+) -> Result<bool> {
     let state = store.state().await?;
     ensure!(
         state.as_ref().is_none_or(|state| state.start_height == 0),
@@ -85,6 +95,7 @@ pub(crate) async fn follow_chain_step(gateway: &Gateway, store: &mut BlockStore)
     } else {
         None
     };
+    on_caught_up(chain_caught_up(through, pending, info.height));
     if let Some(height) = pending {
         let through = through.unwrap();
         let mut metadata_store = store.reconnect().await?;
@@ -807,6 +818,22 @@ fn block_metadata<'a>(
 
 #[cfg(test)]
 mod metadata_tests {
+    #[test]
+    fn bundle_readiness_requires_metadata_through_the_current_safe_height() {
+        let tip = super::CONSENSUS_DEPTH + 100;
+        assert!(!super::chain_caught_up(None, None, tip));
+        assert!(!super::chain_caught_up(Some(99), None, tip));
+        assert!(!super::chain_caught_up(Some(150), Some(100), tip));
+        assert!(super::chain_caught_up(Some(100), Some(101), tip));
+        assert!(super::chain_caught_up(Some(100), None, tip));
+        assert!(!super::chain_caught_up(Some(100), None, tip + 1));
+        assert!(!super::chain_caught_up(
+            Some(100),
+            None,
+            super::CONSENSUS_DEPTH - 1
+        ));
+    }
+
     #[tokio::test]
     #[ignore = "requires ar_io_rust_test; verifies cross-block batch rollback"]
     async fn failed_metadata_batch_keeps_heights_pending() -> Result<()> {
