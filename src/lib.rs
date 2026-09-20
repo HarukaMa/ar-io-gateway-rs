@@ -169,17 +169,13 @@ impl Config {
             .unwrap_or_else(|_| "3".to_owned())
             .parse()
             .context("invalid ARWEAVE_MAX_PEER_ATTEMPTS")?;
-        let max_data_size = env::var("ARWEAVE_MAX_DATA_SIZE_BYTES")
-            .unwrap_or_else(|_| (1024 * 1024 * 1024).to_string())
-            .parse()
-            .context("invalid ARWEAVE_MAX_DATA_SIZE_BYTES")?;
         let mut config = Config::new(
             trusted_node,
             archive,
             sources,
             Duration::from_secs(timeout),
             max_attempts,
-            max_data_size,
+            usize::MAX,
         )?;
         config.graphql_sources = env::var("ARWEAVE_GRAPHQL_URLS")
             .unwrap_or_else(|_| {
@@ -788,6 +784,9 @@ impl Gateway {
         data: &mut VerifiedData,
         tags: Option<Vec<Tag>>,
     ) -> Result<()> {
+        if !data.bytes.is_materialized() {
+            return Ok(());
+        }
         let (Some(cache), Some(store)) = (&self.disk_cache, &self.block_store) else {
             return Ok(());
         };
@@ -3488,13 +3487,17 @@ impl BundleEntry {
                                 .saturating_add(MAX_DATA_ITEM_HEADER_BYTES),
                         "data item exceeds configured data size limit"
                     );
-                    bytes = bytes
-                        .materialize(
-                            gateway.config.max_memory_data_size,
-                            Arc::clone(&gateway.spool_budget),
-                        )
-                        .await?
-                        .0;
+                    if bytes.len() <= gateway.config.max_memory_data_size
+                        || bytes.len() <= gateway.config.max_spool_bytes
+                    {
+                        bytes = bytes
+                            .materialize(
+                                gateway.config.max_memory_data_size,
+                                Arc::clone(&gateway.spool_budget),
+                            )
+                            .await?
+                            .0;
+                    }
                 }
                 Ok(Some(verify_data_item(bytes, &id).await?))
             }
@@ -3515,14 +3518,18 @@ impl BundleEntry {
                 };
                 if let Some(gateway) = materialize {
                     checked_data_size(item.data.len() as u128, gateway.config.max_data_size)?;
-                    item.data = item
-                        .data
-                        .materialize(
-                            gateway.config.max_memory_data_size,
-                            Arc::clone(&gateway.spool_budget),
-                        )
-                        .await?
-                        .0;
+                    if item.data.len() <= gateway.config.max_memory_data_size
+                        || item.data.len() <= gateway.config.max_spool_bytes
+                    {
+                        item.data = item
+                            .data
+                            .materialize(
+                                gateway.config.max_memory_data_size,
+                                Arc::clone(&gateway.spool_budget),
+                            )
+                            .await?
+                            .0;
+                    }
                 }
                 Ok(Some(item))
             }
@@ -4977,6 +4984,11 @@ mod tests {
             .expect("streamed hashing stalled")
             .unwrap();
         assert_eq!(hashes, (sha256(&[&bytes]), sha384(&[&bytes])));
+        assert_eq!(
+            requests.started.swap(0, Ordering::SeqCst),
+            chunks.len(),
+            "read-ahead fetched a proof chunk more than once"
+        );
         let peak = requests.peak.load(Ordering::SeqCst);
         assert!((2..=8).contains(&peak), "peak in-flight requests: {peak}");
         requests.peak.store(0, Ordering::SeqCst);
@@ -4988,10 +5000,31 @@ mod tests {
         .expect("background read-ahead stalled")
         .unwrap();
         assert_eq!(hashes, (sha256(&[&bytes]), sha384(&[&bytes])));
+        assert_eq!(
+            requests.started.swap(0, Ordering::SeqCst),
+            chunks.len(),
+            "background read-ahead fetched a proof chunk more than once"
+        );
         let peak = requests.peak.load(Ordering::SeqCst);
         assert!(
             (2..=16).contains(&peak),
             "background peak in-flight requests: {peak}"
+        );
+        let range = 137..bytes.len() - 83;
+        let hashes = fresh()
+            .slice(range.clone())
+            .unwrap()
+            .hashes()
+            .await
+            .unwrap();
+        assert_eq!(
+            hashes,
+            (sha256(&[&bytes[range.clone()]]), sha384(&[&bytes[range]]))
+        );
+        assert_eq!(
+            requests.started.load(Ordering::SeqCst),
+            chunks.len(),
+            "unaligned read-ahead fetched a proof chunk more than once"
         );
         let (verified, _) =
             verify_bundle_item(fresh(), crate::BundleFormat::Binary, &id, None, None)
@@ -5229,6 +5262,72 @@ mod tests {
         .unwrap();
         let requested = bundled_item.map_or(id, |(id, _)| id.to_owned());
         (gateway, requested, corrupt_chunk, server, chunk_requests)
+    }
+
+    #[tokio::test]
+    async fn retrieval_beyond_spool_capacity_preserves_proofs_and_diagnostic_limits() {
+        use std::sync::atomic::Ordering;
+
+        let payload = vec![42; 3 * MAX_CHUNK_SIZE as usize + 17];
+        let (item, item_id) = signed_data_item(&payload, &[]);
+        let binary = encode_bundle(&[&item]);
+        let json = include_bytes!("../tests/fixtures/json-bundle-434410.json");
+        let fixture: serde_json::Value = serde_json::from_slice(json).unwrap();
+        let json_item = &fixture["items"][0];
+        let json_payload = decode_b64(json_item["data"].as_str().unwrap(), "fixture data").unwrap();
+        let binary_tags: &[(&[u8], &[u8])] =
+            &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+        let json_tags: &[(&[u8], &[u8])] =
+            &[(b"Bundle-Format", b"json"), (b"Bundle-Version", b"1.0.0")];
+        for (root, tags, item_id, expected) in [
+            (payload.clone(), &[][..], None, payload.clone()),
+            (
+                binary,
+                binary_tags,
+                Some(URL_SAFE_NO_PAD.encode(item_id)),
+                payload,
+            ),
+            (
+                json.to_vec(),
+                json_tags,
+                Some(json_item["id"].as_str().unwrap().to_owned()),
+                json_payload,
+            ),
+        ] {
+            let (fixture, id, corrupt, server, _) = retrieval_fixture(
+                &root,
+                tags,
+                item_id.as_deref().map(|id| (id, expected.len())),
+            )
+            .await;
+            let _server = tokio_util::task::AbortOnDropHandle::new(server);
+            let mut config = fixture.config.clone();
+            config.max_data_size = usize::MAX;
+            config.max_memory_data_size = 1;
+            config.max_spool_bytes = 1;
+            let gateway = Gateway::new(config.clone()).unwrap();
+            let data = gateway.retrieve(&id).await.unwrap();
+            assert_eq!(data.sha256, hex(&sha256(&[&expected])));
+            assert_eq!(
+                data.bytes.read_all(expected.len()).await.unwrap().as_ref(),
+                expected.as_slice()
+            );
+
+            let mut bounded = config.clone();
+            bounded.max_data_size = expected.len() - 1;
+            let error = Gateway::new(bounded)
+                .unwrap()
+                .retrieve(&id)
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("size limit"), "{error:#}");
+
+            corrupt.store(true, Ordering::SeqCst);
+            assert!(
+                Gateway::new(config).unwrap().retrieve(&id).await.is_err(),
+                "retrieval accepted a corrupt chunk without a spool"
+            );
+        }
     }
 
     #[tokio::test]

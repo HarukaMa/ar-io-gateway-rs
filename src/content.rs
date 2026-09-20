@@ -287,6 +287,10 @@ impl Content {
         matches!(&self.0, Storage::Memory { .. })
     }
 
+    pub(crate) fn is_materialized(&self) -> bool {
+        matches!(&self.0, Storage::Memory { .. } | Storage::File { .. })
+    }
+
     pub fn resident_len(&self) -> usize {
         match &self.0 {
             Storage::Memory { resident_len, .. } => *resident_len,
@@ -380,6 +384,11 @@ impl Content {
         memory_limit: usize,
         budget: Arc<SpoolBudget>,
     ) -> Result<(Self, [u8; 32])> {
+        if !self.is_materialized() && self.len() > memory_limit && self.len() > budget.max_bytes {
+            // Retain proof-backed content after verification when a full spool cannot fit.
+            let (hash, _) = self.hashes().await?;
+            return Ok((self, hash));
+        }
         if matches!(&self.0, Storage::Base64 { .. }) {
             let mut writer = ContentWriter::new(self.len(), memory_limit, budget).await?;
             let mut reader = self.reader().await?;

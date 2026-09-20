@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use axum::body::Bytes;
-use futures_util::{Stream, StreamExt, stream};
+use futures_util::{Stream, StreamExt, TryStreamExt, stream};
 use reqwest::Client;
 use tokio::sync::Mutex;
 use tokio_util::task::AbortOnDropHandle;
@@ -65,24 +65,55 @@ impl ChunkSource {
         );
         let size = crate::MAX_CHUNK_SIZE as usize;
         let background = crate::BACKGROUND_CPU.try_with(|()| ()).is_ok();
-        Ok(stream::iter((offset..end).step_by(size))
-            .map(move |position| {
-                let source = Arc::clone(&self);
+        let read = move |position| {
+            let source = Arc::clone(&self);
+            async move {
+                // Proof checks must progress while the consumer waits for the same CPU pool.
+                AbortOnDropHandle::new(tokio::spawn(async move {
+                    let read = source.chunk_at(position);
+                    if background {
+                        crate::BACKGROUND_CPU.scope((), read).await
+                    } else {
+                        read.await
+                    }
+                }))
+                .await
+                .context("stream read-ahead task failed")?
+            }
+        };
+        // Positions a maximum chunk apart cannot select the same proof chunk.
+        // Reserve one request slot for gaps left by smaller proof chunks.
+        let pending = stream::iter((offset..end).step_by(size))
+            .map(read.clone())
+            .buffered(if background { 15 } else { 7 });
+        Ok(stream::try_unfold(
+            (Box::pin(pending), None::<(usize, Bytes)>, offset),
+            move |(mut pending, mut next, position)| {
+                let read = read.clone();
                 async move {
-                    // Proof checks must progress while the consumer waits for the same CPU pool.
-                    AbortOnDropHandle::new(tokio::spawn(async move {
-                        let read = source.read_at(position, size.min(end - position));
-                        if background {
-                            crate::BACKGROUND_CPU.scope((), read).await
-                        } else {
-                            read.await
-                        }
-                    }))
-                    .await
-                    .context("stream read-ahead task failed")?
+                    if position == end {
+                        return Ok(None);
+                    }
+                    if next.is_none() {
+                        next = pending.try_next().await?;
+                    }
+                    let (start, bytes) = match &next {
+                        Some((start, _)) if *start <= position => next.take().unwrap(),
+                        _ => read(position).await?,
+                    };
+                    ensure!(
+                        start <= position && position - start < bytes.len(),
+                        "verified stream made no progress"
+                    );
+                    let within = position - start;
+                    let count = (end - position).min(bytes.len() - within);
+                    Ok(Some((
+                        bytes.slice(within..within + count),
+                        (pending, next, position + count),
+                    )))
                 }
-            })
-            .buffered(if background { 16 } else { 8 }))
+            },
+        ))
     }
 
     pub(crate) async fn read_at(&self, offset: usize, length: usize) -> Result<Bytes> {
@@ -97,27 +128,7 @@ impl ChunkSource {
         output.try_reserve_exact(length)?;
         let mut position = offset;
         while position < end {
-            let hit = {
-                let cached = self.cached.lock().await;
-                cached
-                    .iter()
-                    .find(|(start, bytes)| *start <= position && position - start < bytes.len())
-                    .cloned()
-            };
-            let (start, bytes) = match hit {
-                Some(chunk) => chunk,
-                None => self.fetch(position).await?,
-            };
-            {
-                let mut cached = self.cached.lock().await;
-                if let Some(index) = cached.iter().position(|(offset, _)| *offset == start) {
-                    cached.remove(index);
-                }
-                if cached.len() == 2 {
-                    cached.pop_back();
-                }
-                cached.push_front((start, bytes.clone()));
-            }
+            let (start, bytes) = self.chunk_at(position).await?;
             let within = position - start;
             let count = (end - position).min(bytes.len() - within);
             ensure!(count > 0, "verified stream made no progress");
@@ -125,6 +136,29 @@ impl ChunkSource {
             position += count;
         }
         Ok(Bytes::from(output))
+    }
+
+    async fn chunk_at(&self, position: usize) -> Result<(usize, Bytes)> {
+        let hit = {
+            let cached = self.cached.lock().await;
+            cached
+                .iter()
+                .find(|(start, bytes)| *start <= position && position - start < bytes.len())
+                .cloned()
+        };
+        let (start, bytes) = match hit {
+            Some(chunk) => chunk,
+            None => self.fetch(position).await?,
+        };
+        let mut cached = self.cached.lock().await;
+        if let Some(index) = cached.iter().position(|(offset, _)| *offset == start) {
+            cached.remove(index);
+        }
+        if cached.len() == 2 {
+            cached.pop_back();
+        }
+        cached.push_front((start, bytes.clone()));
+        Ok((start, bytes))
     }
 
     async fn fetch(&self, position: usize) -> Result<(usize, Bytes)> {
