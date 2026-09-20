@@ -11,6 +11,7 @@ code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono"
 .stage-tooltip{white-space:normal}
 .failure-details{margin:12px 0 0;padding-left:12px;border-left:2px solid #60777c}.failure-details dt{margin-top:10px}.failure-details dd{font-size:14px}
 .unavailable{color:#edc879}.relationship-graph{overflow-x:auto;padding-bottom:8px}.relationship-graph svg{display:block}.relationship-graph text{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;fill:#e6edef}.relationship-graph .link-label{font:12px system-ui,sans-serif}
+.relationship-group+.relationship-group{border-top:1px solid #304044;margin-top:24px;padding-top:24px}.relationship-group h3{margin:0 0 8px;font-size:16px}.relationship-group p{margin:8px 0}.relationship-group .retrieval-status{font-weight:600}
 </style>
 </head>
 <body>
@@ -26,7 +27,7 @@ code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono"
 <div id="results" hidden>
 <div class="result-head"><h2>Diagnostic report</h2><a id="download" class="download" download="diagnostic.json">Download JSON</a></div>
 <div class="grid"><section><h2>Resolution</h2><dl id="resolution"></dl></section><section><h2>Local state</h2><dl id="local"></dl><p class="note">Cache presence checks file type and size. Retrieval runs fresh verification.</p></section></div>
-<section><h2>Bundle relationships</h2><p class="note">Arrows point from an item to a possible parent bundle. Verified links passed item verification.</p><div id="ancestry" class="relationship-graph" role="region" aria-label="Bundle relationship graph" tabindex="0"></div><p id="no-ancestry">No bundle locations discovered.</p></section>
+<section><h2>Bundle relationships</h2><p class="note">Each section shows one content item's ancestry. Arrows point to parent bundles. Link verification applies to that item.</p><div id="ancestry"></div></section>
 <section><h2>Retrieval and verification</h2><p class="note">Stages appear in start order. Alternative paths can run concurrently.</p><ol id="steps"></ol><p id="truncated" hidden>Stage limit reached. This trace is incomplete.</p></section>
 <section id="content-section" hidden><h2>Verified content</h2><dl id="content"></dl></section>
 <details><summary>Raw JSON</summary><pre id="json"></pre></details>
@@ -80,21 +81,58 @@ function renderRelationships(report) {
     if (rank[step.status] > rank[link.status]) link.status = step.status;
     links.set(key, link);
   }
-  element('no-ancestry').hidden = links.size > 0;
-  if (!links.size) return;
+  const groups = report.manifest
+    ? [{id: report.manifest.id, name: 'Site manifest'}, {id: report.manifest.target_id, name: 'Requested asset'}]
+    : [{id: report.resolved_id || report.root_id, name: 'Requested content'}];
+  for (const [index, group] of groups.entries()) {
+    const container = document.createElement('div');
+    container.className = 'relationship-group';
+    const heading = document.createElement('h3');
+    heading.textContent = group.name;
+    const retrieval = report.steps.findLast(step => step.stage === 'verified_retrieval' && step.id === group.id);
+    const status = document.createElement('p');
+    status.className = 'retrieval-status ' + (retrieval?.status || '');
+    status.textContent = {
+      passed: 'Content retrieval verified',
+      failed: 'Content retrieval failed',
+      unavailable: 'Content unavailable',
+      not_found: 'Content not found',
+      running: 'Content retrieval incomplete'
+    }[retrieval?.status] || 'Content retrieval not reached';
+    container.append(heading, status);
+    if (retrieval?.error || retrieval?.message) {
+      const error = document.createElement('p');
+      error.textContent = retrieval.message || retrieval.error;
+      container.append(error);
+    }
+    if (group.id) {
+      const id = document.createElement('p');
+      id.className = 'data-id';
+      id.textContent = group.id;
+      container.append(id);
+    }
+    element('ancestry').append(container);
+    renderAncestry(group, links, container, index);
+  }
+}
+function renderAncestry(group, links, container, index) {
+  if (!group.id) return;
   const nodes = new Map();
   const add = (id, depth) => {
     if (!nodes.has(id)) nodes.set(id, {id, depth});
   };
-  add(report.resolved_id || report.input, 0);
+  add(group.id, 0);
   for (const node of nodes.values()) {
     for (const link of links.values()) {
       if (link.child === node.id) add(link.parent, node.depth + 1);
     }
   }
-  for (const link of links.values()) {
-    add(link.child, 0);
-    add(link.parent, nodes.get(link.child).depth + 1);
+  const ancestry = [...links.values()].filter(link => nodes.has(link.child));
+  if (!ancestry.length) {
+    const empty = document.createElement('p');
+    empty.textContent = 'No parent bundle discovered.';
+    container.append(empty);
+    return;
   }
   const rows = [];
   for (const node of nodes.values()) {
@@ -111,25 +149,26 @@ function renderRelationships(report) {
   };
   const graph = svg('svg', {
     width: rows.length * 500 - 100, height: Math.max(...rows) * 90,
-    role: 'img', 'aria-label': 'Item to parent bundle relationships'
+    role: 'img', 'aria-label': `${group.name} bundle ancestry`
   });
-  graph.append(svg('desc', {}, [...links.values()].map(link =>
-    `${link.child} to ${link.parent}: ${link.status === 'passed' ? 'verified' : link.status}`
+  graph.append(svg('desc', {}, ancestry.map(link =>
+    `${link.child} to ${link.parent}: ${link.status === 'passed' ? 'item verified' : link.status}`
   ).join('. ')));
   const defs = svg('defs');
-  const arrow = svg('marker', {id: 'relationship-arrow', viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse'});
+  const markerId = `relationship-arrow-${index}`;
+  const arrow = svg('marker', {id: markerId, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse'});
   arrow.append(svg('path', {d: 'M 0 0 L 10 5 L 0 10 z', fill: '#a5b6bb'}));
   defs.append(arrow);
   graph.append(defs);
-  for (const link of links.values()) {
+  for (const link of ancestry) {
     const child = nodes.get(link.child), parent = nodes.get(link.parent);
     const x = child.x + 370, y = child.y + 26, endY = parent.y + 26;
     const color = {passed: '#8bdbc6', failed: '#f19b9b', unavailable: '#edc879'}[link.status] || '#a5b6bb';
-    const status = link.status === 'passed' ? 'verified' : link.status;
+    const status = link.status === 'passed' ? 'item verified' : link.status;
     const path = svg('path', {
       d: `M ${x} ${y} C ${x + 60} ${y}, ${parent.x - 60} ${endY}, ${parent.x - 4} ${endY}`,
       fill: 'none', stroke: color, 'stroke-width': 2,
-      'stroke-dasharray': link.status === 'passed' ? 'none' : '5 4', 'marker-end': 'url(#relationship-arrow)'
+      'stroke-dasharray': link.status === 'passed' ? 'none' : '5 4', 'marker-end': `url(#${markerId})`
     });
     path.append(svg('title', {}, `${link.child} to ${link.parent}: ${status}`));
     graph.append(path, svg('text', {x: x + 10, y: (y + endY) / 2 - 10, class: 'link-label', style: `fill:${color}`}, status));
@@ -140,7 +179,13 @@ function renderRelationships(report) {
       svg('text', {x: node.x + 12, y: node.y + 31}, node.id)
     );
   }
-  element('ancestry').append(graph);
+  const viewport = document.createElement('div');
+  viewport.className = 'relationship-graph';
+  viewport.setAttribute('role', 'region');
+  viewport.setAttribute('aria-label', `${group.name} bundle ancestry`);
+  viewport.tabIndex = 0;
+  viewport.append(graph);
+  container.append(viewport);
 }
 function render(report) {
   const alternateFailure = report.steps.some(step => step.stage === 'bundle_item_verification' && ['failed', 'unavailable'].includes(step.status));

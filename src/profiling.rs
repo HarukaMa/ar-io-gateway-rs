@@ -1,10 +1,14 @@
 use std::{
     future::Future,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::Mutex;
+use serde::Serialize;
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy)]
@@ -67,6 +71,8 @@ struct State {
     outcome: &'static str,
     origins: std::collections::BTreeMap<String, Counter>,
     counters: [Counter; STAGES.len()],
+    data_size: Option<u128>,
+    last_progress: Instant,
 }
 
 pub(crate) struct Profile {
@@ -75,6 +81,22 @@ pub(crate) struct Profile {
     root: String,
     log_prefix: &'static str,
     state: Mutex<State>,
+    downloaded_bytes: Option<Arc<AtomicU64>>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct LiveBundle<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) data_size: Option<u128>,
+    pub(crate) phase: &'static str,
+    pub(crate) activity: &'static str,
+    pub(crate) outcome: &'static str,
+    pub(crate) elapsed_seconds: f64,
+    pub(crate) progress_age_seconds: f64,
+    pub(crate) downloaded_bytes: u64,
+    pub(crate) downloading: bool,
+    pub(crate) verifying: bool,
+    pub(crate) persisting: bool,
 }
 
 tokio::task_local! {
@@ -110,15 +132,19 @@ impl State {
 }
 
 impl Profile {
-    pub(crate) fn new(root: String) -> Arc<Self> {
-        Self::with_prefix(root, "bundle_profile")
+    pub(crate) fn new(root: String, downloaded_bytes: Option<Arc<AtomicU64>>) -> Arc<Self> {
+        Self::with_prefix(root, "bundle_profile", downloaded_bytes)
     }
 
     pub(crate) fn transaction_window(range: String) -> Arc<Self> {
-        Self::with_prefix(range, "transaction_profile")
+        Self::with_prefix(range, "transaction_profile", None)
     }
 
-    fn with_prefix(root: String, log_prefix: &'static str) -> Arc<Self> {
+    fn with_prefix(
+        root: String,
+        log_prefix: &'static str,
+        downloaded_bytes: Option<Arc<AtomicU64>>,
+    ) -> Arc<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Arc::new(Self {
             attempt: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -128,6 +154,7 @@ impl Profile {
                 .as_micros() as u64,
             root,
             log_prefix,
+            downloaded_bytes,
             state: Mutex::new(State {
                 updated: Instant::now(),
                 phases: [Duration::ZERO; 3],
@@ -135,8 +162,49 @@ impl Profile {
                 outcome: "running",
                 counters: std::array::from_fn(|_| Counter::default()),
                 origins: Default::default(),
+                data_size: None,
+                last_progress: Instant::now(),
             }),
         })
+    }
+
+    pub(crate) fn set_size(&self, size: u128) {
+        self.state.lock().data_size = Some(size);
+    }
+
+    pub(crate) fn live_snapshot(&self) -> LiveBundle<'_> {
+        let mut state = self.state.lock();
+        state.update();
+        let active = |stage: Stage| state.counters[stage as usize].active > 0;
+        let downloading = active(Stage::ChunkHeaders) || active(Stage::ChunkBody);
+        let verifying = active(Stage::CpuExecution)
+            || active(Stage::CpuAdmission)
+            || active(Stage::CpuDispatch);
+        let persisting = active(Stage::Persistence);
+        let phase = ["queued", "preparing", "processing"][state.phase];
+        LiveBundle {
+            id: &self.root,
+            data_size: state.data_size,
+            phase,
+            activity: if state.phase == 0 {
+                "queued"
+            } else if persisting {
+                "persisting"
+            } else if downloading {
+                "downloading"
+            } else if verifying || active(Stage::Traversal) {
+                "verifying"
+            } else {
+                phase
+            },
+            outcome: state.outcome,
+            elapsed_seconds: state.phases.iter().sum::<Duration>().as_secs_f64(),
+            progress_age_seconds: state.last_progress.elapsed().as_secs_f64(),
+            downloaded_bytes: state.counters[Stage::ChunkBody as usize].bytes,
+            downloading,
+            verifying,
+            persisting,
+        }
     }
 
     pub(crate) fn phase(&self, phase: usize) {
@@ -218,13 +286,15 @@ pub(crate) fn start_origin(source: &str) -> Option<Timer> {
 
 pub(crate) fn verified_chunk(source: &str, bytes: usize) {
     if let (Some(profile), Ok(url)) = (current(), reqwest::Url::parse(source)) {
-        profile
-            .state
-            .lock()
+        let mut state = profile.state.lock();
+        state
             .origins
             .entry(url.origin().ascii_serialization())
             .or_default()
             .bytes += bytes as u64;
+        if bytes > 0 {
+            state.last_progress = Instant::now();
+        }
     }
 }
 
@@ -257,7 +327,16 @@ fn start_counter(profile: &Option<Arc<Profile>>, key: CounterKey) -> Option<Time
 
 impl Timer {
     pub(crate) fn add_bytes(&self, bytes: u64) {
-        self.profile.state.lock().counter(&self.key).bytes += bytes;
+        let mut state = self.profile.state.lock();
+        state.counter(&self.key).bytes += bytes;
+        if bytes > 0 {
+            state.last_progress = Instant::now();
+            if matches!(self.key, CounterKey::Stage(Stage::ChunkBody))
+                && let Some(total) = &self.profile.downloaded_bytes
+            {
+                total.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
     }
 
     pub(crate) fn finish(mut self, success: bool, bytes: u64) {
@@ -270,6 +349,21 @@ impl Drop for Timer {
     fn drop(&mut self) {
         let mut state = self.profile.state.lock();
         state.update();
+        if self.bytes > 0
+            || (self.outcome == Some(true)
+                && matches!(
+                    self.key,
+                    CounterKey::Stage(Stage::CpuExecution | Stage::Traversal | Stage::Persistence)
+                ))
+        {
+            state.last_progress = Instant::now();
+        }
+        if self.bytes > 0
+            && matches!(self.key, CounterKey::Stage(Stage::ChunkBody))
+            && let Some(total) = &self.profile.downloaded_bytes
+        {
+            total.fetch_add(self.bytes, Ordering::Relaxed);
+        }
         let counter = state.counter(&self.key);
         counter.active -= 1;
         counter.bytes += self.bytes;
@@ -298,6 +392,36 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn live_snapshot_reports_progress_without_exposing_origins() {
+        let total = Arc::new(AtomicU64::new(0));
+        let profile = Profile::new("public-bundle-id".into(), Some(Arc::clone(&total)));
+        profile.phase(2);
+        profile.state.lock().last_progress -= Duration::from_secs(60);
+        let before = profile.live_snapshot().progress_age_seconds;
+        scope(Some(Arc::clone(&profile)), async {
+            let _origin = start_origin("http://user:secret@private.invalid:1984").unwrap();
+            let body = start(Stage::ChunkBody).unwrap();
+            body.add_bytes(25);
+            let sample = profile.live_snapshot();
+            assert_eq!(sample.activity, "downloading");
+            assert!(sample.progress_age_seconds < before);
+            let public = serde_json::to_string(&sample).unwrap();
+            assert!(
+                !public.contains("private.invalid")
+                    && !public.contains("secret")
+                    && !public.contains("origin")
+            );
+            body.finish(false, 0);
+            let persistence = start(Stage::Persistence).unwrap();
+            assert_eq!(profile.live_snapshot().activity, "persisting");
+            persistence.finish(true, 0);
+        })
+        .await;
+        drop(profile);
+        assert_eq!(total.load(Ordering::Relaxed), 25);
+    }
+
+    #[tokio::test]
     async fn failed_chunk_body_retains_received_bytes() -> anyhow::Result<()> {
         let app = axum::Router::new().fallback(|| async { "{bad}\r\n" });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -305,7 +429,8 @@ mod tests {
         let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         }));
-        let profile = Profile::new("body-failure-test".to_owned());
+        let total = Arc::new(AtomicU64::new(0));
+        let profile = Profile::new("body-failure-test".to_owned(), Some(Arc::clone(&total)));
         scope(Some(Arc::clone(&profile)), async {
             let response = reqwest::Client::new().get(url).send().await?;
             assert!(crate::read_chunk_response(response).await.is_err());
@@ -316,12 +441,13 @@ mod tests {
         assert_eq!(sample["stages"]["chunk_body"]["failed"], 1);
         assert_eq!(sample["stages"]["chunk_body"]["active"], 0);
         assert_eq!(sample["stages"]["chunk_body"]["bytes"], 7);
+        assert_eq!(total.load(Ordering::Relaxed), 7);
         Ok(())
     }
 
     #[tokio::test]
     async fn active_overlap_failures_and_cancelled_work_are_accounted() {
-        let profile = Profile::new("timing-test".to_owned());
+        let profile = Profile::new("timing-test".to_owned(), None);
         scope(Some(Arc::clone(&profile)), async {
             let first = start(Stage::ChunkBody).unwrap();
             let second = start(Stage::ChunkBody).unwrap();

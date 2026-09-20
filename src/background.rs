@@ -38,6 +38,8 @@ struct WorkerStatus {
     chain: &'static str,
     bundles: &'static str,
     last_failure: Option<serde_json::Value>,
+    download_sample: Option<(Instant, u64)>,
+    download_rate: Option<f64>,
 }
 
 struct Admission {
@@ -51,6 +53,7 @@ struct Admission {
     paused: AtomicBool,
     live_pending: AtomicBool,
     status: Mutex<WorkerStatus>,
+    downloaded_bytes: Arc<AtomicU64>,
 }
 
 struct AdmissionState {
@@ -69,6 +72,8 @@ impl Admission {
                 chain: "disabled",
                 bundles: "idle",
                 last_failure: None,
+                download_sample: None,
+                download_rate: None,
             }),
             state: Mutex::new(AdmissionState {
                 ids: HashMap::with_capacity(max_jobs),
@@ -92,6 +97,7 @@ impl Admission {
             },
             changed: tokio::sync::Notify::new(),
             last_indexed_at: AtomicU64::new(0),
+            downloaded_bytes: Arc::new(AtomicU64::new(0)),
             paused: AtomicBool::new(false),
             live_pending: AtomicBool::new(false),
         })
@@ -119,7 +125,10 @@ impl Admission {
         {
             return None;
         }
-        let profile = crate::profiling::Profile::new(URL_SAFE_NO_PAD.encode(id));
+        let profile = crate::profiling::Profile::new(
+            URL_SAFE_NO_PAD.encode(id),
+            Some(Arc::clone(&self.downloaded_bytes)),
+        );
         state.ids.insert(id, Arc::clone(&profile));
         state.bytes += bytes;
         if scheduled {
@@ -262,6 +271,7 @@ impl BundleSubmitter {
         let Some(reservation) = self.admission.reserve(id, job_bytes(root)) else {
             return;
         };
+        reservation.profile.set_size(root.data.bytes.len() as u128);
         let Ok(permit) = self.sender.try_reserve() else {
             return;
         };
@@ -287,6 +297,7 @@ impl BundleSubmitter {
         ) else {
             return;
         };
+        reservation.profile.set_size(root.bytes.len() as u128);
         let Ok(permit) = self.sender.try_reserve() else {
             return;
         };
@@ -306,15 +317,41 @@ impl BundleSubmitter {
 
     pub(crate) fn status(&self) -> serde_json::Value {
         let status = self.admission.status.lock();
+        let profiles: Vec<_> = self.admission.state.lock().ids.values().cloned().collect();
+        let mut jobs: Vec<_> = profiles
+            .iter()
+            .map(|profile| profile.live_snapshot())
+            .filter(|job| job.outcome == "running")
+            .collect();
+        jobs.sort_unstable_by(|a, b| {
+            (a.phase == "queued")
+                .cmp(&(b.phase == "queued"))
+                .then_with(|| b.elapsed_seconds.total_cmp(&a.elapsed_seconds))
+        });
+        let queued = jobs.iter().filter(|job| job.phase == "queued").count();
+        let rate = status
+            .download_sample
+            .filter(|(at, _)| at.elapsed() <= Duration::from_secs(15))
+            .and(status.download_rate);
         serde_json::json!({
             "running": !self.is_closed(),
             "chain": status.chain,
             "bundles": if self.admission.paused.load(Ordering::Relaxed) {
                 "waiting for chain"
-            } else if status.bundles == "idle" && !self.admission.state.lock().ids.is_empty() {
+            } else if status.bundles == "idle" && !profiles.is_empty() {
                 "fetching or queued"
             } else { status.bundles },
             "last_failure": status.last_failure,
+            "live": {
+                "active": jobs.len() - queued,
+                "queued": queued,
+                "downloading": jobs.iter().filter(|job| job.downloading).count(),
+                "verifying": jobs.iter().filter(|job| job.verifying).count(),
+                "persisting": jobs.iter().filter(|job| job.persisting).count(),
+                "downloaded_bytes": self.admission.downloaded_bytes.load(Ordering::Relaxed),
+                "download_bytes_per_second": rate,
+                "jobs": jobs,
+            },
         })
     }
 }
@@ -540,6 +577,17 @@ async fn run(
                     continue;
                 }
                 _ = snapshots.tick() => {
+                    let now = Instant::now();
+                    let bytes = admission.downloaded_bytes.load(Ordering::Relaxed);
+                    {
+                        let mut status = admission.status.lock();
+                        status.download_rate = status.download_sample.and_then(|(at, previous)| {
+                            let elapsed = now.duration_since(at);
+                            (elapsed >= Duration::from_secs(1) && elapsed <= Duration::from_secs(15))
+                                .then(|| bytes.saturating_sub(previous) as f64 / elapsed.as_secs_f64())
+                        });
+                        status.download_sample = Some((now, bytes));
+                    }
                     let profiles: Vec<_> = admission.state.lock().ids.values().cloned().collect();
                     for profile in profiles {
                         eprintln!("bundle_profile {}", profile.snapshot("sample"));
@@ -736,6 +784,7 @@ async fn download_pending(
                         .map(|reservation| (reservation, spool))
                 });
                 if let Some((mut reservation, spool)) = reserved {
+                    reservation.profile.set_size(data_size);
                     downloads.push(async move {
                         let encoded = URL_SAFE_NO_PAD.encode(id);
                         if streamed {
@@ -966,6 +1015,42 @@ mod tests {
     use super::*;
     use crate::content::{ContentWriter, SpoolBudget};
     use crate::{Tag, VerifiedData, content::Content};
+
+    #[test]
+    fn live_status_tracks_active_jobs_and_retains_downloads_after_completion() {
+        let admission = Admission::new(64 * MAX_JSON_BYTES, 8, false);
+        let (sender, _receiver) = mpsc::channel(8);
+        let submitter = BundleSubmitter {
+            sender,
+            admission: Arc::clone(&admission),
+        };
+        let queued = admission.reserve_scheduled([1; 32], 0).unwrap();
+        queued.profile.set_size(2 * 1024 * 1024 * 1024);
+        let active = admission.reserve_scheduled([2; 32], 0).unwrap();
+        active.profile.set_size(4096);
+        active.profile.phase(2);
+        let timer = crate::profiling::start_for(
+            &Some(Arc::clone(&active.profile)),
+            crate::profiling::Stage::ChunkBody,
+        )
+        .unwrap();
+        timer.add_bytes(1024);
+        let status = submitter.status();
+        assert_eq!(status["live"]["active"], 1);
+        assert_eq!(status["live"]["queued"], 1);
+        assert_eq!(status["live"]["downloading"], 1);
+        assert_eq!(status["live"]["jobs"][0]["activity"], "downloading");
+        assert_eq!(
+            status["live"]["jobs"][1]["data_size"],
+            2_u64 * 1024 * 1024 * 1024
+        );
+        timer.finish(false, 0);
+        drop(active);
+        assert_eq!(submitter.status()["live"]["downloaded_bytes"], 1024);
+        assert_eq!(submitter.status()["live"]["active"], 0);
+        drop(queued);
+        assert_eq!(submitter.status()["live"]["queued"], 0);
+    }
 
     #[test]
     fn live_rewind_is_preserved_while_an_older_page_is_outstanding() {
