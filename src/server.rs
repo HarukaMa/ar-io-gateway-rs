@@ -640,6 +640,23 @@ async fn serve_info(State(state): State<Arc<AppState>>) -> Response {
     json_response(&info)
 }
 
+fn counter_rate(
+    current: &serde_json::Value,
+    previous: &serde_json::Value,
+    elapsed: Duration,
+) -> Option<f64> {
+    let count = |value: &serde_json::Value| {
+        value
+            .as_u64()
+            .map(u128::from)
+            .or_else(|| value.as_str()?.parse::<u128>().ok())
+    };
+    if elapsed.is_zero() {
+        return None;
+    }
+    Some(count(current)?.checked_sub(count(previous)?)? as f64 / elapsed.as_secs_f64())
+}
+
 async fn refresh_indexing_status(state: Arc<AppState>) {
     let mut ticks = interval(Duration::from_secs(30));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -679,6 +696,7 @@ async fn refresh_indexing_status(state: Arc<AppState>) {
         snapshot["trusted_tip"] = serde_json::json!(tip);
         snapshot["last_progress_at"] = serde_json::Value::Null;
         snapshot["transactions"]["per_second"] = serde_json::Value::Null;
+        snapshot["bundles"]["items_per_second"] = serde_json::Value::Null;
         if let Some((started, old)) = &previous {
             snapshot["last_progress_at"] = old["last_progress_at"].clone();
             if [
@@ -692,22 +710,23 @@ async fn refresh_indexing_status(state: Arc<AppState>) {
             {
                 snapshot["last_progress_at"] = serde_json::json!(now);
             }
-            if let (Some(current), Some(before)) = (
-                snapshot["transactions"]["complete"].as_u64(),
-                old["transactions"]["complete"].as_u64(),
-            ) {
-                snapshot["transactions"]["per_second"] = serde_json::json!(
-                    current
-                        .checked_sub(before)
-                        .map(|delta| delta as f64 / started.elapsed().as_secs_f64())
-                );
+            let elapsed = started.elapsed();
+            for (group, counter, rate) in [
+                ("transactions", "complete", "per_second"),
+                ("bundles", "items", "items_per_second"),
+            ] {
+                snapshot[group][rate] = serde_json::json!(counter_rate(
+                    &snapshot[group][counter],
+                    &old[group][counter],
+                    elapsed
+                ));
             }
         }
         previous = Some((Instant::now(), snapshot.clone()));
         let mut cached = state.indexing_status.lock();
         if let Some(totals) = cached["bundles"].as_object() {
             for (key, value) in totals {
-                if key != "items" {
+                if !matches!(key.as_str(), "items" | "items_per_second" | "scan") {
                     snapshot["bundles"][key] = value.clone();
                 }
             }
@@ -722,6 +741,7 @@ async fn refresh_indexing_status(state: Arc<AppState>) {
 async fn refresh_bundle_totals(state: Arc<AppState>) {
     let mut ticks = interval(Duration::from_secs(30));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut previous: Option<(Instant, serde_json::Value)> = None;
     loop {
         ticks.tick().await;
         let store = state.gateway.block_store.as_ref().expect("status database");
@@ -729,6 +749,16 @@ async fn refresh_bundle_totals(state: Arc<AppState>) {
         let mut cached = state.indexing_status.lock();
         match result {
             Ok(Ok(mut totals)) => {
+                for (counter, rate) in [
+                    ("complete_roots", "completed_roots_per_second"),
+                    ("completed_bytes", "completed_bytes_per_second"),
+                ] {
+                    totals[rate] =
+                        serde_json::json!(previous.as_ref().and_then(|(started, old)| {
+                            counter_rate(&totals[counter], &old[counter], started.elapsed())
+                        }));
+                }
+                previous = Some((Instant::now(), totals.clone()));
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -739,6 +769,8 @@ async fn refresh_bundle_totals(state: Arc<AppState>) {
                     cached["last_progress_at"] = serde_json::json!(now);
                 }
                 totals["items"] = cached["bundles"]["items"].clone();
+                totals["items_per_second"] = cached["bundles"]["items_per_second"].clone();
+                totals["scan"] = cached["bundles"]["scan"].clone();
                 totals["state"] = serde_json::json!("ready");
                 totals["sampled_at"] = serde_json::json!(now);
                 cached["bundles"] = totals;
@@ -2791,6 +2823,22 @@ mod tests {
     const ANT_ACCOUNT: &str = "4V5G8FIth1HvoAjpa37s8c/C2Ag+tWaWAF3YqgG8LaURyc0NNzQfLAEAAABAKwAAADNGX3lsZHFXX3p0NkNpXzQ3dy03Tzc2bFBwZWdwdTFyczdIMml5dWx0VlkAEA4AAAEAAAAAAC2+lbeF1KeVB3WX89Ksp18jfWPgMFBF9tJsgtCTCP9M/wEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
     const ARNS_PROGRAM: &str = "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ";
     const ANT_PROGRAM: &str = "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5";
+
+    #[test]
+    fn counter_rates_preserve_large_deltas_and_reject_resets() {
+        let now = serde_json::json!(u128::MAX.to_string());
+        let before = serde_json::json!((u128::MAX - 30).to_string());
+        assert_eq!(
+            counter_rate(&now, &before, Duration::from_secs(10)),
+            Some(3.0)
+        );
+        assert_eq!(counter_rate(&before, &now, Duration::from_secs(10)), None);
+        assert_eq!(
+            counter_rate(&now, &serde_json::Value::Null, Duration::from_secs(10)),
+            None
+        );
+        assert_eq!(counter_rate(&now, &before, Duration::ZERO), None);
+    }
 
     #[tokio::test]
     async fn public_diagnostics_bound_concurrency_and_hide_upstream_details() {

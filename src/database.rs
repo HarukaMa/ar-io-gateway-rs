@@ -385,7 +385,15 @@ impl BlockStore {
             ) FROM public.block_index_state s LEFT JOIN progress p ON true WHERE singleton),
             'transactions',(SELECT json_build_object(
                 'complete',t.transactions-p.transactions,'pending',p.transactions) FROM totals t CROSS JOIN pending p),
-            'bundles',(SELECT json_build_object('items',t.items-p.items) FROM totals t CROSS JOIN pending p)
+            'bundles',(SELECT json_build_object(
+                'items',t.items-p.items,
+                'scan',(SELECT json_build_object(
+                    'boundary_height',s.bundle_scan_boundary,
+                    'live_height',CASE WHEN s.bundle_scan_boundary IS NOT NULL
+                        THEN coalesce(s.bundle_cursor_height,s.bundle_scan_boundary) END,
+                    'backfill_height',coalesce(s.bundle_backfill_height,s.bundle_scan_boundary)
+                ) FROM public.block_index_state s WHERE singleton)
+            ) FROM totals t CROSS JOIN pending p)
         )::text";
 
     pub(crate) async fn indexing_progress(&self) -> Result<serde_json::Value> {

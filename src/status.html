@@ -27,6 +27,8 @@
 <div><dt>Recent rate</dt><dd id="transaction-rate">-</dd></div>
 </dl></section>
 <section><h2>Bundles <small>Discovered so far</small></h2><dl>
+<div><dt>Live cursor / stable height</dt><dd id="bundle-live-height">-</dd></div>
+<div><dt>Backfill cursor (descending)</dt><dd id="bundle-backfill-height">-</dd></div>
 <div><dt>Root bundles</dt><dd id="roots">-</dd></div>
 <div><dt>Completed roots</dt><dd id="completed-roots">-</dd></div>
 <div><dt>Pending roots</dt><dd id="pending-roots">-</dd></div>
@@ -35,6 +37,9 @@
 <div><dt>Pending root bytes</dt><dd id="pending-bytes">-</dd></div>
 <div><dt>Nested bundles found</dt><dd id="nested">-</dd></div>
 <div><dt>Indexed items</dt><dd id="items">-</dd></div>
+<div><dt>Items / sec</dt><dd id="bundle-item-rate">-</dd></div>
+<div><dt>Completed roots / sec</dt><dd id="bundle-root-rate">-</dd></div>
+<div><dt>Completed MiB / sec</dt><dd id="bundle-byte-rate">-</dd></div>
 </dl><p id="bundle-status" class="note" aria-live="polite">Collecting bundle totals</p><p class="note">Recognized binary and JSON bundles. Processed bytes count completed roots. Pending bytes include full sizes of partially processed roots.</p></section>
 <section><h2>Worker</h2><dl>
 <div><dt>State</dt><dd id="worker">-</dd></div>
@@ -103,12 +108,17 @@ async function refresh() {
     coverage('metadata', chain.metadata_height, data.trusted_tip, chain.start_height);
     text('transactions', number(tx.complete)); text('pending-transactions', number(tx.pending));
     text('transaction-rate', tx.per_second == null ? '-' : `${number(tx.per_second)} / sec`);
+    text('bundle-live-height', bundles.scan?.live_height == null ? '-' : `${number(bundles.scan.live_height)} / ${number(chain.checkpoint_height)}`);
+    text('bundle-backfill-height', number(bundles.scan?.backfill_height));
     text('roots', number(bundles.discovered_roots)); text('completed-roots', number(bundles.complete_roots));
     text('pending-roots', number(bundles.pending_roots)); text('pending-bytes', bytes(bundles.pending_bytes));
     text('discovered-bytes', bytes(bundles.discovered_bytes)); text('completed-bytes', bytes(bundles.completed_bytes));
     text('nested', number(bundles.nested_bundles)); text('items', number(bundles.items));
     const totalsStale = bundles.sampled_at != null && Date.now() / 1000 - bundles.sampled_at > 90;
     const totalsFailed = bundles.state === 'unavailable';
+    text('bundle-item-rate', number(stale || data.state !== 'ready' ? null : bundles.items_per_second));
+    text('bundle-root-rate', number(totalsStale || bundles.state !== 'ready' ? null : bundles.completed_roots_per_second));
+    text('bundle-byte-rate', number(totalsStale || bundles.state !== 'ready' || bundles.completed_bytes_per_second == null ? null : bundles.completed_bytes_per_second / 1024 ** 2));
     const totalsTime = bundles.sampled_at == null ? '' : ` (${date(bundles.sampled_at)})`;
     text('bundle-status', (totalsFailed ? 'Bundle totals refresh failed' : totalsStale ? 'Bundle totals stale' : bundles.state === 'ready' ? 'Bundle totals updated' : 'Collecting bundle totals') + totalsTime);
     element('bundle-status').classList.toggle('warning', totalsFailed || totalsStale);
