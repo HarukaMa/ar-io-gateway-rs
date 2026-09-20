@@ -18,7 +18,7 @@ use tokio::{
 
 use crate::{
     Config, ContentCache, Gateway, MAX_JSON_BYTES, VerifiedRoot,
-    database::{BlockStore, BundleCursor},
+    database::{BlockStore, BundleScan},
     disk_cache::DiskCache,
     indexer::index_bundle_content,
     require_bundle_tags,
@@ -49,12 +49,13 @@ struct Admission {
     changed: tokio::sync::Notify,
     last_indexed_at: AtomicU64,
     paused: AtomicBool,
+    live_pending: AtomicBool,
     status: Mutex<WorkerStatus>,
 }
 
 struct AdmissionState {
     ids: HashMap<[u8; 32], Arc<crate::profiling::Profile>>,
-    scan_cursors: HashMap<[u8; 32], Option<Arc<BundleCursor>>>,
+    scan_cursors: HashMap<[u8; 32], (u64, Option<Arc<BundleScan>>)>,
     bytes: usize,
     scheduled_bytes: usize,
     scheduled_jobs: usize,
@@ -92,6 +93,7 @@ impl Admission {
             changed: tokio::sync::Notify::new(),
             last_indexed_at: AtomicU64::new(0),
             paused: AtomicBool::new(false),
+            live_pending: AtomicBool::new(false),
         })
     }
 
@@ -138,31 +140,30 @@ impl Admission {
         self.reserve_inner(id, bytes, true)
     }
 
-    fn track_scan(&self, id: [u8; 32], after: Option<Arc<BundleCursor>>) {
+    fn track_scan(&self, id: [u8; 32], sequence: u64, after: Option<Arc<BundleScan>>) {
         let mut state = self.state.lock();
         if state.ids.contains_key(&id) {
             state
                 .scan_cursors
                 .entry(id)
                 .and_modify(|saved| {
-                    if after < *saved {
-                        *saved = after.clone();
+                    if sequence < saved.0 {
+                        *saved = (sequence, after.clone());
                     }
                 })
-                .or_insert(after);
+                .or_insert((sequence, after));
         }
     }
 
-    fn scan_checkpoint(&self, boundary: Option<&BundleCursor>) -> Option<BundleCursor> {
+    fn scan_checkpoint(&self, boundary: Option<&BundleScan>) -> Option<BundleScan> {
         // Replay the page containing the earliest outstanding root after a restart.
         self.state
             .lock()
             .scan_cursors
             .values()
-            .map(|cursor| cursor.as_deref())
-            .chain(std::iter::once(boundary))
-            .min()
-            .flatten()
+            .min_by_key(|(sequence, _)| sequence)
+            .map(|(_, cursor)| cursor.as_deref())
+            .unwrap_or(boundary)
             .cloned()
     }
 
@@ -425,10 +426,18 @@ pub(crate) async fn start(
                         loop {
                             worker_admission.status.lock().chain = "indexing";
                             let result = crate::indexer::follow_chain_step(&gateway, store, |caught_up| {
-                                worker_admission.paused.store(!caught_up, Ordering::Relaxed);
+                                let was_paused = worker_admission.paused.swap(!caught_up, Ordering::Relaxed);
+                                if was_paused && caught_up {
+                                    worker_admission.live_pending.store(true, Ordering::Relaxed);
+                                    worker_admission.changed.notify_one();
+                                }
                             }).await;
                             match result {
-                                Ok(true) => tokio::task::yield_now().await,
+                                Ok(true) => {
+                                    worker_admission.live_pending.store(true, Ordering::Relaxed);
+                                    worker_admission.changed.notify_one();
+                                    tokio::task::yield_now().await;
+                                }
                                 result => {
                                     worker_admission.status.lock().chain = if result.is_err() { "retrying" } else { "waiting" };
                                     if let Err(error) = result {
@@ -605,6 +614,9 @@ async fn download_pending(
         None
     };
     let mut page_start = cursor.clone().map(Arc::new);
+    let mut sequence = 0;
+    let mut range_cursor = None;
+    let mut was_paused = admission.paused.load(Ordering::Relaxed);
     let mut saved_cursor = cursor.clone();
     let mut checkpoint_at = Instant::now();
     let mut pending: Option<(Vec<u8>, u64, u128)> = None;
@@ -614,6 +626,35 @@ async fn download_pending(
     let mut next_poll = Instant::now();
     loop {
         let paused = admission.paused.load(Ordering::Relaxed);
+        if !paused && (admission.live_pending.swap(false, Ordering::Relaxed) || was_paused) {
+            // Reconsider live work before admitting the rest of a historical page.
+            if pending.is_some() || candidates.len() > 0 {
+                cursor = page_start.as_deref().cloned();
+                pending = None;
+                candidates = Vec::new().into_iter();
+            }
+            discovery = None;
+            next_poll = Instant::now();
+        }
+        was_paused = paused;
+        if !paused && range.is_none() && cursor.is_none() {
+            let state = timeout(gateway.config.request_timeout, checkpoint_store.state())
+                .await
+                .context("loading bundle scan boundary timed out")??;
+            let Some(height) = state.and_then(|state| {
+                state
+                    .imported_through
+                    .map(|height| height.min(state.checkpoint.height))
+            }) else {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            };
+            cursor = Some(BundleScan {
+                boundary: i64::try_from(height)?,
+                live: None,
+                backfill: None,
+            });
+        }
         if paused && downloads.is_empty() && discovery.is_none() {
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
@@ -736,7 +777,7 @@ async fn download_pending(
                 }
             }
             if range.is_none() {
-                admission.track_scan(id, page_start.clone());
+                admission.track_scan(id, sequence, page_start.clone());
             }
         }
         if exhausted && downloads.is_empty() && range.is_some() {
@@ -750,14 +791,26 @@ async fn download_pending(
             && (!exhausted || range.is_none())
         {
             let after = cursor.clone();
+            let bounded_after = range_cursor.clone();
             let poll_at = next_poll;
             // Keep this query alive across download completions and admission wakeups.
             discovery = Some(Box::pin(async move {
                 sleep_until(poll_at).await;
-                timeout(
-                    Duration::from_secs(125),
-                    store.pending_bundles_after(after.as_ref(), discovery_range),
-                )
+                timeout(Duration::from_secs(125), async {
+                    if range.is_some() {
+                        store
+                            .pending_bundles_after(bounded_after.as_ref(), discovery_range, false)
+                            .await
+                            .map(|page| (page, false))
+                    } else {
+                        store
+                            .pending_bundle_scan(
+                                after.as_ref().expect("initialized bundle scan"),
+                                gateway.config.index_bundle_start_height,
+                            )
+                            .await
+                    }
+                })
                 .await
                 .context("discovering pending bundles timed out")?
             }));
@@ -780,16 +833,29 @@ async fn download_pending(
             result = async { discovery.as_mut().expect("pending discovery").await }, if discovery.is_some() => {
                 discovery = None;
                 match result {
-                    Ok(page) if page.after.is_some() => {
+                    Ok((page, backfill)) if page.after.is_some() => {
+                        sequence += 1;
                         page_start = cursor.clone().map(Arc::new);
-                        cursor = page.after;
+                        if let Some(cursor) = cursor.as_mut() {
+                            if backfill {
+                                cursor.backfill = page.after;
+                            } else {
+                                cursor.live = page.after;
+                            }
+                        } else {
+                            range_cursor = page.after;
+                        }
                         candidates = page.roots.into_iter();
                         exhausted = false;
                         next_poll = Instant::now();
                     }
                     Ok(_) => {
                         exhausted = true;
-                        cursor = None;
+                        if let Some(cursor) = cursor.as_mut() {
+                            cursor.live = None;
+                            cursor.backfill = None;
+                        }
+                        range_cursor = None;
                         next_poll = Instant::now() + RETRY_INTERVAL;
                     }
                     Err(error) if range.is_some() => return Err(error),
@@ -888,21 +954,25 @@ mod tests {
     #[test]
     fn scan_checkpoint_waits_for_outstanding_pages_and_preserves_wraparound() {
         let cursor = |height| {
-            Arc::new(BundleCursor {
-                height,
-                position: 0,
-                kind: 0,
-                id: vec![0; 32],
+            Arc::new(BundleScan {
+                boundary: 100,
+                live: None,
+                backfill: Some(crate::database::BundleCursor {
+                    height,
+                    position: 0,
+                    kind: 0,
+                    id: vec![0; 32],
+                }),
             })
         };
-        let first_page = cursor(10);
-        let second_page = cursor(20);
-        let next_page = cursor(30);
+        let first_page = cursor(90);
+        let second_page = cursor(80);
+        let next_page = cursor(70);
         let admission = Admission::new(1024, 8, false);
         let first = admission.reserve([1; 32], 0).unwrap();
-        admission.track_scan([1; 32], Some(Arc::clone(&first_page)));
+        admission.track_scan([1; 32], 1, Some(Arc::clone(&first_page)));
         let second = admission.reserve([2; 32], 0).unwrap();
-        admission.track_scan([2; 32], Some(Arc::clone(&second_page)));
+        admission.track_scan([2; 32], 2, Some(Arc::clone(&second_page)));
         assert_eq!(
             admission.scan_checkpoint(Some(&next_page)),
             Some((*first_page).clone())
@@ -926,7 +996,7 @@ mod tests {
         );
         assert_eq!(admission.scan_checkpoint(None), None);
         let wrapped = admission.reserve([3; 32], 0).unwrap();
-        admission.track_scan([3; 32], None);
+        admission.track_scan([3; 32], 3, None);
         assert_eq!(admission.scan_checkpoint(Some(&next_page)), None);
         drop(wrapped);
         assert_eq!(
@@ -936,7 +1006,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires ar_io_rust_test schema 11; temporarily changes and locks its bundle cursor"]
+    #[ignore = "requires ar_io_rust_test schema 15; temporarily changes and locks its bundle cursor"]
     async fn bundle_checkpoint_retries_after_row_lock_timeout() -> Result<()> {
         let url = std::env::var("DATABASE_URL")?;
         let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
@@ -969,11 +1039,10 @@ mod tests {
         let gateway = Gateway::new(config)?.with_database(&url).await?;
         let store = gateway.block_store.as_ref().unwrap();
         let original = store.bundle_scan_cursor().await?;
-        let initial = BundleCursor {
-            height: 0,
-            position: 0,
-            kind: 0,
-            id: vec![0; 32],
+        let initial = BundleScan {
+            boundary: 0,
+            live: None,
+            backfill: None,
         };
         store.save_bundle_scan_cursor(Some(&initial)).await?;
         let result = async {
@@ -984,7 +1053,7 @@ mod tests {
             ).await?;
             let admission = Admission::new(1024, 1, false);
             let _reservation = admission.reserve([1; 32], 0).unwrap();
-            admission.track_scan([1; 32], None);
+            admission.track_scan([1; 32], 0, None);
             let (sender, _receiver) = mpsc::channel(1);
             let mut running = Box::pin(download_pending(&gateway, sender, &admission, None));
             let failed = async {

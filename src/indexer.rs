@@ -1934,7 +1934,7 @@ mod bundle_tests {
             let cursor = crate::database::BundleCursor {
                 height, position, kind: 0, id: cursor_id.to_vec(),
             };
-            let discovered = store.pending_bundles_after(Some(&cursor), Some((height as u64, height as u64))).await?
+            let discovered = store.pending_bundles_after(Some(&cursor), Some((height as u64, height as u64)), false).await?
                 .roots.into_iter().next().context("JSON root was not discovered")?;
             ensure!(discovered.0 == root_id && discovered.2 == bytes.len() as u128, "wrong JSON discovery result");
             store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
@@ -1953,7 +1953,7 @@ mod bundle_tests {
             replay.context("unchanged replay waited for a placement write lock")??;
             ensure!(client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == written, "bundle replay added rows");
             ensure!(store.bundle_complete(&root_id).await?, "JSON root was not completed");
-            ensure!(store.pending_bundles_after(Some(&cursor), Some((height as u64, height as u64))).await?
+            ensure!(store.pending_bundles_after(Some(&cursor), Some((height as u64, height as u64)), false).await?
                 .roots.iter().all(|candidate| candidate.0 != root_id), "completed JSON root was rediscovered");
             let mut corrupt = locations.clone();
             corrupt[0].json = false;

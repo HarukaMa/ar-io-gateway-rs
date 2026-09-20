@@ -59,6 +59,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "014_bundle_classification_jit",
         include_str!("../migrations/014_bundle_classification_jit.sql"),
     ),
+    (
+        "015_bundle_scan_directions",
+        include_str!("../migrations/015_bundle_scan_directions.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -239,6 +243,13 @@ pub(crate) struct BundleCursor {
     pub(crate) position: i32,
     pub(crate) kind: i16,
     pub(crate) id: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BundleScan {
+    pub(crate) boundary: i64,
+    pub(crate) live: Option<BundleCursor>,
+    pub(crate) backfill: Option<BundleCursor>,
 }
 
 pub(crate) struct BundlePage {
@@ -465,7 +476,7 @@ impl BlockStore {
             .client
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
-                    WHERE version = 13 AND name = '013_bundle_tag_casing')
+                    WHERE version = 15 AND name = '015_bundle_scan_directions')
                     AND to_regclass('public.bundle_progress') IS NOT NULL
                     AND to_regclass('public.item_locations') IS NOT NULL
                     AND to_regclass('public.canonical_placements') IS NOT NULL
@@ -476,7 +487,7 @@ impl BlockStore {
             .try_get(0)?;
         ensure!(
             installed,
-            "bundle indexing requires schema migration 013_bundle_tag_casing"
+            "bundle indexing requires schema migration 015_bundle_scan_directions"
         );
         Ok(())
     }
@@ -1197,35 +1208,48 @@ impl BlockStore {
             .collect()
     }
 
-    pub(crate) async fn bundle_scan_cursor(&self) -> Result<Option<BundleCursor>> {
+    pub(crate) async fn bundle_scan_cursor(&self) -> Result<Option<BundleScan>> {
         self.client
             .query_opt(
-                "SELECT bundle_cursor_height,bundle_cursor_position,bundle_cursor_kind,bundle_cursor_id
-                 FROM public.block_index_state WHERE singleton AND bundle_cursor_height IS NOT NULL",
+                "SELECT bundle_scan_boundary,
+                    bundle_cursor_height,bundle_cursor_position,bundle_cursor_kind,bundle_cursor_id,
+                    bundle_backfill_height,bundle_backfill_position,bundle_backfill_kind,bundle_backfill_id
+                 FROM public.block_index_state WHERE singleton AND bundle_scan_boundary IS NOT NULL",
                 &[],
             )
             .await?
             .map(|row| {
-                Ok(BundleCursor {
-                    height: row.try_get(0)?,
-                    position: row.try_get(1)?,
-                    kind: row.try_get(2)?,
-                    id: row.try_get(3)?,
+                let cursor = |offset| -> Result<Option<BundleCursor>> {
+                    Ok(row.try_get::<_, Option<i64>>(offset)?.map(|height| BundleCursor {
+                        height,
+                        position: row.get(offset + 1),
+                        kind: row.get(offset + 2),
+                        id: row.get(offset + 3),
+                    }))
+                };
+                Ok(BundleScan {
+                    boundary: row.try_get(0)?,
+                    live: cursor(1)?,
+                    backfill: cursor(5)?,
                 })
             })
             .transpose()
     }
 
-    pub(crate) async fn save_bundle_scan_cursor(
-        &self,
-        cursor: Option<&BundleCursor>,
-    ) -> Result<()> {
+    pub(crate) async fn save_bundle_scan_cursor(&self, scan: Option<&BundleScan>) -> Result<()> {
+        let live = scan.and_then(|scan| scan.live.as_ref());
+        let backfill = scan.and_then(|scan| scan.backfill.as_ref());
         let updated = self.client.execute(
             "UPDATE public.block_index_state
-             SET bundle_cursor_height=$1,bundle_cursor_position=$2,bundle_cursor_kind=$3,bundle_cursor_id=$4
+             SET bundle_scan_boundary=$1,
+                 bundle_cursor_height=$2,bundle_cursor_position=$3,bundle_cursor_kind=$4,bundle_cursor_id=$5,
+                 bundle_backfill_height=$6,bundle_backfill_position=$7,bundle_backfill_kind=$8,bundle_backfill_id=$9
              WHERE singleton",
-            &[&cursor.map(|c| c.height), &cursor.map(|c| c.position),
-              &cursor.map(|c| c.kind), &cursor.map(|c| c.id.as_slice())],
+            &[&scan.map(|scan| scan.boundary),
+              &live.map(|c| c.height), &live.map(|c| c.position),
+              &live.map(|c| c.kind), &live.map(|c| c.id.as_slice()),
+              &backfill.map(|c| c.height), &backfill.map(|c| c.position),
+              &backfill.map(|c| c.kind), &backfill.map(|c| c.id.as_slice())],
         ).await?;
         ensure!(
             updated == 1,
@@ -1238,6 +1262,7 @@ impl BlockStore {
         &self,
         after: Option<&BundleCursor>,
         range: Option<(u64, u64)>,
+        descending: bool,
     ) -> Result<BundlePage> {
         ensure!(
             after.is_none_or(|c| c.id.len() == 32
@@ -1252,7 +1277,7 @@ impl BlockStore {
         );
         let start = range.map(|(start, _)| sql_height(start)).transpose()?;
         let end = range.map(|(_, end)| sql_height(end)).transpose()?;
-        let rows = self.client.query(
+        const FORWARD: &str =
             "SELECT p.id,p.block_height,p.position,p.kind,o.data_size::text AS data_size
              FROM public.block_index_state s JOIN public.canonical_placements p
                  ON p.block_height>s.start_height AND p.block_height<=s.imported_through
@@ -1266,10 +1291,31 @@ impl BlockStore {
                      JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
                      WHERE c.height=p.block_height AND bt.position=p.position
                          AND bt.object_key=o.key AND b.timestamp IS NOT NULL LIMIT 1) IS TRUE
-             ORDER BY p.block_height,p.position,p.kind,p.id LIMIT 64",
-            &[&after.map(|c| c.height), &after.map(|c| c.position), &after.map(|c| c.kind),
-              &after.map(|c| c.id.as_slice()), &start, &end],
-        ).await?;
+             ORDER BY p.block_height,p.position,p.kind,p.id LIMIT 64";
+        static REVERSE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            FORWARD.replace(")>(", ")<(").replace(
+                "ORDER BY p.block_height,p.position,p.kind,p.id",
+                "ORDER BY p.block_height DESC,p.position DESC,p.kind DESC,p.id DESC",
+            )
+        });
+        let rows = self
+            .client
+            .query(
+                if descending {
+                    REVERSE.as_str()
+                } else {
+                    FORWARD
+                },
+                &[
+                    &after.map(|c| c.height),
+                    &after.map(|c| c.position),
+                    &after.map(|c| c.kind),
+                    &after.map(|c| c.id.as_slice()),
+                    &start,
+                    &end,
+                ],
+            )
+            .await?;
         let after = rows
             .last()
             .map(|row| {
@@ -1292,6 +1338,43 @@ impl BlockStore {
             })
             .collect::<Result<_>>()?;
         Ok(BundlePage { roots, after })
+    }
+
+    pub(crate) async fn pending_bundle_scan(
+        &self,
+        scan: &BundleScan,
+        start: u64,
+    ) -> Result<(BundlePage, bool)> {
+        let boundary = u64::try_from(scan.boundary)?;
+        let stable = self
+            .state()
+            .await?
+            .map_or(0, |state| state.checkpoint.height);
+        if boundary < stable && start <= stable {
+            let live = self
+                .pending_bundles_after(
+                    scan.live.as_ref(),
+                    Some((start.max(boundary + 1), stable)),
+                    false,
+                )
+                .await?;
+            if live.after.is_some() {
+                return Ok((live, false));
+            }
+        }
+        let end = boundary.min(stable);
+        if start > end {
+            return Ok((
+                BundlePage {
+                    roots: Vec::new(),
+                    after: None,
+                },
+                true,
+            ));
+        }
+        self.pending_bundles_after(scan.backfill.as_ref(), Some((start, end)), true)
+            .await
+            .map(|page| (page, true))
     }
 
     pub(crate) async fn bundle_status(
@@ -2454,17 +2537,10 @@ mod tests {
                 )
                 .await?
                 .get(0);
-            if version == 10 {
-                store
-                    .client
-                    .batch_execute(include_str!("../migrations/011_bundle_scan_cursor.sql"))
-                    .await?;
-            } else {
-                ensure!(
-                    matches!(version, 11 | 12 | 13),
-                    "unexpected test schema version"
-                );
-            }
+            ensure!(
+                version == MIGRATIONS.len() as i32,
+                "requires the current test schema"
+            );
             store
                 .client
                 .execute(
@@ -2478,24 +2554,38 @@ mod tests {
                     &[],
                 )
                 .await?;
-            let page = store.pending_bundles_after(None, None).await?;
+            let page = store.pending_bundles_after(None, None, false).await?;
             let first = page
                 .roots
                 .first()
                 .context("test requires a canonical bundle root")?
                 .0
                 .clone();
-            store.save_bundle_scan_cursor(page.after.as_ref()).await?;
+            let scan = BundleScan {
+                boundary: 0,
+                live: page.after,
+                backfill: None,
+            };
+            store.save_bundle_scan_cursor(Some(&scan)).await?;
+            let saved = store
+                .bundle_scan_cursor()
+                .await?
+                .context("missing saved scan")?;
             let resumed = store
-                .pending_bundles_after(store.bundle_scan_cursor().await?.as_ref(), None)
+                .pending_bundles_after(saved.live.as_ref(), None, false)
                 .await?;
             ensure!(
                 resumed.roots.iter().all(|root| root.0 != first),
                 "restart retried an earlier incomplete root"
             );
             store.save_bundle_scan_cursor(None).await?;
+            let saved = store.bundle_scan_cursor().await?;
             let wrapped = store
-                .pending_bundles_after(store.bundle_scan_cursor().await?.as_ref(), None)
+                .pending_bundles_after(
+                    saved.as_ref().and_then(|scan| scan.live.as_ref()),
+                    None,
+                    false,
+                )
                 .await?;
             ensure!(
                 wrapped.roots.iter().any(|root| root.0 == first),
@@ -2952,7 +3042,9 @@ mod tests {
         ) -> Result<Vec<(Vec<u8>, u64, u128)>> {
             let mut roots = Vec::new();
             loop {
-                let page = store.pending_bundles_after(after.as_ref(), None).await?;
+                let page = store
+                    .pending_bundles_after(after.as_ref(), None, false)
+                    .await?;
                 ensure!(page.roots.len() <= 64, "discovery exceeded its root limit");
                 roots.extend(page.roots);
                 let Some(next) = page.after else {
@@ -2985,7 +3077,9 @@ mod tests {
             error.code() == Some(&tokio_postgres::error::SqlState::READ_ONLY_SQL_TRANSACTION),
             "bundle discovery connection allowed writes"
         );
-        reader.pending_bundles_after(None, Some((0, 0))).await?;
+        reader
+            .pending_bundles_after(None, Some((0, 0)), false)
+            .await?;
         store.client.batch_execute("BEGIN").await?;
         let result = async {
             let mut roots = store
@@ -3047,19 +3141,82 @@ mod tests {
                 )
                 .await?;
             ensure!(collect(&store, None).await? == roots, "chronological discovery lost or repeated a root");
+            let mut scan = BundleScan { boundary: height, live: None, backfill: None };
+            let (page, backfill) = store.pending_bundle_scan(&scan, 0).await?;
+            ensure!(backfill, "initial scan did not start with historical bundles");
+            let expected: Vec<_> = roots.iter().rev().cloned().collect();
+            ensure!(page.roots == expected[..64], "backfill did not select newest bundles first");
+            scan.backfill = page.after;
+            store.save_bundle_scan_cursor(Some(&scan)).await?;
+            let mut resumed = store.bundle_scan_cursor().await?.context("missing scan checkpoint")?;
+            let mut reverse = page.roots;
+            loop {
+                let (page, backfill) = store.pending_bundle_scan(&resumed, 0).await?;
+                ensure!(backfill, "historical scan changed lanes");
+                reverse.extend(page.roots);
+                if page.after.is_none() {
+                    break;
+                }
+                resumed.backfill = page.after;
+            }
+            ensure!(reverse == expected, "reverse pagination skipped or repeated roots after restart");
+
+            store.client.batch_execute("SAVEPOINT incoming_bundle").await?;
+            let tip = store.client.query_one(
+                "SELECT c.height,c.block_hash FROM public.canonical_blocks c
+                 JOIN public.block_index_state s ON s.singleton
+                 WHERE c.height>$1 AND c.height<=s.imported_through ORDER BY c.height LIMIT 1",
+                &[&height],
+            ).await?;
+            let tip_height: i64 = tip.get(0);
+            let tip_hash: Vec<u8> = tip.get(1);
+            let incoming = keys.last().unwrap();
+            store.client.execute(
+                "UPDATE public.blocks SET timestamp=1 WHERE hash=$1", &[&tip_hash],
+            ).await?;
+            store.client.execute(
+                "DELETE FROM public.block_transactions WHERE object_key=$1", &[incoming],
+            ).await?;
+            store.client.execute(
+                "INSERT INTO public.block_transactions(block_hash,position,object_key) VALUES($1,0,$2)",
+                &[&tip_hash,incoming],
+            ).await?;
+            store.client.execute(
+                "UPDATE public.canonical_placements SET block_height=$1,position=0 WHERE object_key=$2",
+                &[&tip_height,incoming],
+            ).await?;
+            store.client.execute(
+                "UPDATE public.block_index_state SET checkpoint_height=$1 WHERE singleton", &[&height],
+            ).await?;
+            let (waiting, backfill) = store.pending_bundle_scan(&scan, 0).await?;
+            ensure!(backfill && waiting.roots == expected[64..128],
+                "an unstable bundle bypassed the stable checkpoint");
+            store.client.execute(
+                "UPDATE public.block_index_state SET checkpoint_height=$1 WHERE singleton", &[&tip_height],
+            ).await?;
+            let (live, backfill) = store.pending_bundle_scan(&scan, 0).await?;
+            ensure!(!backfill && live.roots == vec![(roots.last().unwrap().0.clone(),tip_height as u64,size)],
+                "newly eligible bundle did not take priority over backfill");
+            scan.live = live.after;
+            store.save_bundle_scan_cursor(Some(&scan)).await?;
+            let resumed = store.bundle_scan_cursor().await?.context("missing dual checkpoint")?;
+            let (page, backfill) = store.pending_bundle_scan(&resumed, 0).await?;
+            ensure!(backfill && page.roots == expected[64..128],
+                "restart repeated live work or lost the historical cursor");
+            store.client.batch_execute("ROLLBACK TO SAVEPOINT incoming_bundle").await?;
             let clone_start: i32 = store.client.query_one(
                 "SELECT min(position) FROM public.block_transactions WHERE object_key=ANY($1::bigint[])",
                 &[&keys],
             ).await?.get(0);
             let before_clones = BundleCursor { height, position: clone_start-1, kind: 1, id: vec![255;32] };
-            let first = store.pending_bundles_after(Some(&before_clones), None).await?;
+            let first = store.pending_bundles_after(Some(&before_clones), None, false).await?;
             ensure!(first.roots == roots[1..65], "first discovery page differs");
             ensure!(collect(&store, first.after).await? == roots[65..],
                 "later discovery pages lost or repeated a root");
             let last = BundleCursor { height, position: clone_start+256, kind: 0, id: roots.last().unwrap().0.clone() };
             ensure!(collect(&store, Some(last)).await?.is_empty(),
                 "discovery repeated its final cursor root");
-            let outside = store.pending_bundles_after(None, Some((0,0))).await?;
+            let outside = store.pending_bundles_after(None, Some((0,0)), false).await?;
             ensure!(outside.roots.is_empty() && outside.after.is_none(),
                 "discovery ignored the height range");
             store.client.batch_execute("SAVEPOINT rejected_candidates").await?;
@@ -3068,7 +3225,7 @@ mod tests {
                  WHERE bt.object_key=o.key AND o.id=ANY($1::bytea[])",
                 &[&&ids[1..257]],
             ).await?;
-            let skipped = store.pending_bundles_after(Some(&before_clones), None).await?;
+            let skipped = store.pending_bundles_after(Some(&before_clones), None, false).await?;
             ensure!(skipped.roots == roots[257..],
                 "discovery did not skip directly to later canonical roots");
             ensure!(collect(&store, skipped.after).await?.is_empty(),
