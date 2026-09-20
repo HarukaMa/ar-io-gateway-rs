@@ -40,6 +40,7 @@ struct WorkerStatus {
     last_failure: Option<serde_json::Value>,
     download_sample: Option<(Instant, u64)>,
     download_rate: Option<f64>,
+    live_scan_height: Option<u64>,
 }
 
 struct Admission {
@@ -74,6 +75,7 @@ impl Admission {
                 last_failure: None,
                 download_sample: None,
                 download_rate: None,
+                live_scan_height: None,
             }),
             state: Mutex::new(AdmissionState {
                 ids: HashMap::with_capacity(max_jobs),
@@ -343,6 +345,7 @@ impl BundleSubmitter {
             } else { status.bundles },
             "last_failure": status.last_failure,
             "live": {
+                "scan_height": status.live_scan_height,
                 "active": jobs.len() - queued,
                 "queued": queued,
                 "downloading": jobs.iter().filter(|job| job.downloading).count(),
@@ -897,6 +900,11 @@ async fn download_pending(
             _ = gateway.spool_budget.released.notified(), if pending.is_some() => {}
             result = async { discovery.as_mut().expect("pending discovery").await }, if discovery.is_some() => {
                 discovery = None;
+                if let Ok((page, _)) = &result
+                    && let Some(height) = page.live_scanned_height
+                {
+                    admission.status.lock().live_scan_height = Some(height);
+                }
                 match result {
                     Ok((page, backfill)) if page.after.is_some() => {
                         sequence += 1;

@@ -280,6 +280,7 @@ impl BundleScan {
 pub(crate) struct BundlePage {
     pub(crate) roots: Vec<(Vec<u8>, u64, u128)>,
     pub(crate) after: Option<BundleCursor>,
+    pub(crate) live_scanned_height: Option<u64>,
 }
 
 pub struct BlockStore {
@@ -1311,26 +1312,42 @@ impl BlockStore {
         );
         let start = range.map(|(start, _)| sql_height(start)).transpose()?;
         let end = range.map(|(_, end)| sql_height(end)).transpose()?;
+        // Limit each canonical block before advancing; nested items never drive this scan.
         const FORWARD: &str =
-            "SELECT p.id,p.block_height,p.position,p.kind,o.data_size::text AS data_size
-             FROM public.block_index_state s JOIN public.canonical_placements p
-                 ON p.block_height>s.start_height AND p.block_height<=s.imported_through
-             JOIN public.objects o ON o.key=p.object_key
-             WHERE s.singleton AND p.kind=0 AND o.kind=0 AND o.metadata_complete AND o.is_bundle
-                 AND ($1::bigint IS NULL OR (p.block_height,p.position,p.kind,p.id)>($1,$2::integer,$3::smallint,$4::bytea))
-                 AND ($5::bigint IS NULL OR p.block_height BETWEEN $5 AND $6)
-                 AND NOT EXISTS (SELECT 1 FROM public.bundle_progress bp WHERE bp.root_key=o.key AND bp.complete)
-                 AND (SELECT true FROM public.canonical_blocks c
-                     JOIN public.blocks b ON b.hash=c.block_hash AND b.height=c.height
-                     JOIN public.block_transactions bt ON bt.block_hash=c.block_hash
-                     WHERE c.height=p.block_height AND bt.position=p.position
-                         AND bt.object_key=o.key AND b.timestamp IS NOT NULL LIMIT 1) IS TRUE
-             ORDER BY p.block_height,p.position,p.kind,p.id LIMIT 64";
+            "SELECT roots.id,c.height AS block_height,roots.position,0::smallint AS kind,roots.data_size
+             FROM public.canonical_blocks c
+             JOIN public.blocks b ON b.hash=c.block_hash AND b.height=c.height AND b.timestamp IS NOT NULL
+             CROSS JOIN LATERAL (
+                 SELECT p.id,bt.position,o.data_size::text AS data_size
+                 FROM public.block_transactions bt
+                 JOIN LATERAL (SELECT o.data_size FROM public.objects o
+                     WHERE o.key=bt.object_key AND o.kind=0 AND o.metadata_complete AND o.is_bundle LIMIT 1) o ON true
+                 JOIN LATERAL (SELECT p.id FROM public.canonical_placements p
+                     WHERE p.object_key=bt.object_key AND p.block_height=c.height
+                         AND p.position=bt.position AND p.kind=0 LIMIT 1) p ON true
+                 WHERE bt.block_hash=c.block_hash
+                     AND ($1::bigint IS NULL OR (c.height,bt.position,0::smallint,p.id)>($1,$2::integer,$3::smallint,$4::bytea))
+                     AND (SELECT true FROM public.bundle_progress bp
+                         WHERE bp.root_key=bt.object_key AND bp.complete LIMIT 1) IS NOT TRUE
+                 ORDER BY bt.position LIMIT 64
+             ) roots
+             WHERE c.height>(SELECT start_height FROM public.block_index_state WHERE singleton)
+                 AND c.height<=(SELECT imported_through FROM public.block_index_state WHERE singleton)
+                 AND ($1::bigint IS NULL OR c.height >= $1)
+                 AND ($5::bigint IS NULL OR c.height BETWEEN $5 AND $6)
+             ORDER BY c.height,roots.position LIMIT 64";
         static REVERSE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-            FORWARD.replace(")>(", ")<(").replace(
-                "ORDER BY p.block_height,p.position,p.kind,p.id",
-                "ORDER BY p.block_height DESC,p.position DESC,p.kind DESC,p.id DESC",
-            )
+            FORWARD
+                .replace(")>(", ")<(")
+                .replace("c.height >= $1", "c.height <= $1")
+                .replace(
+                    "ORDER BY bt.position LIMIT",
+                    "ORDER BY bt.position DESC LIMIT",
+                )
+                .replace(
+                    "ORDER BY c.height,roots.position LIMIT",
+                    "ORDER BY c.height DESC,roots.position DESC LIMIT",
+                )
         });
         let rows = self
             .client
@@ -1371,7 +1388,11 @@ impl BlockStore {
                 ))
             })
             .collect::<Result<_>>()?;
-        Ok(BundlePage { roots, after })
+        Ok(BundlePage {
+            roots,
+            after,
+            live_scanned_height: None,
+        })
     }
 
     pub(crate) async fn metadata_height(&self) -> Result<Option<u64>> {
@@ -1407,17 +1428,20 @@ impl BlockStore {
     ) -> Result<(BundlePage, bool)> {
         let boundary = u64::try_from(scan.boundary)?;
         let metadata = self.metadata_height().await?.unwrap_or(0);
+        let mut live_scanned_height = None;
         if boundary < metadata && start <= metadata {
-            let live = self
+            let mut live = self
                 .pending_bundles_after(
                     scan.live.as_ref(),
                     Some((start.max(boundary + 1), metadata)),
                     false,
                 )
                 .await?;
-            if live.after.is_some() {
+            if let Some(after) = &live.after {
+                live.live_scanned_height = Some(u64::try_from(after.height)?);
                 return Ok((live, false));
             }
+            live_scanned_height = Some(metadata);
         }
         let end = boundary.min(metadata);
         if start > end {
@@ -1425,13 +1449,17 @@ impl BlockStore {
                 BundlePage {
                     roots: Vec::new(),
                     after: None,
+                    live_scanned_height,
                 },
                 true,
             ));
         }
         self.pending_bundles_after(scan.backfill.as_ref(), Some((start, end)), true)
             .await
-            .map(|page| (page, true))
+            .map(|mut page| {
+                page.live_scanned_height = live_scanned_height;
+                (page, true)
+            })
     }
 
     pub(crate) async fn bundle_status(
@@ -3347,12 +3375,16 @@ mod tests {
             let (live, backfill) = store.pending_bundle_scan(&scan, 0).await?;
             ensure!(!backfill && live.roots == vec![(roots.last().unwrap().0.clone(),tip_height as u64,size)],
                 "newly eligible bundle did not take priority over backfill");
+            ensure!(live.live_scanned_height == Some(tip_height as u64),
+                "live scan position did not advance above stable");
             scan.live = live.after;
             store.save_bundle_scan_cursor(Some(&scan)).await?;
             let resumed = store.bundle_scan_cursor().await?.context("missing dual checkpoint")?;
             let (page, backfill) = store.pending_bundle_scan(&resumed, 0).await?;
             ensure!(backfill && page.roots == expected[64..128],
                 "restart repeated live work or lost the historical cursor");
+            ensure!(page.live_scanned_height == Some(tip_height as u64),
+                "empty live scan lost the checked metadata height");
             let replacement = keys[0];
             store.client.execute(
                 "DELETE FROM public.block_transactions WHERE object_key=$1 OR object_key=$2",
@@ -3374,6 +3406,8 @@ mod tests {
             let (replayed, backfill) = store.pending_bundle_scan(&replay_scan, 0).await?;
             ensure!(!backfill && replayed.roots == vec![(roots[1].0.clone(),tip_height as u64,size)],
                 "replacement root below the old live cursor was skipped");
+            ensure!(replayed.live_scanned_height == Some(tip_height as u64),
+                "replayed live scan reported the restart checkpoint");
             ensure!(replay_scan.backfill == scan.backfill, "live rewind changed historical progress");
             store.client.batch_execute("ROLLBACK TO SAVEPOINT incoming_bundle").await?;
             let clone_start: i32 = store.client.query_one(
