@@ -846,7 +846,7 @@ impl BlockStore {
             &transaction
                 .query_opt(
                     "SELECT start_height, imported_through, checkpoint_height, checkpoint_hash, source
-                     FROM public.block_index_state WHERE singleton FOR UPDATE",
+                     FROM public.block_index_state WHERE singleton FOR NO KEY UPDATE",
                     &[],
                 )
                 .await?
@@ -1028,7 +1028,7 @@ impl BlockStore {
         transaction
             .query_opt(
                 "SELECT singleton FROM public.block_index_state
-                 WHERE singleton AND checkpoint_height<$1 FOR SHARE",
+                 WHERE singleton AND checkpoint_height<$1 FOR KEY SHARE",
                 &[&height],
             )
             .await?;
@@ -1592,9 +1592,10 @@ impl BlockStore {
             .context("bundle root lacks completed canonical metadata")?;
         let unstable = root.try_get::<_, i64>(1)? > checkpoint;
         if unstable {
+            // Exclude rewind's FOR UPDATE while allowing non-key progress updates.
             transaction
                 .query_one(
-                    "SELECT singleton FROM public.block_index_state WHERE singleton FOR SHARE",
+                    "SELECT singleton FROM public.block_index_state WHERE singleton FOR KEY SHARE",
                     &[],
                 )
                 .await?;
@@ -1986,7 +1987,7 @@ impl BlockStore {
                      LEFT JOIN public.objects o ON o.id=incoming.id
                      LEFT JOIN public.canonical_placements p ON p.object_key=o.key
                      WHERE p.block_height IS NULL OR p.block_height>s.checkpoint_height
-                 ) FOR SHARE OF s",
+                 ) FOR KEY SHARE OF s",
                 &[&ids],
             )
             .await?;
@@ -3906,6 +3907,52 @@ mod tests {
             actor.client.batch_execute("ROLLBACK").await?;
             store.client.batch_execute("RESET lock_timeout").await?;
 
+            actor.client.execute(
+                "UPDATE public.block_index_state SET checkpoint_height=$1 WHERE singleton",
+                &[&(height - 1)],
+            ).await?;
+            actor.client.batch_execute("BEGIN").await?;
+            actor.client.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended(encode($1::bytea,'hex'),1))",
+                &[&root_id],
+            ).await?;
+            let concurrent_progress = async {
+                let outcome = async {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            let blockers: Vec<i32> = actor.client.query_one(
+                                "SELECT pg_blocking_pids($1)", &[&pid],
+                            ).await?.get(0);
+                            if blockers.contains(&actor_pid) {
+                                return Ok::<_, anyhow::Error>(());
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    }).await.context("bundle did not reach its root lock")??;
+                    let mut progress = actor.reconnect().await?;
+                    progress.client.batch_execute("SET lock_timeout='500ms'").await?;
+                    let saved = progress.bundle_scan_cursor().await?;
+                    progress.save_bundle_scan_cursor(saved.as_ref()).await
+                        .context("ingestion blocked bundle checkpoint saving")?;
+                    let previous = Checkpoint { height: (height - 1) as u64, hash: original.checkpoint.hash.clone() };
+                    let next = Checkpoint { height: height as u64, hash: previous.hash.clone() };
+                    progress.advance_checkpoint(&previous, &next, &original.source).await
+                        .context("ingestion blocked stable checkpoint advancement")?;
+                    let error = progress.commit_batch(&[], &next, &original.source).await
+                        .expect_err("empty anchor batch was accepted");
+                    ensure!(error.to_string() == "block-index batch must contain 1 to 256 blocks",
+                        "anchor append could not reach validation during ingestion: {error:#}");
+                    Ok::<_, anyhow::Error>(())
+                }.await;
+                actor.client.batch_execute("ROLLBACK").await?;
+                outcome
+            };
+            let (written, advanced) = tokio::join!(
+                store.commit_bundle_batch(&root_id, &[], &[], false),
+                concurrent_progress,
+            );
+            advanced?;
+            written?;
             actor.client.execute(
                 "UPDATE public.block_index_state SET checkpoint_height=$1 WHERE singleton",
                 &[&(height - 1)],
