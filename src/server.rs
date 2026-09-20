@@ -106,6 +106,75 @@ impl ServerConfig {
             && !self.blocklist.names.contains(&input.to_ascii_lowercase())
     }
 
+    pub(crate) fn diagnostic_target(&self, input: &str) -> Result<(String, Option<String>)> {
+        ensure!(input.len() <= 8192, "diagnostic input exceeds size limit");
+        if !input.contains("://") {
+            if decode_fixed::<32>(input, "data ID").is_ok() {
+                return Ok((input.to_owned(), None));
+            }
+            let name = input.to_ascii_lowercase();
+            split_arns_name(&name)?;
+            return Ok((name, None));
+        }
+        let url = Url::parse(input).context("invalid diagnostic URL")?;
+        ensure!(
+            matches!(url.scheme(), "http" | "https"),
+            "URL must use HTTP or HTTPS"
+        );
+        ensure!(
+            url.username().is_empty() && url.password().is_none(),
+            "URL credentials are unsupported"
+        );
+        let path = percent_encoding::percent_decode_str(url.path())
+            .decode_utf8()
+            .context("URL path is not UTF-8")?;
+        let path = path.strip_prefix('/').unwrap_or(&path);
+        ensure!(
+            path.len() <= MAX_MANIFEST_PATH_BYTES,
+            "manifest path exceeds size limit"
+        );
+        let (first, rest) = path.split_once('/').unwrap_or((path, ""));
+        if first == "raw" {
+            decode_fixed::<32>(rest, "raw data ID")?;
+            return Ok((rest.to_owned(), None));
+        }
+        if decode_fixed::<32>(first, "data ID").is_ok() {
+            return Ok((first.to_owned(), Some(rest.to_owned())));
+        }
+        ensure!(!is_data_id_shape(first), "invalid data ID");
+        let host = url
+            .host_str()
+            .context("URL has no hostname")?
+            .trim_end_matches('.');
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, host.parse()?);
+        let name = if self.root_host(host).is_some() {
+            if self.root_host(host).is_some_and(|root| root.host == host)
+                && let Some(id) = &self.apex_tx_id
+            {
+                return Ok((id.clone(), Some(path.to_owned())));
+            }
+            arns_name(&headers, self).context("URL has no ArNS name or data ID")?
+        } else {
+            ensure!(
+                host.parse::<std::net::IpAddr>().is_err(),
+                "URL has no ArNS name or data ID"
+            );
+            let name = host.split_once('.').context("URL has no ArNS subdomain")?.0;
+            ensure!(
+                name != "www" && (name.len() <= 51 || name.contains('_')),
+                "URL has no ArNS name or data ID"
+            );
+            split_arns_name(name)?;
+            name.to_owned()
+        };
+        Ok((name, Some(path.to_owned())))
+    }
+
+    pub(crate) fn diagnostic_content_allowed(&self, data: &VerifiedData) -> bool {
+        !self.blocklist.blocks(data)
+    }
+
     pub fn new(
         listen_addr: &str,
         arns_root_host: &str,
@@ -327,8 +396,8 @@ pub(crate) struct Resolution {
     pub(crate) resolved_id: String,
     ttl: u32,
     ant_id: String,
-    limit: u16,
-    index: usize,
+    pub(crate) limit: u16,
+    pub(crate) index: usize,
     resolved_at: u128,
 }
 
@@ -344,9 +413,9 @@ struct Manifest {
     paths: serde_json::Map<String, serde_json::Value>,
 }
 
-struct ManifestResolution {
-    id: String,
-    fallback: bool,
+pub(crate) struct ManifestResolution {
+    pub(crate) id: String,
+    pub(crate) fallback: bool,
 }
 
 #[derive(Serialize)]
@@ -438,7 +507,7 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .route("/ar-io/diagnostics", get(serve_diagnostic_page))
         .route(
             "/ar-io/diagnostics/run",
-            post(serve_diagnostic).layer(DefaultBodyLimit::max(1024)),
+            post(serve_diagnostic).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route("/ar-io/peers", get(serve_peers))
         .route("/ar-io/resolver/{name}", get(serve_resolver))
@@ -836,13 +905,11 @@ async fn serve_diagnostic(
     axum::Json(request): axum::Json<DiagnosticRequest>,
 ) -> Response {
     let input = request.input.trim();
-    if input.len() > 255
-        || (decode_fixed::<32>(input, "data ID").is_err()
-            && split_arns_name(&input.to_ascii_lowercase()).is_err())
-    {
-        return error_response(StatusCode::BAD_REQUEST, "Enter an ArNS name or data ID");
-    }
-    if !state.config.diagnostic_allowed(input) {
+    let target = match state.config.diagnostic_target(input) {
+        Ok((target, _)) => target,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    if !state.config.diagnostic_allowed(&target) {
         return error_response(StatusCode::FORBIDDEN, "Content is blocked");
     }
     let _diagnostic = match state.diagnostic_permits.try_acquire() {
@@ -1370,15 +1437,7 @@ async fn retrieve_response(
         });
     }
 
-    let target = async {
-        ensure!(
-            verified.bytes.len() <= MAX_MANIFEST_BYTES,
-            "manifest exceeds size limit"
-        );
-        let bytes = verified.bytes.read_all(MAX_MANIFEST_BYTES).await?;
-        resolve_manifest(&bytes, manifest_path)
-    }
-    .await;
+    let target = resolve_manifest_content(&verified, manifest_path).await;
     let target = match target {
         Ok(Some(target)) => target,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not found"),
@@ -1424,12 +1483,24 @@ async fn retrieve_response(
     response
 }
 
-fn is_manifest_content_type(value: &str) -> bool {
+pub(crate) fn is_manifest_content_type(value: &str) -> bool {
     value.split(';').next().is_some_and(|media_type| {
         media_type
             .trim()
             .eq_ignore_ascii_case(MANIFEST_CONTENT_TYPE)
     })
+}
+
+pub(crate) async fn resolve_manifest_content(
+    verified: &VerifiedData,
+    path: &str,
+) -> Result<Option<ManifestResolution>> {
+    ensure!(
+        verified.bytes.len() <= MAX_MANIFEST_BYTES,
+        "manifest exceeds size limit"
+    );
+    let bytes = verified.bytes.read_all(MAX_MANIFEST_BYTES).await?;
+    resolve_manifest(&bytes, path)
 }
 
 fn resolve_manifest(bytes: &[u8], path: &str) -> Result<Option<ManifestResolution>> {
@@ -2823,6 +2894,54 @@ mod tests {
     const ANT_ACCOUNT: &str = "4V5G8FIth1HvoAjpa37s8c/C2Ag+tWaWAF3YqgG8LaURyc0NNzQfLAEAAABAKwAAADNGX3lsZHFXX3p0NkNpXzQ3dy03Tzc2bFBwZWdwdTFyczdIMml5dWx0VlkAEA4AAAEAAAAAAC2+lbeF1KeVB3WX89Ksp18jfWPgMFBF9tJsgtCTCP9M/wEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
     const ARNS_PROGRAM: &str = "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ";
     const ANT_PROGRAM: &str = "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5";
+
+    #[test]
+    fn diagnostic_urls_preserve_routes_and_decode_paths() {
+        let config = ServerConfig::new(
+            "127.0.0.1:0",
+            "ar.mrx.im",
+            "http://127.0.0.1:1",
+            ARNS_PROGRAM,
+            ANT_PROGRAM,
+            1,
+        )
+        .unwrap();
+        let id = URL_SAFE_NO_PAD.encode([7; 32]);
+        assert_eq!(
+            config
+                .diagnostic_target(&format!(
+                    "https://foreign.invalid/{id}/a%20b%2Fc+z?x=1#part"
+                ))
+                .unwrap(),
+            (id.clone(), Some("a b/c+z".into()))
+        );
+        assert_eq!(
+            config
+                .diagnostic_target(&format!("https://foreign.invalid/raw/{id}"))
+                .unwrap(),
+            (id.clone(), None)
+        );
+        assert_eq!(config.diagnostic_target(&id).unwrap(), (id, None));
+        for host in ["gateways_haruka.ar.mrx.im", "gateways_haruka.other.example"] {
+            assert_eq!(
+                config
+                    .diagnostic_target(&format!("https://{host}/assets/font.woff"))
+                    .unwrap(),
+                ("gateways_haruka".into(), Some("assets/font.woff".into()))
+            );
+        }
+        assert!(
+            config
+                .diagnostic_target("https://user:secret@foreign.invalid/path")
+                .is_err()
+        );
+        assert!(config.diagnostic_target("file:///private/path").is_err());
+        assert!(
+            config
+                .diagnostic_target("https://foreign.invalid/%FF")
+                .is_err()
+        );
+    }
 
     #[test]
     fn counter_rates_preserve_large_deltas_and_reject_resets() {

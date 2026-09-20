@@ -6,7 +6,7 @@ use ar_io_gateway::{
     server::{self, ServerConfig},
 };
 
-const USAGE: &str = "usage: ar-io-gateway serve\n       ar-io-gateway cache-cleanup\n       ar-io-gateway diagnose <arns-name|id>\n       ar-io-gateway <fetch|fetch-bundled> <id> <output-file>";
+const USAGE: &str = "usage: ar-io-gateway serve\n       ar-io-gateway cache-cleanup\n       ar-io-gateway diagnose <url|arns-name|id>\n       ar-io-gateway <fetch|fetch-bundled> <id> <output-file>";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {

@@ -148,6 +148,13 @@ fn error_text(error: &anyhow::Error, public: bool) -> String {
         "ArNS name is missing or inactive",
         "ArNS config account is missing",
         "Content is blocked",
+        "ArNS undername exceeds the allowed limit",
+        "Manifest path was not found",
+        "manifest exceeds size limit",
+        "manifest path exceeds size limit",
+        "invalid manifest type",
+        "unsupported manifest version",
+        "invalid manifest JSON",
         "diagnostic preparation timed out",
         "verified retrieval timed out",
         "verified bundle retrieval timed out",
@@ -517,27 +524,55 @@ async fn run(
             "input": input,
             "resolved_id": null,
             "resolution": null,
+            "root_id": null,
+            "request_path": null,
+            "manifest": null,
             "index": {"state": "not_checked"},
             "cache": {"state": "not_checked", "integrity_checked": false},
             "retrieval_mode": "fresh",
             "content": null,
         });
         let preparation = tokio::time::timeout(deadline, async {
+            let (target, path) = check("input_resolution", input, async {
+                resolver.diagnostic_target(input)
+            }).await?;
+            anyhow::ensure!(resolver.diagnostic_allowed(&target), "Content is blocked");
+            report["request_path"] = json!(path);
             let gateway = setup.await?;
-            let id = if decode_fixed::<32>(input, "data ID").is_ok() {
-                input.to_owned()
+            let mut id = if decode_fixed::<32>(&target, "data ID").is_ok() {
+                target.clone()
             } else {
-                let resolution = check("name_resolution", input, async {
-                    server::resolve_arns(&gateway, resolver, input.to_ascii_lowercase())
-                        .await?
+                let resolution = check("name_resolution", &target, async {
+                    server::resolve_arns(&gateway, resolver, target.clone()).await?
                         .context("ArNS name is missing or inactive")
                 }).await?;
+                anyhow::ensure!(resolution.index <= usize::from(resolution.limit), "ArNS undername exceeds the allowed limit");
                 let id = resolution.resolved_id.clone();
                 report["resolution"] = serde_json::to_value(resolution)?;
                 id
             };
             report["resolved_id"] = json!(id);
             anyhow::ensure!(resolver.diagnostic_allowed(&id), "Content is blocked");
+            report["root_id"] = json!(id);
+            let mut retrieved = None;
+            if let Some(path) = path {
+                let root = check("verified_retrieval", &id, gateway.retrieve(&id)).await?;
+                anyhow::ensure!(resolver.diagnostic_content_allowed(&root), "Content is blocked");
+                if server::is_manifest_content_type(&root.content_type) {
+                    report["manifest"] = json!({"id": id, "path": path, "target_id": null});
+                    let resolved = check("manifest_resolution", &id, async {
+                        server::resolve_manifest_content(&root, &path).await?
+                            .context("Manifest path was not found")
+                    }).await?;
+                    report["manifest"]["target_id"] = json!(resolved.id);
+                    report["manifest"]["fallback"] = json!(resolved.fallback);
+                    id = resolved.id;
+                    report["resolved_id"] = json!(id);
+                    anyhow::ensure!(resolver.diagnostic_allowed(&id), "Content is blocked");
+                } else {
+                    retrieved = Some(root);
+                }
+            }
             let key = decode_fixed::<32>(&id, "data ID")?;
             if let Some(store) = &gateway.block_store {
                 match check("index_inspection", &id, store.diagnostic_object(&key)).await {
@@ -560,15 +595,19 @@ async fn run(
                     "not_configured"
                 });
             }
-            Ok::<_, anyhow::Error>((gateway, id))
+            Ok::<_, anyhow::Error>((gateway, id, retrieved))
         }).await.context("diagnostic preparation timed out").and_then(|result| result);
         let result = match preparation {
-            Ok((gateway, id)) => {
-                match check("verified_retrieval", &id, gateway.retrieve(&id)).await {
-                    Ok(data) => serde_json::to_value(data).map(|data| report["content"] = data)
-                        .map_err(anyhow::Error::from),
-                    Err(error) => Err(error),
-                }
+            Ok((gateway, id, retrieved)) => {
+                let content = match retrieved {
+                    Some(data) => Ok(data),
+                    None => check("verified_retrieval", &id, gateway.retrieve(&id)).await,
+                };
+                content.and_then(|data| {
+                    anyhow::ensure!(resolver.diagnostic_content_allowed(&data), "Content is blocked");
+                    report["content"] = json!(data);
+                    Ok(())
+                })
             }
             Err(error) => Err(error),
         };
@@ -605,7 +644,167 @@ async fn inspect_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn site_diagnostics_resolve_manifest_paths_and_enforce_target_blocks() {
+        let manifest_id = URL_SAFE_NO_PAD.encode([7; 32]);
+        let asset_id = URL_SAFE_NO_PAD.encode([8; 32]);
+        let make_gateway = |include_asset: bool| {
+            let config = Config::new(
+                "http://127.0.0.1:1",
+                "http://127.0.0.1:1",
+                vec!["http://127.0.0.1:1".into()],
+                Duration::from_secs(1),
+                1,
+                65536,
+            )
+            .unwrap();
+            let gateway = Gateway::new(config).unwrap();
+            let manifest = serde_json::to_vec(&json!({
+                "manifest": "arweave/paths", "version": "0.1.0",
+                "index": {"path": "font file.woff"},
+                "paths": {"font file.woff": {"id": asset_id}}
+            }))
+            .unwrap();
+            for (id, bytes, content_type) in [
+                (
+                    manifest_id.clone(),
+                    manifest,
+                    "application/x.arweave-manifest+json",
+                ),
+                (asset_id.clone(), b"font payload".to_vec(), "font/woff"),
+            ] {
+                if id == asset_id && !include_asset {
+                    continue;
+                }
+                let digest = Sha256::digest(&bytes);
+                let data = crate::VerifiedData {
+                    id,
+                    content_length: bytes.len(),
+                    bytes: bytes.into(),
+                    cache_hit: false,
+                    block_height: 1,
+                    block_hash: None,
+                    stable_anchor: true,
+                    content_type: content_type.into(),
+                    content_encoding: None,
+                    etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
+                    sha256: crate::hex(&digest),
+                    indexing_root: None,
+                };
+                gateway.cache.lock().unwrap().insert(data, 8, 65536);
+            }
+            gateway
+        };
+        let resolver = server::ServerConfig::new(
+            "127.0.0.1:0",
+            "example.com",
+            "http://127.0.0.1:1",
+            "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ",
+            "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5",
+            1,
+        )
+        .unwrap();
+        let url = format!("https://foreign.invalid/{manifest_id}/font%20file.woff");
+        let report = run(
+            async { Ok(make_gateway(true)) },
+            &resolver,
+            &url,
+            None,
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+        assert_eq!(report["status"], "passed", "{report}");
+        assert_eq!(report["root_id"], manifest_id);
+        assert_eq!(report["resolved_id"], asset_id);
+        assert_eq!(report["content"]["content_type"], "font/woff");
+        assert_eq!(report["manifest"]["path"], "font file.woff");
+
+        let missing = format!("https://foreign.invalid/{manifest_id}/missing.woff");
+        let report = run(
+            async { Ok(make_gateway(true)) },
+            &resolver,
+            &missing,
+            None,
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+        assert_eq!(report["error"], "Manifest path was not found");
+        assert!(
+            report["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["stage"] == "manifest_resolution" && step["status"] == "failed")
+        );
+
+        let report = run(
+            async { Ok(make_gateway(false)) },
+            &resolver,
+            &url,
+            None,
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["resolved_id"], asset_id);
+        assert!(
+            report["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["stage"] == "verified_retrieval"
+                    && step["id"] == asset_id
+                    && step["status"] != "passed")
+        );
+
+        let resolver = resolver
+            .with_blocklist(&serde_json::to_vec(&json!({"ids": [asset_id]})).unwrap())
+            .unwrap();
+        let report = run(
+            async { Ok(make_gateway(true)) },
+            &resolver,
+            &url,
+            None,
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+        assert_eq!(report["status"], "failed");
+        assert_eq!(report["error"], "Content is blocked");
+        assert!(report["content"].is_null());
+
+        let gateway = make_gateway(true);
+        let hash = gateway
+            .cache
+            .lock()
+            .unwrap()
+            .get(&manifest_id)
+            .unwrap()
+            .etag
+            .trim_matches('"')
+            .to_owned();
+        let resolver = resolver
+            .with_blocklist(&serde_json::to_vec(&json!({"hashes": [hash]})).unwrap())
+            .unwrap();
+        let report = run(
+            async { Ok(gateway) },
+            &resolver,
+            &url,
+            None,
+            Duration::from_secs(2),
+            true,
+        )
+        .await;
+        assert_eq!(report["error"], "Content is blocked");
+        assert!(report["manifest"].is_null());
+        assert!(report["content"].is_null());
+    }
 
     #[tokio::test]
     async fn concurrent_bundle_attempts_distinguish_unavailable_data_from_invalid_content() {

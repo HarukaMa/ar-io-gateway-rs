@@ -21,6 +21,7 @@ dependencies = [
  "futures-util",
  "k256",
  "parking_lot",
+ "percent-encoding",
  "reqwest",
  "rsa",
  "serde",

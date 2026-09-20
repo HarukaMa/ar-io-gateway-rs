@@ -17,9 +17,10 @@ code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono"
 <header><div><h1>Diagnostics</h1><p>AR.IO gateway</p></div><a href="/ar-io/status">Indexing status</a></header>
 <main>
 <form id="form">
-<label for="input">ArNS name or data ID</label>
-<div class="input-row"><input id="input" name="input" required maxlength="255" autocomplete="off" spellcheck="false" placeholder="Enter an ArNS name or data ID"><button id="run" type="submit">Run diagnostic</button></div>
+<label for="input">Site URL, ArNS name or data ID</label>
+<div class="input-row"><input id="input" name="input" required maxlength="8192" autocomplete="off" spellcheck="false" placeholder="Enter a site URL, ArNS name or data ID"><button id="run" type="submit">Run diagnostic</button></div>
 <p class="note">Fresh retrieval, up to 64 MiB. Preparation and retrieval each have a one-minute limit. One diagnostic can run at a time.</p>
+<p class="note">URLs are traced through this gateway. For unfamiliar hosts, the first hostname label is used as the ArNS name.</p>
 <output id="status" aria-live="polite"></output>
 </form>
 <div id="results" hidden>
@@ -37,6 +38,8 @@ const element = id => document.getElementById(id);
 const label = value => String(value).replaceAll('_', ' ');
 const stageDescriptions = {
   database_connection: 'Connects to the local index database for metadata lookups.',
+  input_resolution: 'Identifies the data ID or ArNS name and path from the input.',
+  manifest_resolution: 'Looks up the requested path in the verified manifest, including index and fallback entries.',
   name_resolution: 'Resolves the ArNS name to a content ID using its ArNS and ANT records.',
   index_inspection: 'Checks whether this ID has locally indexed metadata and whether that metadata is complete.',
   cache_inspection: 'Checks for a cached file and compares its type and size with the cache record. Cached bytes are not authenticated here.',
@@ -148,6 +151,13 @@ function render(report) {
   for (const id of ['resolution', 'local', 'ancestry', 'steps', 'content']) element(id).replaceChildren();
   field(element('resolution'), 'Input', report.input, /^[A-Za-z0-9_-]{43}$/.test(report.input));
   field(element('resolution'), 'Resolved ID', report.resolved_id, true);
+  if (report.root_id && report.root_id !== report.resolved_id) field(element('resolution'), 'Root ID', report.root_id, true);
+  if (report.request_path !== null && report.request_path !== undefined) field(element('resolution'), 'Requested path', report.request_path || '/');
+  if (report.manifest) {
+    field(element('resolution'), 'Manifest ID', report.manifest.id, true);
+    field(element('resolution'), 'Target ID', report.manifest.target_id, true);
+    if (report.manifest.fallback) field(element('resolution'), 'Manifest fallback', 'Used');
+  }
   if (report.resolution) {
     field(element('resolution'), 'ANT', report.resolution.ant_id, true);
     field(element('resolution'), 'Record', report.resolution.record);
@@ -244,7 +254,7 @@ element('form').addEventListener('submit', async event => {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({input: element('input').value.trim()})
     });
-    if (!response.ok) throw new Error(response.status === 429 ? 'A diagnostic is already running. Try again later.' : response.status === 400 || response.status === 422 ? 'Enter a valid ArNS name or data ID.' : response.status === 403 ? 'Content is blocked.' : 'Diagnostic unavailable. Try again later.');
+    if (!response.ok) throw new Error(response.status === 429 ? 'A diagnostic is already running. Try again later.' : response.status === 400 || response.status === 422 ? 'Enter a valid HTTP(S) URL, ArNS name or data ID.' : response.status === 403 ? 'Content is blocked.' : 'Diagnostic unavailable. Try again later.');
     render(await response.json());
   } catch (error) {
     element('status').className = 'failed';
