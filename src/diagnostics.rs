@@ -183,6 +183,7 @@ fn error_text(error: &anyhow::Error, public: bool) -> String {
         "discovery response exceeds location limit",
         "discovered ancestor is not a supported bundle",
         "discovery returned the wrong data item",
+        "discovery returned an invalid or empty parent bundle ID",
         "a data item cannot be its own parent",
         "bundle item table exceeds parent bounds",
         "bundle item exceeds parent bounds",
@@ -733,6 +734,60 @@ mod tests {
             error_text(&error, true),
             "Upstream returned HTTP 429 Too Many Requests"
         );
+    }
+
+    #[tokio::test]
+    async fn public_diagnostic_explains_missing_parent_location() {
+        let id = URL_SAFE_NO_PAD.encode([7; 32]);
+        let response = json!({"data": {"transactions": {"edges": [{
+            "node": {"id": id, "bundledIn": {"id": ""}, "data": {"size": "12862"}}
+        }]}}});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/graphql/private-key",
+            axum::routing::post(move || {
+                let response = response.clone();
+                async move { axum::Json(response) }
+            }),
+        );
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let mut config = Config::new(
+            &url,
+            &url,
+            vec![url.clone()],
+            Duration::from_secs(5),
+            1,
+            1024,
+        )
+        .unwrap();
+        config.graphql_sources = vec![format!("{url}/graphql/private-key")];
+        let gateway = Gateway::new(config).unwrap();
+        let resolver = server::ServerConfig::new(
+            "127.0.0.1:0",
+            "example.com",
+            &url,
+            "2yCUx5edFvUrkibYaUa2ZXWyx9kuJkS8CwyzsgHPWdZZ",
+            "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5",
+            1,
+        )
+        .unwrap();
+        let report = diagnose_public(&gateway, &resolver, &id).await;
+        let reason = "discovery returned an invalid or empty parent bundle ID";
+        assert_eq!(report["status"], "failed", "{report}");
+        assert_eq!(report["error"], reason, "{report}");
+        assert!(report["content"].is_null());
+        let discovery = report["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["stage"] == "bundle_discovery")
+            .unwrap();
+        assert_eq!(discovery["error"], reason);
+        assert!(!report.to_string().contains("private-key"));
+        assert!(!report.to_string().contains(&url));
     }
 
     #[tokio::test]

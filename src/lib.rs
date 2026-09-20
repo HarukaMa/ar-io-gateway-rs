@@ -1650,7 +1650,8 @@ impl Gateway {
                 continue;
             };
             let parent_id = parent.id;
-            decode_fixed::<32>(&parent_id, "discovered parent ID")?;
+            decode_fixed::<32>(&parent_id, "discovered parent ID")
+                .context("discovery returned an invalid or empty parent bundle ID")?;
             ensure!(parent_id != id, "data item cannot be its own parent");
             let size = parse_u128(&node.data.size, "discovered data item size")?;
             if !seen.insert((parent_id.clone(), size)) {
