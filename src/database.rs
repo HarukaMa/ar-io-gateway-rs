@@ -129,12 +129,26 @@ const BUNDLE_FORMAT_MATCH: &str = "
 
 fn bundle_lookup_sql() -> String {
     format!(
-        "{BUNDLE_TAGS}, bundle_candidates AS (
-        SELECT requested.key AS object_key, bool_or(criteria.json) AS json
-        FROM public.objects requested CROSS JOIN bundle_tags criteria
-        WHERE requested.id=$1 AND {BUNDLE_FORMAT_MATCH}
-        GROUP BY requested.key HAVING count(DISTINCT criteria.json)=1
-    ) {CANONICAL_BUNDLES} AND o.id=$1"
+        "WITH requested_tags AS MATERIALIZED (
+            SELECT requested.key AS object_key,
+                translate(encode(n.value,'escape'),
+                    'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') AS name,
+                v.value
+            FROM public.objects requested
+            JOIN public.object_tags t ON t.object_key=requested.key
+            JOIN public.tag_names n ON n.key=t.name_key
+            JOIN public.tag_values v ON v.key=t.value_key
+            WHERE requested.id=$1
+        ), formats AS (
+            SELECT object_key,
+                bool_or(name='bundle-format' AND value='binary'::bytea)
+                    AND bool_or(name='bundle-version' AND value='2.0.0'::bytea) AS is_binary,
+                bool_or(name='bundle-format' AND value='json'::bytea)
+                    AND bool_or(name='bundle-version' AND value='1.0.0'::bytea) AS is_json
+            FROM requested_tags GROUP BY object_key
+        ), bundle_candidates AS (
+            SELECT object_key,is_json AS json FROM formats WHERE is_binary<>is_json
+        ) {CANONICAL_BUNDLES} AND o.id=$1"
     )
 }
 
@@ -2518,6 +2532,69 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[tokio::test]
+    #[ignore = "requires a canonical bundle in ar_io_rust_test; tag changes are rolled back"]
+    async fn bundle_lookup_preserves_format_tag_semantics() -> Result<()> {
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store.client.batch_execute("BEGIN").await?;
+        let result = async {
+            let row = store.client.query_one(
+                "SELECT o.id,o.key FROM public.objects o
+                 JOIN public.canonical_placements p ON p.object_key=o.key
+                 WHERE o.kind=0 AND o.is_bundle AND o.metadata_complete LIMIT 1", &[],
+            ).await?;
+            let id: Vec<u8> = row.get(0);
+            let key: i64 = row.get(1);
+            ensure!(store.bundle_status(&id).await?.is_some(), "fixture lacks canonical membership");
+            let cases: &[(&[(&[u8], &[u8])], Option<bool>)] = &[
+                (&[(b"bundle-format", b"binary"), (b"BUNDLE-FORMAT", b"binary"),
+                   (b"Bundle-Version", b"2.0.0"), (b"bundle-version", b"2.0.0"),
+                   (b"\xff", b"\xfe")], Some(false)),
+                (&[(b"BuNdLe-FoRmAt", b"json"), (b"bundle-version", b"1.0.0")], Some(true)),
+                (&[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0"),
+                   (b"Bundle-Format", b"json"), (b"Bundle-Version", b"1.0.0")], None),
+                (&[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"1.0.0")], None),
+                (&[], None),
+            ];
+            for (tags, expected_json) in cases {
+                store.client.execute("DELETE FROM public.object_tags WHERE object_key=$1", &[&key]).await?;
+                for (ordinal, (name, value)) in tags.iter().enumerate() {
+                    let mut keys = [0_i64; 2];
+                    for (index, (table, bytes)) in [("tag_names", name), ("tag_values", value)].into_iter().enumerate() {
+                        let row = store.client.query_one(&format!(
+                            "WITH inserted AS (
+                                 INSERT INTO public.{table}(value) SELECT $1::bytea
+                                 WHERE NOT EXISTS (SELECT 1 FROM public.{table} WHERE value=$1)
+                                 RETURNING key
+                             ) SELECT key FROM inserted UNION ALL
+                               SELECT key FROM public.{table} WHERE value=$1 LIMIT 1"
+                        ), &[bytes]).await?;
+                        keys[index] = row.get(0);
+                    }
+                    store.client.execute(
+                        "INSERT INTO public.object_tags(object_key,ordinal,name_key,value_key) VALUES($1,$2,$3,$4)",
+                        &[&key, &i32::try_from(ordinal)?, &keys[0], &keys[1]],
+                    ).await?;
+                }
+                let actual = store.bundle_status(&id).await?
+                    .map(|(_, _, _, format)| matches!(format, crate::BundleFormat::Json));
+                ensure!(actual == *expected_json, "bundle format differed for tags {tags:?}");
+            }
+            Ok(())
+        }.await;
+        store.client.batch_execute("ROLLBACK").await?;
+        result
+    }
 
     #[tokio::test]
     #[ignore = "requires ar_io_rust_test; cursor migration and fixture changes are rolled back"]
