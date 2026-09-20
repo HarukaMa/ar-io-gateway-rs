@@ -1937,6 +1937,30 @@ mod bundle_tests {
             let discovered = store.pending_bundles_after(Some(&cursor), Some((height as u64, height as u64)), false).await?
                 .roots.into_iter().next().context("JSON root was not discovered")?;
             ensure!(discovered.0 == root_id && discovered.2 == bytes.len() as u128, "wrong JSON discovery result");
+            let parent_id = &locations.iter().find(|location| location.path.len()>1)
+                .context("fixture lacks a nested parent")?.parent_id;
+            ensure!(objects.iter().any(|object| &object.id == parent_id), "fixture lacks parent metadata");
+            let mut corrupted = objects.clone();
+            let before_parent_checks: Vec<i64> = client.query_one(counts, &[]).await?.get(0);
+            for tags in [
+                Vec::new(),
+                vec![(b"Bundle-Format".to_vec(), b"binary".to_vec()),
+                     (b"Bundle-Version".to_vec(), b"2.0.0".to_vec()),
+                     (b"Bundle-Format".to_vec(), b"json".to_vec()),
+                     (b"Bundle-Version".to_vec(), b"1.0.0".to_vec())],
+            ] {
+                for object in &mut corrupted {
+                    if &object.id == parent_id {
+                        object.tags.clone_from(&tags);
+                    }
+                }
+                let error = store.commit_bundle_batch(&root_id, &corrupted, &locations, true).await
+                    .expect_err("invalid parent format was accepted");
+                ensure!(format!("{error:#}").contains("invalid nested bundle parent"),
+                    "unexpected parent validation error: {error:#}");
+                ensure!(client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == before_parent_checks,
+                    "rejected parent format changed stored rows");
+            }
             store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
             let indexed = store.bundle_location(&leaf_id).await?.context("JSON child has no indexed location")?;
             let item = verify_indexed_bundle(bytes.clone().into(), crate::BundleFormat::Json, leaf_id.as_slice().try_into()?, &indexed, None).await?;

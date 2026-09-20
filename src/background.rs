@@ -157,14 +157,21 @@ impl Admission {
 
     fn scan_checkpoint(&self, boundary: Option<&BundleScan>) -> Option<BundleScan> {
         // Replay the page containing the earliest outstanding root after a restart.
-        self.state
+        let mut checkpoint = self
+            .state
             .lock()
             .scan_cursors
             .values()
             .min_by_key(|(sequence, _)| sequence)
             .map(|(_, cursor)| cursor.as_deref())
             .unwrap_or(boundary)
-            .cloned()
+            .cloned();
+        if let (Some(checkpoint), Some(boundary)) = (checkpoint.as_mut(), boundary)
+            && boundary.live < checkpoint.live
+        {
+            checkpoint.live.clone_from(&boundary.live);
+        }
+        checkpoint
     }
 
     fn indexed(&self, count: u64) {
@@ -616,7 +623,7 @@ async fn download_pending(
     let mut page_start = cursor.clone().map(Arc::new);
     let mut sequence = 0;
     let mut range_cursor = None;
-    let mut was_paused = admission.paused.load(Ordering::Relaxed);
+    let mut was_paused = true;
     let mut saved_cursor = cursor.clone();
     let mut checkpoint_at = Instant::now();
     let mut pending: Option<(Vec<u8>, u64, u128)> = None;
@@ -632,6 +639,15 @@ async fn download_pending(
                 cursor = page_start.as_deref().cloned();
                 pending = None;
                 candidates = Vec::new().into_iter();
+            }
+            if let Some(scan) = cursor.as_mut()
+                && let Some(state) =
+                    timeout(gateway.config.request_timeout, checkpoint_store.state())
+                        .await
+                        .context("loading live scan checkpoint timed out")??
+            {
+                // Revisit the unstable window after metadata changes or a restart.
+                scan.rewind_live(i64::try_from(state.checkpoint.height)?);
             }
             discovery = None;
             next_poll = Instant::now();
@@ -950,6 +966,26 @@ mod tests {
     use super::*;
     use crate::content::{ContentWriter, SpoolBudget};
     use crate::{Tag, VerifiedData, content::Content};
+
+    #[test]
+    fn live_rewind_is_preserved_while_an_older_page_is_outstanding() {
+        let cursor = |height| crate::database::BundleCursor {
+            height,
+            position: 0,
+            kind: 0,
+            id: vec![0; 32],
+        };
+        let mut scan = BundleScan {
+            boundary: 100,
+            live: Some(cursor(150)),
+            backfill: Some(cursor(50)),
+        };
+        let admission = Admission::new(1024, 8, false);
+        let _job = admission.reserve([1; 32], 0).unwrap();
+        admission.track_scan([1; 32], 1, Some(Arc::new(scan.clone())));
+        scan.rewind_live(120);
+        assert_eq!(admission.scan_checkpoint(Some(&scan)), Some(scan));
+    }
 
     #[test]
     fn scan_checkpoint_waits_for_outstanding_pages_and_preserves_wraparound() {

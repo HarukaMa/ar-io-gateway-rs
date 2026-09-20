@@ -77,6 +77,7 @@ const BUNDLE_OVERLAP: &str = "
     ) siblings
     WHERE item_offset < previous_end LIMIT 1";
 
+#[cfg(test)]
 const BUNDLE_TAGS: &str = "
     WITH bundle_tags AS MATERIALIZED (
         SELECT fn.key AS format_name, fv.key AS format_value,
@@ -121,11 +122,13 @@ const CANONICAL_BUNDLES: &str = "
         WHERE s.singleton AND c.height=p.block_height AND bt.position=p.position
           AND bt.object_key=o.key AND b.timestamp IS NOT NULL)";
 
-const BUNDLE_FORMAT_MATCH: &str = "
-    (SELECT true FROM public.object_tags f WHERE f.object_key=requested.key
-        AND f.name_key=criteria.format_name AND f.value_key=criteria.format_value LIMIT 1) IS TRUE
-    AND (SELECT true FROM public.object_tags v WHERE v.object_key=requested.key
-        AND v.name_key=criteria.version_name AND v.value_key=criteria.version_value LIMIT 1) IS TRUE";
+const BUNDLE_FORMAT_FLAGS: &str = "
+    SELECT object_key,
+        bool_or(name='bundle-format' AND value='binary'::bytea)
+            AND bool_or(name='bundle-version' AND value='2.0.0'::bytea) AS is_binary,
+        bool_or(name='bundle-format' AND value='json'::bytea)
+            AND bool_or(name='bundle-version' AND value='1.0.0'::bytea) AS is_json
+    FROM requested_tags GROUP BY object_key";
 
 fn bundle_lookup_sql() -> String {
     format!(
@@ -140,12 +143,7 @@ fn bundle_lookup_sql() -> String {
             JOIN public.tag_values v ON v.key=t.value_key
             WHERE requested.id=$1
         ), formats AS (
-            SELECT object_key,
-                bool_or(name='bundle-format' AND value='binary'::bytea)
-                    AND bool_or(name='bundle-version' AND value='2.0.0'::bytea) AS is_binary,
-                bool_or(name='bundle-format' AND value='json'::bytea)
-                    AND bool_or(name='bundle-version' AND value='1.0.0'::bytea) AS is_json
-            FROM requested_tags GROUP BY object_key
+            {BUNDLE_FORMAT_FLAGS}
         ), bundle_candidates AS (
             SELECT object_key,is_json AS json FROM formats WHERE is_binary<>is_json
         ) {CANONICAL_BUNDLES} AND o.id=$1"
@@ -266,6 +264,19 @@ pub(crate) struct BundleScan {
     pub(crate) backfill: Option<BundleCursor>,
 }
 
+impl BundleScan {
+    pub(crate) fn rewind_live(&mut self, stable: i64) {
+        if let Some(cursor) = &mut self.live
+            && cursor.height > stable
+        {
+            cursor.height = stable;
+            cursor.position = i32::MAX;
+            cursor.kind = 1;
+            cursor.id.fill(u8::MAX);
+        }
+    }
+}
+
 pub(crate) struct BundlePage {
     pub(crate) roots: Vec<(Vec<u8>, u64, u128)>,
     pub(crate) after: Option<BundleCursor>,
@@ -382,7 +393,8 @@ impl BlockStore {
             WHERE NOT metadata_complete ORDER BY height LIMIT 1
         ), pending AS (
             SELECT count(*) FILTER (WHERE p.kind=0) AS transactions,
-                count(*) FILTER (WHERE p.kind=1) AS items
+                count(*) FILTER (WHERE p.kind=1) AS items,
+                min(p.block_height) FILTER (WHERE p.kind=0) AS metadata_pending
             FROM public.objects o JOIN public.canonical_placements p ON p.object_key=o.key
             WHERE NOT o.metadata_complete
         ), totals AS (
@@ -393,10 +405,10 @@ impl BlockStore {
             'chain', (SELECT json_build_object(
                 'start_height',s.start_height,'anchor_height',s.imported_through,
                 'checkpoint_height',s.checkpoint_height,
-                'metadata_height',CASE WHEN p.pending=s.start_height THEN NULL
-                    ELSE coalesce(p.pending-1,s.imported_through) END,
-                'first_pending_height',p.pending
-            ) FROM public.block_index_state s LEFT JOIN progress p ON true WHERE singleton),
+                'metadata_height',CASE WHEN least(p.pending,t.metadata_pending)<=s.start_height THEN NULL
+                    ELSE coalesce(least(p.pending,t.metadata_pending)-1,s.imported_through) END,
+                'first_pending_height',least(p.pending,t.metadata_pending)
+            ) FROM public.block_index_state s LEFT JOIN progress p ON true CROSS JOIN pending t WHERE singleton),
             'transactions',(SELECT json_build_object(
                 'complete',t.transactions-p.transactions,'pending',p.transactions) FROM totals t CROSS JOIN pending p),
             'bundles',(SELECT json_build_object(
@@ -1362,21 +1374,44 @@ impl BlockStore {
         Ok(BundlePage { roots, after })
     }
 
+    pub(crate) async fn metadata_height(&self) -> Result<Option<u64>> {
+        let Some(state) = self.state().await? else {
+            return Ok(None);
+        };
+        let Some(through) = state.imported_through else {
+            return Ok(None);
+        };
+        let blocks = self
+            .pending_metadata_blocks(state.start_height, through, 1)
+            .await?;
+        let transactions = self
+            .pending_transactions(state.start_height, through, 1, &[])
+            .await?;
+        let pending = blocks
+            .first()
+            .map(|block| block.height)
+            .into_iter()
+            .chain(transactions.first().map(|(_, height)| *height))
+            .min();
+        Ok(match pending {
+            Some(height) if height <= state.start_height => None,
+            Some(height) => Some(height - 1),
+            None => Some(through),
+        })
+    }
+
     pub(crate) async fn pending_bundle_scan(
         &self,
         scan: &BundleScan,
         start: u64,
     ) -> Result<(BundlePage, bool)> {
         let boundary = u64::try_from(scan.boundary)?;
-        let stable = self
-            .state()
-            .await?
-            .map_or(0, |state| state.checkpoint.height);
-        if boundary < stable && start <= stable {
+        let metadata = self.metadata_height().await?.unwrap_or(0);
+        if boundary < metadata && start <= metadata {
             let live = self
                 .pending_bundles_after(
                     scan.live.as_ref(),
-                    Some((start.max(boundary + 1), stable)),
+                    Some((start.max(boundary + 1), metadata)),
                     false,
                 )
                 .await?;
@@ -1384,7 +1419,7 @@ impl BlockStore {
                 return Ok((live, false));
             }
         }
-        let end = boundary.min(stable);
+        let end = boundary.min(metadata);
         if start > end {
             return Ok((
                 BundlePage {
@@ -1659,17 +1694,27 @@ impl BlockStore {
         let conflict = transaction
             .query_opt(
                 &format!(
-                    "{BUNDLE_TAGS}
-             SELECT l.key FROM public.item_locations l
-             JOIN unnest($2::text[]) incoming(path) ON l.path=incoming.path::numeric[]
+                    "WITH selected_locations AS MATERIALIZED (
+                 SELECT l.key,l.parent_key,l.root_key,l.parent_path,l.item_offset,l.item_size,l.json
+                 FROM unnest($2::text[]) incoming(path)
+                 JOIN public.item_locations l ON l.root_key=$1 AND l.path=incoming.path::numeric[]
+             ), requested_tags AS MATERIALIZED (
+                 SELECT parents.parent_key AS object_key,
+                     translate(encode(n.value,'escape'),
+                         'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') AS name,
+                     v.value
+                 FROM (SELECT DISTINCT parent_key FROM selected_locations) parents
+                 JOIN public.object_tags t ON t.object_key=parents.parent_key
+                 JOIN public.tag_names n ON n.key=t.name_key
+                 JOIN public.tag_values v ON v.key=t.value_key
+             ), formats AS ({BUNDLE_FORMAT_FLAGS})
+             SELECT l.key FROM selected_locations l
              LEFT JOIN public.item_locations p ON p.root_key=l.root_key AND p.path=l.parent_path
              JOIN public.objects requested ON requested.key=l.parent_key
-             LEFT JOIN LATERAL (
-                 SELECT count(DISTINCT criteria.json) AS matches, bool_or(criteria.json) AS json
-                 FROM bundle_tags criteria WHERE {BUNDLE_FORMAT_MATCH}
-             ) format ON true
-             WHERE l.root_key=$1 AND (
-                 format.matches<>1 OR format.json<>l.json OR NOT requested.metadata_complete
+             LEFT JOIN formats format ON format.object_key=l.parent_key
+             WHERE (
+                 NOT coalesce(format.is_binary<>format.is_json,false)
+                 OR format.is_json IS DISTINCT FROM l.json OR NOT requested.metadata_complete
                  OR (l.parent_path IS NOT NULL AND p.object_key IS DISTINCT FROM l.parent_key)
                  OR l.item_offset + l.item_size > requested.data_size)
              LIMIT 1"
@@ -3226,6 +3271,11 @@ mod tests {
                 )
                 .await?;
             ensure!(collect(&store, None).await? == roots, "chronological discovery lost or repeated a root");
+            store.client.execute(
+                "UPDATE public.canonical_blocks SET metadata_complete=true WHERE height<=$1",
+                &[&height],
+            ).await?;
+            ensure!(store.metadata_height().await? == Some(height as u64), "metadata bound differs from the complete prefix");
             let mut scan = BundleScan { boundary: height, live: None, backfill: None };
             let (page, backfill) = store.pending_bundle_scan(&scan, 0).await?;
             ensure!(backfill, "initial scan did not start with historical bundles");
@@ -3275,9 +3325,24 @@ mod tests {
             ).await?;
             let (waiting, backfill) = store.pending_bundle_scan(&scan, 0).await?;
             ensure!(backfill && waiting.roots == expected[64..128],
-                "an unstable bundle bypassed the stable checkpoint");
+                "a bundle with incomplete block metadata bypassed the metadata bound");
             store.client.execute(
-                "UPDATE public.block_index_state SET checkpoint_height=$1 WHERE singleton", &[&tip_height],
+                "UPDATE public.canonical_blocks SET metadata_complete=true WHERE height=$1", &[&tip_height],
+            ).await?;
+            store.client.execute(
+                "UPDATE public.objects SET metadata_complete=false WHERE key=$1", &[incoming],
+            ).await?;
+            let (waiting, backfill) = store.pending_bundle_scan(&scan, 0).await?;
+            ensure!(backfill && waiting.roots == expected[64..128],
+                "a transaction metadata gap was skipped");
+            ensure!(store.metadata_height().await? == Some(height as u64), "transaction metadata gap did not bound discovery");
+            let status: serde_json::Value = serde_json::from_str(
+                store.client.query_one(BlockStore::STATUS_PROGRESS, &[]).await?.get(0),
+            )?;
+            ensure!(status["chain"]["metadata_height"].as_u64() == Some(height as u64),
+                "status metadata height ignored pending transactions");
+            store.client.execute(
+                "UPDATE public.objects SET metadata_complete=true WHERE key=$1", &[incoming],
             ).await?;
             let (live, backfill) = store.pending_bundle_scan(&scan, 0).await?;
             ensure!(!backfill && live.roots == vec![(roots.last().unwrap().0.clone(),tip_height as u64,size)],
@@ -3288,6 +3353,28 @@ mod tests {
             let (page, backfill) = store.pending_bundle_scan(&resumed, 0).await?;
             ensure!(backfill && page.roots == expected[64..128],
                 "restart repeated live work or lost the historical cursor");
+            let replacement = keys[0];
+            store.client.execute(
+                "DELETE FROM public.block_transactions WHERE object_key=$1 OR object_key=$2",
+                &[incoming, &replacement],
+            ).await?;
+            store.client.execute(
+                "DELETE FROM public.canonical_placements WHERE object_key=$1", &[incoming],
+            ).await?;
+            store.client.execute(
+                "INSERT INTO public.block_transactions(block_hash,position,object_key) VALUES($1,0,$2)",
+                &[&tip_hash, &replacement],
+            ).await?;
+            store.client.execute(
+                "UPDATE public.canonical_placements SET block_height=$1,position=0 WHERE object_key=$2",
+                &[&tip_height, &replacement],
+            ).await?;
+            let mut replay_scan = resumed;
+            replay_scan.rewind_live(height);
+            let (replayed, backfill) = store.pending_bundle_scan(&replay_scan, 0).await?;
+            ensure!(!backfill && replayed.roots == vec![(roots[1].0.clone(),tip_height as u64,size)],
+                "replacement root below the old live cursor was skipped");
+            ensure!(replay_scan.backfill == scan.backfill, "live rewind changed historical progress");
             store.client.batch_execute("ROLLBACK TO SAVEPOINT incoming_bundle").await?;
             let clone_start: i32 = store.client.query_one(
                 "SELECT min(position) FROM public.block_transactions WHERE object_key=ANY($1::bigint[])",

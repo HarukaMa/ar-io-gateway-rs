@@ -27,7 +27,7 @@
 <div><dt>Recent rate</dt><dd id="transaction-rate">-</dd></div>
 </dl></section>
 <section><h2>Bundles <small>Discovered so far</small></h2><dl>
-<div><dt>Live cursor / stable height</dt><dd id="bundle-live-height">-</dd></div>
+<div><dt>Live cursor / metadata height</dt><dd id="bundle-live-height">-</dd></div>
 <div><dt>Backfill cursor (descending)</dt><dd id="bundle-backfill-height">-</dd></div>
 <div><dt>Root bundles</dt><dd id="roots">-</dd></div>
 <div><dt>Completed roots</dt><dd id="completed-roots">-</dd></div>
@@ -108,7 +108,7 @@ async function refresh() {
     coverage('metadata', chain.metadata_height, data.trusted_tip, chain.start_height);
     text('transactions', number(tx.complete)); text('pending-transactions', number(tx.pending));
     text('transaction-rate', tx.per_second == null ? '-' : `${number(tx.per_second)} / sec`);
-    text('bundle-live-height', bundles.scan?.live_height == null ? '-' : `${number(bundles.scan.live_height)} / ${number(chain.checkpoint_height)}`);
+    text('bundle-live-height', bundles.scan?.live_height == null ? '-' : `${number(bundles.scan.live_height)} / ${number(chain.metadata_height)}`);
     text('bundle-backfill-height', number(bundles.scan?.backfill_height));
     text('roots', number(bundles.discovered_roots)); text('completed-roots', number(bundles.complete_roots));
     text('pending-roots', number(bundles.pending_roots)); text('pending-bytes', bytes(bundles.pending_bytes));
