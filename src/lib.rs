@@ -4219,7 +4219,7 @@ fn typed_ethereum_message_hash(message: &[u8], address: &[u8; 20]) -> [u8; 32] {
     let domain_name = keccak256(&[b"Bundlr"]);
     let domain_version = keccak256(&[b"1"]);
     let domain = keccak256(&[&domain_type, &domain_name, &domain_version]);
-    let message_type = keccak256(&[b"Bundlr(bytes Transaction hash, address address)"]);
+    let message_type = keccak256(&[b"Bundlr(bytes Transaction hash,address address)"]);
     let transaction_hash = keccak256(&[message]);
     let mut encoded_address = [0; 32];
     encoded_address[12..].copy_from_slice(address);
@@ -6887,15 +6887,14 @@ mod tests {
             "Aptos multisignature must meet its owner threshold"
         );
 
-        let public_key = secp256k1.verifying_key().to_sec1_point(false);
-        let public_key_hash = keccak256(&[&public_key.as_bytes()[1..]]);
-        let address: [u8; 20] = public_key_hash[12..].try_into().unwrap();
-        let typed_owner = format!("0x{}", hex(&address)).into_bytes();
-        let payload =
-            data_item_signature_payload(7, &typed_owner, &[], &[], RAW_TAGS, deep_hash_blob(DATA));
-        let signature =
-            recoverable_signature(&secp256k1, &typed_ethereum_message_hash(&payload, &address));
-        check_data_item(7, &typed_owner, &signature, DATA).await;
+        // Fixed signature from @dha-team/arbundles TypedEthereumSigner.
+        let typed_owner = b"0x3325a78425f17a7e487eb5666b2bfd93abb06c70";
+        let signature = decode_b64(
+            "g8UfJ2gQNlp92ERKDW2w4SKuif_K8bqzDmRSkX0gOUA7OYAxglorAxeVYNyIS7RIEzwqvLOnBHQzeUFoHs89-xw",
+            "typed Ethereum fixture signature",
+        )
+        .unwrap();
+        check_data_item(7, typed_owner, &signature, DATA).await;
 
         assert!(data_item_signature_sizes(8).is_err());
     }
