@@ -357,6 +357,17 @@ tokio::task_local! {
     static BACKGROUND_CPU: ();
 }
 
+fn retrieval_deadline<F: Future>(
+    duration: Duration,
+    future: F,
+) -> impl Future<Output = std::result::Result<F::Output, tokio::time::error::Elapsed>> {
+    if BACKGROUND_CPU.try_with(|()| ()).is_ok() {
+        futures_util::future::Either::Left(futures_util::FutureExt::map(future, Ok))
+    } else {
+        futures_util::future::Either::Right(tokio::time::timeout(duration, future))
+    }
+}
+
 async fn cpu_work<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
@@ -936,7 +947,7 @@ impl Gateway {
             }
         };
         if let Some(mut leader) = leader {
-            let result = tokio::time::timeout(self.config.retrieval_timeout, async {
+            let result = retrieval_deadline(self.config.retrieval_timeout, async {
                 let data = retrieve.await?;
                 diagnostics::check("canonical_anchor", id, async {
                     ensure!(
@@ -974,7 +985,7 @@ impl Gateway {
             drop(leader);
             result
         } else {
-            tokio::time::timeout(self.config.retrieval_timeout, receiver.changed())
+            retrieval_deadline(self.config.retrieval_timeout, receiver.changed())
                 .await
                 .context("coalesced retrieval timed out")?
                 .context("coalesced retrieval canceled")?;
@@ -3510,6 +3521,14 @@ struct VerifiedItem {
 }
 
 impl VerifiedItem {
+    fn id(&self, header_id: &[u8; 32]) -> [u8; 32] {
+        if self.signature.is_empty() {
+            *header_id
+        } else {
+            sha256(&[&self.signature])
+        }
+    }
+
     fn text_tag(&self, name: &[u8]) -> Option<String> {
         transactions::optional_text_tag(
             self.tags
@@ -3591,6 +3610,16 @@ impl BundleEntry {
 
     fn is_json(&self) -> bool {
         matches!(self, Self::Json(_))
+    }
+    async fn matches_signature_id(&self, expected_id: &[u8; 32]) -> Result<bool> {
+        let Self::Binary { bytes, .. } = self else {
+            return Ok(false);
+        };
+        if bytes.len() < 514 {
+            return Ok(false);
+        }
+        let prefix = bytes.read_at(0, 514).await?;
+        Ok(prefix[..2] == [1, 0] && sha256(&[&prefix[2..]]) == *expected_id)
     }
 
     async fn verify(self, materialize: Option<&Gateway>) -> Result<Option<VerifiedItem>> {
@@ -3772,24 +3801,45 @@ async fn verify_bundle_item(
     materialize: Option<&Gateway>,
 ) -> Result<(VerifiedItem, usize)> {
     diagnostics::check_item(expected_id, async {
-        let mut entries = BundleItems::new(bundle, format).await?;
-        let mut found = None;
-        let mut scanned = 0;
-        while let Some(entry) = entries.next().await? {
-            let offset = entry.offset();
-            if entry.id() == Some(expected_id)
-                && expected_offset.is_none_or(|expected| expected == offset as u128)
-                && found.is_none()
-            {
-                // Invalid JSON occurrences do not hide a later valid copy of the same ID.
-                found = entry.verify(materialize).await?.map(|item| (item, offset));
+        // Check the bundle table first so ordinary lookups never read unrelated item headers.
+        for signature_lookup in [false, true] {
+            if signature_lookup && (format != BundleFormat::Binary || expected_offset.is_some()) {
+                break;
             }
-            scanned += 1;
-            if scanned % 256 == 0 {
-                tokio::task::yield_now().await;
+            let mut entries = BundleItems::new(bundle.clone(), format).await?;
+            let mut found = None;
+            let mut scanned = 0;
+            while let Some(entry) = entries.next().await? {
+                let offset = entry.offset();
+                if found.is_none()
+                    && expected_offset.is_none_or(|expected| expected == offset as u128)
+                    && (expected_offset.is_some()
+                        || if signature_lookup {
+                            entry.matches_signature_id(expected_id).await?
+                        } else {
+                            entry.id() == Some(expected_id)
+                        })
+                {
+                    let header_id = entry.id().copied();
+                    // Invalid JSON occurrences do not hide a later valid copy of the same ID.
+                    if let Some(item) = entry.verify(materialize).await? {
+                        ensure!(
+                            header_id.is_some_and(|id| item.id(&id) == *expected_id),
+                            "bundle item signed identity does not match requested ID"
+                        );
+                        found = Some((item, offset));
+                    }
+                }
+                scanned += 1;
+                if scanned % 256 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            if let Some(found) = found {
+                return Ok(found);
             }
         }
-        found.context("valid data item is absent from verified parent at the expected offset")
+        bail!("valid data item is absent from verified parent at the expected offset")
     })
     .await
 }
@@ -3932,8 +3982,10 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
     let tags = parse_avro_tags(&header.slice_ref(raw_tags), tag_count)?;
     let data = item.slice(cursor..item.len())?;
 
+    let signed_identity = sha256(&[signature]) == *expected_id;
+    let content_identity = unsigned || (!legacy && signature_type == 1 && !signed_identity);
     ensure!(
-        unsigned || sha256(&[signature]) == *expected_id,
+        content_identity || signed_identity,
         "data item ID is not the signature hash"
     );
     let (body_hash, body_sha384) = data.hashes().await?;
@@ -3954,11 +4006,25 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
     } else {
         data_item_signature_payload(signature_type, owner, target, anchor, raw_tags, data_hash)
     };
-    let (signature_bytes, owner_bytes) = if unsigned {
+    if content_identity {
+        let identity_payload = if unsigned {
+            payload
+        } else {
+            data_item_signature_payload(
+                signature_type,
+                &[0; 512],
+                target,
+                anchor,
+                raw_tags,
+                data_hash,
+            )
+        };
         ensure!(
-            sha256(&[&payload]) == *expected_id,
+            sha256(&[&identity_payload]) == *expected_id,
             "unsigned data item ID does not match its content"
         );
+    }
+    let (signature_bytes, owner_bytes) = if unsigned {
         // AO unsigned IDs commit to the preimage. They carry no signer metadata.
         (Bytes::new(), Bytes::new())
     } else {
@@ -6536,6 +6602,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compatibility_signed_ao_child_uses_signature_identity() {
+        let bytes = include_bytes!("../tests/fixtures/ao-signed-child.bin").to_vec();
+        let header_id =
+            decode_fixed::<32>("s_X7zqM3z-QVtSwsu573ExfCrEwpXS5xAmZ2ISk0keo", "header ID").unwrap();
+        let signed_id =
+            decode_fixed::<32>("IZpnPHwiTdWpLF3ZjJrIGXcIqSlcbeL2byJhvKqNXYQ", "signed ID").unwrap();
+        let item = verify_data_item(bytes.clone().into(), &header_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            hex(&item.body_hash),
+            "966dcfa21f262c070ec7159abb86b213e0b3fb202d5839651c7c7a35aacfb7f0"
+        );
+        assert_eq!(sha256(&[&item.signature]), signed_id);
+        assert!(!item.owner.is_empty());
+        let mut bundle = encode_bundle(&[&bytes]);
+        bundle[64..96].copy_from_slice(&header_id);
+        let (retrieved, offset) = verify_bundle_item(
+            bundle.clone().into(),
+            BundleFormat::Binary,
+            &signed_id,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retrieved.body_hash, item.body_hash);
+        assert_eq!(offset, 96);
+        assert!(
+            verify_bundle_item(
+                bundle.clone().into(),
+                BundleFormat::Binary,
+                &[9; 32],
+                Some(96),
+                None,
+            )
+            .await
+            .is_err()
+        );
+        for position in [2, 514, bytes.len() - 1] {
+            let mut corrupt = bytes.clone();
+            corrupt[position] ^= 1;
+            assert!(verify_data_item(corrupt.into(), &header_id).await.is_err());
+        }
+        let mut wrong_header = header_id;
+        wrong_header[0] ^= 1;
+        let mut corrupt = bundle;
+        corrupt[64..96].copy_from_slice(&wrong_header);
+        assert!(
+            verify_bundle_item(
+                corrupt.into(),
+                BundleFormat::Binary,
+                &signed_id,
+                Some(96),
+                None,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unindexed_signature_lookup_reaches_late_children() {
+        let child = include_bytes!("../tests/fixtures/ao-signed-child.bin");
+        let signed_id = sha256(&[&child[2..514]]);
+        let header_id =
+            decode_fixed::<32>("s_X7zqM3z-QVtSwsu573ExfCrEwpXS5xAmZ2ISk0keo", "header ID").unwrap();
+        let (other, _) = signed_data_item(b"other", &[]);
+        for preceding in [255, 256] {
+            let mut items = vec![other.as_slice(); preceding];
+            items.push(child);
+            let mut bundle = encode_bundle(&items);
+            let header_start = 64 + preceding * BUNDLE_ENTRY_SIZE;
+            bundle[header_start..header_start + 32].copy_from_slice(&header_id);
+            let offset = 32 + items.len() * BUNDLE_ENTRY_SIZE + preceding * other.len();
+            let result = verify_bundle_item(
+                bundle.clone().into(),
+                BundleFormat::Binary,
+                &signed_id,
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(result.unwrap().1, offset);
+            assert_eq!(
+                verify_bundle_item(
+                    bundle.into(),
+                    BundleFormat::Binary,
+                    &signed_id,
+                    Some(offset as u128),
+                    None,
+                )
+                .await
+                .unwrap()
+                .1,
+                offset
+            );
+        }
+        let mut bundle = encode_bundle(&[child, child]);
+        for header_start in [64, 128] {
+            bundle[header_start..header_start + 32].copy_from_slice(&header_id);
+        }
+        assert!(
+            format!(
+                "{:#}",
+                verify_bundle_item(bundle.into(), BundleFormat::Binary, &header_id, None, None,)
+                    .await
+                    .err()
+                    .unwrap()
+            )
+            .contains("bundle item signed identity does not match requested ID")
+        );
+    }
+
+    #[tokio::test]
     async fn compatibility_unsigned_ao_children_preserve_identity_without_a_signer() {
         let bytes = include_bytes!("../tests/fixtures/ao-unsigned-parent.bin");
         let parent_id =
@@ -7405,6 +7586,42 @@ mod cache_tests {
                 .await
                 .unwrap()
                 .cache_hit
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_retrieval_outlives_http_deadline() {
+        let gateway = Arc::new(gateway());
+        let worker = Arc::clone(&gateway);
+        let leader = tokio::spawn(BACKGROUND_CPU.scope((), async move {
+            worker
+                .retrieve_cached(&worker.cache, "long", true, async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok(data("long"))
+                })
+                .await
+        }));
+        tokio::task::yield_now().await;
+        let (background, http, leader) = tokio::join!(
+            BACKGROUND_CPU.scope(
+                (),
+                gateway.retrieve_cached(&gateway.cache, "long", true, async {
+                    panic!("duplicate retrieval")
+                },)
+            ),
+            gateway.retrieve_cached(&gateway.cache, "long", true, async {
+                panic!("duplicate retrieval")
+            },),
+            leader,
+        );
+        assert!(http.unwrap_err().to_string().contains("timed out"));
+        assert_eq!(
+            background.unwrap().bytes.read_all(5).await.unwrap(),
+            b"hello"[..]
+        );
+        assert_eq!(
+            leader.unwrap().unwrap().bytes.read_all(5).await.unwrap(),
+            b"hello"[..]
         );
     }
 

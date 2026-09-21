@@ -953,7 +953,7 @@ async fn fetch_scheduled(
     encoded: &str,
     height: u64,
 ) -> Result<Option<Arc<VerifiedRoot>>> {
-    timeout(gateway.config.retrieval_timeout, async {
+    crate::retrieval_deadline(gateway.config.retrieval_timeout, async {
         if timeout(gateway.config.request_timeout, store.bundle_complete(id))
             .await
             .context("checking bundle completion timed out")??
@@ -992,7 +992,7 @@ async fn process_job(gateway: &Gateway, store: &mut BlockStore, job: Job) -> Res
             }
             JobContent::Complete(root) => root,
         };
-        timeout(gateway.config.retrieval_timeout, async {
+        crate::retrieval_deadline(gateway.config.retrieval_timeout, async {
             if timeout(
                 gateway.config.request_timeout,
                 store.bundle_complete(&reservation.id),

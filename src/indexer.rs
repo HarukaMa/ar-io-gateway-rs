@@ -1491,7 +1491,7 @@ async fn index_bundle_source(
     facts: Option<&RootFacts>,
 ) -> Result<u64> {
     let reused_facts = facts.is_some();
-    timeout(gateway.config.retrieval_timeout, async {
+    crate::retrieval_deadline(gateway.config.retrieval_timeout, async {
         let root_id = crate::decode_fixed::<32>(encoded_id, "bundle root ID")?;
         let format = require_bundle_tags(tags)?;
         let deadline = gateway.config.request_timeout;
@@ -1780,6 +1780,7 @@ impl BundleTraversal {
             let Some(item) = entry.verify(None).await? else {
                 continue;
             };
+            let id = item.id(&id);
             let mut path = parent.path.clone();
             path.push(offset);
             let location = BundleLocation {
@@ -1824,6 +1825,57 @@ mod bundle_tests {
 
     const BUNDLE_TAGS: &[(&[u8], &[u8])] =
         &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+
+    #[tokio::test]
+    async fn signed_ao_child_indexes_and_retrieves_by_signature() -> Result<()> {
+        let child = include_bytes!("../tests/fixtures/ao-signed-child.bin");
+        let header_id =
+            crate::decode_fixed::<32>("s_X7zqM3z-QVtSwsu573ExfCrEwpXS5xAmZ2ISk0keo", "header ID")?;
+        let signed_id = crate::sha256(&[&child[2..514]]);
+        let mut inner = encode_bundle(&[child, child]);
+        inner[64..96].copy_from_slice(&header_id);
+        let (parent, parent_id) = signed_data_item(&inner, BUNDLE_TAGS);
+        let bytes = encode_bundle(&[&parent]);
+        let root_id = [0xad; 32];
+        let mut traversal =
+            BundleTraversal::new(bytes.clone().into(), &root_id, crate::BundleFormat::Binary)
+                .await?;
+        let (parent, parent_location) = traversal.next().await?.context("missing parent")?;
+        assert_eq!(parent.id, parent_id);
+        let mut previous = None;
+        for expected_offset in [160, 160 + child.len()] {
+            let (object, location) = traversal.next().await?.context("missing child")?;
+            assert_eq!(object.id, signed_id);
+            assert_eq!(location.id, signed_id);
+            assert_eq!(location.parent_id, parent_id);
+            assert_eq!(location.item_offset, expected_offset as u128);
+            assert!(!object.owner_public_key.is_empty());
+            if let Some(previous) = &previous {
+                assert_eq!(&object, previous);
+            }
+            let indexed = IndexedBundle {
+                root_id: root_id.to_vec(),
+                data_size: object.data_size,
+                content_type: object.content_type.clone(),
+                locations: vec![parent_location.clone(), location],
+            };
+            let retrieved = verify_indexed_bundle(
+                bytes.clone().into(),
+                crate::BundleFormat::Binary,
+                &signed_id,
+                &indexed,
+                None,
+            )
+            .await?;
+            assert_eq!(
+                crate::hex(&retrieved.body_hash),
+                "966dcfa21f262c070ec7159abb86b213e0b3fb202d5839651c7c7a35aacfb7f0"
+            );
+            previous = Some(object);
+        }
+        assert!(traversal.next().await?.is_none());
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires ar_io_rust_test; fixture rows are removed after the check"]
