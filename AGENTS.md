@@ -45,3 +45,9 @@
 - Include implementation, verification, signed commit, and push in one concrete approval batch when publication is intended. Include issue updates only for specific tracked work and its completion. Complete the approved delivery before moving to the next issue.
 - Verify the published commit is remotely reachable before closing its issue. Local implementation, passing checks, or a local commit alone do not satisfy issue closure.
 - Keep unrelated experiments and private operational files out of implementation commits. Published rollback requires separately approved signed reverts and corresponding issue updates.
+
+## Local deployment context
+
+Machine-specific deployment details are kept in the optional, Git-excluded file below. Keep private infrastructure details and credentials out of tracked guidance.
+
+@.omp/deployment.md
