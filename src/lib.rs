@@ -3539,7 +3539,11 @@ impl VerifiedItem {
             kind: 1,
             signature: self.signature.to_vec(),
             anchor: self.anchor.to_vec(),
-            owner_address: sha256(&[&self.owner]).to_vec(),
+            owner_address: if self.owner.is_empty() {
+                Vec::new()
+            } else {
+                sha256(&[&self.owner]).to_vec()
+            },
             owner_public_key: self.owner.to_vec(),
             target: self.target.to_vec(),
             data_size: self.data.len() as u128,
@@ -3902,6 +3906,10 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
     let (signature_size, owner_size) = data_item_signature_sizes(signature_type)?;
     let signature = take(&header, &mut cursor, signature_size, "data item signature")?;
     let owner = take(&header, &mut cursor, owner_size, "data item owner")?;
+    let unsigned = !legacy
+        && signature_type == 1
+        && signature.iter().all(|byte| *byte == 0)
+        && owner.iter().all(|byte| *byte == 0);
     let target = read_optional_32(&header, &mut cursor, "data item target")?;
     let anchor = read_optional_32(&header, &mut cursor, "data item anchor")?;
     let tag_count = usize::try_from(read_le_u64(&header, &mut cursor, "data item tag count")?)
@@ -3925,7 +3933,7 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
     let data = item.slice(cursor..item.len())?;
 
     ensure!(
-        sha256(&[signature]) == *expected_id,
+        unsigned || sha256(&[signature]) == *expected_id,
         "data item ID is not the signature hash"
     );
     let (body_hash, body_sha384) = data.hashes().await?;
@@ -3946,15 +3954,24 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
     } else {
         data_item_signature_payload(signature_type, owner, target, anchor, raw_tags, data_hash)
     };
-    let signature_bytes = header.slice_ref(signature);
-    let owner_bytes = header.slice_ref(owner);
+    let (signature_bytes, owner_bytes) = if unsigned {
+        ensure!(
+            sha256(&[&payload]) == *expected_id,
+            "unsigned data item ID does not match its content"
+        );
+        // AO unsigned IDs commit to the preimage. They carry no signer metadata.
+        (Bytes::new(), Bytes::new())
+    } else {
+        let signature_bytes = header.slice_ref(signature);
+        let owner_bytes = header.slice_ref(owner);
+        cpu_work(move || {
+            verify_data_item_signature(signature_type, &owner_bytes, &signature_bytes, &payload)?;
+            Ok((signature_bytes, owner_bytes))
+        })
+        .await?
+    };
     let target_bytes = header.slice_ref(target);
     let anchor_bytes = header.slice_ref(anchor);
-    let (signature_bytes, owner_bytes) = cpu_work(move || {
-        verify_data_item_signature(signature_type, &owner_bytes, &signature_bytes, &payload)?;
-        Ok((signature_bytes, owner_bytes))
-    })
-    .await?;
 
     Ok(VerifiedItem {
         data,
@@ -3985,7 +4002,7 @@ fn item_content_type(tags: &[ItemTag]) -> Result<String> {
 }
 
 fn parse_avro_tags(bytes: &axum::body::Bytes, expected_count: usize) -> Result<Vec<ItemTag>> {
-    if bytes.is_empty() && expected_count == 0 {
+    if expected_count == 0 && (bytes.is_empty() || bytes.as_ref() == [0, 0]) {
         return Ok(Vec::new());
     }
     let mut cursor = 0;
@@ -6516,6 +6533,90 @@ mod tests {
         assert!(item.metadata(&id).tags.is_empty());
         let inconsistent = encode_data_item(2, &signature, &owner, data, &[], 1);
         assert!(verify_data_item(inconsistent.into(), &id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn compatibility_unsigned_ao_children_preserve_identity_without_a_signer() {
+        let bytes = include_bytes!("../tests/fixtures/ao-unsigned-parent.bin");
+        let parent_id =
+            decode_fixed::<32>("z8dH98cY5MvVjBWm7DC6-NjuJOFMZxZeQjh_7hUuK54", "parent ID").unwrap();
+        let parent = verify_data_item(bytes.to_vec().into(), &parent_id)
+            .await
+            .unwrap();
+        let cases = [
+            (
+                "ZY3X3fBheZtdR9-kgnOMoyHP4QBiWE91DEC5SCOFGFg",
+                160,
+                1139,
+                "5922d13b97c5896e661792eb978901dc89c7959254d390e02251e150a8e97b2a",
+            ),
+            (
+                "a_mjp1YQSGLUwwLE3HuNAqhIlmsmZvjg-tteqNMAj64",
+                1299,
+                7075,
+                "e548b5f35e4332ac3b5baf9f76a90d485326a63435613755864c4ce743e0d92b",
+            ),
+        ];
+        for (encoded_id, offset, size, digest) in cases {
+            let id = decode_fixed::<32>(encoded_id, "child ID").unwrap();
+            let (item, _) = verify_bundle_item(
+                parent.data.clone(),
+                BundleFormat::Binary,
+                &id,
+                Some(offset as u128),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(hex(&item.body_hash), digest);
+            let metadata = item.metadata(&id);
+            assert!(metadata.owner_address.is_empty());
+            assert!(metadata.owner_public_key.is_empty());
+            assert!(metadata.signature.is_empty());
+            let raw = parent.data.read_at(offset, size).await.unwrap();
+            for position in [2, 514, raw.len() - 1] {
+                let mut corrupt = raw.to_vec();
+                corrupt[position] ^= 1;
+                assert!(verify_data_item(corrupt.into(), &id).await.is_err());
+            }
+        }
+        let mut forged_owner = parent.data.read_at(160, 1139).await.unwrap().to_vec();
+        forged_owner[514] = 1;
+        let forged_id = decode_fixed::<32>(
+            "TAeaI2tWRDZMzziHy2v2Ed7U8sW9Fb5mwrqBD0DkcRg",
+            "forged owner preimage ID",
+        )
+        .unwrap();
+        assert!(
+            verify_data_item(forged_owner.into(), &forged_id)
+                .await
+                .is_err()
+        );
+        let mut corrupt_parent = bytes.to_vec();
+        *corrupt_parent.last_mut().unwrap() ^= 1;
+        assert!(
+            verify_data_item(corrupt_parent.into(), &parent_id)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_double_zero_empty_tags_keep_signed_bytes() {
+        let bytes = include_bytes!("../tests/fixtures/double-zero-tags.bin");
+        let mut entries = BundleItems::checked(bytes.to_vec().into(), BundleFormat::Binary)
+            .await
+            .unwrap();
+        while let Some(entry) = entries.next().await.unwrap() {
+            let item = entry.verify(None).await.unwrap().unwrap();
+            assert!(item.tags.is_empty());
+            assert_eq!(
+                hex(&item.body_hash),
+                "31f9e5f6031a3f2fb398433473bc57ab05ec1074f38e530e98be16358e4f1c2b"
+            );
+        }
+        assert!(parse_avro_tags(&Bytes::from_static(&[0, 0]), 1).is_err());
+        assert!(parse_avro_tags(&Bytes::from_static(&[0, 1]), 0).is_err());
     }
 
     #[tokio::test]

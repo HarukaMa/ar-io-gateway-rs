@@ -2608,6 +2608,57 @@ mod tests {
     use std::time::Instant;
 
     #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; fixture writes are rolled back"]
+    async fn unsigned_ao_metadata_has_no_signer() -> Result<()> {
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let parent_id =
+            crate::decode_fixed::<32>("z8dH98cY5MvVjBWm7DC6-NjuJOFMZxZeQjh_7hUuK54", "parent ID")?;
+        let parent = crate::verify_data_item(
+            include_bytes!("../tests/fixtures/ao-unsigned-parent.bin")
+                .to_vec()
+                .into(),
+            &parent_id,
+        )
+        .await?;
+        let id =
+            crate::decode_fixed::<32>("ZY3X3fBheZtdR9-kgnOMoyHP4QBiWE91DEC5SCOFGFg", "child ID")?;
+        let (item, _) = crate::verify_bundle_item(
+            parent.data,
+            crate::BundleFormat::Binary,
+            &id,
+            Some(160),
+            None,
+        )
+        .await?;
+        let transaction = store.client.transaction().await?;
+        BlockStore::write_objects(&transaction, &[item.metadata(&id)]).await?;
+        let row = transaction
+            .query_one(
+                "SELECT o.metadata_complete AND o.signature=''::bytea
+                    AND o.owner_address=''::bytea AND w.public_key=''::bytea
+             FROM public.objects o JOIN public.owners w ON w.address=o.owner_address
+             WHERE o.id=$1",
+                &[&id.as_slice()],
+            )
+            .await?;
+        ensure!(
+            row.get::<_, bool>(0),
+            "unsigned metadata acquired a signer or signature"
+        );
+        transaction.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     #[ignore = "requires a canonical bundle in ar_io_rust_test; tag changes are rolled back"]
     async fn bundle_lookup_preserves_format_tag_semantics() -> Result<()> {
         let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
