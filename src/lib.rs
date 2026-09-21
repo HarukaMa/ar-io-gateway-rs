@@ -3436,17 +3436,18 @@ fn content_type(tags: &[Tag]) -> Result<String> {
 
 fn response_content_type(value: String) -> String {
     let mut parts = value.split(';');
-    let media_type = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    let media_type = parts.next().unwrap_or_default();
     let has_charset = parts.any(|parameter| {
         parameter
             .split_once('=')
-            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("charset"))
+            .is_some_and(|(name, _)| name.trim() == "charset")
     });
 
+    // Match Express 4's mime 1.x defaults, including case-sensitive prefix matching.
     if !has_charset
         && (media_type.starts_with("text/")
-            || media_type == "application/json"
-            || media_type.ends_with("+json"))
+            || media_type.starts_with("application/json")
+            || media_type.starts_with("application/javascript"))
     {
         format!("{value}; charset=utf-8")
     } else {
@@ -6936,16 +6937,37 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_content_type_and_bounds_data_size() {
-        assert_eq!(
-            response_content_type("Application/JSON".to_owned()),
-            "Application/JSON; charset=utf-8"
-        );
-        assert_eq!(
-            response_content_type("Text/Plain; Charset=ISO-8859-1".to_owned()),
-            "Text/Plain; Charset=ISO-8859-1"
-        );
-        assert_eq!(response_content_type("image/png".to_owned()), "image/png");
+    fn content_type_matches_express_charset_defaults() {
+        for (tag, expected) in [
+            ("text/html", "text/html; charset=utf-8"),
+            ("application/json", "application/json; charset=utf-8"),
+            (
+                "application/javascript",
+                "application/javascript; charset=utf-8",
+            ),
+            ("application/ld+json", "application/ld+json"),
+            ("Application/JSON", "Application/JSON"),
+            (" text/html", " text/html"),
+            (
+                "text/plain; \tcharset \t=iso-8859-1",
+                "text/plain; \tcharset \t=iso-8859-1",
+            ),
+            (
+                "text/plain; Charset=ISO-8859-1",
+                "text/plain; Charset=ISO-8859-1; charset=utf-8",
+            ),
+            (
+                "application/json-seq",
+                "application/json-seq; charset=utf-8",
+            ),
+            ("image/png", "image/png"),
+        ] {
+            assert_eq!(response_content_type(tag.to_owned()), expected, "{tag}");
+        }
+    }
+
+    #[test]
+    fn bounds_data_size() {
         assert_eq!(checked_data_size(145, 1024).unwrap(), 145);
         assert!(checked_data_size(1025, 1024).is_err());
     }
