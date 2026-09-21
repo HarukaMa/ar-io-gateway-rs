@@ -12,6 +12,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 base64 = "0.22"
 ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }
 bs58 = "0.5"
+flate2 = "1.1"
 k256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
 parking_lot = "0.12"
 percent-encoding = "2.3"

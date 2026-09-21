@@ -1585,6 +1585,11 @@ mod tests {
             "tx_path": crate::URL_SAFE_NO_PAD.encode([root.as_slice(), end.as_slice()].concat()),
         }))
         .unwrap();
+        let binary = crate::tests::binary_chunk_fixture(
+            body,
+            &[root.as_slice(), end.as_slice()].concat(),
+            &[hash.as_slice(), end.as_slice()].concat(),
+        );
         let index_entry = |weave: u128, root: [u8; 32]| {
             let mut bytes = vec![0; 48];
             bytes.extend_from_slice(&16_u16.to_be_bytes());
@@ -1605,6 +1610,8 @@ mod tests {
             ("/trusted/block_index2/0/1", [previous, current].concat()),
             ("/chunk/1002", chunk.clone()),
             ("/chunk/1001", chunk),
+            ("/chunk2/1002", binary.clone()),
+            ("/chunk2/1001", binary),
         ]));
         let mode = Arc::new(AtomicUsize::new(0));
         let mode_in = Arc::clone(&mode);
@@ -1621,11 +1628,24 @@ mod tests {
                 if mode.load(Ordering::Relaxed) == 5 && request.uri().path() == "/trusted/info" {
                     return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new());
                 }
-                if request.uri().path().starts_with("/chunk/") {
+                if request.uri().path().starts_with("/chunk/")
+                    || request.uri().path().starts_with("/chunk2/")
+                {
+                    if request
+                        .headers()
+                        .get("x-packing")
+                        .and_then(|v| v.to_str().ok())
+                        != Some("unpacked")
+                    {
+                        return (axum::http::StatusCode::BAD_REQUEST, Vec::new());
+                    }
                     counted.fetch_add(1, Ordering::Relaxed);
                     match mode.load(Ordering::Relaxed) {
                         1 => std::future::pending::<()>().await,
                         2 => return (axum::http::StatusCode::NOT_FOUND, Vec::new()),
+                        6 if request.uri().path().starts_with("/chunk2/") => {
+                            return (axum::http::StatusCode::NOT_FOUND, Vec::new());
+                        }
                         3 => {
                             return (
                                 axum::http::StatusCode::OK,
@@ -1747,6 +1767,32 @@ mod tests {
         );
         assert_eq!(
             gateway
+                .retrieve_chunk(1001)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .bytes
+                .read_all(body.len())
+                .await
+                .unwrap()
+                .as_ref(),
+            body
+        );
+        mode.store(6, Ordering::Relaxed);
+        let mut fallback = crate::Gateway::new(gateway.config.clone()).unwrap();
+        fallback.client = gateway.client.clone();
+        fallback.peers = Arc::clone(&gateway.peers);
+        assert_eq!(
+            crate::streaming::ChunkSource::new(&fallback, geometry)
+                .read_at(0, body.len())
+                .await
+                .unwrap()
+                .as_ref(),
+            body
+        );
+        assert_eq!(
+            fallback
                 .retrieve_chunk(1001)
                 .await
                 .unwrap()

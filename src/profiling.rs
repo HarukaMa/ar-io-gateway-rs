@@ -433,7 +433,7 @@ mod tests {
         let profile = Profile::new("body-failure-test".to_owned(), Some(Arc::clone(&total)));
         scope(Some(Arc::clone(&profile)), async {
             let response = reqwest::Client::new().get(url).send().await?;
-            assert!(crate::read_chunk_response(response).await.is_err());
+            assert!(crate::read_chunk_response(response, false).await.is_err());
             Ok::<_, anyhow::Error>(())
         })
         .await?;

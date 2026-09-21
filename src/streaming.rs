@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tokio_util::task::AbortOnDropHandle;
 
 use crate::{
-    Geometry, cpu_work, endpoint, peers::PeerState, read_chunk_response, verify_chunk_range,
+    Geometry, chunk_request, cpu_work, peers::PeerState, read_chunk_response, verify_chunk_range,
 };
 
 pub(crate) struct ChunkSource {
@@ -171,25 +171,22 @@ impl ChunkSource {
                     .checked_add(position as u128)
                     .context("stream chunk offset overflow")?;
                 let request = |source: String| async move {
-                    let path = format!("chunk/{absolute}");
-                    let request = if self.sources.iter().any(|configured| configured == &source) {
-                        self.client.get(endpoint(&source, &path))
-                    } else {
-                        self.peers.get(endpoint(&source, &path))
-                    };
                     let started = Instant::now();
-                    let response =
-                        crate::profiling::measure(crate::profiling::Stage::ChunkHeaders, async {
-                            Ok(request
-                                .timeout((self.timeout / 4).min(crate::CHUNK_PEER_DEADLINE))
-                                .send()
-                                .await?
-                                .error_for_status()?)
-                        })
-                        .await?;
+                    let (response, binary) = crate::profiling::measure(
+                        crate::profiling::Stage::ChunkHeaders,
+                        chunk_request(
+                            &self.client,
+                            &self.peers,
+                            &self.sources,
+                            &source,
+                            absolute,
+                            (self.timeout / 4).min(crate::CHUNK_PEER_DEADLINE),
+                        ),
+                    )
+                    .await?;
                     let headers = started.elapsed();
                     let started = Instant::now();
-                    let chunk = read_chunk_response(response).await?;
+                    let chunk = read_chunk_response(response, binary).await?;
                     let body = started.elapsed();
                     let geometry = self.geometry;
                     let proof = cpu_work(move || {
@@ -197,7 +194,7 @@ impl ChunkSource {
                     })
                     .await?;
                     let offset = usize::try_from(proof.data.start)?;
-                    Ok::<_, anyhow::Error>((offset, Bytes::from(proof.bytes), headers, body))
+                    Ok::<_, anyhow::Error>((offset, proof.bytes, headers, body))
                 };
                 let fetches = crate::peers::hedged_requests(
                     &self.peers,

@@ -28,6 +28,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use axum::body::Bytes;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use content::{Content, SpoolBudget};
 use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
@@ -1223,10 +1224,10 @@ impl Gateway {
                 data_size: proof.transaction.size,
                 relative_start_offset: proof.data.start,
                 tx_start_offset: proof.first_offset,
+                chunk: URL_SAFE_NO_PAD.encode(&proof.bytes),
+                data_path: URL_SAFE_NO_PAD.encode(&proof.data_path),
+                tx_path: URL_SAFE_NO_PAD.encode(&proof.tx_path),
                 bytes: proof.bytes.into(),
-                chunk: proof.chunk,
-                data_path: proof.data_path,
-                tx_path: proof.tx_path,
                 start_offset,
                 read_offset,
                 source_host,
@@ -2249,35 +2250,23 @@ impl Gateway {
         }
     }
 
-    async fn fetch_chunk(
-        &self,
-        source: &str,
-        offset: u128,
-    ) -> Result<(JsonChunk, Duration, Duration)> {
-        let url = endpoint(source, &format!("chunk/{offset}"));
-        let request = if self
-            .config
-            .chunk_sources
-            .iter()
-            .any(|configured| configured.trim_end_matches('/') == source.trim_end_matches('/'))
-        {
-            self.client.get(url)
-        } else {
-            self.peers.get(url)
-        };
+    async fn fetch_chunk(&self, source: &str, offset: u128) -> Result<(Chunk, Duration, Duration)> {
         let started = Instant::now();
-        // Reserve time for fallback within the shared chunk deadline.
-        let response = profiling::measure(profiling::Stage::ChunkHeaders, async {
-            Ok(request
-                .timeout((self.config.request_timeout / 4).min(CHUNK_PEER_DEADLINE))
-                .send()
-                .await?
-                .error_for_status()?)
-        })
+        let (response, binary) = profiling::measure(
+            profiling::Stage::ChunkHeaders,
+            chunk_request(
+                &self.client,
+                &self.peers,
+                &self.config.chunk_sources,
+                source,
+                offset,
+                (self.config.request_timeout / 4).min(CHUNK_PEER_DEADLINE),
+            ),
+        )
         .await?;
         let headers = started.elapsed();
         let started = Instant::now();
-        let chunk = read_chunk_response(response).await?;
+        let chunk = read_chunk_response(response, binary).await?;
         Ok((chunk, headers, started.elapsed()))
     }
 
@@ -2316,27 +2305,145 @@ async fn read_json_response<T: DeserializeOwned>(response: reqwest::Response) ->
     read_json_response_with_limit(response, MAX_JSON_BYTES, &remaining, None).await
 }
 
-async fn read_chunk_response(response: reqwest::Response) -> Result<JsonChunk> {
+async fn chunk_request(
+    client: &Client,
+    peers: &peers::PeerState,
+    configured: &[String],
+    source: &str,
+    offset: u128,
+    timeout: Duration,
+) -> Result<(reqwest::Response, bool)> {
+    let configured = configured
+        .iter()
+        .any(|url| url.trim_end_matches('/') == source.trim_end_matches('/'));
+    let request = |binary| {
+        let path = format!("{}/{offset}", if binary { "chunk2" } else { "chunk" });
+        let request = if configured {
+            client.get(endpoint(source, &path))
+        } else {
+            peers.get(endpoint(source, &path))
+        };
+        request
+            .header("x-packing", "unpacked")
+            .header("accept-encoding", if binary { "identity" } else { "gzip" })
+    };
+    let started = Instant::now();
+    let mut binary = !configured;
+    let mut response = request(binary).timeout(timeout).send().await?;
+    if binary && response.status() == reqwest::StatusCode::NOT_FOUND {
+        drop(response);
+        let remaining = timeout.saturating_sub(started.elapsed());
+        ensure!(!remaining.is_zero(), "chunk peer deadline exceeded");
+        binary = false;
+        response = request(binary).timeout(remaining).send().await?;
+    }
+    Ok((response.error_for_status()?, binary))
+}
+
+const MAX_BINARY_CHUNK_BYTES: usize =
+    MAX_CHUNK_SIZE as usize + 2 * MAX_PROOF_BYTES + 3 * 3 + 1 + b"unpacked".len();
+
+async fn read_chunk_response(response: reqwest::Response, binary: bool) -> Result<Chunk> {
     let timer = profiling::start(profiling::Stage::ChunkBody);
-    let remaining = AtomicUsize::new(MAX_JSON_BYTES);
-    let result =
-        read_json_response_with_limit(response, MAX_JSON_BYTES, &remaining, timer.as_ref()).await;
+    let result = async {
+        let mut encodings = response.headers().get_all("content-encoding").iter();
+        let gzip = match encodings.next() {
+            None => false,
+            Some(value) if value.as_bytes().eq_ignore_ascii_case(b"identity") => false,
+            Some(value) if value.as_bytes().eq_ignore_ascii_case(b"gzip") => true,
+            _ => bail!("unsupported chunk content encoding"),
+        };
+        ensure!(
+            encodings.next().is_none(),
+            "multiple chunk content encodings"
+        );
+        let limit = if binary {
+            MAX_BINARY_CHUNK_BYTES
+        } else {
+            MAX_JSON_BYTES
+        };
+        let remaining = AtomicUsize::new(limit);
+        let body =
+            read_response_body_with_limit(response, limit, &remaining, timer.as_ref()).await?;
+        cpu_work(move || {
+            let body = if gzip {
+                use std::io::Read;
+                let decoder = flate2::bufread::MultiGzDecoder::new(body.as_slice());
+                let mut decoded = Vec::new();
+                decoder
+                    .take(limit as u64 + 1)
+                    .read_to_end(&mut decoded)
+                    .context("invalid gzip chunk response")?;
+                ensure!(
+                    decoded.len() <= limit,
+                    "decoded chunk response exceeds size limit"
+                );
+                decoded
+            } else {
+                body
+            };
+            if binary {
+                decode_binary_chunk(body.into())
+            } else {
+                serde_json::from_slice(&body).context("source returned malformed chunk JSON")
+            }
+        })
+        .await
+    }
+    .await;
     if let Some(timer) = timer {
         timer.finish(result.is_ok(), 0);
     }
     result
 }
 
+fn decode_binary_chunk(body: Bytes) -> Result<Chunk> {
+    let mut cursor = 0;
+    let mut field = |width: usize, limit: usize| -> Result<Bytes> {
+        let length = take(&body, &mut cursor, width, "binary chunk field length")?
+            .iter()
+            .fold(0usize, |length, byte| (length << 8) | usize::from(*byte));
+        ensure!(length <= limit, "binary chunk field exceeds size limit");
+        let bytes = take(&body, &mut cursor, length, "binary chunk field")?;
+        Ok(body.slice_ref(bytes))
+    };
+    let chunk = field(3, MAX_CHUNK_SIZE as usize)?;
+    let tx_path = field(3, MAX_PROOF_BYTES)?;
+    let data_path = field(3, MAX_PROOF_BYTES)?;
+    let packing = field(1, b"unpacked".len())?;
+    ensure!(packing == b"unpacked"[..], "binary chunk is not unpacked");
+    ensure!(
+        cursor == body.len(),
+        "binary chunk response has trailing bytes"
+    );
+    // Cached payloads must not retain the response's proof buffers or spare capacity.
+    Ok(Chunk {
+        chunk: Bytes::copy_from_slice(&chunk),
+        data_path,
+        tx_path,
+    })
+}
+
 async fn read_json_response_with_limit<T: DeserializeOwned>(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     limit: usize,
     remaining_bytes: &AtomicUsize,
     timer: Option<&profiling::Timer>,
 ) -> Result<T> {
+    let body = read_response_body_with_limit(response, limit, remaining_bytes, timer).await?;
+    serde_json::from_slice(&body).context("source returned malformed JSON")
+}
+
+async fn read_response_body_with_limit(
+    mut response: reqwest::Response,
+    limit: usize,
+    remaining_bytes: &AtomicUsize,
+    timer: Option<&profiling::Timer>,
+) -> Result<Vec<u8>> {
     if let Some(length) = response.content_length() {
         ensure!(
             length <= limit.min(remaining_bytes.load(Ordering::Relaxed)) as u64,
-            "JSON response exceeds size limit"
+            "HTTP response exceeds size limit"
         );
     }
 
@@ -2352,11 +2459,11 @@ async fn read_json_response_with_limit<T: DeserializeOwned>(
             .unwrap();
         ensure!(
             chunk.len() <= remaining && body.len().saturating_add(chunk.len()) <= limit,
-            "JSON response exceeds size limit"
+            "HTTP response exceeds size limit"
         );
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).context("source returned malformed JSON")
+    Ok(body)
 }
 
 #[derive(Deserialize)]
@@ -3144,10 +3251,22 @@ enum BundleHint {
 }
 
 #[derive(Deserialize)]
-struct JsonChunk {
-    chunk: String,
-    data_path: String,
-    tx_path: String,
+struct Chunk {
+    #[serde(deserialize_with = "deserialize_chunk_bytes")]
+    chunk: Bytes,
+    #[serde(deserialize_with = "deserialize_chunk_bytes")]
+    data_path: Bytes,
+    #[serde(deserialize_with = "deserialize_chunk_bytes")]
+    tx_path: Bytes,
+}
+
+fn deserialize_chunk_bytes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Bytes, D::Error> {
+    let encoded = String::deserialize(deserializer)?;
+    decode_b64(&encoded, "chunk field")
+        .map(Bytes::from)
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Clone, Copy)]
@@ -3169,10 +3288,9 @@ struct BlockGeometry {
 }
 
 struct ProvenChunk {
-    bytes: Vec<u8>,
-    chunk: String,
-    data_path: String,
-    tx_path: String,
+    bytes: Bytes,
+    data_path: Bytes,
+    tx_path: Bytes,
     transaction: TxPath,
     data: DataPath,
     relative_offset: u128,
@@ -3180,7 +3298,7 @@ struct ProvenChunk {
 }
 
 fn verify_chunk_range(
-    chunk: JsonChunk,
+    chunk: Chunk,
     absolute_offset: u128,
     relative_offset: u128,
     geometry: &Geometry,
@@ -3218,18 +3336,15 @@ fn verify_chunk_range(
 }
 
 fn verify_chunk_proof(
-    chunk: JsonChunk,
+    chunk: Chunk,
     absolute_offset: u128,
     geometry: &BlockGeometry,
 ) -> Result<ProvenChunk> {
-    let JsonChunk {
-        chunk,
-        data_path,
-        tx_path,
+    let Chunk {
+        chunk: bytes,
+        data_path: data_path_bytes,
+        tx_path: tx_path_bytes,
     } = chunk;
-    let bytes = decode_b64(&chunk, "chunk bytes")?;
-    let data_path_bytes = decode_b64(&data_path, "data_path")?;
-    let tx_path_bytes = decode_b64(&tx_path, "tx_path")?;
     ensure!(
         bytes.len() <= MAX_CHUNK_SIZE as usize,
         "chunk exceeds protocol limit"
@@ -3284,9 +3399,8 @@ fn verify_chunk_proof(
 
     Ok(ProvenChunk {
         bytes,
-        chunk,
-        data_path,
-        tx_path,
+        data_path: data_path_bytes,
+        tx_path: tx_path_bytes,
         transaction,
         data,
         relative_offset,
@@ -4880,6 +4994,158 @@ mod tests {
         server.abort();
     }
 
+    pub(super) fn binary_chunk_fixture(chunk: &[u8], tx_path: &[u8], data_path: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for field in [chunk, tx_path, data_path] {
+            body.extend_from_slice(&(field.len() as u32).to_be_bytes()[1..]);
+            body.extend_from_slice(field);
+        }
+        body.push(8);
+        body.extend_from_slice(b"unpacked");
+        body
+    }
+
+    #[test]
+    fn binary_chunk_framing_preserves_proofs_and_rejects_invalid_fields() {
+        let payload = b"binary chunk";
+        let end = note(payload.len() as u128);
+        let hash = sha256(&[payload]);
+        let root = hash_leaf(&hash, &end);
+        let tx_path = [root.as_slice(), end.as_slice()].concat();
+        let data_path = [hash.as_slice(), end.as_slice()].concat();
+        let geometry = Geometry {
+            tx_root: hash_leaf(&root, &end),
+            data_root: root,
+            block_weave_size: payload.len() as u128,
+            previous_weave_size: 0,
+            first_offset: 1,
+            end_offset: payload.len() as u128,
+            data_size: payload.len() as u128,
+        };
+        let binary = binary_chunk_fixture(payload, &tx_path, &data_path);
+        let chunk = decode_binary_chunk(binary.clone().into()).unwrap();
+        assert_eq!(
+            verify_chunk_range(chunk, 1, 0, &geometry)
+                .unwrap()
+                .bytes
+                .as_ref(),
+            payload
+        );
+
+        let mut corrupt = binary.clone();
+        corrupt[3] ^= 1;
+        let chunk = decode_binary_chunk(corrupt.into()).unwrap();
+        assert!(verify_chunk_range(chunk, 1, 0, &geometry).is_err());
+
+        let mut trailing = binary.clone();
+        trailing.push(0);
+        let mut packed = binary.clone();
+        *packed.last_mut().unwrap() = b'x';
+        for invalid in [
+            binary[..binary.len() - 1].to_vec(),
+            trailing,
+            packed,
+            binary_chunk_fixture(&vec![0; MAX_CHUNK_SIZE as usize + 1], &tx_path, &data_path),
+            binary_chunk_fixture(payload, &vec![0; MAX_PROOF_BYTES + 1], &data_path),
+            binary_chunk_fixture(payload, &tx_path, &vec![0; MAX_PROOF_BYTES + 1]),
+        ] {
+            assert!(decode_binary_chunk(invalid.into()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn gzip_chunk_transport_bounds_decoding_and_counts_transferred_bytes() {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let payload = vec![7; 64 * 1024];
+        let end = note(payload.len() as u128);
+        let hash = sha256(&[&payload]);
+        let root = hash_leaf(&hash, &end);
+        let json = serde_json::to_vec(&serde_json::json!({
+            "chunk": URL_SAFE_NO_PAD.encode(&payload),
+            "tx_path": URL_SAFE_NO_PAD.encode([root.as_slice(), end.as_slice()].concat()),
+            "data_path": URL_SAFE_NO_PAD.encode([hash.as_slice(), end.as_slice()].concat()),
+        }))
+        .unwrap();
+        let gzip = |bytes: &[u8]| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(bytes).unwrap();
+            encoder.finish().unwrap()
+        };
+        let encoded = gzip(&json);
+        let wire_bytes = encoded.len();
+        let truncated = encoded[..encoded.len() - 1].to_vec();
+        let mut oversized = vec![b' '; MAX_JSON_BYTES];
+        oversized.extend_from_slice(&json);
+        let replies = [encoded, truncated, gzip(&oversized)];
+        let mode = Arc::new(AtomicUsize::new(0));
+        let selected = Arc::clone(&mode);
+        let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let valid_headers = headers.get("accept-encoding").is_some_and(|v| v == "gzip")
+                && headers.get("x-packing").is_some_and(|v| v == "unpacked");
+            let body = replies[selected.load(Ordering::Relaxed)].clone();
+            async move {
+                axum::http::Response::builder()
+                    .status(if valid_headers { 200 } else { 400 })
+                    .header("content-encoding", "gzip")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let gateway = Gateway::new(
+            Config::new(
+                &url,
+                &url,
+                vec![url.clone()],
+                Duration::from_secs(5),
+                1,
+                payload.len(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let geometry = Geometry {
+            tx_root: hash_leaf(&root, &end),
+            data_root: root,
+            block_weave_size: payload.len() as u128,
+            previous_weave_size: 0,
+            first_offset: 1,
+            end_offset: payload.len() as u128,
+            data_size: payload.len() as u128,
+        };
+        let transferred = Arc::new(AtomicU64::new(0));
+        let profile =
+            profiling::Profile::new("gzip-chunk".to_owned(), Some(Arc::clone(&transferred)));
+        profiling::scope(Some(profile), async {
+            let (chunk, _, _) = gateway.fetch_chunk(&url, 1).await.unwrap();
+            assert_eq!(
+                verify_chunk_range(chunk, 1, 0, &geometry)
+                    .unwrap()
+                    .bytes
+                    .as_ref(),
+                payload
+            );
+            let bytes = streaming::ChunkSource::new(&gateway, geometry)
+                .read_at(0, payload.len())
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), payload);
+        })
+        .await;
+        assert_eq!(transferred.load(Ordering::Relaxed), 2 * wire_bytes as u64);
+        for invalid in [1, 2] {
+            mode.store(invalid, Ordering::Relaxed);
+            assert!(gateway.fetch_chunk(&url, 1).await.is_err());
+        }
+    }
+
     fn tree(chunks: &[&[u8]], start: usize) -> ([u8; 32], Vec<Vec<u8>>) {
         if chunks.len() == 1 {
             let hash = sha256(&[chunks[0]]);
@@ -6332,10 +6598,10 @@ mod tests {
         let tx_end = note(body.len() as u128);
         let tx_root = hash_leaf(&data_root, &tx_end);
         let tx_path = [data_root.as_slice(), tx_end.as_slice()].concat();
-        let chunk = || JsonChunk {
-            chunk: URL_SAFE_NO_PAD.encode(body),
-            data_path: URL_SAFE_NO_PAD.encode(&data_path),
-            tx_path: URL_SAFE_NO_PAD.encode(&tx_path),
+        let chunk = || Chunk {
+            chunk: Bytes::copy_from_slice(body),
+            data_path: Bytes::copy_from_slice(&data_path),
+            tx_path: Bytes::copy_from_slice(&tx_path),
         };
         let mut geometry = Geometry {
             tx_root,
@@ -6350,7 +6616,8 @@ mod tests {
         assert_eq!(
             verify_chunk_range(chunk(), 1_001, 0, &geometry)
                 .unwrap()
-                .bytes,
+                .bytes
+                .as_ref(),
             body
         );
         let proof = verify_chunk_proof(
@@ -6367,15 +6634,15 @@ mod tests {
         assert_eq!((proof.data.start, proof.data.end), (0, body.len() as u128));
 
         let mut corrupt_bytes = chunk();
-        corrupt_bytes.chunk = URL_SAFE_NO_PAD.encode(b"corrupt");
+        corrupt_bytes.chunk = Bytes::from_static(b"corrupt");
         assert!(verify_chunk_range(corrupt_bytes, 1_001, 0, &geometry).is_err());
 
         let mut incomplete_data_path = chunk();
-        incomplete_data_path.data_path = URL_SAFE_NO_PAD.encode(&data_path[..data_path.len() - 1]);
+        incomplete_data_path.data_path.truncate(data_path.len() - 1);
         assert!(verify_chunk_range(incomplete_data_path, 1_001, 0, &geometry).is_err());
 
         let mut incomplete_tx_path = chunk();
-        incomplete_tx_path.tx_path = URL_SAFE_NO_PAD.encode(&tx_path[..tx_path.len() - 1]);
+        incomplete_tx_path.tx_path.truncate(tx_path.len() - 1);
         assert!(verify_chunk_range(incomplete_tx_path, 1_001, 0, &geometry).is_err());
 
         geometry.data_root[0] ^= 1;

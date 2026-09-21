@@ -20,7 +20,7 @@ code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono"
 <form id="form">
 <label for="input">Site URL, ArNS name or data ID</label>
 <div class="input-row"><input id="input" name="input" required maxlength="8192" autocomplete="off" spellcheck="false" placeholder="Enter a site URL, ArNS name or data ID"><button id="run" type="submit">Run diagnostic</button></div>
-<p class="note">Fresh retrieval, up to 64 MiB. Preparation and retrieval each have a one-minute limit. One diagnostic can run at a time.</p>
+<p class="note">The 64 MiB retrieval limit applies only to this diagnostic tool. Preparation and retrieval each have a one-minute limit. One diagnostic can run at a time.</p>
 <p class="note">URLs are traced through this gateway. For unfamiliar hosts, the first hostname label is used as the ArNS name.</p>
 <output id="status" aria-live="polite"></output>
 </form>
