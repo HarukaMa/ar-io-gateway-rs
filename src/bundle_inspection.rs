@@ -67,9 +67,31 @@ pub(crate) async fn inspect(gateway: &Gateway, request: &InspectionRequest) -> R
         .timeout(gateway.config.request_timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let mut urls = vec![crate::endpoint(
+        &gateway.config.archive_url,
+        &format!("raw/{}", request.id),
+    )];
+    for base in gateway
+        .config
+        .graphql_sources
+        .iter()
+        .filter_map(|url| url.trim_end_matches('/').strip_suffix("/graphql"))
+    {
+        let url = crate::endpoint(base, &format!("raw/{}", request.id));
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls.truncate(
+        gateway
+            .config
+            .max_peer_attempts
+            .min(crate::MAX_GRAPHQL_SOURCES + 1),
+    );
     let source = RangeReader {
         client,
-        url: crate::endpoint(&gateway.config.archive_url, &format!("raw/{}", request.id)),
+        urls,
+        selected: AtomicUsize::new(0),
         remaining: AtomicUsize::new(MAX_TABLE_BYTES + 32 + crate::MAX_DATA_ITEM_HEADER_BYTES),
     };
     let (count_bytes, total) = source.read(0, 32, None).await?;
@@ -229,13 +251,36 @@ fn integer(bytes: &[u8]) -> Result<u128> {
 
 struct RangeReader {
     client: reqwest::Client,
-    url: String,
+    urls: Vec<String>,
+    selected: AtomicUsize,
     remaining: AtomicUsize,
 }
 
 impl RangeReader {
     async fn read(
         &self,
+        offset: u128,
+        length: usize,
+        total: Option<u128>,
+    ) -> Result<(Bytes, u128)> {
+        let mut last_error = None;
+        for index in self.selected.load(std::sync::atomic::Ordering::Relaxed)..self.urls.len() {
+            self.selected
+                .store(index, std::sync::atomic::Ordering::Relaxed);
+            match self
+                .read_from(&self.urls[index], offset, length, total)
+                .await
+            {
+                Ok(range) => return Ok(range),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No configured range gateway")))
+    }
+
+    async fn read_from(
+        &self,
+        url: &str,
         offset: u128,
         length: usize,
         total: Option<u128>,
@@ -250,7 +295,7 @@ impl RangeReader {
         );
         let response = self
             .client
-            .get(&self.url)
+            .get(url)
             .header(RANGE, format!("bytes={offset}-{end}"))
             .header(ACCEPT_ENCODING, "identity")
             .send()
@@ -258,7 +303,8 @@ impl RangeReader {
             .context("Upstream range request failed")?;
         ensure!(
             response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
-            "Upstream did not return a byte range (206). Full downloads are disabled."
+            "Upstream returned HTTP {} for bytes={offset}-{end}, expected 206. Full downloads are disabled.",
+            response.status().as_u16()
         );
         ensure!(
             response
@@ -556,6 +602,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn falls_back_without_full_downloads_and_keeps_the_working_gateway() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route(
+                "/timeout",
+                get({
+                    let attempts = attempts.clone();
+                    move || {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        async { std::future::pending::<StatusCode>().await }
+                    }
+                }),
+            )
+            .route(
+                "/full",
+                get(|| async {
+                    axum::http::Response::builder()
+                        .header("content-length", "2039312245")
+                        .body(axum::body::Body::from_stream(
+                            futures_util::stream::pending::<Result<Bytes, std::io::Error>>(),
+                        ))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/range",
+                get(|headers: HeaderMap| async move {
+                    let range = headers["range"]
+                        .to_str()
+                        .unwrap()
+                        .strip_prefix("bytes=")
+                        .unwrap();
+                    let (start, end) = range.split_once('-').unwrap();
+                    let (start, end): (usize, usize) =
+                        (start.parse().unwrap(), end.parse().unwrap());
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        [("content-range", format!("bytes {range}/100"))],
+                        vec![7u8; end - start + 1],
+                    )
+                }),
+            );
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap()
+        }));
+        let reader = RangeReader {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(250))
+                .build()
+                .unwrap(),
+            urls: vec![
+                format!("{url}/timeout"),
+                format!("{url}/full"),
+                format!("{url}/range"),
+            ],
+            selected: AtomicUsize::new(0),
+            remaining: AtomicUsize::new(128),
+        };
+        let (first, total) = reader.read(0, 32, None).await.unwrap();
+        assert_eq!(first.as_ref(), &[7; 32]);
+        assert_eq!(total, 100);
+        assert_eq!(
+            reader.read(32, 32, Some(total)).await.unwrap().0.as_ref(),
+            &[7; 32]
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(reader.read(64, 32, Some(101)).await.is_err());
+    }
+
+    #[tokio::test]
     async fn refuses_full_downloads_and_wrong_ranges() {
         for (status, range, body) in [
             (StatusCode::OK, "bytes 0-31/100", vec![0; 32]),
@@ -574,7 +692,8 @@ mod tests {
             }));
             let source = RangeReader {
                 client: reqwest::Client::new(),
-                url,
+                urls: vec![url],
+                selected: AtomicUsize::new(0),
                 remaining: AtomicUsize::new(32),
             };
             assert!(source.read(0, 32, None).await.is_err());
