@@ -848,14 +848,20 @@ impl BlockStore {
             )
             .await?
             .is_some_and(|r| r.get::<_, bool>(0));
+        // Match the child index's predicate and ordering, including its nullable parent key.
+        let parent_filter = if path.is_some() {
+            "l.parent_path=$2::text::numeric[]"
+        } else {
+            "l.parent_path IS NULL AND $2::text IS NULL"
+        };
         let rows = self.client.query(
-            "SELECT o.key,o.id,l.item_offset::text,l.item_size::text,l.data_offset::text,
+            &format!("SELECT o.key,o.id,l.item_offset::text,l.item_size::text,l.data_offset::text,
                     o.data_size::text,o.signature_type,owner.public_key,o.target,o.anchor,o.signature,l.json
              FROM public.item_locations l JOIN public.objects o ON o.key=l.object_key
              LEFT JOIN public.owners owner ON owner.address=o.owner_address
-             WHERE l.root_key=$1 AND l.parent_path IS NOT DISTINCT FROM $2::text::numeric[]
+             WHERE l.root_key=$1 AND {parent_filter}
                AND o.metadata_complete
-             ORDER BY l.item_offset LIMIT $3 OFFSET $4",
+             ORDER BY l.parent_path,l.item_offset LIMIT $3 OFFSET $4"),
             &[&root,&path,&((crate::bundle_inspection::PAGE_SIZE + 1) as i64),&(start as i64)],
         ).await?;
         if rows.is_empty() && !complete {
