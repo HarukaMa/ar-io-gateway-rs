@@ -253,6 +253,7 @@ struct Job {
     reservation: Reservation,
 }
 
+#[derive(Clone)]
 pub(crate) struct BundleSubmitter {
     sender: mpsc::Sender<Job>,
     admission: Arc<Admission>,

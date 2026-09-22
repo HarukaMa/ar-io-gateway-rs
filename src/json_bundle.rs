@@ -496,8 +496,8 @@ impl JsonEntry {
 
 #[derive(Debug)]
 pub(crate) struct Base64Data {
-    encoded: Content,
-    checkpoints: Arc<Vec<(usize, usize)>>,
+    pub(crate) encoded: Content,
+    pub(crate) checkpoints: Arc<Vec<(usize, usize)>>,
     pub(crate) len: usize,
 }
 

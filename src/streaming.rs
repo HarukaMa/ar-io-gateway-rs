@@ -1,27 +1,17 @@
-use std::{
-    collections::VecDeque,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 use axum::body::Bytes;
 use futures_util::{Stream, StreamExt, TryStreamExt, stream};
-use reqwest::Client;
 use tokio::sync::Mutex;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::{
-    Geometry, chunk_request, cpu_work, peers::PeerState, read_chunk_response, verify_chunk_range,
-};
+use crate::Geometry;
 
 pub(crate) struct ChunkSource {
-    client: Client,
-    peers: Arc<PeerState>,
-    sources: Vec<String>,
-    timeout: Duration,
+    gateway: crate::Gateway,
     geometry: Geometry,
-    cached: Mutex<VecDeque<(usize, Bytes)>>,
+    cached: Mutex<VecDeque<(usize, Bytes, [u8; 32])>>,
     profile: Option<std::sync::Weak<crate::profiling::Profile>>,
 }
 
@@ -32,12 +22,18 @@ impl std::fmt::Debug for ChunkSource {
 }
 
 impl ChunkSource {
+    pub(crate) fn geometry(&self) -> Geometry {
+        self.geometry
+    }
+
+    pub(crate) fn persistent(&self) -> bool {
+        self.gateway.disk_cache.is_some()
+    }
     pub(crate) fn new(gateway: &crate::Gateway, geometry: Geometry) -> Arc<Self> {
+        let mut gateway = gateway.clone();
+        gateway.bundle_indexer = None;
         Arc::new(Self {
-            client: gateway.client.clone(),
-            peers: gateway.peers.clone(),
-            sources: gateway.config.chunk_sources.clone(),
-            timeout: gateway.config.request_timeout.min(crate::CHUNK_DEADLINE),
+            gateway,
             geometry,
             cached: Mutex::new(VecDeque::with_capacity(2)),
             profile: crate::profiling::current().as_ref().map(Arc::downgrade),
@@ -69,14 +65,14 @@ impl ChunkSource {
             let source = Arc::clone(&self);
             async move {
                 // Proof checks must progress while the consumer waits for the same CPU pool.
-                AbortOnDropHandle::new(tokio::spawn(async move {
+                AbortOnDropHandle::new(tokio::spawn(crate::shared::inherit(async move {
                     let read = source.chunk_at(position);
                     if background {
                         crate::BACKGROUND_CPU.scope((), read).await
                     } else {
                         read.await
                     }
-                }))
+                })))
                 .await
                 .context("stream read-ahead task failed")?
             }
@@ -143,25 +139,28 @@ impl ChunkSource {
             let cached = self.cached.lock().await;
             cached
                 .iter()
-                .find(|(start, bytes)| *start <= position && position - start < bytes.len())
+                .find(|(start, bytes, _)| *start <= position && position - start < bytes.len())
                 .cloned()
         };
-        let (start, bytes) = match hit {
+        let (start, bytes, hash) = match hit {
             Some(chunk) => chunk,
             None => self.fetch(position).await?,
         };
+        if let Some(cache) = &self.gateway.disk_cache {
+            cache.touch(hash);
+        }
         let mut cached = self.cached.lock().await;
-        if let Some(index) = cached.iter().position(|(offset, _)| *offset == start) {
+        if let Some(index) = cached.iter().position(|(offset, _, _)| *offset == start) {
             cached.remove(index);
         }
         if cached.len() == 2 {
             cached.pop_back();
         }
-        cached.push_front((start, bytes.clone()));
+        cached.push_front((start, bytes.clone(), hash));
         Ok((start, bytes))
     }
 
-    async fn fetch(&self, position: usize) -> Result<(usize, Bytes)> {
+    async fn fetch(&self, position: usize) -> Result<(usize, Bytes, [u8; 32])> {
         crate::profiling::scope(
             self.profile.as_ref().and_then(std::sync::Weak::upgrade),
             async {
@@ -170,59 +169,25 @@ impl ChunkSource {
                     .first_offset
                     .checked_add(position as u128)
                     .context("stream chunk offset overflow")?;
-                let request = |source: String| async move {
-                    let started = Instant::now();
-                    let (response, binary) = crate::profiling::measure(
-                        crate::profiling::Stage::ChunkHeaders,
-                        chunk_request(
-                            &self.client,
-                            &self.peers,
-                            &self.sources,
-                            &source,
-                            absolute,
-                            (self.timeout / 4).min(crate::CHUNK_PEER_DEADLINE),
-                        ),
+                let fetched = self
+                    .gateway
+                    .fetch_verified_chunk(
+                        absolute,
+                        crate::BlockGeometry {
+                            tx_root: self.geometry.tx_root,
+                            block_weave_size: self.geometry.block_weave_size,
+                            previous_weave_size: self.geometry.previous_weave_size,
+                        },
                     )
-                    .await?;
-                    let headers = started.elapsed();
-                    let started = Instant::now();
-                    let chunk = read_chunk_response(response, binary).await?;
-                    let body = started.elapsed();
-                    let geometry = self.geometry;
-                    let proof = cpu_work(move || {
-                        verify_chunk_range(chunk, absolute, position as u128, &geometry)
-                    })
-                    .await?;
-                    let offset = usize::try_from(proof.data.start)?;
-                    Ok::<_, anyhow::Error>((offset, proof.bytes, headers, body))
-                };
-                let fetches = crate::peers::hedged_requests(
-                    &self.peers,
-                    absolute,
-                    &self.sources,
-                    &request,
-                    self.timeout,
-                );
-                tokio::pin!(fetches);
-                let mut failures = Vec::new();
-                while let Some((source, result)) = fetches.next().await {
-                    match result {
-                        Ok((offset, bytes, headers, body)) => {
-                            self.peers
-                                .record_chunk_result(&source, Some((headers, body, bytes.len())));
-                            return Ok((offset, bytes));
-                        }
-                        Err(error) => {
-                            self.peers.record_chunk_result(&source, None);
-                            failures.push(error.context(source));
-                        }
-                    }
-                }
-                Err(crate::AttemptFailures {
-                    context: "all streaming chunk candidates failed",
-                    errors: failures,
-                }
-                .into())
+                    .await?
+                    .context("streaming chunk not found")?;
+                let proof = &fetched.proof;
+                crate::check_chunk_geometry(proof, position as u128, &self.geometry)?;
+                Ok((
+                    usize::try_from(proof.data.start)?,
+                    proof.bytes.clone(),
+                    proof.data.data_hash,
+                ))
             },
         )
         .await

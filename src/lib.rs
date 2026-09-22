@@ -9,6 +9,7 @@ mod json_bundle;
 mod peers;
 mod profiling;
 pub mod server;
+mod shared;
 mod streaming;
 mod transactions;
 
@@ -361,7 +362,7 @@ fn retrieval_deadline<F: Future>(
     duration: Duration,
     future: F,
 ) -> impl Future<Output = std::result::Result<F::Output, tokio::time::error::Elapsed>> {
-    if BACKGROUND_CPU.try_with(|()| ()).is_ok() {
+    if BACKGROUND_CPU.try_with(|()| ()).is_ok() || shared::has_parent() {
         futures_util::future::Either::Left(futures_util::FutureExt::map(future, Ok))
     } else {
         futures_util::future::Either::Right(tokio::time::timeout(duration, future))
@@ -407,12 +408,11 @@ struct CachedContent {
     block_height: u64,
     content_type: String,
     content_encoding: Option<String>,
-    blob_hash: [u8; 32],
-    blob_size: usize,
-    offset: usize,
     length: usize,
     digest: [u8; 32],
     tags: Option<Vec<Tag>>,
+    #[serde(default)]
+    stream: Option<content::CachedStream>,
 }
 
 #[derive(Debug)]
@@ -443,28 +443,12 @@ impl VerifiedChunk {
 }
 
 type ChunkResponse = Option<(Arc<VerifiedChunk>, bool)>;
-type ChunkOutcome = Option<std::result::Result<ChunkResponse, RetrievalFailure>>;
 
 #[derive(Default)]
 struct ChunkCache {
-    entries: HashMap<u128, (Arc<VerifiedChunk>, BlockGeometry, u64, Instant)>,
-    inflight: HashMap<u128, tokio::sync::watch::Sender<ChunkOutcome>>,
+    entries: HashMap<u128, (Arc<VerifiedChunk>, BlockGeometry, u64, Instant, [u8; 32])>,
+    inflight: shared::Flights<u128, std::result::Result<ChunkResponse, RetrievalFailure>>,
     bytes: usize,
-}
-
-struct ChunkLeader<'a> {
-    cache: &'a Mutex<ChunkCache>,
-    offset: u128,
-    completed: bool,
-}
-
-impl Drop for ChunkLeader<'_> {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        self.cache.lock().unwrap().inflight.remove(&self.offset);
-    }
 }
 
 const CHUNK_DEADLINE: Duration = Duration::from_secs(20);
@@ -502,15 +486,28 @@ impl std::error::Error for AttemptFailures {}
 #[derive(Clone)]
 enum RetrievalFailure {
     NotFound,
-    Other(String),
+    Other(Arc<anyhow::Error>),
 }
 
-type RetrievalResult = Option<std::result::Result<VerifiedData, RetrievalFailure>>;
+#[derive(Debug)]
+struct SharedFailure(Arc<anyhow::Error>);
+
+impl std::fmt::Display for SharedFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl std::error::Error for SharedFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
 
 #[derive(Default)]
 struct ContentCache {
     entries: HashMap<String, (VerifiedData, u128)>,
-    inflight: HashMap<String, tokio::sync::watch::Sender<RetrievalResult>>,
+    inflight: shared::Flights<String, std::result::Result<VerifiedData, RetrievalFailure>>,
     bytes: usize,
     clock: u128,
 }
@@ -549,36 +546,22 @@ impl ContentCache {
     }
 }
 
-struct RetrievalLeader<'a> {
-    cache: &'a Mutex<ContentCache>,
-    id: &'a str,
-    completed: bool,
-}
-
-impl Drop for RetrievalLeader<'_> {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        if let Some(sender) = self.cache.lock().unwrap().inflight.remove(self.id) {
-            sender.send_replace(Some(Err(RetrievalFailure::Other(
-                "verified retrieval canceled".to_owned(),
-            ))));
-        }
-    }
-}
-
+#[derive(Clone)]
 pub struct Gateway {
     config: Config,
     client: Client,
-    cache: Mutex<ContentCache>,
+    cache: Arc<Mutex<ContentCache>>,
     peers: Arc<peers::PeerState>,
-    block_store: Option<database::BlockStore>,
+    block_store: Option<Arc<database::BlockStore>>,
     spool_budget: Arc<SpoolBudget>,
     disk_cache: Option<disk_cache::DiskCache>,
     direct_cache: Arc<Mutex<ContentCache>>,
     bundle_indexer: Option<background::BundleSubmitter>,
-    chunk_cache: Mutex<ChunkCache>,
+    chunk_cache: Arc<Mutex<ChunkCache>>,
+    chunk_flights: shared::Flights<
+        (u128, BlockGeometry),
+        std::result::Result<Option<ChunkFetch>, RetrievalFailure>,
+    >,
 }
 
 impl Gateway {
@@ -623,8 +606,9 @@ impl Gateway {
             spool_budget: Arc::new(SpoolBudget::new(config.max_spool_bytes)),
             config,
             client,
-            cache: Mutex::new(ContentCache::default()),
-            chunk_cache: Mutex::new(ChunkCache::default()),
+            cache: Arc::new(Mutex::new(ContentCache::default())),
+            chunk_cache: Arc::new(Mutex::new(ChunkCache::default())),
+            chunk_flights: Default::default(),
             peers,
             block_store: None,
             disk_cache: None,
@@ -646,7 +630,7 @@ impl Gateway {
             state.source == self.config.trusted_node_url,
             "block index belongs to a different trusted node"
         );
-        self.block_store = Some(store);
+        self.block_store = Some(Arc::new(store));
         Ok(self)
     }
     pub async fn with_disk_cache(mut self, path: PathBuf, min_free_bytes: u64) -> Result<Self> {
@@ -670,10 +654,7 @@ impl Gateway {
             .disk_cache
             .as_mut()
             .context("cache cleanup requires AR_IO_DISK_CACHE_DIR")?;
-        let deadline = Instant::now() + self.config.retrieval_timeout;
-        tokio::time::timeout_at(deadline.into(), cache.cleanup(store, deadline))
-            .await
-            .context("content cache cleanup timed out")?
+        cache.cleanup(store).await
     }
 
     async fn maintain_content_cache(&self) {
@@ -705,6 +686,17 @@ impl Gateway {
                         connection = None;
                         break;
                     }
+                }
+            }
+            if let Some(store) = &connection {
+                if let Err(error) = store
+                    .trim_cache_objects((
+                        self.config.cache_max_entries,
+                        self.config.cache_max_bytes,
+                    ))
+                    .await
+                {
+                    eprintln!("Cache descriptor eviction failed: {error:#}");
                 }
             }
         }
@@ -749,21 +741,33 @@ impl Gateway {
                 entry.length <= self.config.max_data_size,
                 "cached content exceeds size limit"
             );
-            let end = entry
-                .offset
-                .checked_add(entry.length)
-                .context("cached content offset overflow")?;
-            ensure!(end <= entry.blob_size, "cached content exceeds parent file");
-            let Some(blob) = cache.load(entry.blob_hash, entry.blob_size).await? else {
-                return Ok(None);
-            };
-            let bytes = blob.slice(entry.offset..end)?;
-            let digest = if entry.offset == 0 && entry.length == entry.blob_size {
-                entry.blob_hash
+            let digest = entry.digest;
+            let mut cache_hit = true;
+            let bytes = if let Some(stream) = entry.stream {
+                let (geometry, offset, len) = stream.backing_range();
+                let start = geometry
+                    .first_offset
+                    .checked_add(offset as u128)
+                    .context("cached range offset overflow")?;
+                let end = start
+                    .checked_add(len as u128)
+                    .context("cached range end overflow")?;
+                cache_hit = store
+                    .cached_range_complete(&block_hash, geometry.first_offset, start, end)
+                    .await?;
+                Content::from_cached_stream(stream, self)?
             } else {
-                bytes.hashes().await?.0
+                let Some(blob) = cache.load(entry.digest, entry.length).await? else {
+                    return Ok(None);
+                };
+                cache.touch(entry.digest);
+                blob
             };
-            ensure!(digest == entry.digest, "cached content digest mismatch");
+            ensure!(
+                bytes.len() == entry.length,
+                "cached content length mismatch"
+            );
+            cache.touch_object(key);
             Ok(Some((
                 VerifiedData {
                     bytes,
@@ -779,8 +783,8 @@ impl Gateway {
                     content_encoding: entry.content_encoding,
                     content_length: entry.length,
                     etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
+                    cache_hit,
                     sha256: hex(&digest),
-                    cache_hit: true,
                     indexing_root: None,
                 },
                 entry.tags,
@@ -796,66 +800,76 @@ impl Gateway {
         data: &mut VerifiedData,
         tags: Option<Vec<Tag>>,
     ) -> Result<()> {
-        if !data.bytes.is_materialized() {
+        if !shared::cache_requested() {
             return Ok(());
         }
         let (Some(cache), Some(store)) = (&self.disk_cache, &self.block_store) else {
             return Ok(());
         };
-        let Some(_publication) = cache.publication_guard() else {
+        let stream = data.bytes.cached_stream();
+        if stream.is_none() && !data.bytes.is_memory() {
             return Ok(());
-        };
-        let Some((_, block)) = store.block_pair(data.block_height).await? else {
-            return Ok(());
-        };
-        ensure!(
-            data.block_hash.as_ref().map(|hash| hash.as_slice()) == Some(block.hash.as_slice()),
-            "verified content block changed before cache admission"
-        );
+        }
         let digest = decode_fixed::<32>(data.etag.trim_matches('"'), "verified content digest")?;
-        let bytes = if data.bytes.persistent_blob().is_some() {
-            data.bytes.clone()
-        } else {
-            let Some(bytes) = cache.store(&data.bytes, digest).await? else {
-                return Ok(());
-            };
-            bytes
-        };
-        let (blob_hash, blob_size, offset) = bytes
-            .persistent_blob()
-            .context("cache publication did not return persistent content")?;
         let entry = CachedContent {
             id: data.id.clone(),
             block_height: data.block_height,
             content_type: data.content_type.clone(),
             content_encoding: data.content_encoding.clone(),
-            blob_hash,
-            blob_size,
-            offset,
             length: data.content_length,
             digest,
             tags,
+            stream,
         };
         let metadata = serde_json::to_string(&entry)?;
-        if store
-            .cache_content(
-                &decode_fixed::<32>(&data.id, "data ID")?,
-                data.block_height,
-                &block.hash,
-                &metadata,
-            )
-            .await?
-        {
-            data.bytes = bytes;
-        }
-        Ok(())
+        ensure!(
+            metadata.len() <= MAX_JSON_BYTES,
+            "cached content descriptor exceeds limit"
+        );
+        let permit = cache.admission().await?;
+        let cache = cache.clone();
+        let store = Arc::clone(store);
+        let bytes = data.bytes.clone();
+        let block_hash = data
+            .block_hash
+            .context("verified content has no block hash")?;
+        let limits = (self.config.cache_max_entries, self.config.cache_max_bytes);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Some(_publication) = cache.publication_guard() else {
+                return Ok(());
+            };
+            let inline = entry.stream.is_none();
+            if inline {
+                if cache.store(&bytes, digest).await?.is_none() {
+                    return Ok(());
+                }
+                store.register_cache_blob(&digest, bytes.len()).await?;
+            }
+            store
+                .cache_content(
+                    &decode_fixed::<32>(&entry.id, "data ID")?,
+                    entry.block_height,
+                    &block_hash,
+                    &metadata,
+                    inline.then_some(digest.as_slice()),
+                    limits,
+                )
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("cache metadata publication task failed")?
     }
 
     pub async fn retrieve(&self, id: &str) -> Result<VerifiedData> {
         decode_fixed::<32>(id, "data ID")?;
+        let worker = self.clone();
+        let key = id.to_owned();
         // Keep the retrieval state machine off the Windows HTTP thread's stack.
-        let data = Box::pin(self.retrieve_cached(&self.cache, id, true, async {
-            if let Some((mut data, tags)) = self.load_content_cache(id).await? {
+        let data = Box::pin(self.retrieve_cached(&self.cache, id, true, async move {
+            let id = key.as_str();
+            if let Some((mut data, tags)) = worker.load_content_cache(id).await? {
                 if let Some(tags) = tags {
                     data = Arc::new(VerifiedRoot {
                         data,
@@ -866,10 +880,10 @@ impl Gateway {
                 }
                 return Ok(data);
             }
-            match self.retrieve_discovered(id).await {
+            match worker.retrieve_discovered(id).await {
                 Ok(Some(data)) => Ok(data),
-                Ok(None) => self.retrieve_direct(id).await,
-                Err(discovery_error) => match self.retrieve_direct(id).await {
+                Ok(None) => worker.retrieve_direct(id).await,
+                Err(discovery_error) => match worker.retrieve_direct(id).await {
                     Ok(data) => Ok(data),
                     Err(error) if error.is::<ContentNotFound>() => Err(discovery_error),
                     Err(error) => Err(error),
@@ -911,103 +925,70 @@ impl Gateway {
             .is_some_and(|entry| entry.hash == URL_SAFE_NO_PAD.encode(expected)))
     }
 
-    async fn retrieve_cached(
-        &self,
-        cache: &Mutex<ContentCache>,
-        id: &str,
+    fn retrieve_cached<'a>(
+        &'a self,
+        cache: &'a Arc<Mutex<ContentCache>>,
+        id: &'a str,
         cache_result: bool,
-        retrieve: impl Future<Output = Result<VerifiedData>>,
-    ) -> Result<VerifiedData> {
-        let cached = { cache.lock().unwrap().get(id) };
-        if let Some(data) = cached {
-            if self.current_anchor(&data).await? {
-                return Ok(data);
-            }
-            let mut state = cache.lock().unwrap();
-            if let Some((old, _)) = state.entries.remove(id) {
-                state.bytes -= old.cache_bytes();
-            }
-        }
-        let (mut receiver, leader) = {
-            let mut state = cache.lock().unwrap();
-            match state.inflight.get(id) {
-                Some(sender) => (sender.subscribe(), None),
-                None => {
-                    let (sender, receiver) = tokio::sync::watch::channel(None);
-                    state.inflight.insert(id.to_owned(), sender);
-                    (
-                        receiver,
-                        Some(RetrievalLeader {
-                            cache,
-                            id,
-                            completed: false,
-                        }),
-                    )
+        retrieve: impl Future<Output = Result<VerifiedData>> + Send + 'static,
+    ) -> futures_util::future::BoxFuture<'a, Result<VerifiedData>> {
+        let retrieve: futures_util::future::BoxFuture<'static, _> = Box::pin(retrieve);
+        Box::pin(async move {
+            let cached = { cache.lock().unwrap().get(id) };
+            if let Some(data) = cached {
+                if self.current_anchor(&data).await? {
+                    if let Some(cache) = &self.disk_cache {
+                        cache.touch_object(decode_fixed::<32>(&data.id, "data ID")?);
+                        if data.bytes.is_memory() {
+                            cache.touch(decode_fixed::<32>(
+                                data.etag.trim_matches('"'),
+                                "verified content digest",
+                            )?);
+                        }
+                    }
+                    return Ok(data);
+                }
+                let mut state = cache.lock().unwrap();
+                if let Some((old, _)) = state.entries.remove(id) {
+                    state.bytes -= old.cache_bytes();
                 }
             }
-        };
-        if let Some(mut leader) = leader {
-            let result = retrieval_deadline(self.config.retrieval_timeout, async {
-                let data = retrieve.await?;
-                diagnostics::check("canonical_anchor", id, async {
+            let flights = cache.lock().unwrap().inflight.clone();
+            let gateway = self.clone();
+            let cache = Arc::clone(cache);
+            let result = shared::run(&flights, id.to_owned(), async move {
+                let result = async {
+                    let data = retrieve.await?;
                     ensure!(
-                        self.current_anchor(&data).await?,
+                        gateway.current_anchor(&data).await?,
                         "content block changed during retrieval"
                     );
-                    Ok(())
-                })
-                .await?;
-                Ok(data)
-            })
-            .await
-            .context("verified retrieval timed out")
-            .and_then(|result| result);
-            {
-                let mut cache = cache.lock().unwrap();
-                if cache_result && let Ok(data) = &result {
-                    cache.insert(
-                        data.clone(),
-                        self.config.cache_max_entries,
-                        self.config.cache_max_bytes,
-                    );
+                    if cache_result {
+                        cache.lock().unwrap().insert(
+                            data.clone(),
+                            gateway.config.cache_max_entries,
+                            gateway.config.cache_max_bytes,
+                        );
+                    }
+                    Ok(data)
                 }
-                if let Some(sender) = cache.inflight.remove(id) {
-                    sender.send_replace(Some(match &result {
-                        Ok(data) => Ok(data.clone()),
-                        Err(error) if error.is::<ContentNotFound>() => {
-                            Err(RetrievalFailure::NotFound)
-                        }
-                        Err(error) => Err(RetrievalFailure::Other(format!("{error:#}"))),
-                    }));
-                }
-                leader.completed = true;
-            }
-            drop(leader);
-            result
-        } else {
-            retrieval_deadline(self.config.retrieval_timeout, receiver.changed())
+                .await;
+                result.map_err(RetrievalFailure::from)
+            });
+            let data = retrieval_deadline(self.config.retrieval_timeout, result)
                 .await
-                .context("coalesced retrieval timed out")?
-                .context("coalesced retrieval canceled")?;
-            let data = receiver
-                .borrow_and_update()
-                .as_ref()
-                .context("coalesced retrieval returned no result")?
-                .clone()
-                .map_err(|error| match error {
-                    RetrievalFailure::NotFound => anyhow::Error::new(ContentNotFound),
-                    RetrievalFailure::Other(message) => anyhow::Error::msg(message),
-                })?;
+                .context("verified retrieval timed out")?
+                .map_err(anyhow::Error::from)?;
             ensure!(
                 self.current_anchor(&data).await?,
                 "coalesced content block changed"
             );
             Ok(data)
-        }
+        })
     }
 
     pub async fn retrieve_direct(&self, id: &str) -> Result<VerifiedData> {
-        let root = tokio::time::timeout(
+        let root = retrieval_deadline(
             self.config.retrieval_timeout,
             self.retrieve_direct_with_tags(id),
         )
@@ -1017,7 +998,7 @@ impl Gateway {
     }
 
     pub async fn retrieve_bundled(&self, id: &str) -> Result<VerifiedData> {
-        tokio::time::timeout(self.config.retrieval_timeout, async {
+        retrieval_deadline(self.config.retrieval_timeout, async {
             decode_fixed::<32>(id, "data item ID")?;
             if let Some((data, None)) = self.load_content_cache(id).await? {
                 ensure!(
@@ -1035,52 +1016,20 @@ impl Gateway {
     }
 
     pub async fn retrieve_chunk(&self, offset: u128) -> Result<ChunkResponse> {
+        let flights = self.chunk_cache.lock().unwrap().inflight.clone();
+        let gateway = self.clone();
         tokio::time::timeout(
             self.config.request_timeout.min(Duration::from_secs(60)),
-            async {
-                let (mut receiver, leader) = {
-                    let mut cache = self.chunk_cache.lock().unwrap();
-                    if let Some(sender) = cache.inflight.get(&offset) {
-                        (sender.subscribe(), false)
-                    } else {
-                        let (sender, receiver) = tokio::sync::watch::channel(None);
-                        cache.inflight.insert(offset, sender);
-                        (receiver, true)
-                    }
-                };
-                if !leader {
-                    receiver
-                        .changed()
-                        .await
-                        .context("coalesced chunk retrieval canceled")?;
-                    return match receiver
-                        .borrow()
-                        .clone()
-                        .context("missing chunk retrieval result")?
-                    {
-                        Ok(result) => Ok(result),
-                        Err(RetrievalFailure::Other(message)) => bail!("{message}"),
-                        Err(RetrievalFailure::NotFound) => Ok(None),
-                    };
-                }
-                let mut leader = ChunkLeader {
-                    cache: &self.chunk_cache,
-                    offset,
-                    completed: false,
-                };
-                let result = self.retrieve_cached_chunk(offset).await;
-                if let Some(sender) = self.chunk_cache.lock().unwrap().inflight.remove(&offset) {
-                    sender.send_replace(Some(match &result {
-                        Ok(result) => Ok(result.clone()),
-                        Err(error) => Err(RetrievalFailure::Other(format!("{error:#}"))),
-                    }));
-                }
-                leader.completed = true;
-                result
-            },
+            shared::run(&flights, offset, async move {
+                gateway
+                    .retrieve_cached_chunk(offset)
+                    .await
+                    .map_err(RetrievalFailure::from)
+            }),
         )
         .await
         .context("chunk retrieval timed out")?
+        .map_err(anyhow::Error::from)
     }
 
     async fn retrieve_cached_chunk(&self, offset: u128) -> Result<ChunkResponse> {
@@ -1089,17 +1038,20 @@ impl Gateway {
             cache
                 .entries
                 .get_mut(&offset)
-                .map(|(chunk, geometry, height, used)| {
+                .map(|(chunk, geometry, height, used, hash)| {
                     *used = Instant::now();
-                    (Arc::clone(chunk), *geometry, *height)
+                    (Arc::clone(chunk), *geometry, *height, *hash)
                 })
         };
-        if let Some((chunk, geometry, height)) = cached {
+        if let Some((chunk, geometry, height, hash)) = cached {
             if self.chunk_anchor_matches(geometry, height).await? {
+                if let Some(cache) = &self.disk_cache {
+                    cache.touch(hash);
+                }
                 return Ok(Some((chunk, true)));
             }
             let mut cache = self.chunk_cache.lock().unwrap();
-            if let Some((old, _, _, _)) = cache.entries.remove(&offset) {
+            if let Some((old, ..)) = cache.entries.remove(&offset) {
                 cache.bytes -= old.retained_bytes();
             }
         }
@@ -1108,10 +1060,10 @@ impl Gateway {
             cache
                 .entries
                 .values()
-                .find(|(_, geometry, _, _)| {
+                .find(|(_, geometry, _, _, _)| {
                     offset > geometry.previous_weave_size && offset <= geometry.block_weave_size
                 })
-                .map(|(_, geometry, height, _)| (*geometry, *height))
+                .map(|(_, geometry, height, _, _)| (*geometry, *height))
         };
         let anchor = match nearby {
             Some((geometry, height)) if self.chunk_anchor_matches(geometry, height).await? => {
@@ -1122,7 +1074,8 @@ impl Gateway {
         let Some((geometry, height)) = anchor else {
             return Ok(None);
         };
-        let Some(chunk) = self.retrieve_chunk_inner(offset, geometry).await? else {
+        let Some((chunk, disk_hit, hash)) = self.retrieve_chunk_inner(offset, geometry).await?
+        else {
             return Ok(None);
         };
         ensure!(
@@ -1139,18 +1092,18 @@ impl Gateway {
                 let victim = *cache
                     .entries
                     .iter()
-                    .min_by_key(|(_, (_, _, _, used))| *used)
+                    .min_by_key(|(_, (_, _, _, used, _))| *used)
                     .unwrap()
                     .0;
                 cache.bytes -= cache.entries.remove(&victim).unwrap().0.retained_bytes();
             }
             cache.entries.insert(
                 offset,
-                (Arc::clone(&chunk), geometry, height, Instant::now()),
+                (Arc::clone(&chunk), geometry, height, Instant::now(), hash),
             );
             cache.bytes += size;
         }
-        Ok(Some((chunk, false)))
+        Ok(Some((chunk, disk_hit)))
     }
 
     async fn chunk_anchor_matches(&self, geometry: BlockGeometry, height: u64) -> Result<bool> {
@@ -1181,9 +1134,121 @@ impl Gateway {
         &self,
         offset: u128,
         geometry: BlockGeometry,
-    ) -> Result<Option<VerifiedChunk>> {
-        let mut invalid = Vec::new();
-        let request = |source: String| async move { self.fetch_chunk(&source, offset).await };
+    ) -> Result<Option<(VerifiedChunk, bool, [u8; 32])>> {
+        let Some(fetched) = self.fetch_verified_chunk(offset, geometry).await? else {
+            return Ok(None);
+        };
+        let proof = &fetched.proof;
+        Ok(Some((
+            VerifiedChunk {
+                data_root: URL_SAFE_NO_PAD.encode(proof.transaction.data_root),
+                data_size: proof.transaction.size,
+                relative_start_offset: proof.data.start,
+                tx_start_offset: proof.first_offset,
+                chunk: URL_SAFE_NO_PAD.encode(&proof.bytes),
+                data_path: URL_SAFE_NO_PAD.encode(&proof.data_path),
+                tx_path: URL_SAFE_NO_PAD.encode(&proof.tx_path),
+                bytes: proof.bytes.clone().into(),
+                start_offset: proof
+                    .first_offset
+                    .checked_add(proof.data.start)
+                    .context("chunk offset overflow")?,
+                read_offset: proof
+                    .relative_offset
+                    .checked_sub(proof.data.start)
+                    .context("chunk offset underflow")?,
+                source_host: fetched.source_host,
+            },
+            fetched.cache_hit,
+            proof.data.data_hash,
+        )))
+    }
+
+    async fn fetch_verified_chunk(
+        &self,
+        offset: u128,
+        geometry: BlockGeometry,
+    ) -> Result<Option<ChunkFetch>> {
+        let flights = self
+            .disk_cache
+            .as_ref()
+            .map(|cache| cache.flights())
+            .unwrap_or(&self.chunk_flights);
+        let gateway = self.clone();
+        tokio::time::timeout(
+            self.config.request_timeout.min(CHUNK_DEADLINE),
+            shared::run(flights, (offset, geometry), async move {
+                gateway
+                    .fetch_verified_chunk_inner(offset, geometry)
+                    .await
+                    .map_err(RetrievalFailure::from)
+            }),
+        )
+        .await
+        .context("verified chunk retrieval timed out")?
+        .map_err(anyhow::Error::from)
+    }
+
+    async fn fetch_verified_chunk_inner(
+        &self,
+        offset: u128,
+        geometry: BlockGeometry,
+    ) -> Result<Option<ChunkFetch>> {
+        if let (Some(cache), Some(store)) = (&self.disk_cache, &self.block_store) {
+            let cached = async {
+                let Some(_publication) = cache.publication_guard() else {
+                    return Ok(None);
+                };
+                while let Some(entry) = store.cached_chunk(offset, geometry).await? {
+                    let candidate = async {
+                        let Some(bytes) = cache
+                            .load_chunk_bytes(entry.hash, usize::try_from(entry.end - entry.start)?)
+                            .await?
+                        else {
+                            return Ok(None);
+                        };
+                        let chunk = Chunk {
+                            chunk: bytes,
+                            data_path: entry.data_path.clone().into(),
+                            tx_path: entry.tx_path.clone().into(),
+                        };
+                        let proof =
+                            cpu_work(move || verify_chunk_proof(chunk, offset, &geometry)).await?;
+                        ensure!(
+                            proof.first_offset.checked_add(proof.data.start) == Some(entry.start)
+                                && proof.first_offset.checked_add(proof.data.end)
+                                    == Some(entry.end)
+                                && proof.data.data_hash == entry.hash,
+                            "cached chunk interval mismatch"
+                        );
+                        Ok::<_, anyhow::Error>(Some(proof))
+                    }
+                    .await;
+                    if let Ok(Some(proof)) = candidate {
+                        cache.touch(entry.hash);
+                        return Ok(Some(ChunkFetch {
+                            proof: Arc::new(proof),
+                            source_host: entry.source_host,
+                            cache_hit: true,
+                        }));
+                    }
+                    store.forget_cached_chunk(&entry.hash, entry.start).await?;
+                }
+                Ok::<_, anyhow::Error>(None)
+            }
+            .await;
+            cache.record_lookup(shared::cache_requested(), &cached);
+            match cached {
+                Ok(Some(chunk)) => return Ok(Some(chunk)),
+                Err(error) => eprintln!("chunk cache lookup failed: {error:#}"),
+                _ => {}
+            }
+        }
+        let request = |source: String| async move {
+            let (chunk, headers, body) = self.fetch_chunk(&source, offset).await?;
+            let proof = cpu_work(move || verify_chunk_proof(chunk, offset, &geometry)).await?;
+            Ok::<_, anyhow::Error>((proof, headers, body))
+        };
         let fetches = peers::hedged_requests(
             &self.peers,
             offset,
@@ -1192,64 +1257,91 @@ impl Gateway {
             self.config.request_timeout.min(CHUNK_DEADLINE),
         );
         tokio::pin!(fetches);
+        let mut invalid = Vec::new();
         while let Some((source, result)) = fetches.next().await {
-            let (candidate, headers, body) = match result {
-                Ok(candidate) => candidate,
+            match result {
+                Ok((proof, headers, body)) => {
+                    self.peers
+                        .record_chunk_result(&source, Some((headers, body, proof.bytes.len())));
+                    let fetched = ChunkFetch {
+                        proof: Arc::new(proof),
+                        source_host: Url::parse(&source)?
+                            .host_str()
+                            .context("chunk source has no host")?
+                            .to_owned(),
+                        cache_hit: false,
+                    };
+                    if shared::cache_requested() {
+                        if let Err(error) = self.publish_chunk(&fetched, offset, geometry).await {
+                            eprintln!("chunk cache admission failed: {error:#}");
+                        }
+                    }
+                    return Ok(Some(fetched));
+                }
                 Err(error) => {
                     self.peers.record_chunk_result(&source, None);
                     if error
                         .downcast_ref::<reqwest::Error>()
                         .is_none_or(|error| error.status() != Some(reqwest::StatusCode::NOT_FOUND))
                     {
-                        invalid.push(format!("{source}: {error:#}"));
+                        invalid.push(error.context(source));
                     }
-                    continue;
                 }
-            };
-            let proof =
-                match cpu_work(move || verify_chunk_proof(candidate, offset, &geometry)).await {
-                    Ok(proof) => proof,
-                    Err(error) => {
-                        self.peers.record_chunk_result(&source, None);
-                        invalid.push(format!("{source}: {error:#}"));
-                        continue;
-                    }
-                };
-            let start_offset = proof
-                .first_offset
-                .checked_add(proof.data.start)
-                .context("chunk start offset overflow")?;
-            let read_offset = proof
-                .relative_offset
-                .checked_sub(proof.data.start)
-                .context("chunk read offset underflow")?;
-            let source_host = Url::parse(&source)?
-                .host_str()
-                .context("chunk source has no host")?
-                .to_owned();
-
-            self.peers
-                .record_chunk_result(&source, Some((headers, body, proof.bytes.len())));
-            return Ok(Some(VerifiedChunk {
-                data_root: URL_SAFE_NO_PAD.encode(proof.transaction.data_root),
-                data_size: proof.transaction.size,
-                relative_start_offset: proof.data.start,
-                tx_start_offset: proof.first_offset,
-                chunk: URL_SAFE_NO_PAD.encode(&proof.bytes),
-                data_path: URL_SAFE_NO_PAD.encode(&proof.data_path),
-                tx_path: URL_SAFE_NO_PAD.encode(&proof.tx_path),
-                bytes: proof.bytes.into(),
-                start_offset,
-                read_offset,
-                source_host,
-            }));
+            }
         }
-
         if invalid.is_empty() {
             Ok(None)
         } else {
-            bail!("all chunk candidates failed: {}", invalid.join("; "))
+            Err(AttemptFailures {
+                context: "all chunk candidates failed",
+                errors: invalid,
+            }
+            .into())
         }
+    }
+
+    async fn publish_chunk(
+        &self,
+        fetched: &ChunkFetch,
+        offset: u128,
+        geometry: BlockGeometry,
+    ) -> Result<()> {
+        let (Some(cache), Some(store)) = (&self.disk_cache, &self.block_store) else {
+            return Ok(());
+        };
+        let permit = cache.admission().await?;
+        let cache = cache.clone();
+        let store = Arc::clone(store);
+        let fetched = fetched.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let Some(_publication) = cache.publication_guard() else {
+                return Ok(());
+            };
+            let Some((previous, block)) = store.block_for_offset(offset).await? else {
+                return Ok(());
+            };
+            ensure!(
+                block.tx_root.as_slice() == geometry.tx_root
+                    && block.weave_size == geometry.block_weave_size
+                    && previous.weave_size == geometry.previous_weave_size,
+                "cache chunk anchor changed"
+            );
+            let proof = fetched.proof;
+            let bytes = Content::from(proof.bytes.clone());
+            if cache.store(&bytes, proof.data.data_hash).await?.is_none() {
+                return Ok(());
+            }
+            store
+                .register_cache_blob(&proof.data.data_hash, proof.bytes.len())
+                .await?;
+            store
+                .cache_chunk(&block, &proof, &fetched.source_host)
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("chunk cache publication task failed")?
     }
 
     async fn trusted_chunk_anchor(&self, offset: u128) -> Result<Option<(BlockGeometry, u64)>> {
@@ -1684,29 +1776,37 @@ impl Gateway {
     }
 
     async fn retrieve_direct_with_tags(&self, id: &str) -> Result<Arc<VerifiedRoot>> {
-        let data = Box::pin(self.retrieve_cached(&self.direct_cache, id, false, async {
-            let root = if let Some((data, Some(tags))) = self.load_content_cache(id).await? {
-                VerifiedRoot {
-                    data,
-                    tags,
-                    facts: None,
-                }
-            } else {
-                let started = Instant::now();
-                let (mut data, tags, facts) = self.fetch_direct_with_tags(id).await?;
-                if facts.is_some() {
-                    eprintln!(
-                        "verified bundle root {id}: retrieval_ms={}",
-                        started.elapsed().as_millis()
-                    );
-                }
-                if let Err(error) = self.save_content_cache(&mut data, Some(tags.clone())).await {
-                    eprintln!("content cache admission failed: {error:#}");
-                }
-                VerifiedRoot { data, tags, facts }
-            };
-            Ok(Arc::new(root).verified())
-        }))
+        let worker = self.clone();
+        let key = id.to_owned();
+        let data = Box::pin(
+            self.retrieve_cached(&self.direct_cache, id, false, async move {
+                let id = key.as_str();
+                let root = if let Some((data, Some(tags))) = worker.load_content_cache(id).await? {
+                    VerifiedRoot {
+                        data,
+                        tags,
+                        facts: None,
+                    }
+                } else {
+                    let started = Instant::now();
+                    let (mut data, tags, facts) = worker.fetch_direct_with_tags(id).await?;
+                    if facts.is_some() {
+                        eprintln!(
+                            "verified bundle root {id}: retrieval_ms={}",
+                            started.elapsed().as_millis()
+                        );
+                    }
+                    if let Err(error) = worker
+                        .save_content_cache(&mut data, Some(tags.clone()))
+                        .await
+                    {
+                        eprintln!("content cache admission failed: {error:#}");
+                    }
+                    VerifiedRoot { data, tags, facts }
+                };
+                Ok(Arc::new(root).verified())
+            }),
+        )
         .await?;
         let Some(IndexingRoot::Complete(root)) = data.indexing_root else {
             bail!("direct retrieval lacks complete root metadata");
@@ -3280,8 +3380,8 @@ fn deserialize_chunk_bytes<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 
-#[derive(Clone, Copy)]
-struct Geometry {
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct Geometry {
     tx_root: [u8; 32],
     data_root: [u8; 32],
     block_weave_size: u128,
@@ -3291,7 +3391,7 @@ struct Geometry {
     data_size: u128,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct BlockGeometry {
     tx_root: [u8; 32],
     block_weave_size: u128,
@@ -3308,6 +3408,33 @@ struct ProvenChunk {
     first_offset: u128,
 }
 
+#[derive(Clone)]
+pub(crate) struct ChunkFetch {
+    proof: Arc<ProvenChunk>,
+    source_host: String,
+    cache_hit: bool,
+}
+
+impl From<anyhow::Error> for RetrievalFailure {
+    fn from(error: anyhow::Error) -> Self {
+        if error.is::<ContentNotFound>() {
+            Self::NotFound
+        } else {
+            Self::Other(Arc::new(error))
+        }
+    }
+}
+
+impl From<RetrievalFailure> for anyhow::Error {
+    fn from(error: RetrievalFailure) -> Self {
+        match error {
+            RetrievalFailure::NotFound => ContentNotFound.into(),
+            RetrievalFailure::Other(error) => anyhow::Error::new(SharedFailure(error)),
+        }
+    }
+}
+
+#[cfg(test)]
 fn verify_chunk_range(
     chunk: Chunk,
     absolute_offset: u128,
@@ -3323,6 +3450,15 @@ fn verify_chunk_range(
             previous_weave_size: geometry.previous_weave_size,
         },
     )?;
+    check_chunk_geometry(&proof, relative_offset, geometry)?;
+    Ok(proof)
+}
+
+fn check_chunk_geometry(
+    proof: &ProvenChunk,
+    relative_offset: u128,
+    geometry: &Geometry,
+) -> Result<()> {
     ensure!(
         proof.transaction.data_root == geometry.data_root,
         "tx_path data root mismatch"
@@ -3343,7 +3479,7 @@ fn verify_chunk_range(
         proof.relative_offset == relative_offset,
         "tx_path relative offset mismatch"
     );
-    Ok(proof)
+    Ok(())
 }
 
 fn verify_chunk_proof(
@@ -7457,7 +7593,7 @@ mod cache_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires ar_io_rust_test; briefly locks content_cache"]
+    #[ignore = "requires ar_io_rust_test; briefly locks cache_blobs"]
     async fn cache_startup_skips_sweep_and_cleanup_remains_exclusive() -> Result<()> {
         let url = std::env::var("DATABASE_URL")?;
         let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
@@ -7481,14 +7617,14 @@ mod cache_tests {
         base.config.trusted_node_url = source;
         let base = base.with_database(&url).await?;
         let directory = tempfile::tempdir()?;
-        let orphan = directory.path().join("a7").join(hex(&[0xa7; 32]));
+        let orphan = disk_cache::blob_path(directory.path(), [0xa7; 32]);
         let unrelated = directory.path().join("keep.txt");
-        std::fs::create_dir(orphan.parent().unwrap())?;
+        std::fs::create_dir_all(orphan.parent().unwrap())?;
         std::fs::write(&orphan, b"abandoned")?;
         std::fs::write(&unrelated, b"unrelated")?;
         let transaction = client.transaction().await?;
         transaction.batch_execute(
-            "SET LOCAL lock_timeout='1s'; LOCK TABLE public.content_cache IN ACCESS EXCLUSIVE MODE"
+            "SET LOCAL lock_timeout='1s'; LOCK TABLE public.cache_blobs IN ACCESS EXCLUSIVE MODE"
         ).await?;
         let mut opened = tokio::time::timeout(
             Duration::from_secs(1),
@@ -7572,10 +7708,11 @@ mod cache_tests {
         for limit in [1024, 4] {
             gateway.config.cache_max_bytes = limit;
             let id = limit.to_string();
+            let fetched_id = id.clone();
             let (leader, follower) = tokio::join!(
-                gateway.retrieve_cached(&gateway.cache, &id, true, async {
+                gateway.retrieve_cached(&gateway.cache, &id, true, async move {
                     tokio::task::yield_now().await;
-                    Ok(data(&id))
+                    Ok(data(&fetched_id))
                 }),
                 gateway.retrieve_cached(&gateway.cache, &id, true, async {
                     panic!("duplicate retrieval")
@@ -7584,8 +7721,14 @@ mod cache_tests {
             let leader = leader.unwrap();
             let follower = follower.unwrap();
             assert!(!leader.cache_hit && !follower.cache_hit);
+            let fetched_id = id.clone();
             let next = gateway
-                .retrieve_cached(&gateway.cache, &id, true, async { Ok(data(&id)) })
+                .retrieve_cached(
+                    &gateway.cache,
+                    &id,
+                    true,
+                    async move { Ok(data(&fetched_id)) },
+                )
                 .await
                 .unwrap();
             assert_eq!(next.cache_hit, limit >= 5);
@@ -7675,7 +7818,13 @@ mod cache_tests {
             .await
         );
         drop(leader);
-        assert!(follower.await.unwrap_err().to_string().contains("canceled"));
+        assert!(
+            follower
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("timed out")
+        );
         assert!(
             !gateway
                 .retrieve_cached(&gateway.cache, "cancel", true, async { Ok(data("cancel")) })

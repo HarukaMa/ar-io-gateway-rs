@@ -63,6 +63,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "015_bundle_scan_directions",
         include_str!("../migrations/015_bundle_scan_directions.sql"),
     ),
+    (
+        "016_chunk_cache",
+        include_str!("../migrations/016_chunk_cache.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -283,6 +287,16 @@ pub(crate) struct BundlePage {
     pub(crate) live_scanned_height: Option<u64>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CachedChunk {
+    pub(crate) hash: [u8; 32],
+    pub(crate) start: u128,
+    pub(crate) end: u128,
+    pub(crate) data_path: Vec<u8>,
+    pub(crate) tx_path: Vec<u8>,
+    pub(crate) source_host: String,
+}
+
 pub struct BlockStore {
     client: Client,
     driver: JoinHandle<()>,
@@ -296,6 +310,129 @@ impl Drop for BlockStore {
 }
 
 impl BlockStore {
+    pub(crate) async fn register_cache_blob(&self, hash: &[u8; 32], size: usize) -> Result<()> {
+        let stored = self
+            .client
+            .execute(
+                "INSERT INTO public.cache_blobs AS b(hash,size,last_access)
+             VALUES($1,$2,extract(epoch FROM clock_timestamp())::bigint)
+             ON CONFLICT(hash) DO UPDATE SET last_access=EXCLUDED.last_access
+             WHERE b.size=EXCLUDED.size",
+                &[&hash.as_slice(), &i64::try_from(size)?],
+            )
+            .await?;
+        ensure!(stored == 1, "conflicting cached blob size");
+        Ok(())
+    }
+
+    pub(crate) async fn cached_chunk(
+        &self,
+        offset: u128,
+        geometry: crate::BlockGeometry,
+    ) -> Result<Option<CachedChunk>> {
+        self.client.query_opt(
+            "SELECT r.hash,r.start_offset::text,r.end_offset::text,r.data_path,t.tx_path,r.source_host
+             FROM public.cache_chunks r
+             JOIN public.cache_transactions t USING(block_hash,tx_start)
+             JOIN public.canonical_blocks c ON c.height=t.block_height AND c.block_hash=t.block_hash
+             JOIN public.blocks b ON b.hash=c.block_hash
+             JOIN public.canonical_blocks pc ON pc.height=c.height-1
+             JOIN public.blocks pb ON pb.hash=pc.block_hash
+             WHERE r.start_offset <= $1::text::numeric AND r.end_offset > $1::text::numeric
+               AND r.start_offset > $1::text::numeric-262144
+               AND b.tx_root=$2 AND b.weave_size=$3::text::numeric AND pb.weave_size=$4::text::numeric
+             ORDER BY r.start_offset DESC LIMIT 1",
+            &[&offset.to_string(), &geometry.tx_root.as_slice(),
+              &geometry.block_weave_size.to_string(), &geometry.previous_weave_size.to_string()],
+        ).await?.map(|row| {
+            let hash: Vec<u8> = row.try_get(0)?;
+            Ok(CachedChunk {
+                hash: hash.try_into().map_err(|_| anyhow::anyhow!("invalid cached chunk hash"))?,
+                start: row.try_get::<_, String>(1)?.parse()?,
+                end: row.try_get::<_, String>(2)?.parse()?,
+                data_path: row.try_get(3)?, tx_path: row.try_get(4)?, source_host: row.try_get(5)?,
+            })
+        }).transpose()
+    }
+
+    pub(crate) async fn cache_chunk(
+        &self,
+        block: &IndexBlock,
+        proof: &crate::ProvenChunk,
+        source_host: &str,
+    ) -> Result<()> {
+        let start = proof
+            .first_offset
+            .checked_add(proof.data.start)
+            .context("chunk offset overflow")?;
+        let end = proof
+            .first_offset
+            .checked_add(proof.data.end)
+            .context("chunk end overflow")?;
+        let inserted = self.client.execute(
+            "WITH anchor AS MATERIALIZED (
+                SELECT height,block_hash FROM public.canonical_blocks
+                WHERE height=$1 AND block_hash=$2 FOR SHARE
+             ), placement AS (
+                INSERT INTO public.cache_transactions AS t
+                    (block_height,block_hash,tx_start,tx_end,tx_path)
+                SELECT height,block_hash,$3::text::numeric,$4::text::numeric,$5 FROM anchor
+                ON CONFLICT(block_hash,tx_start) DO UPDATE SET tx_start=t.tx_start
+                WHERE t.tx_end=EXCLUDED.tx_end AND t.tx_path=EXCLUDED.tx_path
+                RETURNING block_hash,tx_start
+             )
+             INSERT INTO public.cache_chunks AS r(block_hash,tx_start,start_offset,end_offset,hash,data_path,source_host)
+             SELECT block_hash,tx_start,$7::text::numeric,$8::text::numeric,$9,$10,$6 FROM placement
+             ON CONFLICT(block_hash,start_offset,end_offset,hash) DO UPDATE SET source_host=EXCLUDED.source_host
+             WHERE r.tx_start=EXCLUDED.tx_start AND r.data_path=EXCLUDED.data_path",
+            &[&sql_height(block.height)?, &block.hash, &proof.first_offset.to_string(),
+              &proof.transaction.end_offset.to_string(), &proof.tx_path.as_ref(), &source_host,
+              &start.to_string(), &end.to_string(), &proof.data.data_hash.as_slice(), &proof.data_path.as_ref()],
+        ).await?;
+        ensure!(inserted <= 1, "invalid chunk publication result");
+        Ok(())
+    }
+
+    pub(crate) async fn forget_cached_chunk(&self, hash: &[u8; 32], start: u128) -> Result<()> {
+        self.client
+            .execute(
+                "DELETE FROM public.cache_chunks WHERE hash=$1 AND start_offset=$2::text::numeric",
+                &[&hash.as_slice(), &start.to_string()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn touch_cache_blobs(&self, hashes: &[[u8; 32]]) -> Result<()> {
+        ensure!(hashes.len() <= 4096, "cache touch batch exceeds bound");
+        let hashes: Vec<Vec<u8>> = hashes.iter().map(|hash| hash.to_vec()).collect();
+        self.client.execute(
+            "UPDATE public.cache_blobs SET last_access=extract(epoch FROM clock_timestamp())::bigint
+             WHERE hash=ANY($1) AND last_access < extract(epoch FROM clock_timestamp())::bigint-60",
+            &[&hashes],
+        ).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn cache_victims(&self) -> Result<Vec<([u8; 32], u64)>> {
+        self.client
+            .query(
+                "SELECT hash,size FROM public.cache_blobs ORDER BY last_access,hash LIMIT 512",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                let hash: Vec<u8> = row.try_get(0)?;
+                Ok((
+                    hash.try_into()
+                        .map_err(|_| anyhow::anyhow!("invalid cached blob hash"))?,
+                    u64::try_from(row.try_get::<_, i64>(1)?)?,
+                ))
+            })
+            .collect()
+    }
+
     pub async fn connect(url: &str) -> Result<Self> {
         let config = local_config(url)?;
         let (client, connection) = timeout(CONNECT_TIMEOUT, config.connect(NoTls))
@@ -342,22 +479,25 @@ impl BlockStore {
     }
 
     pub(crate) async fn remove_cache_mappings(&self, hashes: &[[u8; 32]]) -> Result<u64> {
-        ensure!(hashes.len() <= 64, "cache eviction batch exceeds 64 blobs");
-        let hashes = hashes
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<Vec<_>, _>>()?;
+        ensure!(
+            hashes.len() <= 512,
+            "cache eviction batch exceeds 512 blobs"
+        );
+        let hashes: Vec<Vec<u8>> = hashes.iter().map(|hash| hash.to_vec()).collect();
+        self.client
+            .execute(
+                "DELETE FROM public.cache_transactions t
+             WHERE EXISTS (SELECT 1 FROM public.cache_chunks c
+                 WHERE c.block_hash=t.block_hash AND c.tx_start=t.tx_start AND c.hash=ANY($1))
+               AND NOT EXISTS (SELECT 1 FROM public.cache_chunks c
+                 WHERE c.block_hash=t.block_hash AND c.tx_start=t.tx_start AND NOT c.hash=ANY($1))",
+                &[&hashes],
+            )
+            .await?;
         Ok(self
             .client
             .execute(
-                "WITH victims AS (
-               SELECT id FROM public.content_cache
-               WHERE metadata::jsonb -> 'blob_hash' IN
-                 (SELECT value::jsonb FROM unnest($1::text[]) AS value)
-               LIMIT 256
-             )
-             DELETE FROM public.content_cache AS cache USING victims
-             WHERE cache.id=victims.id",
+                "DELETE FROM public.cache_blobs WHERE hash=ANY($1)",
                 &[&hashes],
             )
             .await?)
@@ -531,54 +671,38 @@ impl BlockStore {
         let installed: bool = self
             .client
             .query_one(
-                "SELECT to_regclass('public.content_cache') IS NOT NULL
-                    AND to_regclass('public.ar_io_schema_migrations') IS NOT NULL
-                    AND to_regclass('public.content_cache_blob_hash_idx') IS NOT NULL",
+                "SELECT to_regclass('public.cache_chunks') IS NOT NULL
+                AND to_regclass('public.cache_objects') IS NOT NULL
+                AND to_regclass('public.cache_blobs_access') IS NOT NULL
+                AND EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
+                    WHERE version=16 AND name='016_chunk_cache')",
                 &[],
             )
             .await?
-            .try_get(0)?;
-        let instruction = "disk cache requires schema migration 005_cache_cleanup; apply \
-            migrations/005_cache_cleanup.sql through the approved migration workflow \
-            before enabling disk cache";
-        ensure!(installed, "{instruction}");
-        let version: bool = self
-            .client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
-                 WHERE version = 5 AND name = '005_cache_cleanup')",
-                &[],
-            )
-            .await?
-            .try_get(0)?;
-        ensure!(version, "{instruction}");
+            .get(0);
+        ensure!(
+            installed,
+            "disk cache requires schema migration 016_chunk_cache"
+        );
         Ok(())
     }
     pub(crate) async fn referenced_cache_blobs(
         &self,
         hashes: &[[u8; 32]],
     ) -> Result<HashSet<[u8; 32]>> {
-        ensure!(hashes.len() <= 128, "cache cleanup batch exceeds 128 blobs");
-        if hashes.is_empty() {
-            return Ok(HashSet::new());
-        }
-        let hashes = hashes
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<Vec<_>, _>>()?;
+        ensure!(hashes.len() <= 512, "cache cleanup batch exceeds 512 blobs");
+        let hashes: Vec<Vec<u8>> = hashes.iter().map(|hash| hash.to_vec()).collect();
         self.client
             .query(
-                "SELECT value FROM unnest($1::text[]) AS value
-                 WHERE EXISTS (
-                     SELECT 1 FROM public.content_cache
-                     WHERE metadata::jsonb -> 'blob_hash' = value::jsonb)",
+                "SELECT hash FROM public.cache_blobs WHERE hash=ANY($1)",
                 &[&hashes],
             )
             .await?
-            .into_iter()
+            .iter()
             .map(|row| {
-                let hash: String = row.try_get(0)?;
-                Ok(serde_json::from_str(&hash)?)
+                let hash: Vec<u8> = row.get(0);
+                hash.try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid cached blob hash"))
             })
             .collect()
     }
@@ -617,13 +741,12 @@ impl BlockStore {
     pub(crate) async fn cached_content(&self, id: &[u8; 32]) -> Result<Option<(String, Vec<u8>)>> {
         self.client
             .query_opt(
-                "SELECT cached.metadata, cached.block_hash FROM public.content_cache cached
-                 JOIN public.canonical_blocks c
-                   ON c.height = cached.block_height AND c.block_hash = cached.block_hash
-                 JOIN public.block_index_state s
-                   ON s.singleton AND c.height > s.start_height
-                   AND c.height <= s.imported_through
-                 WHERE cached.id = $1 AND octet_length(cached.metadata) <= 1048576",
+                "SELECT cached.metadata, cached.block_hash FROM public.cache_objects cached
+             JOIN public.canonical_blocks c
+               ON c.height=cached.block_height AND c.block_hash=cached.block_hash
+             JOIN public.block_index_state s
+               ON s.singleton AND c.height>s.start_height AND c.height<=s.imported_through
+             WHERE cached.id=$1",
                 &[&id.as_slice()],
             )
             .await?
@@ -637,38 +760,87 @@ impl BlockStore {
         height: u64,
         block_hash: &[u8],
         metadata: &str,
+        inline_hash: Option<&[u8]>,
+        limits: (usize, usize),
     ) -> Result<bool> {
         ensure!(block_hash.len() == 48, "cache block hash must be 48 bytes");
         ensure!(metadata.len() <= 1_048_576, "cache metadata exceeds 1 MiB");
-        let row = self
-            .client
-            .query_one(
-                "WITH anchor AS MATERIALIZED (
-                    SELECT c.height, c.block_hash FROM public.canonical_blocks c
-                    JOIN public.block_index_state s
-                      ON s.singleton AND c.height > s.start_height
-                      AND c.height <= s.imported_through
-                    WHERE c.height = $2 AND c.block_hash = $3
-                 ), admitted AS (
-                    INSERT INTO public.content_cache AS stored
-                        (id, block_height, block_hash, metadata)
-                    SELECT $1, height, block_hash, $4 FROM anchor WHERE true
-                    ON CONFLICT (id) DO UPDATE SET id = stored.id
-                    WHERE ROW(stored.block_height, stored.block_hash, stored.metadata)
-                        = ROW(EXCLUDED.block_height, EXCLUDED.block_hash, EXCLUDED.metadata)
-                    RETURNING id
-                 )
-                 SELECT EXISTS (SELECT 1 FROM anchor), EXISTS (SELECT 1 FROM admitted)",
-                &[&id.as_slice(), &sql_height(height)?, &block_hash, &metadata],
-            )
-            .await?;
-        let anchored: bool = row.try_get(0)?;
-        let admitted: bool = row.try_get(1)?;
+        if limits.0 == 0 || metadata.len() > limits.1 {
+            return Ok(false);
+        }
+        let row = self.client.query_one(
+            "WITH anchor AS MATERIALIZED (
+                SELECT c.height,c.block_hash FROM public.canonical_blocks c
+                JOIN public.block_index_state s ON s.singleton
+                  AND c.height>s.start_height AND c.height<=s.imported_through
+                WHERE c.height=$2 AND c.block_hash=$3 FOR SHARE OF c
+             ), pruned AS MATERIALIZED (
+                SELECT public.prune_cache_objects($1,$6,$7) AS removed WHERE EXISTS(SELECT 1 FROM anchor)
+             ), admitted AS (
+                INSERT INTO public.cache_objects AS stored
+                    (id,block_height,block_hash,metadata,inline_hash)
+                SELECT $1,height,block_hash,$4,$5 FROM anchor
+                WHERE (SELECT removed FROM pruned)>=0
+                ON CONFLICT (id) DO UPDATE SET last_access=EXCLUDED.last_access
+                WHERE (stored.block_height,stored.block_hash,stored.metadata,stored.inline_hash)
+                    IS NOT DISTINCT FROM
+                    (EXCLUDED.block_height,EXCLUDED.block_hash,EXCLUDED.metadata,EXCLUDED.inline_hash)
+                RETURNING id
+             ) SELECT EXISTS(SELECT 1 FROM anchor),EXISTS(SELECT 1 FROM admitted)",
+            &[&id.as_slice(), &sql_height(height)?, &block_hash, &metadata, &inline_hash,
+              &i64::try_from(limits.0-1)?, &i64::try_from(limits.1-metadata.len())?],
+        ).await?;
+        let anchor: bool = row.get(0);
+        let admitted: bool = row.get(1);
         ensure!(
-            !anchored || admitted,
+            !anchor || admitted,
             "conflicting immutable cached content descriptor"
         );
-        Ok(admitted)
+        Ok(anchor && admitted)
+    }
+
+    pub(crate) async fn trim_cache_objects(&self, limits: (usize, usize)) -> Result<()> {
+        self.client
+            .query_one(
+                "SELECT public.prune_cache_objects(NULL,$1,$2)",
+                &[&i64::try_from(limits.0)?, &i64::try_from(limits.1)?],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn touch_cache_objects(&self, ids: &[[u8; 32]]) -> Result<()> {
+        ensure!(ids.len() <= 4096, "descriptor touch batch exceeds bound");
+        let ids: Vec<Vec<u8>> = ids.iter().map(|id| id.to_vec()).collect();
+        self.client.execute(
+            "UPDATE public.cache_objects SET last_access=extract(epoch FROM clock_timestamp())::bigint
+             WHERE id=ANY($1) AND last_access < extract(epoch FROM clock_timestamp())::bigint-60",
+            &[&ids],
+        ).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn cached_range_complete(
+        &self,
+        block: &[u8],
+        tx_start: u128,
+        start: u128,
+        end: u128,
+    ) -> Result<bool> {
+        if start == end {
+            return Ok(true);
+        }
+        Ok(self.client.query_one(
+            "WITH ranges AS (
+                SELECT start_offset,end_offset,max(end_offset) OVER(
+                    ORDER BY start_offset,end_offset ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS previous_end
+                FROM public.cache_chunks
+                WHERE block_hash=$1 AND tx_start=$2::text::numeric
+                  AND start_offset<$4::text::numeric AND end_offset>$3::text::numeric
+             ) SELECT coalesce(min(start_offset)<=$3::text::numeric AND max(end_offset)>=$4::text::numeric
+                 AND bool_and(start_offset<=coalesce(previous_end,$3::text::numeric)),false) FROM ranges",
+            &[&block, &tx_start.to_string(), &start.to_string(), &end.to_string()],
+        ).await?.get(0))
     }
 
     pub async fn state(&self) -> Result<Option<ImportState>> {
@@ -2605,7 +2777,6 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     #[tokio::test]
     #[ignore = "requires ar_io_rust_test; fixture writes are rolled back"]
@@ -3529,8 +3700,6 @@ mod tests {
             disk_cache::{DiskCache, EvictionCursor},
         };
         use sha2::{Digest, Sha256};
-        use std::fs::{File, FileTimes};
-        use std::time::SystemTime;
 
         let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
         let database: String = store
@@ -3564,13 +3733,15 @@ mod tests {
                 let content = Content::from(index.to_le_bytes().to_vec());
                 let hash: [u8; 32] = Sha256::digest(index.to_le_bytes()).into();
                 drop(cache.store(&content, hash).await?.unwrap());
-                let name = crate::hex(&hash);
-                let path = directory.path().join(&name[..2]).join(name);
-                File::options().write(true).open(&path)?.set_times(
-                    FileTimes::new().set_accessed(
-                        SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(index) + 1),
-                    ),
-                )?;
+                store.register_cache_blob(&hash, 2).await?;
+                store
+                    .client
+                    .execute(
+                        "UPDATE public.cache_blobs SET last_access=$2 WHERE hash=$1",
+                        &[&hash.as_slice(), &i64::from(index)],
+                    )
+                    .await?;
+                let path = crate::disk_cache::blob_path(directory.path(), hash);
                 hashes.push(hash);
                 paths.push(path);
             }
@@ -3586,10 +3757,32 @@ mod tests {
                 );
                 ensure!(
                     store
-                        .cache_content(id, height, &block_hash, &metadata)
+                        .cache_content(
+                            id,
+                            height,
+                            &block_hash,
+                            &metadata,
+                            Some(hashes[1].as_slice()),
+                            (1024, 1_048_576),
+                        )
                         .await?
                 );
             }
+            cache.touch(hashes[1]);
+            cache.flush_touches(&store).await?;
+            let ordered: Vec<_> = store
+                .cache_victims()
+                .await?
+                .into_iter()
+                .filter(|(hash, _)| hashes.contains(hash))
+                .collect();
+            ensure!(
+                ordered.last().map(|(hash, _)| *hash) == Some(hashes[1]),
+                "database recency did not protect the recently used blob"
+            );
+            let unregistered = crate::disk_cache::blob_path(directory.path(), [0; 32]);
+            std::fs::create_dir_all(unregistered.parent().unwrap())?;
+            std::fs::write(&unregistered, b"unregistered")?;
             drop(cache);
             let cache = DiskCache::new(directory.path().into(), u64::MAX, 1024).await?;
             let parent = cache.load(hashes[0], 2).await?.unwrap();
@@ -3598,8 +3791,11 @@ mod tests {
             let mut cursor = EvictionCursor::default();
             cache.reclaim(&store, &store, &mut cursor).await?;
             ensure!(paths[0].exists(), "active parent was evicted");
-            ensure!(paths[65].exists(), "newest sampled blob was evicted");
-            ensure!(paths[1..65].iter().all(|path| !path.exists()));
+            ensure!(paths[1..].iter().all(|path| !path.exists()));
+            ensure!(
+                std::fs::read(&unregistered)? == b"unregistered",
+                "routine maintenance touched an unregistered file"
+            );
             ensure!(view.read_all(1).await? == [0][..], "active view changed");
             for id in &ids {
                 ensure!(
@@ -3669,16 +3865,31 @@ mod tests {
             wrong_hash[0] ^= 1;
             ensure!(
                 !store
-                    .cache_content(&id, height, &wrong_hash, metadata)
+                    .cache_content(&id, height, &wrong_hash, metadata, None, (1024, 1_048_576))
                     .await?,
                 "mismatched block anchor was admitted"
             );
             ensure!(store.cached_content(&id).await?.is_none());
-            ensure!(store.cache_content(&id, height, &hash, metadata).await?);
-            ensure!(store.cache_content(&id, height, &hash, metadata).await?);
             ensure!(
                 store
-                    .cache_content(&id, height, &hash, r#"{"verified":"conflict"}"#)
+                    .cache_content(&id, height, &hash, metadata, None, (1024, 1_048_576))
+                    .await?
+            );
+            ensure!(
+                store
+                    .cache_content(&id, height, &hash, metadata, None, (1024, 1_048_576))
+                    .await?
+            );
+            ensure!(
+                store
+                    .cache_content(
+                        &id,
+                        height,
+                        &hash,
+                        r#"{"verified":"conflict"}"#,
+                        None,
+                        (1024, 1_048_576)
+                    )
                     .await
                     .is_err(),
                 "conflicting immutable descriptor was accepted"
@@ -3703,7 +3914,9 @@ mod tests {
                 "cache hit survived loss of imported coverage"
             );
             ensure!(
-                !store.cache_content(&id, height, &hash, metadata).await?,
+                !store
+                    .cache_content(&id, height, &hash, metadata, None, (1024, 1_048_576))
+                    .await?,
                 "uncovered block anchor was admitted"
             );
             let directory = tempfile::tempdir()?;
@@ -3711,6 +3924,7 @@ mod tests {
                 crate::disk_cache::DiskCache::new(directory.path().to_path_buf(), 0, 1024).await?;
             let content = crate::content::Content::from(b"cached".to_vec());
             drop(cache.store(&content, blob_hash).await?.unwrap());
+            store.register_cache_blob(&blob_hash, 6).await?;
             let orphan_paths: Vec<_> = (0..130)
                 .map(|byte| {
                     let mut hash = [0xa7; 32];
@@ -3718,10 +3932,7 @@ mod tests {
                     if byte == 129 {
                         hash[0] = 0xa8;
                     }
-                    directory
-                        .path()
-                        .join(format!("{:02x}", hash[0]))
-                        .join(crate::hex(&hash))
+                    crate::disk_cache::blob_path(directory.path(), hash)
                 })
                 .collect();
             for path in &orphan_paths {
@@ -3740,18 +3951,12 @@ mod tests {
             std::fs::write(subdirectory.join("keep.txt"), b"nested")?;
             let active = cache.load(blob_hash, 6).await?.unwrap();
             ensure!(
-                cache
-                    .cleanup(&store, Instant::now() + Duration::from_secs(10))
-                    .await
-                    .is_err(),
+                cache.cleanup(&store).await.is_err(),
                 "cleanup accepted active readers"
             );
             drop(active);
             ensure!(
-                cache
-                    .cleanup(&store, Instant::now() + Duration::from_secs(10))
-                    .await?
-                    == 131,
+                cache.cleanup(&store).await? == 131,
                 "incomplete cache cleanup"
             );
             ensure!(orphan_paths.iter().all(|path| !path.exists()) && !pending_path.exists());
@@ -4549,6 +4754,114 @@ mod tests {
         assert!(validate_batch(&tip, &state, Some(&previous)).is_err());
     }
 
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; run serially"]
+    async fn cache_descriptor_limits_and_recency() -> Result<()> {
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires dedicated test database"
+        );
+        store.client.batch_execute("BEGIN").await?;
+        let result = async {
+            let row = store.client.query_one(
+                "SELECT c.height,c.block_hash FROM public.canonical_blocks c
+                 JOIN public.block_index_state s ON s.singleton
+                 WHERE c.height>s.start_height AND c.height<=s.imported_through ORDER BY c.height LIMIT 1", &[],
+            ).await?;
+            let height = u64::try_from(row.get::<_, i64>(0))?;
+            let hash: Vec<u8> = row.get(1);
+            let ids = [[0xd1; 32], [0xd2; 32], [0xd3; 32], [0xd4; 32]];
+            for (index, id) in ids[..3].iter().enumerate() {
+                ensure!(store.cache_content(id, height, &hash, "123456", None, (2, 16)).await?);
+                store.client.execute("UPDATE public.cache_objects SET last_access=$2 WHERE id=$1",
+                    &[&id.as_slice(), &(index as i64)]).await?;
+            }
+            ensure!(store.cached_content(&ids[0]).await?.is_none(), "descriptor entry limit was exceeded");
+            store.touch_cache_objects(&[ids[1]]).await?;
+            ensure!(store.cache_content(&ids[3], height, &hash, "123456", None, (2, 16)).await?);
+            ensure!(store.cached_content(&ids[1]).await?.is_some(), "recent descriptor was evicted");
+            ensure!(store.cached_content(&ids[2]).await?.is_none(), "old descriptor survived pressure");
+            ensure!(!store.cache_content(&ids[0], height, &hash, "123456789", None, (2, 8)).await?,
+                "oversized descriptor was admitted");
+            store.trim_cache_objects((2, 5)).await?;
+            ensure!(store.cached_content(&ids[1]).await?.is_none()
+                && store.cached_content(&ids[3]).await?.is_none(), "descriptor byte limit was exceeded");
+            ensure!(!store.cache_content(&ids[0], height, &hash, "123456", None, (0, 16)).await?);
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        store.client.batch_execute("ROLLBACK").await?;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test with an empty descriptor cache; run serially"]
+    async fn concurrent_cache_descriptors_obey_global_budget() -> Result<()> {
+        use futures_util::{StreamExt, TryStreamExt};
+        let url = std::env::var("DATABASE_URL")?;
+        let store = BlockStore::connect(&url).await?;
+        let row = store
+            .client
+            .query_one(
+                "SELECT current_database(),(SELECT count(*) FROM public.cache_objects)",
+                &[],
+            )
+            .await?;
+        ensure!(
+            row.get::<_, String>(0) == "ar_io_rust_test" && row.get::<_, i64>(1) == 0,
+            "requires dedicated test database with an empty descriptor cache"
+        );
+        let row = store.client.query_one(
+            "SELECT c.height,c.block_hash FROM public.canonical_blocks c
+             JOIN public.block_index_state s ON s.singleton
+             WHERE c.height>s.start_height AND c.height<=s.imported_through ORDER BY c.height LIMIT 1", &[],
+        ).await?;
+        let height = u64::try_from(row.get::<_, i64>(0))?;
+        let hash: Vec<u8> = row.get(1);
+        let ids: Vec<Vec<u8>> = (0..12).map(|index| vec![0xb0 + index; 32]).collect();
+        futures_util::stream::iter(ids.iter().cloned())
+            .map(|id| {
+                let url = &url;
+                let hash = &hash;
+                async move {
+                    let writer = BlockStore::connect(url).await?;
+                    ensure!(
+                        writer
+                            .cache_content(
+                                &id.try_into().unwrap(),
+                                height,
+                                hash,
+                                "123456",
+                                None,
+                                (3, 18)
+                            )
+                            .await?
+                    );
+                    Ok::<_, anyhow::Error>(())
+                }
+            })
+            .buffer_unordered(4)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let row = store.client.query_one(
+            "SELECT count(*),coalesce(sum(octet_length(metadata)),0)::bigint FROM public.cache_objects", &[],
+        ).await?;
+        ensure!(
+            row.get::<_, i64>(0) == 3 && row.get::<_, i64>(1) == 18,
+            "concurrent publications exceeded the descriptor budget"
+        );
+        store
+            .client
+            .execute("DELETE FROM public.cache_objects WHERE id=ANY($1)", &[&ids])
+            .await?;
+        Ok(())
+    }
+
     #[test]
     fn unencrypted_connections_cannot_escape_loopback() {
         for url in [
@@ -4560,5 +4873,278 @@ mod tests {
         }
         let config = local_config("host=localhost dbname=ar_io_rust_test").unwrap();
         assert_eq!(config.get_hostaddrs(), &[IpAddr::from([127, 0, 0, 1])]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; run serially"]
+    async fn chunk_cache_resumes_and_preserves_placement_proofs() -> Result<()> {
+        use crate::{BlockGeometry, Config, Content, Gateway, Geometry};
+        use axum::{Router, extract::Path, http::StatusCode};
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let store = Arc::new(BlockStore::connect(&std::env::var("DATABASE_URL")?).await?);
+        let name: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            name == "ar_io_rust_test",
+            "requires dedicated test database"
+        );
+        store.require_content_cache().await?;
+        store.client.batch_execute("BEGIN").await?;
+        let result = async {
+            let tail = store.client.query_one(
+                "SELECT c.height,b.hash,b.weave_size::text FROM public.block_index_state s
+                 JOIN public.canonical_blocks c ON c.height=s.imported_through
+                 JOIN public.blocks b ON b.hash=c.block_hash WHERE s.singleton FOR UPDATE OF s",
+                &[],
+            ).await?;
+            let height = tail.get::<_, i64>(0) + 1;
+            let previous_hash: Vec<u8> = tail.get(1);
+            let previous: u128 = tail.get::<_, String>(2).parse()?;
+            let size = crate::MAX_CHUNK_SIZE as usize;
+            let note = |value: usize| {
+                let mut note = [0; 32];
+                note[16..].copy_from_slice(&(value as u128).to_be_bytes());
+                note
+            };
+            let payloads = [vec![b'A'; size], vec![b'B'; size]];
+            let hashes = payloads.each_ref().map(|bytes| crate::sha256(&[bytes]));
+            let leaves = [crate::hash_leaf(&hashes[0], &note(size)), crate::hash_leaf(&hashes[1], &note(2 * size))];
+            let data_root = crate::hash_branch(&leaves[0], &leaves[1], &note(size));
+            let tx_leaves = [crate::hash_leaf(&data_root, &note(2 * size)), crate::hash_leaf(&data_root, &note(4 * size))];
+            let tx_root = crate::hash_branch(&tx_leaves[0], &tx_leaves[1], &note(2 * size));
+            let block_hash = [0xf7; 48];
+            store.client.execute(
+                "INSERT INTO public.blocks(height,hash,previous_hash,tx_root,weave_size)
+                 VALUES($1,$2,$3,$4,$5::text::numeric)", &[
+                    &height, &block_hash.as_slice(), &previous_hash, &tx_root.as_slice(),
+                    &(previous + (4 * size) as u128).to_string(),
+                ],
+            ).await?;
+            store.client.execute("INSERT INTO public.canonical_blocks(height,block_hash) VALUES($1,$2)",
+                &[&height, &block_hash.as_slice()]).await?;
+            store.client.execute(
+                "UPDATE public.block_index_state SET imported_through=$1,
+                 checkpoint_height=greatest(checkpoint_height,$1) WHERE singleton", &[&height],
+            ).await?;
+            let bodies: Vec<_> = (0..4).map(|index| {
+                let tx = index / 2;
+                let part = index % 2;
+                let data_path = [leaves[0].as_slice(), leaves[1].as_slice(), &note(size),
+                    hashes[part].as_slice(), &note((part + 1) * size)].concat();
+                let tx_path = [tx_leaves[0].as_slice(), tx_leaves[1].as_slice(), &note(2 * size),
+                    data_root.as_slice(), &note((tx + 1) * 2 * size)].concat();
+                serde_json::json!({
+                    "chunk": URL_SAFE_NO_PAD.encode(&payloads[part]),
+                    "data_path": URL_SAFE_NO_PAD.encode(data_path),
+                    "tx_path": URL_SAFE_NO_PAD.encode(tx_path),
+                })
+            }).collect();
+            let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)]);
+            let fail = Arc::new(AtomicUsize::new(1));
+            let release = Arc::new(tokio::sync::Notify::new());
+            let app = Router::new().route("/chunk/{offset}", axum::routing::get({
+                let counts = counts.clone();
+                let fail = fail.clone();
+                let release = release.clone();
+                move |Path(offset): Path<String>| {
+                    let index = ((offset.parse::<u128>().unwrap() - previous - 1) / size as u128) as usize;
+                    let body = bodies.get(index).cloned();
+                    let counts = counts.clone();
+                    let fail = fail.clone();
+                    let release = release.clone();
+                    async move {
+                        counts[index].fetch_add(1, Ordering::SeqCst);
+                        if index == 0 && fail.load(Ordering::SeqCst) != 0 {
+                            release.notified().await;
+                            return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!({})));
+                        }
+                        (StatusCode::OK, axum::Json(body.unwrap()))
+                    }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let base = format!("http://{}", listener.local_addr()?);
+            let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            let config = Config::new(&base, &base, vec![base.clone()], Duration::from_secs(12), 1, usize::MAX)?;
+            let directory = tempfile::tempdir()?;
+            let cache = crate::disk_cache::DiskCache::new(directory.path().into(), 0, 8 * size).await?;
+            let fresh = || {
+                let mut gateway = Gateway::new(config.clone()).unwrap();
+                gateway.block_store = Some(store.clone());
+                gateway.disk_cache = Some(cache.clone());
+                gateway
+            };
+            let geometry = Geometry { tx_root, data_root, previous_weave_size: previous,
+                block_weave_size: previous + (4 * size) as u128,
+                first_offset: previous + 1, end_offset: previous + (2 * size) as u128,
+                data_size: (2 * size) as u128 };
+            let block = BlockGeometry { tx_root, previous_weave_size: previous, block_weave_size: geometry.block_weave_size };
+            let gateway = fresh();
+            let stream = Content::streamed(crate::streaming::ChunkSource::new(&gateway, geometry), 2 * size);
+            let mut first = Box::pin(stream.hashes());
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            }).await;
+            timeout(Duration::from_secs(5), async {
+                while store.cached_chunk(previous + size as u128 + 1, block).await?.is_none() {
+                    tokio::task::yield_now().await;
+                }
+                Ok::<_, anyhow::Error>(())
+            }).await??;
+            release.notify_one();
+            ensure!(first.await.is_err(), "failed chunk was accepted");
+            drop(stream);
+            drop(gateway);
+            let reused_count = counts[1].load(Ordering::SeqCst);
+            fail.store(0, Ordering::SeqCst);
+            let gateway = fresh();
+            let stream = Content::streamed(crate::streaming::ChunkSource::new(&gateway, geometry), 2 * size);
+            ensure!(stream.hashes().await?.0 == crate::sha256(&[&payloads[0], &payloads[1]]));
+            ensure!(counts[1].load(Ordering::SeqCst) == reused_count, "retry fetched a committed chunk again");
+            {
+                let encoded = [payloads[0].as_slice(), payloads[1].as_slice()].concat();
+                let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded)?;
+                let decoded_content = Content::decoded_base64(Arc::new(crate::json_bundle::Base64Data {
+                    encoded: stream.clone(), checkpoints: Arc::new(vec![(0, 0)]), len: decoded.len(),
+                }));
+                for (index, bytes, expected) in [(0, stream.clone(), encoded), (1, decoded_content, decoded)] {
+                    let digest = crate::sha256(&[&expected]);
+                    let id = URL_SAFE_NO_PAD.encode([0xe0 + index; 32]);
+                    let mut verified = crate::VerifiedData {
+                        bytes, cache_hit: false, id: id.clone(), block_height: height as u64,
+                        block_hash: Some(block_hash), stable_anchor: false,
+                        content_type: "application/octet-stream".to_owned(), content_encoding: None,
+                        content_length: expected.len(), etag: format!("\"{}\"", URL_SAFE_NO_PAD.encode(digest)),
+                        sha256: crate::hex(&digest), indexing_root: None,
+                    };
+                    gateway.save_content_cache(&mut verified, None).await?;
+                    let restored_gateway = fresh();
+                    let (restored, _) = restored_gateway.load_content_cache(&id).await?.context("content metadata missing")?;
+                    ensure!(restored.cache_hit, "complete chunk coverage reported a miss");
+                    if index == 0 {
+                        store.forget_cached_chunk(&hashes[1], previous + size as u128 + 1).await?;
+                        let (partial, _) = restored_gateway.load_content_cache(&id).await?.unwrap();
+                        ensure!(!partial.cache_hit, "descriptor reported a hit after chunk eviction");
+                        ensure!(partial.bytes.read_all(expected.len()).await?.as_ref() == expected);
+                    }
+                    ensure!(restored.bytes.read_all(expected.len()).await?.as_ref() == expected);
+                    ensure!(!crate::disk_cache::blob_path(directory.path(), digest).exists(),
+                        "chunk-backed content stored a duplicate complete payload");
+                }
+            }
+            let (_, placement) = store.block_pair(height as u64).await?.unwrap();
+            for (part, host) in [(0, "first.example"), (1, "second.example")] {
+                let offset = previous + (part * size) as u128 + 1;
+                let row = store.cached_chunk(offset, block).await?.unwrap();
+                let proof = crate::verify_chunk_proof(crate::Chunk {
+                    chunk: payloads[part].clone().into(),
+                    data_path: row.data_path.into(), tx_path: row.tx_path.into(),
+                }, offset, &block)?;
+                store.cache_chunk(&placement, &proof, host).await?;
+            }
+            let a = gateway.retrieve_chunk(previous + 1).await?.context("first chunk missing")?;
+            let other = gateway.retrieve_chunk(previous + size as u128 + 1).await?.unwrap();
+            ensure!(a.0.source_host == "first.example" && other.0.source_host == "second.example",
+                "cached chunk source was incorrectly shared by transaction");
+            drop(other);
+            let b = gateway.retrieve_chunk(previous + (2 * size) as u128 + 1).await?.context("second placement missing")?;
+            ensure!(a.0.chunk == b.0.chunk && a.0.tx_path != b.0.tx_path, "shared bytes lost placement-specific proofs");
+            ensure!(counts[2].load(Ordering::SeqCst) == 1, "byte presence incorrectly supplied another placement");
+            let count: i64 = store.client.query_one(
+                "SELECT count(*) FROM public.cache_blobs WHERE hash=ANY($1)",
+                &[&hashes.iter().map(|hash| hash.to_vec()).collect::<Vec<_>>()],
+            ).await?.get(0);
+            ensure!(count == 2, "identical chunk bytes were stored twice");
+            drop(a);
+            drop(b);
+            drop(stream);
+            drop(gateway);
+
+            let before = counts[1].load(Ordering::SeqCst);
+            std::fs::write(crate::disk_cache::blob_path(directory.path(), hashes[1]), b"corrupt")?;
+            let gateway = fresh();
+            let recovered = gateway.retrieve_chunk(previous + size as u128 + 1).await?.context("corrupt chunk not repaired")?;
+            ensure!(recovered.0.bytes.read_all(size).await?.as_ref() == payloads[1]);
+            ensure!(counts[1].load(Ordering::SeqCst) > before, "corrupt bytes were reused");
+            drop(recovered);
+            drop(gateway);
+
+            store.client.execute("DELETE FROM public.cache_chunks WHERE block_hash=$1 AND start_offset=$2::text::numeric",
+                &[&block_hash.as_slice(), &(previous + (3 * size) as u128 + 1).to_string()]).await?;
+            let gateway = fresh();
+            crate::BACKGROUND_CPU.scope((), gateway.retrieve_chunk(previous + (3 * size) as u128 + 1)).await?
+                .context("background retrieval failed")?;
+            ensure!(store.cached_chunk(previous + (3 * size) as u128 + 1, block).await?.is_none(),
+                "background-only retrieval populated the cache");
+            drop(gateway);
+            let object_id = [0xf5; 32];
+            ensure!(store.cache_content(&object_id, height as u64, &block_hash, "{}", None, (1024, 1_048_576)).await?);
+            let stale = [0xf6; 48];
+            store.client.execute(
+                "INSERT INTO public.blocks(height,hash,previous_hash,tx_root,weave_size)
+                 VALUES($1,$2,$3,$4,$5::text::numeric)", &[
+                    &height,&stale.as_slice(),&previous_hash,&tx_root.as_slice(),
+                    &geometry.block_weave_size.to_string(),
+                ],
+            ).await?;
+            store.client.execute("UPDATE public.block_index_state SET imported_through=$1 WHERE singleton",
+                &[&(height-1)]).await?;
+            store.client.execute("DELETE FROM public.canonical_blocks WHERE height=$1", &[&height]).await?;
+            store.client.execute("INSERT INTO public.canonical_blocks(height,block_hash) VALUES($1,$2)",
+                &[&height,&stale.as_slice()]).await?;
+            store.client.execute("UPDATE public.block_index_state SET imported_through=$1 WHERE singleton", &[&height]).await?;
+            ensure!(store.cached_chunk(previous + 1, block).await?.is_none(), "stale placement survived a fork");
+            ensure!(store.cached_content(&object_id).await?.is_none(), "stale object metadata survived a fork");
+            ensure!(store.cache_content(&object_id, height as u64, &stale, "{}", None, (1024, 1_048_576)).await?,
+                "new canonical placement could not replace old cache metadata");
+            let gateway = fresh();
+            gateway.retrieve_chunk(previous + 1).await?.context("new placement could not be cached")?;
+            ensure!(store.cached_chunk(previous + 1, block).await?.is_some(), "new placement mapping was not published");
+            drop(gateway);
+            drop(cache);
+            let reopened = crate::disk_cache::DiskCache::new(directory.path().into(), 0, 8 * size).await?;
+            let mut restarted = Gateway::new(config.clone())?;
+            restarted.block_store = Some(store.clone());
+            restarted.disk_cache = Some(reopened);
+            let before = counts[0].load(Ordering::SeqCst);
+            let cached = restarted.retrieve_chunk(previous + 1).await?.context("restart lost the cached chunk")?;
+            ensure!(cached.1 && cached.0.bytes.read_all(size).await?.as_ref() == payloads[0]);
+            ensure!(counts[0].load(Ordering::SeqCst) == before, "restart fetched cached bytes");
+            let port = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = port.local_addr()?;
+            drop(port);
+            let resolver = crate::server::ServerConfig::new(
+                &address.to_string(), "cache.test", &base,
+                &bs58::encode([1; 32]).into_string(), &bs58::encode([2; 32]).into_string(), 8,
+            )?;
+            let _http = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+                crate::server::serve(restarted, resolver),
+            ));
+            timeout(Duration::from_secs(5), async {
+                while tokio::net::TcpStream::connect(address).await.is_err() {
+                    tokio::task::yield_now().await;
+                }
+            }).await?;
+            let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build()?;
+            let response = client.get(format!("http://{address}/chunk/{}/data", previous + 1)).send().await?;
+            ensure!(response.status() == StatusCode::OK && response.headers()["x-cache"] == "HIT");
+            ensure!(response.headers()["x-arweave-chunk-tx-path"] == cached.0.tx_path);
+            ensure!(response.bytes().await?.as_ref() == payloads[0], "HTTP cache hit returned wrong bytes");
+            ensure!(counts[0].load(Ordering::SeqCst) == before, "HTTP cache hit fetched upstream");
+            println!("HTTP chunk-cache smoke: verified payload and tx_path, HIT, zero upstream requests");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        store.client.batch_execute("ROLLBACK").await?;
+        result
     }
 }

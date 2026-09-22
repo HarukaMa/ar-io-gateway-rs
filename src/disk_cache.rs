@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{self, Read as _},
     path::{Path, PathBuf},
@@ -6,7 +7,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -30,6 +30,13 @@ struct CacheDirectory {
     pending_bytes: AtomicUsize,
     publication: Arc<tokio::sync::RwLock<()>>,
     lookups: parking_lot::Mutex<[LookupStats; 2]>,
+    touches: parking_lot::Mutex<HashSet<[u8; 32]>>,
+    object_touches: parking_lot::Mutex<HashSet<[u8; 32]>>,
+    admissions: Arc<tokio::sync::Semaphore>,
+    flights: crate::shared::Flights<
+        (u128, crate::BlockGeometry),
+        std::result::Result<Option<crate::ChunkFetch>, crate::RetrievalFailure>,
+    >,
 }
 
 #[derive(Debug, Default)]
@@ -84,6 +91,58 @@ impl DiskCache {
         &self.0.path
     }
 
+    pub(crate) fn flights(
+        &self,
+    ) -> &crate::shared::Flights<
+        (u128, crate::BlockGeometry),
+        std::result::Result<Option<crate::ChunkFetch>, crate::RetrievalFailure>,
+    > {
+        &self.0.flights
+    }
+
+    pub(crate) async fn admission(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        Ok(Arc::clone(&self.0.admissions).acquire_owned().await?)
+    }
+
+    pub(crate) fn touch(&self, hash: [u8; 32]) {
+        let mut touches = self.0.touches.lock();
+        if touches.len() < 4096 {
+            touches.insert(hash);
+        }
+    }
+
+    pub(crate) fn touch_object(&self, id: [u8; 32]) {
+        let mut touches = self.0.object_touches.lock();
+        if touches.len() < 4096 {
+            touches.insert(id);
+        }
+    }
+
+    pub(crate) async fn flush_touches(&self, store: &crate::database::BlockStore) -> Result<()> {
+        for (touches, objects) in [(&self.0.touches, false), (&self.0.object_touches, true)] {
+            let hashes: Vec<_> = touches.lock().drain().collect();
+            if hashes.is_empty() {
+                continue;
+            }
+            let result = if objects {
+                store.touch_cache_objects(&hashes).await
+            } else {
+                store.touch_cache_blobs(&hashes).await
+            };
+            if let Err(error) = result {
+                let mut touches = touches.lock();
+                for hash in hashes {
+                    if touches.len() == 4096 {
+                        break;
+                    }
+                    touches.insert(hash);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn record_lookup<T>(&self, http: bool, result: &Result<Option<T>>) {
         let mut lookups = self.0.lookups.lock();
         let stats = &mut lookups[usize::from(!http)];
@@ -114,6 +173,7 @@ impl DiskCache {
         spawn_blocking(move || {
             fs::create_dir_all(&path).context("creating content cache directory")?;
             let path = fs::canonicalize(path).context("resolving content cache directory")?;
+            fs::create_dir_all(path.join("chunks")).context("creating chunk cache namespace")?;
             let lock = Arc::new(
                 fs::OpenOptions::new()
                     .read(true)
@@ -131,12 +191,53 @@ impl DiskCache {
                 min_free_bytes,
                 max_pending_bytes,
                 pending_bytes: AtomicUsize::new(0),
+                touches: Default::default(),
+                object_touches: Default::default(),
+                admissions: Arc::new(tokio::sync::Semaphore::new(32)),
+                flights: Default::default(),
                 publication: Arc::new(tokio::sync::RwLock::new(())),
                 lookups: Default::default(),
             })))
         })
         .await
         .context("creating content cache task")?
+    }
+
+    pub(crate) async fn load_chunk_bytes(
+        &self,
+        hash: [u8; 32],
+        size: usize,
+    ) -> Result<Option<axum::body::Bytes>> {
+        ensure!(
+            size <= crate::MAX_CHUNK_SIZE as usize,
+            "cached chunk exceeds size limit"
+        );
+        let path = blob_path(&self.0.path, hash);
+        spawn_blocking(move || -> Result<_> {
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            if !metadata.is_file() || metadata.len() != size as u64 {
+                return Ok(None);
+            }
+            let file = match File::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            if file.try_lock_shared().is_err() {
+                return Ok(None);
+            }
+            let mut bytes = Vec::with_capacity(size);
+            file.take(size as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() != size || <[u8; 32]>::from(Sha256::digest(&bytes)) != hash {
+                return Ok(None);
+            }
+            Ok(Some(axum::body::Bytes::from(bytes)))
+        })
+        .await?
     }
 
     pub(crate) async fn load(&self, hash: [u8; 32], size: usize) -> Result<Option<Content>> {
@@ -257,29 +358,23 @@ impl DiskCache {
         .context("writing content cache task")?
     }
 
-    pub(crate) async fn cleanup(
-        &mut self,
-        store: &crate::database::BlockStore,
-        deadline: Instant,
-    ) -> Result<u64> {
+    pub(crate) async fn cleanup(&mut self, store: &crate::database::BlockStore) -> Result<u64> {
         ensure!(
             Arc::strong_count(&self.0) == 1 && Arc::strong_count(&self.0.lock) == 1,
             "cache cleanup requires exclusive ownership without active readers or writers"
         );
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelWrite(Arc::clone(&cancelled));
-        ensure!(Instant::now() < deadline, "cache cleanup timed out");
         let directory = Arc::clone(&self.0);
         let mut removed = 0;
-        for prefix in 0..=u8::MAX {
-            let shard = directory.path.join(format!("{prefix:02x}"));
+        for prefix in 0..=u16::MAX {
+            let shard = directory.path.join("chunks").join(format!("{prefix:04x}"));
             let worker_cancelled = Arc::clone(&cancelled);
             let entries = spawn_blocking(move || -> Result<_> {
                 ensure!(
                     !worker_cancelled.load(Ordering::Relaxed),
                     "cache cleanup cancelled"
                 );
-                ensure!(Instant::now() < deadline, "cache cleanup timed out");
                 if !is_directory(&shard)? {
                     return Ok(None);
                 }
@@ -297,7 +392,6 @@ impl DiskCache {
                             !worker_cancelled.load(Ordering::Relaxed),
                             "cache cleanup cancelled"
                         );
-                        ensure!(Instant::now() < deadline, "cache cleanup timed out");
                         let Some(entry) = entries.next() else { break };
                         seen += 1;
                         let entry = entry?;
@@ -315,7 +409,7 @@ impl DiskCache {
                             for (index, byte) in hash.iter_mut().enumerate() {
                                 *byte = u8::from_str_radix(&name[index * 2..index * 2 + 2], 16)?;
                             }
-                            if hash[0] != prefix {
+                            if u16::from_be_bytes([hash[0], hash[1]]) != prefix {
                                 continue;
                             }
                             Some(hash)
@@ -336,7 +430,6 @@ impl DiskCache {
                     break;
                 }
                 let hashes: Vec<_> = batch.iter().filter_map(|(_, hash)| *hash).collect();
-                ensure!(Instant::now() < deadline, "cache cleanup timed out");
                 let referenced = store.referenced_cache_blobs(&hashes).await?;
                 let directory = Arc::clone(&self.0);
                 let worker_cancelled = Arc::clone(&cancelled);
@@ -346,7 +439,7 @@ impl DiskCache {
                         hash.is_none_or(|hash| !referenced.contains(&hash))
                             .then_some(path)
                     });
-                    remove_abandoned_files(paths, &worker_cancelled, deadline)
+                    remove_abandoned_files(paths, &worker_cancelled)
                 })
                 .await??;
             }
@@ -357,15 +450,7 @@ impl DiskCache {
 
 #[derive(Default)]
 pub(crate) struct EvictionCursor {
-    prefix: u8,
-    entries: Option<fs::ReadDir>,
     reclaiming: bool,
-}
-
-struct EvictionCandidate {
-    path: PathBuf,
-    hash: [u8; 32],
-    accessed: SystemTime,
 }
 
 impl DiskCache {
@@ -375,49 +460,45 @@ impl DiskCache {
         store: &crate::database::BlockStore,
         cursor: &mut EvictionCursor,
     ) -> Result<bool> {
-        let directory = self.0.clone();
-        let mut next = std::mem::take(cursor);
-        let (next, candidates) = spawn_blocking(move || {
-            let total = fs4::total_space(&directory.path)?;
-            let available = fs4::available_space(&directory.path)?;
-            let reserve = directory
-                .min_free_bytes
-                .saturating_add(directory.max_pending_bytes as u64);
-            let trigger = (total / 10).max(reserve);
-            let target = (total / 5).max(reserve.saturating_add(total / 20));
-            next.reclaiming = available < if next.reclaiming { target } else { trigger };
-            let candidates = if next.reclaiming {
-                next.sample(&directory.path)?
-            } else {
-                Vec::new()
-            };
-            Ok::<_, anyhow::Error>((next, candidates))
+        self.flush_touches(store).await?;
+        let directory = Arc::clone(&self.0);
+        let (total, available) = spawn_blocking(move || -> Result<_> {
+            Ok((
+                fs4::total_space(&directory.path)?,
+                fs4::available_space(&directory.path)?,
+            ))
         })
         .await??;
-        *cursor = next;
-        if candidates.is_empty() {
+        let reserve = self
+            .0
+            .min_free_bytes
+            .saturating_add(self.0.max_pending_bytes as u64);
+        let trigger = (total / 10).max(reserve);
+        let target = (total / 5).max(reserve.saturating_add(total / 20));
+        cursor.reclaiming = available < if cursor.reclaiming { target } else { trigger };
+        if !cursor.reclaiming {
             return Ok(false);
         }
-
-        let guard = self.0.publication.clone().write_owned().await;
-        // Drain already-enqueued publications, including queries whose caller cancelled.
+        let victims = store.cache_victims().await?;
+        if victims.is_empty() {
+            return Ok(false);
+        }
+        let guard = Arc::clone(&self.0.publication).write_owned().await;
         publisher.cache_publication_barrier().await?;
+        let directory = Arc::clone(&self.0);
         let pinned = spawn_blocking(move || -> Result<_> {
             let mut pinned = Vec::new();
-            for candidate in candidates {
-                let Ok(file) = File::open(&candidate.path) else {
-                    continue;
-                };
-                if file.try_lock().is_err() {
+            for (hash, _) in victims {
+                if directory.touches.lock().contains(&hash) {
                     continue;
                 }
-                let metadata = file.metadata()?;
-                if !metadata.is_file() || metadata.accessed()? > candidate.accessed {
-                    continue;
-                }
-                pinned.push((candidate, file));
-                if pinned.len() == 64 {
-                    break;
+                let path = blob_path(&directory.path, hash);
+                match File::open(&path) {
+                    Ok(file) if file.try_lock().is_ok() => pinned.push((hash, path, Some(file))),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        pinned.push((hash, path, None))
+                    }
+                    _ => {}
                 }
             }
             Ok(pinned)
@@ -426,88 +507,24 @@ impl DiskCache {
         if pinned.is_empty() {
             return Ok(false);
         }
-        let hashes: Vec<_> = pinned.iter().map(|(candidate, _)| candidate.hash).collect();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while store.remove_cache_mappings(&hashes).await? != 0 {
-            // Leave the files in place if metadata cleanup needs another pass.
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-        }
-        let removed = spawn_blocking(move || -> Result<u64> {
+        let hashes: Vec<_> = pinned.iter().map(|(hash, _, _)| *hash).collect();
+        store.remove_cache_mappings(&hashes).await?;
+        spawn_blocking(move || -> Result<()> {
             let _guard = guard;
-            let mut removed = 0;
-            for (candidate, _pin) in pinned {
-                match fs::remove_file(&candidate.path) {
-                    Ok(()) => removed += 1,
+            for (_, path, file) in pinned {
+                if file.is_none() {
+                    continue;
+                }
+                match fs::remove_file(path) {
+                    Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error).context("evicting cached blob"),
                 }
             }
-            Ok(removed)
+            Ok(())
         })
         .await??;
-        if removed != 0 {
-            eprintln!("Evicted {removed} cached blobs");
-        }
         Ok(true)
-    }
-}
-
-impl EvictionCursor {
-    fn sample(&mut self, root: &Path) -> Result<Vec<EvictionCandidate>> {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let mut candidates = Vec::new();
-        let mut visited = 0;
-        let mut seen = 0;
-        while seen < 512 && visited < 256 && Instant::now() < deadline {
-            if self.entries.is_none() {
-                let shard = root.join(format!("{:02x}", self.prefix));
-                if !is_directory(&shard)? {
-                    self.prefix = self.prefix.wrapping_add(1);
-                    visited += 1;
-                    continue;
-                }
-                self.entries = Some(fs::read_dir(shard)?);
-            }
-            let Some(entry) = self.entries.as_mut().unwrap().next() else {
-                self.entries = None;
-                self.prefix = self.prefix.wrapping_add(1);
-                visited += 1;
-                continue;
-            };
-            seen += 1;
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name.len() != 64
-                || !name
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                continue;
-            }
-            let hash = std::array::from_fn(|index| {
-                u8::from_str_radix(&name[index * 2..index * 2 + 2], 16).unwrap()
-            });
-            if hash[0] != self.prefix {
-                continue;
-            }
-            let metadata = match fs::symlink_metadata(entry.path()) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            if metadata.file_type().is_file() {
-                candidates.push(EvictionCandidate {
-                    path: entry.path(),
-                    hash,
-                    accessed: metadata.accessed()?,
-                });
-            }
-        }
-        candidates.sort_unstable_by_key(|candidate| candidate.accessed);
-        Ok(candidates)
     }
 }
 
@@ -557,7 +574,7 @@ impl CacheDirectory {
 
 pub(crate) fn blob_path(root: &Path, hash: [u8; 32]) -> PathBuf {
     let name = crate::hex(&hash);
-    root.join(&name[..2]).join(name)
+    root.join("chunks").join(&name[..4]).join(name)
 }
 
 fn is_directory(path: &Path) -> io::Result<bool> {
@@ -571,7 +588,6 @@ fn is_directory(path: &Path) -> io::Result<bool> {
 fn remove_abandoned_files(
     paths: impl IntoIterator<Item = PathBuf>,
     cancelled: &AtomicBool,
-    deadline: Instant,
 ) -> Result<u64> {
     let mut removed = 0;
     for path in paths {
@@ -579,7 +595,6 @@ fn remove_abandoned_files(
             !cancelled.load(Ordering::Relaxed),
             "cache cleanup cancelled"
         );
-        ensure!(Instant::now() < deadline, "cache cleanup timed out");
         // A filesystem call already in progress must finish before cancellation takes effect.
         fs::remove_file(path).context("removing abandoned cache file")?;
         removed += 1;
@@ -665,11 +680,7 @@ mod tests {
                     }
                     path
                 });
-                let outcome = remove_abandoned_files(
-                    paths,
-                    &cancelled,
-                    Instant::now() + std::time::Duration::from_secs(60),
-                );
+                let outcome = remove_abandoned_files(paths, &cancelled);
                 finished.send(outcome).unwrap();
             })
             .await
@@ -688,19 +699,6 @@ mod tests {
         assert!(outcome.is_err());
         assert!(!first.exists());
         assert_eq!(fs::read(second)?, b"second");
-        Ok(())
-    }
-
-    #[test]
-    fn cleanup_expired_deadline_preserves_files() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let path = root.path().join("abandoned");
-        fs::write(&path, b"keep")?;
-        assert!(
-            remove_abandoned_files([path.clone()], &AtomicBool::new(false), Instant::now(),)
-                .is_err()
-        );
-        assert_eq!(fs::read(path)?, b"keep");
         Ok(())
     }
 
@@ -762,8 +760,7 @@ mod tests {
         assert!(cache.load(hash, 4).await?.is_none());
         drop(cache.store(&content, hash).await?.unwrap());
         assert!(cache.load(hash, 3).await?.is_none());
-        let name = crate::hex(&hash);
-        let path = root.path().join(&name[..2]).join(&name);
+        let path = blob_path(root.path(), hash);
         for corrupt in [b"evil".as_slice(), b"dat".as_slice()] {
             fs::write(&path, corrupt)?;
             assert!(cache.load(hash, 4).await?.is_none());
@@ -810,7 +807,7 @@ mod tests {
         #[cfg(unix)]
         {
             let outside = tempfile::tempdir()?;
-            let outside_blob = outside.path().join(&name);
+            let outside_blob = outside.path().join(crate::hex(&hash));
             fs::write(&outside_blob, b"data")?;
             fs::remove_file(shard)?;
             std::os::unix::fs::symlink(outside.path(), shard)?;

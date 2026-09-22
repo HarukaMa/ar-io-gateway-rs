@@ -484,8 +484,9 @@ pub(crate) async fn diagnose_public(
         gateway.spool_budget = serving.spool_budget.clone();
         gateway.peers = serving.peers.clone();
         if let Some(store) = &serving.block_store {
-            gateway.block_store =
-                Some(check("database_connection", input, store.reconnect()).await?);
+            gateway.block_store = Some(std::sync::Arc::new(
+                check("database_connection", input, store.reconnect()).await?,
+            ));
         }
         Ok(gateway)
     };
@@ -631,9 +632,12 @@ async fn inspect_cache(
         return Ok(json!({"state": "absent", "integrity_checked": false}));
     };
     let entry: crate::CachedContent = serde_json::from_str(&metadata)?;
-    let path = crate::disk_cache::blob_path(directory, entry.blob_hash);
+    if entry.stream.is_some() {
+        return Ok(json!({"state": "chunk_backed", "integrity_checked": false}));
+    }
+    let path = crate::disk_cache::blob_path(directory, entry.digest);
     let state = match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) if metadata.is_file() && metadata.len() == entry.blob_size as u64 => "present",
+        Ok(metadata) if metadata.is_file() && metadata.len() == entry.length as u64 => "present",
         Ok(_) => "file_size_or_type_mismatch",
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => "file_missing",
         Err(error) => return Err(error.into()),

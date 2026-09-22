@@ -27,6 +27,34 @@ tokio::task_local! {
     pub(crate) static DOWNLOAD_SPOOL: std::cell::RefCell<Option<Reservation>>;
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CachedStream {
+    Range {
+        geometry: crate::Geometry,
+        offset: usize,
+        len: usize,
+    },
+    Base64 {
+        encoded: Box<CachedStream>,
+        checkpoints: Vec<(usize, usize)>,
+        decoded_len: usize,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl CachedStream {
+    pub(crate) fn backing_range(&self) -> (crate::Geometry, usize, usize) {
+        match self {
+            Self::Range {
+                geometry,
+                offset,
+                len,
+            } => (*geometry, *offset, *len),
+            Self::Base64 { encoded, .. } => encoded.backing_range(),
+        }
+    }
+}
 #[derive(Debug)]
 pub(crate) struct SpoolBudget {
     max_bytes: usize,
@@ -159,6 +187,95 @@ impl From<Bytes> for Content {
 }
 
 impl Content {
+    fn has_chunk_cache(&self) -> bool {
+        match &self.0 {
+            Storage::Stream { source, .. } => source.persistent(),
+            Storage::Base64 { source, .. } => source.encoded.has_chunk_cache(),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn cached_stream(&self) -> Option<CachedStream> {
+        match &self.0 {
+            Storage::Stream {
+                source,
+                offset,
+                len,
+            } if source.persistent() => Some(CachedStream::Range {
+                geometry: source.geometry(),
+                offset: *offset,
+                len: *len,
+            }),
+            Storage::Base64 {
+                source,
+                offset,
+                len,
+            } => Some(CachedStream::Base64 {
+                encoded: Box::new(source.encoded.cached_stream()?),
+                checkpoints: source.checkpoints.as_ref().clone(),
+                decoded_len: source.len,
+                offset: *offset,
+                len: *len,
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_cached_stream(
+        description: CachedStream,
+        gateway: &crate::Gateway,
+    ) -> Result<Self> {
+        match description {
+            CachedStream::Range {
+                geometry,
+                offset,
+                len,
+            } => {
+                let size = usize::try_from(geometry.data_size)?;
+                ensure!(
+                    offset.checked_add(len).is_some_and(|end| end <= size),
+                    "cached range exceeds transaction"
+                );
+                Self::streamed(crate::streaming::ChunkSource::new(gateway, geometry), size)
+                    .slice(offset..offset + len)
+            }
+            CachedStream::Base64 {
+                encoded,
+                checkpoints,
+                decoded_len,
+                offset,
+                len,
+            } => {
+                let encoded = Self::from_cached_stream(*encoded, gateway)?;
+                ensure!(
+                    checkpoints.first() == Some(&(0, 0)) && checkpoints.len() <= 4097,
+                    "invalid cached base64 checkpoints"
+                );
+                ensure!(
+                    checkpoints
+                        .windows(2)
+                        .all(|pair| pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1)
+                        && checkpoints
+                            .iter()
+                            .all(|(raw, decoded)| *raw <= encoded.len() && *decoded <= decoded_len),
+                    "invalid cached base64 checkpoint range"
+                );
+                ensure!(
+                    offset
+                        .checked_add(len)
+                        .is_some_and(|end| end <= decoded_len),
+                    "cached base64 range exceeds data"
+                );
+                Self::decoded_base64(Arc::new(crate::json_bundle::Base64Data {
+                    encoded,
+                    checkpoints: Arc::new(checkpoints),
+                    len: decoded_len,
+                }))
+                .slice(offset..offset + len)
+            }
+        }
+    }
+
     pub(crate) fn decoded_base64(source: Arc<crate::json_bundle::Base64Data>) -> Self {
         let len = source.len;
         Self(Storage::Base64 {
@@ -384,6 +501,10 @@ impl Content {
         memory_limit: usize,
         budget: Arc<SpoolBudget>,
     ) -> Result<(Self, [u8; 32])> {
+        if self.has_chunk_cache() && crate::shared::cache_requested() {
+            let (hash, _) = self.hashes().await?;
+            return Ok((self, hash));
+        }
         if !self.is_materialized() && self.len() > memory_limit && self.len() > budget.max_bytes {
             // Retain proof-backed content after verification when a full spool cannot fit.
             let (hash, _) = self.hashes().await?;
