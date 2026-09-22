@@ -214,6 +214,10 @@ impl DiskCache {
         );
         let path = blob_path(&self.0.path, hash);
         spawn_blocking(move || -> Result<_> {
+            let shard = path.parent().expect("cache shard");
+            if !is_directory(shard.parent().expect("cache prefix"))? || !is_directory(shard)? {
+                return Ok(None);
+            }
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -246,7 +250,8 @@ impl DiskCache {
         let _cancel_on_drop = CancelWrite(Arc::clone(&cancelled));
         let cache_lock = Arc::clone(&self.0.lock);
         spawn_blocking(move || {
-            if !is_directory(path.parent().expect("cache shard"))? {
+            let shard = path.parent().expect("cache shard");
+            if !is_directory(shard.parent().expect("cache prefix"))? || !is_directory(shard)? {
                 return Ok(None);
             }
             verified_file(&path, hash, size, &cancelled)
@@ -274,18 +279,20 @@ impl DiskCache {
             ensure!(!cancelled.load(Ordering::Relaxed), "cache write cancelled");
             let path = blob_path(&directory.path, hash);
             let shard = path.parent().expect("cache shard");
-            match fs::create_dir(shard) {
-                Ok(()) => {
-                    #[cfg(unix)]
-                    File::open(&directory.path)?.sync_all()?;
+            for directory in [shard.parent().expect("cache prefix"), shard] {
+                match fs::create_dir(directory) {
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        File::open(directory.parent().expect("cache parent"))?.sync_all()?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        ensure!(
+                            is_directory(directory)?,
+                            "cache shard is not a regular directory"
+                        );
+                    }
+                    Err(error) => return Err(error).context("creating cache shard"),
                 }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    ensure!(
-                        is_directory(shard)?,
-                        "cache shard is not a regular directory"
-                    );
-                }
-                Err(error) => return Err(error).context("creating cache shard"),
             }
             let Some(mut pending) = directory.admit(reservation, shard)? else {
                 return Ok(None);
@@ -368,14 +375,18 @@ impl DiskCache {
         let directory = Arc::clone(&self.0);
         let mut removed = 0;
         for prefix in 0..=u16::MAX {
-            let shard = directory.path.join("chunks").join(format!("{prefix:04x}"));
+            let shard = directory
+                .path
+                .join("chunks")
+                .join(format!("{:02x}", prefix >> 8))
+                .join(format!("{:02x}", prefix & 0xff));
             let worker_cancelled = Arc::clone(&cancelled);
             let entries = spawn_blocking(move || -> Result<_> {
                 ensure!(
                     !worker_cancelled.load(Ordering::Relaxed),
                     "cache cleanup cancelled"
                 );
-                if !is_directory(&shard)? {
+                if !is_directory(shard.parent().expect("cache prefix"))? || !is_directory(&shard)? {
                     return Ok(None);
                 }
                 fs::read_dir(shard).map(Some).context("reading cache shard")
@@ -574,7 +585,10 @@ impl CacheDirectory {
 
 pub(crate) fn blob_path(root: &Path, hash: [u8; 32]) -> PathBuf {
     let name = crate::hex(&hash);
-    root.join("chunks").join(&name[..4]).join(name)
+    root.join("chunks")
+        .join(&name[..2])
+        .join(&name[2..4])
+        .join(name)
 }
 
 fn is_directory(path: &Path) -> io::Result<bool> {
@@ -711,6 +725,17 @@ mod tests {
         writer.write(b"0123456789").await?;
         let (source, hash) = writer.finish().await?;
         let stored = cache.store(&source, hash).await?.unwrap();
+        let name = crate::hex(&hash);
+        assert_eq!(
+            fs::read(
+                root.path()
+                    .join("chunks")
+                    .join(&name[..2])
+                    .join(&name[2..4])
+                    .join(&name)
+            )?,
+            b"0123456789"
+        );
         drop(source);
         // Persistent bytes no longer retain the temporary spool reservation.
         drop(ContentWriter::new(10, 0, budget).await?);
@@ -802,6 +827,7 @@ mod tests {
         fs::remove_dir(shard)?;
         fs::write(shard, b"keep")?;
         assert!(cache.load(hash, 4).await?.is_none());
+        assert!(cache.load_chunk_bytes(hash, 4).await?.is_none());
         assert!(cache.store(&content, hash).await.is_err());
         assert_eq!(fs::read(shard)?, b"keep");
         #[cfg(unix)]
@@ -812,6 +838,7 @@ mod tests {
             fs::remove_file(shard)?;
             std::os::unix::fs::symlink(outside.path(), shard)?;
             assert!(cache.load(hash, 4).await?.is_none());
+            assert!(cache.load_chunk_bytes(hash, 4).await?.is_none());
             assert!(cache.store(&content, hash).await.is_err());
             assert_eq!(fs::read(outside_blob)?, b"data");
         }
