@@ -742,6 +742,168 @@ impl BlockStore {
         }))
     }
 
+    pub(crate) async fn inspect_bundle(
+        &self,
+        id: &[u8; 32],
+        start: usize,
+    ) -> Result<Option<serde_json::Value>> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use serde_json::json;
+        self.client.batch_execute(
+            "SET default_transaction_read_only=on; SET statement_timeout='3s'; SET lock_timeout='500ms'"
+        ).await?;
+        let installed: bool = self
+            .client
+            .query_one(
+                "SELECT to_regclass('public.item_locations') IS NOT NULL",
+                &[],
+            )
+            .await?
+            .get(0);
+        if !installed {
+            return Ok(None);
+        }
+        let Some(parent) = self
+            .client
+            .query_opt(
+                "SELECT key, kind FROM public.objects WHERE id=$1 AND metadata_complete",
+                &[&id.as_slice()],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let key: i64 = parent.get(0);
+        let tags = self
+            .client
+            .query(
+                "SELECT n.value,v.value FROM public.object_tags t
+             JOIN public.tag_names n ON n.key=t.name_key
+             JOIN public.tag_values v ON v.key=t.value_key
+             WHERE t.object_key=$1 ORDER BY t.ordinal",
+                &[&key],
+            )
+            .await?;
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = tags.iter().map(|r| (r.get(0), r.get(1))).collect();
+        let format = crate::BundleFormat::from_pairs(
+            pairs.iter().map(|(n, v)| (n.as_slice(), v.as_slice())),
+        )
+        .ok();
+        if format.is_none() {
+            let row = self.client.query_one(
+                "SELECT o.data_size::text,o.signature_type,owner.public_key,o.target,o.anchor,o.signature
+                 FROM public.objects o LEFT JOIN public.owners owner ON owner.address=o.owner_address
+                 WHERE o.key=$1", &[&key],
+            ).await?;
+            let location = self
+                .client
+                .query_opt(
+                    "SELECT parent.id,l.item_offset::text,l.item_size::text,l.data_offset::text
+                 FROM public.item_locations l JOIN public.objects parent ON parent.key=l.parent_key
+                 WHERE l.object_key=$1 ORDER BY l.root_key,l.path LIMIT 1",
+                    &[&key],
+                )
+                .await?;
+            let mut item = json!({
+                "id": URL_SAFE_NO_PAD.encode(id), "source": "indexed",
+                "data_size": row.get::<_,String>(0), "signature_type": row.get::<_,i16>(1),
+                "owner": URL_SAFE_NO_PAD.encode(row.get::<_,Option<Vec<u8>>>(2).unwrap_or_default()),
+                "target": URL_SAFE_NO_PAD.encode(row.get::<_,Vec<u8>>(3)),
+                "anchor": URL_SAFE_NO_PAD.encode(row.get::<_,Vec<u8>>(4)),
+                "signature": URL_SAFE_NO_PAD.encode(row.get::<_,Vec<u8>>(5)),
+                "tags": crate::bundle_inspection::tags_json(pairs.into_iter()),
+            });
+            if let Some(location) = location {
+                item["parent_id"] = json!(URL_SAFE_NO_PAD.encode(location.get::<_, Vec<u8>>(0)));
+                item["item_offset"] = json!(location.get::<_, String>(1));
+                item["item_size"] = json!(location.get::<_, String>(2));
+                item["data_offset"] = json!(location.get::<_, String>(3));
+            }
+            return Ok(Some(
+                json!({"id": URL_SAFE_NO_PAD.encode(id), "source": "indexed",
+                "kind": "item", "items": [item], "has_more": false}),
+            ));
+        }
+        let (root, path): (i64, Option<String>) = if parent.get::<_, i16>(1) == 0 {
+            (key, None)
+        } else {
+            let Some(location) = self
+                .client
+                .query_opt(
+                    "SELECT root_key,path::text FROM public.item_locations
+                 WHERE object_key=$1 ORDER BY root_key,path LIMIT 1",
+                    &[&key],
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            (location.get(0), Some(location.get(1)))
+        };
+        let complete = self
+            .client
+            .query_opt(
+                "SELECT complete FROM public.bundle_progress WHERE root_key=$1",
+                &[&root],
+            )
+            .await?
+            .is_some_and(|r| r.get::<_, bool>(0));
+        let rows = self.client.query(
+            "SELECT o.key,o.id,l.item_offset::text,l.item_size::text,l.data_offset::text,
+                    o.data_size::text,o.signature_type,owner.public_key,o.target,o.anchor,o.signature,l.json
+             FROM public.item_locations l JOIN public.objects o ON o.key=l.object_key
+             LEFT JOIN public.owners owner ON owner.address=o.owner_address
+             WHERE l.root_key=$1 AND l.parent_path IS NOT DISTINCT FROM $2::text::numeric[]
+               AND o.metadata_complete
+             ORDER BY l.item_offset LIMIT $3 OFFSET $4",
+            &[&root,&path,&((crate::bundle_inspection::PAGE_SIZE + 1) as i64),&(start as i64)],
+        ).await?;
+        if rows.is_empty() && !complete {
+            return Ok(None);
+        }
+        let mut items = Vec::new();
+        for (index, row) in rows
+            .iter()
+            .take(crate::bundle_inspection::PAGE_SIZE)
+            .enumerate()
+        {
+            let object: i64 = row.get(0);
+            let tags = self
+                .client
+                .query(
+                    "SELECT n.value,v.value FROM public.object_tags t
+                 JOIN public.tag_names n ON n.key=t.name_key
+                 JOIN public.tag_values v ON v.key=t.value_key
+                 WHERE t.object_key=$1 ORDER BY t.ordinal",
+                    &[&object],
+                )
+                .await?;
+            let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+                tags.iter().map(|r| (r.get(0), r.get(1))).collect();
+            let nested = crate::BundleFormat::from_pairs(
+                pairs.iter().map(|(n, v)| (n.as_slice(), v.as_slice())),
+            )
+            .is_ok();
+            items.push(json!({
+                "index": start+index, "id": URL_SAFE_NO_PAD.encode(row.get::<_,Vec<u8>>(1)),
+                "item_offset": row.get::<_,String>(2), "item_size": row.get::<_,String>(3),
+                "data_offset": row.get::<_,String>(4), "data_size": row.get::<_,String>(5),
+                "signature_type": row.get::<_,i16>(6),
+                "owner": URL_SAFE_NO_PAD.encode(row.get::<_,Option<Vec<u8>>>(7).unwrap_or_default()),
+                "target": URL_SAFE_NO_PAD.encode(row.get::<_,Vec<u8>>(8)),
+                "anchor": URL_SAFE_NO_PAD.encode(row.get::<_,Vec<u8>>(9)),
+                "signature": URL_SAFE_NO_PAD.encode(row.get::<_,Vec<u8>>(10)),
+                "json": row.get::<_,bool>(11), "bundle": nested,
+                "source": "indexed", "tags": crate::bundle_inspection::tags_json(pairs.into_iter()),
+            }));
+        }
+        Ok(Some(json!({
+            "id": URL_SAFE_NO_PAD.encode(id), "source": "indexed", "complete": complete,
+            "format": if format == Some(crate::BundleFormat::Binary) { "binary" } else { "json" },
+            "start": start, "has_more": rows.len() > crate::bundle_inspection::PAGE_SIZE, "items": items,
+        })))
+    }
+
     pub(crate) async fn cached_content(&self, id: &[u8; 32]) -> Result<Option<(String, Vec<u8>)>> {
         self.client
             .query_opt(

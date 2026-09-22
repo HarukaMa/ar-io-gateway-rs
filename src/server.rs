@@ -505,6 +505,11 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .route("/ar-io/status", get(serve_indexing_page))
         .route("/ar-io/status.json", get(serve_indexing_status))
         .route("/ar-io/diagnostics", get(serve_diagnostic_page))
+        .route("/ar-io/bundles", get(serve_bundle_page))
+        .route(
+            "/ar-io/bundles/inspect",
+            post(serve_bundle_inspection).layer(DefaultBodyLimit::max(4096)),
+        )
         .route(
             "/ar-io/diagnostics/run",
             post(serve_diagnostic).layer(DefaultBodyLimit::max(64 * 1024)),
@@ -888,6 +893,75 @@ async fn serve_indexing_page() -> Response {
 
 async fn serve_diagnostic_page() -> Response {
     let mut response = axum::response::Html(include_str!("diagnostics.html")).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn serve_bundle_page() -> Response {
+    let mut response = axum::response::Html(include_str!("bundles.html")).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn serve_bundle_inspection(
+    State(state): State<Arc<AppState>>,
+    axum::Json(request): axum::Json<crate::bundle_inspection::InspectionRequest>,
+) -> Response {
+    if crate::decode_fixed::<32>(&request.id, "bundle ID").is_err() {
+        return error_response(StatusCode::BAD_REQUEST, "Enter a valid bundle ID");
+    }
+    let Ok((target, _)) = state.config.diagnostic_target(&request.id) else {
+        return error_response(StatusCode::BAD_REQUEST, "Enter a valid bundle ID");
+    };
+    if !state.config.diagnostic_allowed(&target) {
+        return error_response(StatusCode::FORBIDDEN, "Content is blocked");
+    }
+    let _diagnostic = match state.diagnostic_permits.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "An inspection or diagnostic is already running. Try again later.",
+            );
+        }
+    };
+    let _request = match request_permit(&state.request_permits) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let task_state = state.clone();
+    let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            crate::bundle_inspection::inspect(&task_state.gateway, &request),
+        )
+        .await
+    }));
+    let mut report = match task.await {
+        Ok(Ok(Ok(report))) => report,
+        Ok(Ok(Err(error))) => {
+            return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
+        }
+        Ok(Err(_)) => {
+            return error_response(StatusCode::GATEWAY_TIMEOUT, "Bundle inspection timed out");
+        }
+        Err(error) => return upstream_error_response("Bundle inspection failed", error.into()),
+    };
+    if let Some(items) = report["items"].as_array_mut() {
+        items.retain(|item| {
+            item["id"].as_str().is_some_and(|id| {
+                state
+                    .config
+                    .diagnostic_target(id)
+                    .is_ok_and(|(target, _)| state.config.diagnostic_allowed(&target))
+            })
+        });
+    }
+    let mut response = json_response(&report);
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));

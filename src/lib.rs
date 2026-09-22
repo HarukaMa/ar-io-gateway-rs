@@ -1,4 +1,5 @@
 pub mod background;
+mod bundle_inspection;
 pub mod content;
 pub mod database;
 pub mod diagnostics;
