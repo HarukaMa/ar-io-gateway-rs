@@ -64,7 +64,12 @@ pub(crate) async fn inspect(gateway: &Gateway, request: &InspectionRequest) -> R
         }
     }
     let client = reqwest::Client::builder()
-        .timeout(gateway.config.request_timeout)
+        .timeout(
+            gateway
+                .config
+                .request_timeout
+                .min(std::time::Duration::from_secs(10)),
+        )
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let mut urls = vec![crate::endpoint(
