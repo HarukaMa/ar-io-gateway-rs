@@ -67,6 +67,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "016_chunk_cache",
         include_str!("../migrations/016_chunk_cache.sql"),
     ),
+    (
+        "017_bundle_flag_candidates",
+        include_str!("../migrations/017_bundle_flag_candidates.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -2864,6 +2868,10 @@ mod tests {
             ];
             for (tags, expected_json) in cases {
                 store.client.execute("DELETE FROM public.object_tags WHERE object_key=$1", &[&key]).await?;
+                let recognized: bool = store.client.query_one(
+                    "SELECT is_bundle FROM public.objects WHERE key=$1", &[&key],
+                ).await?.get(0);
+                ensure!(!recognized, "bundle flag survived removal of all tags");
                 for (ordinal, (name, value)) in tags.iter().enumerate() {
                     let mut keys = [0_i64; 2];
                     for (index, (table, bytes)) in [("tag_names", name), ("tag_values", value)].into_iter().enumerate() {
@@ -2885,6 +2893,10 @@ mod tests {
                 let actual = store.bundle_status(&id).await?
                     .map(|(_, _, _, format)| matches!(format, crate::BundleFormat::Json));
                 ensure!(actual == *expected_json, "bundle format differed for tags {tags:?}");
+                let recognized: bool = store.client.query_one(
+                    "SELECT is_bundle FROM public.objects WHERE key=$1", &[&key],
+                ).await?.get(0);
+                ensure!(recognized == expected_json.is_some(), "bundle flag differed for tags {tags:?}");
             }
             Ok(())
         }.await;
