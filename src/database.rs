@@ -75,6 +75,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "018_content_blocklist",
         include_str!("../migrations/018_content_blocklist.sql"),
     ),
+    (
+        "019_object_id_prefix",
+        include_str!("../migrations/019_object_id_prefix.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -153,7 +157,7 @@ fn bundle_lookup_sql() -> String {
             JOIN public.object_tags t ON t.object_key=requested.key
             JOIN public.tag_names n ON n.key=t.name_key
             JOIN public.tag_values v ON v.key=t.value_key
-            WHERE requested.id=$1
+            WHERE public.object_id_prefix(requested.id)=public.object_id_prefix($1) AND requested.id=$1
         ), formats AS (
             {BUNDLE_FORMAT_FLAGS}
         ), bundle_candidates AS (
@@ -749,7 +753,8 @@ impl BlockStore {
         let rows = self
             .client
             .query(
-                "SELECT kind, metadata_complete FROM public.objects WHERE id=$1 ORDER BY kind",
+                "SELECT kind, metadata_complete FROM public.objects
+                 WHERE public.object_id_prefix(id)=public.object_id_prefix($1) AND id=$1 ORDER BY kind",
                 &[&id.as_slice()],
             )
             .await?;
@@ -792,7 +797,8 @@ impl BlockStore {
         let Some(parent) = self
             .client
             .query_opt(
-                "SELECT key, kind FROM public.objects WHERE id=$1 AND metadata_complete",
+                "SELECT key, kind FROM public.objects
+                 WHERE public.object_id_prefix(id)=public.object_id_prefix($1) AND id=$1 AND metadata_complete",
                 &[&id.as_slice()],
             )
             .await?
@@ -1436,6 +1442,7 @@ impl BlockStore {
             for ids in identities.chunks(ROW_BATCH_SIZE) {
                 Self::lock_bundle_roots(transaction, ids).await?;
             }
+            Self::lock_object_ids(transaction, &identities).await?;
         }
         if stored_timestamp.is_none() {
             // Consistent identity order also bounds uniqueness-lock acquisition across writers.
@@ -1443,8 +1450,12 @@ impl BlockStore {
                 transaction
                     .execute(
                         "INSERT INTO public.objects (id, kind)
-                         SELECT id, 0 FROM unnest($1::bytea[]) AS incoming(id) ORDER BY id
-                         ON CONFLICT (id) DO NOTHING",
+                         SELECT id, 0 FROM unnest($1::bytea[]) AS incoming(id)
+                         WHERE NOT EXISTS (
+                             SELECT 1 FROM public.objects o
+                             WHERE public.object_id_prefix(o.id)=public.object_id_prefix(incoming.id)
+                               AND o.id=incoming.id
+                         ) ORDER BY id",
                         &[&ids],
                     )
                     .await?;
@@ -1459,7 +1470,8 @@ impl BlockStore {
                         "INSERT INTO public.block_transactions (block_hash, position, object_key)
                          SELECT $1, ($3 + incoming.ordinality - 1)::integer, o.key
                          FROM unnest($2::bytea[]) WITH ORDINALITY AS incoming(id, ordinality)
-                         JOIN public.objects o ON o.id = incoming.id
+                         JOIN public.objects o ON public.object_id_prefix(o.id)=public.object_id_prefix(incoming.id)
+                           AND o.id=incoming.id
                          ON CONFLICT (block_hash, position) DO NOTHING",
                         &[&block.hash, &ids, &offset],
                     )
@@ -1858,7 +1870,9 @@ impl BlockStore {
     pub(crate) async fn bundle_data_root(&self, id: &[u8]) -> Result<Option<Vec<u8>>> {
         self.client
             .query_one(
-                "SELECT data_root FROM public.objects WHERE id=$1 AND kind=0 AND metadata_complete",
+                "SELECT data_root FROM public.objects
+                 WHERE public.object_id_prefix(id)=public.object_id_prefix($1) AND id=$1
+                   AND kind=0 AND metadata_complete",
                 &[&id],
             )
             .await?
@@ -2059,8 +2073,10 @@ impl BlockStore {
                 incoming.item_offset::public.uint128, incoming.item_size::public.uint128,
                 incoming.data_offset::public.uint128, incoming.json
              FROM {INPUT}
-             JOIN public.objects o ON o.id=incoming.id AND o.kind=1 AND o.metadata_complete
-             JOIN public.objects p ON p.id=incoming.parent_id AND p.metadata_complete
+             JOIN public.objects o ON public.object_id_prefix(o.id)=public.object_id_prefix(incoming.id)
+               AND o.id=incoming.id AND o.kind=1 AND o.metadata_complete
+             JOIN public.objects p ON public.object_id_prefix(p.id)=public.object_id_prefix(incoming.parent_id)
+               AND p.id=incoming.parent_id AND p.metadata_complete
              ORDER BY incoming.path::numeric[]
              ON CONFLICT (root_key, path) DO NOTHING RETURNING key"
                 ),
@@ -2233,6 +2249,26 @@ impl BlockStore {
         Ok(())
     }
 
+    async fn lock_object_ids(transaction: &Transaction<'_>, ids: &[&[u8]]) -> Result<()> {
+        // A separate statement gives waiting writers a fresh snapshot before checking full IDs.
+        transaction
+            .query(
+                "SELECT pg_advisory_xact_lock((prefix >> 32)::integer,prefix::bit(32)::integer)
+                 FROM (
+                     SELECT DISTINCT public.object_id_prefix(incoming.id) AS prefix
+                     FROM unnest($1::bytea[]) AS incoming(id)
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM public.objects o
+                         WHERE public.object_id_prefix(o.id)=public.object_id_prefix(incoming.id)
+                           AND o.id=incoming.id AND o.metadata_complete
+                     ) ORDER BY prefix
+                 ) pending",
+                &[&ids],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn bundle_location(&self, id: &[u8]) -> Result<Option<IndexedBundle>> {
         ensure!(id.len() == 32, "bundle item ID must be 32 bytes");
         let installed: bool = self
@@ -2258,7 +2294,8 @@ impl BlockStore {
                 JOIN public.blocks b ON b.hash=cb.block_hash AND b.timestamp IS NOT NULL
                 JOIN public.block_index_state s
                   ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
-                WHERE o.id=$1 AND o.kind=1 AND o.metadata_complete
+                WHERE public.object_id_prefix(o.id)=public.object_id_prefix($1)
+                  AND o.id=$1 AND o.kind=1 AND o.metadata_complete
                 ORDER BY cb.height, bt.position, l.path LIMIT 1
              )
              SELECT o.id, parent.id, array_to_json(l.path)::text, l.item_offset::text,
@@ -2354,7 +2391,8 @@ impl BlockStore {
                 "SELECT s.singleton FROM public.block_index_state s
                  WHERE s.singleton AND EXISTS (
                      SELECT 1 FROM unnest($1::bytea[]) AS incoming(id)
-                     LEFT JOIN public.objects o ON o.id=incoming.id
+                     LEFT JOIN public.objects o ON public.object_id_prefix(o.id)=public.object_id_prefix(incoming.id)
+                       AND o.id=incoming.id
                      LEFT JOIN public.canonical_placements p ON p.object_key=o.key
                      WHERE p.block_height IS NULL OR p.block_height>s.checkpoint_height
                  ) FOR KEY SHARE OF s",
@@ -2401,6 +2439,8 @@ impl BlockStore {
                 );
             }
         }
+        let ids: Vec<_> = objects.iter().map(|object| object.id.as_slice()).collect();
+        Self::lock_object_ids(transaction, &ids).await?;
         let addresses: Vec<_> = owners.keys().copied().collect();
         let public_keys: Vec<_> = owners.values().copied().collect();
         transaction
@@ -2428,7 +2468,6 @@ impl BlockStore {
             .await?;
         ensure!(conflict.is_none(), "conflicting immutable owner public key");
 
-        let ids: Vec<_> = objects.iter().map(|object| object.id.as_slice()).collect();
         let kinds: Vec<_> = objects.iter().map(|object| object.kind).collect();
         let signatures: Vec<_> = objects
             .iter()
@@ -2505,7 +2544,21 @@ impl BlockStore {
         let completed = transaction
             .query(
                 &format!(
-                    "INSERT INTO public.objects AS stored
+                    "WITH completed AS (
+                     UPDATE public.objects stored
+                     SET signature=incoming.signature, anchor=incoming.anchor,
+                         owner_address=incoming.owner_address, target=incoming.target,
+                         data_size=incoming.data_size::public.uint128, content_type=incoming.content_type,
+                         content_encoding=incoming.content_encoding, signature_type=incoming.signature_type,
+                         format=incoming.format, quantity=incoming.quantity::numeric, reward=incoming.reward::numeric,
+                         denomination=incoming.denomination, data_root=incoming.data_root,
+                         metadata_complete=true, indexed_at=extract(epoch FROM statement_timestamp())::bigint
+                     FROM {INPUT}
+                     WHERE public.object_id_prefix(stored.id)=public.object_id_prefix(incoming.id)
+                       AND stored.id=incoming.id AND NOT stored.metadata_complete AND stored.kind=incoming.kind
+                     RETURNING stored.key
+                     ), inserted AS (
+                     INSERT INTO public.objects
                         (id, kind, signature, anchor, owner_address, target, data_size,
                          content_type, content_encoding, signature_type, format, quantity,
                          reward, denomination, data_root, metadata_complete, indexed_at)
@@ -2516,19 +2569,12 @@ impl BlockStore {
                      FROM {INPUT}
                      WHERE NOT EXISTS (
                          SELECT 1 FROM public.objects existing
-                         WHERE existing.id=incoming.id AND existing.metadata_complete
+                         WHERE public.object_id_prefix(existing.id)=public.object_id_prefix(incoming.id)
+                           AND existing.id=incoming.id
                      )
                      ORDER BY id
-                     ON CONFLICT (id) DO UPDATE
-                     SET signature = EXCLUDED.signature, anchor = EXCLUDED.anchor,
-                         owner_address = EXCLUDED.owner_address, target = EXCLUDED.target,
-                         data_size = EXCLUDED.data_size, content_type = EXCLUDED.content_type,
-                         content_encoding = EXCLUDED.content_encoding, signature_type = EXCLUDED.signature_type,
-                         format = EXCLUDED.format, quantity = EXCLUDED.quantity, reward = EXCLUDED.reward,
-                         denomination = EXCLUDED.denomination, data_root = EXCLUDED.data_root,
-                         metadata_complete = true, indexed_at = EXCLUDED.indexed_at
-                     WHERE NOT stored.metadata_complete AND stored.kind = EXCLUDED.kind
-                     RETURNING key"
+                     RETURNING key
+                     ) SELECT key FROM completed UNION ALL SELECT key FROM inserted"
                 ),
                 parameters,
             )
@@ -2541,7 +2587,8 @@ impl BlockStore {
             .query(
                 &format!(
                     "SELECT stored.key FROM {INPUT}
-                     JOIN public.objects stored ON stored.id = incoming.id
+                     JOIN public.objects stored ON public.object_id_prefix(stored.id)=public.object_id_prefix(incoming.id)
+                       AND stored.id=incoming.id
                      WHERE stored.metadata_complete AND
                          ROW(stored.kind, stored.signature, stored.anchor, stored.owner_address,
                              stored.target, stored.data_size, stored.content_type, stored.content_encoding,
@@ -2975,6 +3022,171 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; run serially"]
+    async fn object_prefix_collisions_preserve_identity_and_concurrent_completion() -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let first_id: [u8; 32] = Sha256::digest(b"object-prefix-regression").into();
+        let mut second_id = first_id;
+        second_id[31] ^= 1;
+        let ids = vec![first_id.to_vec(), second_id.to_vec()];
+        ensure!(
+            !store
+                .client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM public.objects
+                 WHERE public.object_id_prefix(id)=public.object_id_prefix($1) AND id=ANY($2))",
+                    &[&first_id.as_slice(), &ids],
+                )
+                .await?
+                .get::<_, bool>(0),
+            "prefix regression fixture already exists"
+        );
+        let parent_id =
+            crate::decode_fixed::<32>("z8dH98cY5MvVjBWm7DC6-NjuJOFMZxZeQjh_7hUuK54", "parent ID")?;
+        let item = crate::verify_data_item(
+            include_bytes!("../tests/fixtures/ao-unsigned-parent.bin")
+                .to_vec()
+                .into(),
+            &parent_id,
+        )
+        .await?;
+        let mut first = item.metadata(&first_id);
+        first.tags.clear();
+        let mut second = first.clone();
+        second.id = second_id.to_vec();
+        let owner_before = store
+            .client
+            .query_opt(
+                "SELECT public_key FROM public.owners WHERE address=$1",
+                &[&first.owner_address],
+            )
+            .await?;
+        let mut writer = store.reconnect().await?;
+        let transaction = writer.client.transaction().await?;
+        let stub_key: i64 = transaction
+            .query_one(
+                "INSERT INTO public.objects(id,kind) VALUES($1,$2) RETURNING key",
+                &[&first.id, &first.kind],
+            )
+            .await?
+            .get(0);
+        let keys = BlockStore::write_objects(&transaction, std::slice::from_ref(&first)).await?;
+        ensure!(
+            keys == vec![stub_key],
+            "completion replaced the stub identity"
+        );
+        let mut concurrent = store.reconnect().await?;
+        let objects = vec![first.clone(), second.clone()];
+        let pending = concurrent.record_objects(&objects);
+        tokio::pin!(pending);
+        ensure!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending)
+                .await
+                .is_err(),
+            "concurrent writer bypassed the uncommitted prefix"
+        );
+        transaction.commit().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), pending).await??;
+        let rows = store.client.query(
+            "SELECT id,key,metadata_complete FROM public.objects
+             WHERE public.object_id_prefix(id)=public.object_id_prefix($1) AND id=ANY($2) ORDER BY id",
+            &[&first_id.as_slice(), &ids],
+        ).await?;
+        ensure!(
+            rows.len() == 2,
+            "colliding prefixes lost or duplicated an identity"
+        );
+        for row in &rows {
+            ensure!(
+                row.get::<_, bool>(2),
+                "concurrent metadata completion was lost"
+            );
+            if row.get::<_, Vec<u8>>(0) == first.id {
+                ensure!(
+                    row.get::<_, i64>(1) == stub_key,
+                    "concurrent replay replaced the key"
+                );
+            }
+        }
+        let mut conflict = first.clone();
+        conflict.data_size += 1;
+        ensure!(
+            store.record_objects(&[conflict]).await.is_err(),
+            "immutable conflict accepted"
+        );
+        store.record_objects(&objects).await?;
+        let transaction = store.client.transaction().await?;
+        transaction.batch_execute("SAVEPOINT duplicate").await?;
+        let error = transaction
+            .execute(
+                "INSERT INTO public.objects(id,kind) VALUES($1,$2)",
+                &[&first.id, &first.kind],
+            )
+            .await
+            .expect_err("duplicate ID accepted");
+        ensure!(
+            error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
+            "duplicate ID did not report a uniqueness violation"
+        );
+        transaction
+            .batch_execute("ROLLBACK TO SAVEPOINT duplicate")
+            .await?;
+        transaction
+            .batch_execute("SAVEPOINT duplicate_update")
+            .await?;
+        let error = transaction
+            .execute(
+                "UPDATE public.objects SET id=$1 WHERE key=$2",
+                &[&second.id, &stub_key],
+            )
+            .await
+            .expect_err("duplicate ID update accepted");
+        ensure!(
+            error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
+            "duplicate ID update did not report a uniqueness violation"
+        );
+        transaction
+            .batch_execute("ROLLBACK TO SAVEPOINT duplicate_update")
+            .await?;
+        transaction.rollback().await?;
+        let transaction = store.client.transaction().await?;
+        let keys: Vec<i64> = rows.iter().map(|row| row.get(1)).collect();
+        transaction
+            .execute("DELETE FROM public.objects WHERE key=ANY($1)", &[&keys])
+            .await?;
+        if let Some(owner) = owner_before {
+            let public_key: Option<Vec<u8>> = owner.get(0);
+            transaction
+                .execute(
+                    "UPDATE public.owners SET public_key=$2 WHERE address=$1",
+                    &[&first.owner_address, &public_key],
+                )
+                .await?;
+        } else {
+            transaction
+                .execute(
+                    "DELETE FROM public.owners WHERE address=$1
+                 AND NOT EXISTS(SELECT 1 FROM public.objects WHERE owner_address=$1)",
+                    &[&first.owner_address],
+                )
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires ar_io_rust_test; fixture writes are rolled back"]
