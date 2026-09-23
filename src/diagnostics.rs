@@ -537,9 +537,9 @@ async fn run(
             let (target, path) = check("input_resolution", input, async {
                 resolver.diagnostic_target(input)
             }).await?;
-            anyhow::ensure!(resolver.diagnostic_allowed(&target), "Content is blocked");
             report["request_path"] = json!(path);
             let gateway = setup.await?;
+            gateway.ensure_allowed(&target, None).await?;
             let mut id = if decode_fixed::<32>(&target, "data ID").is_ok() {
                 target.clone()
             } else {
@@ -553,12 +553,12 @@ async fn run(
                 id
             };
             report["resolved_id"] = json!(id);
-            anyhow::ensure!(resolver.diagnostic_allowed(&id), "Content is blocked");
+            gateway.ensure_allowed(&id, None).await?;
             report["root_id"] = json!(id);
             let mut retrieved = None;
             if let Some(path) = path {
                 let root = check("verified_retrieval", &id, gateway.retrieve(&id)).await?;
-                anyhow::ensure!(resolver.diagnostic_content_allowed(&root), "Content is blocked");
+                gateway.ensure_allowed(&root.id, Some(root.etag.trim_matches('"'))).await?;
                 if server::is_manifest_content_type(&root.content_type) {
                     report["manifest"] = json!({"id": id, "path": path, "target_id": null});
                     let resolved = check("manifest_resolution", &id, async {
@@ -569,7 +569,7 @@ async fn run(
                     report["manifest"]["fallback"] = json!(resolved.fallback);
                     id = resolved.id;
                     report["resolved_id"] = json!(id);
-                    anyhow::ensure!(resolver.diagnostic_allowed(&id), "Content is blocked");
+                    gateway.ensure_allowed(&id, None).await?;
                 } else {
                     retrieved = Some(root);
                 }
@@ -604,11 +604,12 @@ async fn run(
                     Some(data) => Ok(data),
                     None => check("verified_retrieval", &id, gateway.retrieve(&id)).await,
                 };
-                content.and_then(|data| {
-                    anyhow::ensure!(resolver.diagnostic_content_allowed(&data), "Content is blocked");
+                async {
+                    let data = content?;
+                    gateway.ensure_allowed(&data.id, Some(data.etag.trim_matches('"'))).await?;
                     report["content"] = json!(data);
                     Ok(())
-                })
+                }.await
             }
             Err(error) => Err(error),
         };
@@ -652,6 +653,7 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; inserts and removes blocking fixtures"]
     async fn site_diagnostics_resolve_manifest_paths_and_enforce_target_blocks() {
         let manifest_id = URL_SAFE_NO_PAD.encode([7; 32]);
         let asset_id = URL_SAFE_NO_PAD.encode([8; 32]);
@@ -767,11 +769,33 @@ mod tests {
                     && step["status"] != "passed")
         );
 
-        let resolver = resolver
-            .with_blocklist(&serde_json::to_vec(&json!({"ids": [asset_id]})).unwrap())
+        let database_url = std::env::var("DATABASE_URL").unwrap();
+        let (policy, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+            .await
             .unwrap();
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let database: String = policy
+            .query_one("SELECT current_database()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(database, "ar_io_rust_test");
+        let mut store = crate::database::BlockStore::connect(&database_url)
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
+        let store = std::sync::Arc::new(store);
+        policy
+            .execute(
+                "INSERT INTO public.content_blocklist(kind,value) VALUES('id',$1)",
+                &[&asset_id],
+            )
+            .await
+            .unwrap();
+        let mut gateway = make_gateway(true);
+        gateway.block_store = Some(store.clone());
         let report = run(
-            async { Ok(make_gateway(true)) },
+            async { Ok(gateway) },
             &resolver,
             &url,
             None,
@@ -783,7 +807,15 @@ mod tests {
         assert_eq!(report["error"], "Content is blocked");
         assert!(report["content"].is_null());
 
-        let gateway = make_gateway(true);
+        policy
+            .execute(
+                "DELETE FROM public.content_blocklist WHERE kind='id' AND value=$1",
+                &[&asset_id],
+            )
+            .await
+            .unwrap();
+        let mut gateway = make_gateway(true);
+        gateway.block_store = Some(store);
         let hash = gateway
             .cache
             .lock()
@@ -793,8 +825,12 @@ mod tests {
             .etag
             .trim_matches('"')
             .to_owned();
-        let resolver = resolver
-            .with_blocklist(&serde_json::to_vec(&json!({"hashes": [hash]})).unwrap())
+        policy
+            .execute(
+                "INSERT INTO public.content_blocklist(kind,value) VALUES('hash',$1)",
+                &[&hash],
+            )
+            .await
             .unwrap();
         let report = run(
             async { Ok(gateway) },
@@ -808,6 +844,13 @@ mod tests {
         assert_eq!(report["error"], "Content is blocked");
         assert!(report["manifest"].is_null());
         assert!(report["content"].is_null());
+        policy
+            .execute(
+                "DELETE FROM public.content_blocklist WHERE kind='hash' AND value=$1",
+                &[&hash],
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

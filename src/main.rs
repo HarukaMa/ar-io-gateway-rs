@@ -1,4 +1,4 @@
-use std::{env, fs, io::Read};
+use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 use ar_io_gateway::{
@@ -16,6 +16,12 @@ async fn main() -> Result<()> {
     };
     if command == "cache-cleanup" && args.len() != 0 {
         bail!("{USAGE}");
+    }
+    if command == "serve" && env::var_os("AR_IO_BLOCKLIST_PATH").is_some() {
+        bail!(
+            "AR_IO_BLOCKLIST_PATH is no longer supported. Move its entries to \
+             public.content_blocklist and remove the variable before starting."
+        );
     }
 
     let mut config = Config::from_env()?;
@@ -120,18 +126,6 @@ async fn main() -> Result<()> {
                 .parse()
                 .context("invalid CACHE_APEX_MAX_AGE")?,
         )?;
-        if let Some(path) = env::var("AR_IO_BLOCKLIST_PATH")
-            .ok()
-            .filter(|value| !value.is_empty())
-        {
-            let mut bytes = Vec::new();
-            fs::File::open(path)
-                .context("cannot open AR_IO_BLOCKLIST_PATH")?
-                .take(1024 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .context("cannot read AR_IO_BLOCKLIST_PATH")?;
-            config = config.with_blocklist(&bytes)?;
-        }
         let wallet = env::var("AR_IO_WALLET")
             .ok()
             .filter(|value| !value.is_empty());

@@ -68,26 +68,11 @@ struct RootHost {
     apex_name: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct Blocklist {
-    ids: HashSet<String>,
-    hashes: HashSet<String>,
-    names: HashSet<String>,
-}
-
-impl Blocklist {
-    fn blocks(&self, data: &VerifiedData) -> bool {
-        self.ids.contains(&data.id) || self.hashes.contains(data.etag.trim_matches('"'))
-    }
-}
-
 pub struct ServerConfig {
     listen_addr: SocketAddr,
     arns_root_hosts: Vec<RootHost>,
     apex_tx_id: Option<String>,
     apex_max_age: u64,
-    blocklist: Blocklist,
     solana_rpc_url: Url,
     core_program_id: String,
     gar_program_id: String,
@@ -101,11 +86,6 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    pub(crate) fn diagnostic_allowed(&self, input: &str) -> bool {
-        !self.blocklist.ids.contains(input)
-            && !self.blocklist.names.contains(&input.to_ascii_lowercase())
-    }
-
     pub(crate) fn diagnostic_target(&self, input: &str) -> Result<(String, Option<String>)> {
         ensure!(input.len() <= 8192, "diagnostic input exceeds size limit");
         if !input.contains("://") {
@@ -171,10 +151,6 @@ impl ServerConfig {
         Ok((name, Some(path.to_owned())))
     }
 
-    pub(crate) fn diagnostic_content_allowed(&self, data: &VerifiedData) -> bool {
-        !self.blocklist.blocks(data)
-    }
-
     pub fn new(
         listen_addr: &str,
         arns_root_host: &str,
@@ -214,7 +190,6 @@ impl ServerConfig {
             arns_root_hosts,
             apex_tx_id: None,
             apex_max_age: 3600,
-            blocklist: Blocklist::default(),
             solana_rpc_url,
             core_program_id: "73YoECm6NKXpVRoe5f1Q9BcP5DJGPFUjnFy6AxBE5Nvh".to_owned(),
             gar_program_id: "89fNiiwgpFSPHKuqfNUkgYTYjtAJAhyqHjXmgXeppGpf".to_owned(),
@@ -267,29 +242,6 @@ impl ServerConfig {
             }
         }
         self.apex_max_age = apex_max_age;
-        Ok(self)
-    }
-
-    pub fn with_blocklist(mut self, bytes: &[u8]) -> Result<Self> {
-        ensure!(bytes.len() <= 1024 * 1024, "blocking policy exceeds 1 MiB");
-        let mut policy: Blocklist =
-            serde_json::from_slice(bytes).context("invalid blocking policy JSON")?;
-        for id in &policy.ids {
-            decode_fixed::<32>(id, "blocked ID")?;
-        }
-        for hash in &policy.hashes {
-            decode_fixed::<32>(hash, "blocked SHA-256")?;
-        }
-        policy.names = policy
-            .names
-            .into_iter()
-            .map(|name| {
-                let name = name.to_ascii_lowercase();
-                split_arns_name(&name)?;
-                Ok(name)
-            })
-            .collect::<Result<_>>()?;
-        self.blocklist = policy;
         Ok(self)
     }
 
@@ -917,8 +869,8 @@ async fn serve_bundle_inspection(
     let Ok((target, _)) = state.config.diagnostic_target(&request.id) else {
         return error_response(StatusCode::BAD_REQUEST, "Enter a valid bundle ID");
     };
-    if !state.config.diagnostic_allowed(&target) {
-        return error_response(StatusCode::FORBIDDEN, "Content is blocked");
+    if let Some(response) = blocked_response(&state.gateway, &target, None).await {
+        return response;
     }
     let _diagnostic = match state.diagnostic_permits.try_acquire() {
         Ok(permit) => permit,
@@ -952,14 +904,20 @@ async fn serve_bundle_inspection(
         Err(error) => return upstream_error_response("Bundle inspection failed", error.into()),
     };
     if let Some(items) = report["items"].as_array_mut() {
-        items.retain(|item| {
-            item["id"].as_str().is_some_and(|id| {
-                state
-                    .config
-                    .diagnostic_target(id)
-                    .is_ok_and(|(target, _)| state.config.diagnostic_allowed(&target))
-            })
-        });
+        let mut visible = Vec::with_capacity(items.len());
+        for item in items.drain(..) {
+            let Some(id) = item["id"].as_str() else {
+                continue;
+            };
+            match state.gateway.blocking_reason(id, None).await {
+                Ok(None) => visible.push(item),
+                Ok(Some(_)) => {}
+                Err(error) => {
+                    return upstream_error_response("Blocking policy lookup failed", error);
+                }
+            }
+        }
+        *items = visible;
     }
     let mut response = json_response(&report);
     response
@@ -983,8 +941,8 @@ async fn serve_diagnostic(
         Ok((target, _)) => target,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    if !state.config.diagnostic_allowed(&target) {
-        return error_response(StatusCode::FORBIDDEN, "Content is blocked");
+    if let Some(response) = blocked_response(&state.gateway, &target, None).await {
+        return response;
     }
     let _diagnostic = match state.diagnostic_permits.try_acquire() {
         Ok(permit) => permit,
@@ -1009,14 +967,15 @@ async fn serve_diagnostic(
         Ok(report) => report,
         Err(error) => return upstream_error_response("Diagnostic failed", error.into()),
     };
-    if report["content"]["etag"].as_str().is_some_and(|etag| {
-        state
-            .config
-            .blocklist
-            .hashes
-            .contains(etag.trim_matches('"'))
-    }) {
-        return error_response(StatusCode::FORBIDDEN, "Content is blocked");
+    if let (Some(id), Some(etag)) = (
+        report["content"]["id"].as_str(),
+        report["content"]["etag"].as_str(),
+    ) {
+        if let Some(response) =
+            blocked_response(&state.gateway, id, Some(etag.trim_matches('"'))).await
+        {
+            return response;
+        }
     }
     let mut response = json_response(&report);
     response
@@ -1334,23 +1293,34 @@ async fn serve_raw(
     if decode_fixed::<32>(&id, "data ID").is_err() {
         return invalid_id_response(&id);
     }
-    if state.config.blocklist.ids.contains(&id) {
-        return blocked_response(&id);
+    if let Some(response) = blocked_response(&state.gateway, &id, None).await {
+        return response;
     }
     match state.gateway.retrieve(&id).await {
-        Ok(verified) => verified_response(
-            verified,
-            None,
-            &state.config,
-            &headers,
-            &state.gateway.config,
-            permit,
-        )
-        .await
-        .unwrap_or_else(|error| {
-            eprintln!("response construction failed: {error:#}");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-        }),
+        Ok(verified) => {
+            if let Some(response) = blocked_response(
+                &state.gateway,
+                &verified.id,
+                Some(verified.etag.trim_matches('"')),
+            )
+            .await
+            {
+                return response;
+            }
+            verified_response(
+                verified,
+                None,
+                &state.config,
+                &headers,
+                &state.gateway.config,
+                permit,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("response construction failed: {error:#}");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            })
+        }
         Err(error) => retrieval_error_response(error),
     }
 }
@@ -1451,8 +1421,8 @@ async fn serve_arns_path(
     let Some(name) = arns_name(headers, &state.config) else {
         return error_response(StatusCode::NOT_FOUND, "Not found");
     };
-    if state.config.blocklist.names.contains(&name) {
-        return blocked_response(&name);
+    if let Some(response) = blocked_response(&state.gateway, &name, None).await {
+        return response;
     }
     let resolution = match resolve_arns(&state.gateway, &state.config, name).await {
         Ok(Some(resolution)) => resolution,
@@ -1485,15 +1455,17 @@ async fn retrieve_response(
     headers: &HeaderMap,
     permit: RequestPermit,
 ) -> Response {
-    if state.config.blocklist.ids.contains(id) {
-        return blocked_response(id);
+    if let Some(response) = blocked_response(&state.gateway, id, None).await {
+        return response;
     }
     let verified = match state.gateway.retrieve(id).await {
         Ok(verified) => verified,
         Err(error) => return retrieval_error_response(error),
     };
-    if state.config.blocklist.blocks(&verified) {
-        return blocked_response(id);
+    if let Some(response) =
+        blocked_response(&state.gateway, id, Some(verified.etag.trim_matches('"'))).await
+    {
+        return response;
     }
     if !is_manifest_content_type(&verified.content_type) {
         return verified_response(
@@ -1528,13 +1500,22 @@ async fn retrieve_response(
     drop(verified);
 
     let fallback = target.fallback;
-    if state.config.blocklist.ids.contains(&target.id) {
-        return blocked_response(&target.id);
+    if let Some(response) = blocked_response(&state.gateway, &target.id, None).await {
+        return response;
     }
     let verified_target = match state.gateway.retrieve(&target.id).await {
         Ok(verified) => verified,
         Err(error) => return retrieval_error_response(error),
     };
+    if let Some(response) = blocked_response(
+        &state.gateway,
+        &target.id,
+        Some(verified_target.etag.trim_matches('"')),
+    )
+    .await
+    {
+        return response;
+    }
     let mut response = verified_response(
         verified_target,
         resolution,
@@ -2411,9 +2392,6 @@ async fn verified_response(
     limits: &Config,
     permit: RequestPermit,
 ) -> Result<Response> {
-    if config.blocklist.blocks(&verified) {
-        return Ok(blocked_response(&verified.id));
-    }
     ensure!(
         verified.bytes.len() == verified.content_length,
         "verified content length mismatch"
@@ -2716,16 +2694,32 @@ fn html_error_response(status: StatusCode, message: &str) -> Response {
         .unwrap()
 }
 
-fn blocked_response(id: &str) -> Response {
-    let message =
+async fn blocked_response(gateway: &Gateway, id: &str, hash: Option<&str>) -> Option<Response> {
+    match gateway.blocking_reason(id, hash).await {
+        Ok(None) => None,
+        Ok(Some(reason)) => Some(blocked_page(id, &reason)),
+        Err(error) => {
+            eprintln!("blocking policy lookup failed: {error:#}");
+            Some(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Content policy unavailable",
+            ))
+        }
+    }
+}
+
+fn blocked_page(id: &str, reason: &str) -> Response {
+    let mut message =
         format!("Requested content blocked by this node's content policy. Blocked ID: {id}");
-    Response::builder()
-        .status(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS)
-        .header("cache-control", "public, max-age=2592000, immutable")
-        .header("content-type", "text/html; charset=utf-8")
-        .header("content-length", message.len().to_string())
-        .body(Body::from(message))
-        .unwrap()
+    if !reason.is_empty() {
+        message.push_str("\nReason: ");
+        message.push_str(reason);
+    }
+    let mut response = html_error_response(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, &message);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 fn empty_error_response(status: StatusCode) -> Response {
@@ -3647,7 +3641,23 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; inserts and removes blocking fixtures"]
     async fn apex_manifest_and_blocking_policy_cover_cached_targets() {
+        let database_url = std::env::var("DATABASE_URL").unwrap();
+        let (policy, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let database: String = policy
+            .query_one("SELECT current_database()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(database, "ar_io_rust_test");
+        let mut store = crate::database::BlockStore::connect(&database_url)
+            .await
+            .unwrap();
+        store.migrate().await.unwrap();
         let id = |byte: u8| URL_SAFE_NO_PAD.encode([byte; 32]);
         let manifest_id = id(1);
         let good_id = id(2);
@@ -3660,7 +3670,8 @@ mod tests {
             "fallback": {"id": hashed_id}
         }))
         .unwrap();
-        let gateway = Gateway::new(stream_limits()).unwrap();
+        let mut gateway = Gateway::new(stream_limits()).unwrap();
+        gateway.block_store = Some(Arc::new(store));
         for (id, bytes, content_type) in [
             (&manifest_id, manifest.as_slice(), MANIFEST_CONTENT_TYPE),
             (&good_id, b"hello".as_slice(), "text/plain"),
@@ -3685,15 +3696,6 @@ mod tests {
         )
         .unwrap()
         .with_routing(Some(&manifest_id), None, 3600)
-        .unwrap()
-        .with_blocklist(
-            &serde_json::to_vec(&serde_json::json!({
-                "ids": [blocked_id],
-                "hashes": [URL_SAFE_NO_PAD.encode(Sha256::digest(b"blocked fallback"))],
-                "names": ["blocked-name"]
-            }))
-            .unwrap(),
-        )
         .unwrap();
         let state = Arc::new(AppState {
             gateway,
@@ -3755,6 +3757,15 @@ mod tests {
             "public, max-age=3600, must-revalidate"
         );
         assert_eq!(malformed.text().await.unwrap(), "Malformed 'range' header");
+        let blocked_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(b"blocked fallback"));
+        policy
+            .execute(
+                "INSERT INTO public.content_blocklist(kind,value) VALUES
+             ('id',$1),('hash',$2),('name','blocked-name')",
+                &[&blocked_id, &blocked_hash],
+            )
+            .await
+            .unwrap();
         for (host, path) in [
             ("deep.example.com", "/blocked".to_owned()),
             ("deep.example.com", "/missing".to_owned()),
@@ -3781,10 +3792,7 @@ mod tests {
                 StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
                 "{path}"
             );
-            assert_eq!(
-                response.headers()[CACHE_CONTROL],
-                "public, max-age=2592000, immutable"
-            );
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
             assert!(response.text().await.unwrap().contains("Blocked ID: "));
         }
         let response = client
@@ -3801,6 +3809,58 @@ mod tests {
                 sandbox_name(&[2; 32])
             )
         );
+        let raw_url = format!("{base}/raw/{good_id}");
+        let reason = "Reported phishing <script>alert('x')</script> & fraud";
+        policy
+            .execute(
+                "INSERT INTO public.content_blocklist(kind,value,reason) VALUES('id',$1,$2)",
+                &[&good_id, &reason],
+            )
+            .await
+            .unwrap();
+        let response = client.get(&raw_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        let body = response.text().await.unwrap();
+        assert!(body.contains(&escape_html(reason)));
+        assert!(!body.contains("<script>"));
+        policy
+            .execute(
+                "UPDATE public.content_blocklist SET reason=NULL WHERE kind='id' AND value=$1",
+                &[&good_id],
+            )
+            .await
+            .unwrap();
+        let response = client.get(&raw_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert!(!response.text().await.unwrap().contains("Reason:"));
+        policy
+            .execute(
+                "DELETE FROM public.content_blocklist WHERE kind='id' AND value=$1",
+                &[&good_id],
+            )
+            .await
+            .unwrap();
+        let response = client.get(&raw_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "hello");
+
+        policy
+            .batch_execute("BEGIN; LOCK TABLE public.content_blocklist IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let response = client.get(&raw_url).send().await.unwrap();
+        policy.batch_execute("ROLLBACK").await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        policy
+            .execute(
+                "DELETE FROM public.content_blocklist WHERE (kind='id' AND value=$1)
+             OR (kind='hash' AND value=$2) OR (kind='name' AND value='blocked-name')",
+                &[&blocked_id, &blocked_hash],
+            )
+            .await
+            .unwrap();
         server.abort();
     }
 
@@ -3869,7 +3929,6 @@ mod tests {
             headers.insert(HOST, host.parse().unwrap());
             assert_eq!(arns_name(&headers, &config).as_deref(), expected);
         }
-        assert!(config.with_blocklist(br#"{"ids":["invalid"]}"#).is_err());
     }
 
     #[tokio::test]

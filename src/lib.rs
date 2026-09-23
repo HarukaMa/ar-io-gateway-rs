@@ -634,6 +634,32 @@ impl Gateway {
         self.block_store = Some(Arc::new(store));
         Ok(self)
     }
+    pub(crate) async fn blocking_reason(
+        &self,
+        target: &str,
+        hash: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(store) = &self.block_store else {
+            return Ok(None);
+        };
+        let name;
+        let (kind, value) = if decode_fixed::<32>(target, "data ID").is_ok() {
+            ("id", target)
+        } else {
+            name = target.to_ascii_lowercase();
+            ("name", name.as_str())
+        };
+        store.blocking_reason(kind, value, hash).await
+    }
+
+    pub(crate) async fn ensure_allowed(&self, target: &str, hash: Option<&str>) -> Result<()> {
+        ensure!(
+            self.blocking_reason(target, hash).await?.is_none(),
+            "Content is blocked"
+        );
+        Ok(())
+    }
+
     pub async fn with_disk_cache(mut self, path: PathBuf, min_free_bytes: u64) -> Result<Self> {
         let store = self
             .block_store

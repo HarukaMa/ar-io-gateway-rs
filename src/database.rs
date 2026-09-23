@@ -71,6 +71,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "017_bundle_flag_candidates",
         include_str!("../migrations/017_bundle_flag_candidates.sql"),
     ),
+    (
+        "018_content_blocklist",
+        include_str!("../migrations/018_content_blocklist.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -314,6 +318,28 @@ impl Drop for BlockStore {
 }
 
 impl BlockStore {
+    pub(crate) async fn blocking_reason(
+        &self,
+        kind: &str,
+        value: &str,
+        hash: Option<&str>,
+    ) -> Result<Option<String>> {
+        let row = timeout(
+            Duration::from_secs(3),
+            self.client.query_opt(
+                "SELECT coalesce(reason, '') FROM public.content_blocklist
+                 WHERE (kind=$1 AND value=$2) OR (kind='hash' AND value=$3)
+                 ORDER BY kind='hash' LIMIT 1",
+                &[&kind, &value, &hash],
+            ),
+        )
+        .await
+        .context("blocking policy lookup timed out")??;
+        row.map(|row| row.try_get(0))
+            .transpose()
+            .map_err(Into::into)
+    }
+
     pub(crate) async fn register_cache_blob(&self, hash: &[u8; 32], size: usize) -> Result<()> {
         let stored = self
             .client
