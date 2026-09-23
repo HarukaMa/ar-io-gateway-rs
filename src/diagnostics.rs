@@ -556,7 +556,7 @@ async fn run(
     deadline: std::time::Duration,
     public_errors: bool,
 ) -> Value {
-    let profile = crate::profiling::Profile::diagnostic(input.to_owned());
+    let profile = crate::profiling::Profile::diagnostic();
     profile.phase(1);
     let mut report = crate::profiling::scope(Some(profile.clone()), TRACE.scope(RefCell::new(Trace {
         public_errors,
