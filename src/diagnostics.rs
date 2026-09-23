@@ -1,4 +1,4 @@
-use std::{cell::RefCell, future::Future, path::Path};
+use std::{cell::RefCell, future::Future, path::Path, time::Instant};
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -19,6 +19,8 @@ struct Trace {
     truncated: bool,
     #[serde(skip)]
     public_errors: bool,
+    #[serde(skip)]
+    started: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -295,6 +297,9 @@ struct Step {
     stage: &'static str,
     id: String,
     status: &'static str,
+    started_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -318,6 +323,20 @@ impl Trace {
         let index = self.steps.len();
         self.steps.push(step);
         Some(index)
+    }
+}
+
+struct StepTimer {
+    index: usize,
+    started: Instant,
+}
+
+impl Drop for StepTimer {
+    fn drop(&mut self) {
+        let _ = TRACE.try_with(|trace| {
+            trace.borrow_mut().steps[self.index].elapsed_us =
+                Some(self.started.elapsed().as_micros() as u64);
+        });
     }
 }
 
@@ -350,28 +369,37 @@ pub(crate) fn check<T, F>(
 where
     F: Future<Output = Result<T>>,
 {
-    let index = TRACE
+    let timer = TRACE
         .try_with(|trace| {
-            trace.borrow_mut().push(Step {
-                stage,
-                id: id.to_owned(),
-                status: "incomplete",
-                error: None,
-                details: Vec::new(),
-                message: None,
-                parent_id: None,
-                source: None,
-                attempt_parent_id: ATTEMPT_PARENT.try_with(Clone::clone).ok(),
-            })
+            let started = Instant::now();
+            let mut trace = trace.borrow_mut();
+            let started_us = started
+                .duration_since(*trace.started.get_or_insert(started))
+                .as_micros() as u64;
+            trace
+                .push(Step {
+                    stage,
+                    id: id.to_owned(),
+                    status: "incomplete",
+                    started_us,
+                    elapsed_us: None,
+                    error: None,
+                    details: Vec::new(),
+                    message: None,
+                    parent_id: None,
+                    source: None,
+                    attempt_parent_id: ATTEMPT_PARENT.try_with(Clone::clone).ok(),
+                })
+                .map(|index| StepTimer { index, started })
         })
         .ok()
         .flatten();
     operation.inspect(move |result| {
-        if let Some(index) = index {
+        if let Some(timer) = timer {
             let _ = TRACE.try_with(|trace| {
                 let mut trace = trace.borrow_mut();
                 let public_errors = trace.public_errors;
-                let step = &mut trace.steps[index];
+                let step = &mut trace.steps[timer.index];
                 let error = result.as_ref().err();
                 step.status = if error.is_none() { "passed" } else { "failed" };
                 step.error = error.map(|error| error_text(error, public_errors));
@@ -386,6 +414,7 @@ where
                     step.message = Some("No L1 transaction was found for this ID.");
                 }
             });
+            drop(timer);
         }
     })
 }
@@ -405,10 +434,17 @@ where
 
 pub(crate) fn location(id: &str, parent: &str, source: &str) {
     let _ = TRACE.try_with(|trace| {
-        trace.borrow_mut().push(Step {
+        let started = Instant::now();
+        let mut trace = trace.borrow_mut();
+        let started_us = started
+            .duration_since(*trace.started.get_or_insert(started))
+            .as_micros() as u64;
+        trace.push(Step {
             stage: "bundle_location",
             id: id.to_owned(),
             status: "discovered",
+            started_us,
+            elapsed_us: Some(0),
             error: None,
             details: Vec::new(),
             message: None,
@@ -520,7 +556,13 @@ async fn run(
     deadline: std::time::Duration,
     public_errors: bool,
 ) -> Value {
-    TRACE.scope(RefCell::new(Trace { public_errors, ..Trace::default() }), async {
+    let profile = crate::profiling::Profile::diagnostic(input.to_owned());
+    profile.phase(1);
+    let mut report = crate::profiling::scope(Some(profile.clone()), TRACE.scope(RefCell::new(Trace {
+        public_errors,
+        started: Some(Instant::now()),
+        ..Trace::default()
+    }), async {
         let mut report = json!({
             "input": input,
             "resolved_id": null,
@@ -621,7 +663,22 @@ async fn run(
             report["trace_truncated"] = json!(trace.truncated);
         });
         report
-    }).await
+    })).await;
+    profile.finish(if report["status"] == "passed" {
+        "passed"
+    } else {
+        "failed"
+    });
+    let mut snapshot = profile.snapshot("finished");
+    let mut stages = snapshot["stages"].take();
+    if public_errors && let Some(stages) = stages.as_object_mut() {
+        stages.retain(|name, _| !name.starts_with("origin:"));
+    }
+    report["timings"] = json!({
+        "elapsed_us": snapshot["elapsed_us"],
+        "stages": stages,
+    });
+    report
 }
 
 async fn inspect_cache(
@@ -1082,6 +1139,19 @@ mod tests {
                 .any(|step| step["stage"] == "name_resolution"
                     && step["status"] == "incomplete"
                     && step.get("error").is_none()),
+            "{report}"
+        );
+        let resolution = report["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["stage"] == "name_resolution")
+            .unwrap();
+        let elapsed = resolution["elapsed_us"].as_u64().unwrap();
+        assert!(elapsed >= 40_000, "{report}");
+        assert!(
+            resolution["started_us"].as_u64().unwrap() + elapsed
+                <= report["timings"]["elapsed_us"].as_u64().unwrap(),
             "{report}"
         );
     }

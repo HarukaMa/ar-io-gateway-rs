@@ -1890,37 +1890,43 @@ impl Gateway {
         diagnostics::check("transaction_authentication", id, async {
             decode_fixed::<32>(id, "transaction ID")?;
 
-            let status_url = endpoint(&self.config.archive_url, &format!("tx/{id}/status"));
-            let response = self
-                .client
-                .get(&status_url)
-                .send()
+            let status: TxStatus = diagnostics::check("transaction_status", id, async {
+                let status_url = endpoint(&self.config.archive_url, &format!("tx/{id}/status"));
+                let response = self
+                    .client
+                    .get(&status_url)
+                    .send()
+                    .await
+                    .context("failed to fetch transaction status")?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND
+                    && response.url().as_str() == status_url
+                {
+                    return Err(ContentNotFound.into());
+                }
+                read_json_response(
+                    response
+                        .error_for_status()
+                        .context("transaction status source rejected request")?,
+                )
                 .await
-                .context("failed to fetch transaction status")?;
-            if response.status() == reqwest::StatusCode::NOT_FOUND
-                && response.url().as_str() == status_url
-            {
-                return Err(ContentNotFound.into());
-            }
-            let status: TxStatus = read_json_response(
-                response
-                    .error_for_status()
-                    .context("transaction status source rejected request")?,
-            )
+            })
             .await?;
             decode_fixed::<48>(&status.block_indep_hash, "status block hash")?;
 
-            let indexed = match &self.block_store {
-                Some(store)
-                    if store
-                        .stable_canonical_hash(status.block_height)
-                        .await?
-                        .is_some() =>
-                {
-                    store.block_pair(status.block_height).await?
-                }
-                _ => None,
-            };
+            let indexed = diagnostics::check("indexed_block_anchor", id, async {
+                Ok(match &self.block_store {
+                    Some(store)
+                        if store
+                            .stable_canonical_hash(status.block_height)
+                            .await?
+                            .is_some() =>
+                    {
+                        store.block_pair(status.block_height).await?
+                    }
+                    _ => None,
+                })
+            })
+            .await?;
             let stable_anchor;
             let entries: Vec<BlockIndexEntry> = if let Some((previous, block)) = indexed {
                 stable_anchor = true;
@@ -2356,7 +2362,12 @@ impl Gateway {
         height: u64,
         transaction_id: Option<&str>,
     ) -> Result<BlockHeader> {
-        let value = self.request_json(request).await?;
+        let value = diagnostics::check(
+            "block_header_fetch",
+            &entry.hash,
+            self.request_json(request),
+        )
+        .await?;
         let mut block = historical::decode_header(value)?;
         ensure!(
             block.height == height && block.indep_hash == entry.hash,

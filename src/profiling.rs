@@ -140,6 +140,10 @@ impl Profile {
         Self::with_prefix(range, "transaction_profile", None)
     }
 
+    pub(crate) fn diagnostic(input: String) -> Arc<Self> {
+        Self::with_prefix(input, "diagnostic_profile", None)
+    }
+
     fn with_prefix(
         root: String,
         log_prefix: &'static str,
