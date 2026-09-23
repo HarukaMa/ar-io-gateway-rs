@@ -554,6 +554,7 @@ pub struct Gateway {
     cache: Arc<Mutex<ContentCache>>,
     peers: Arc<peers::PeerState>,
     block_store: Option<Arc<database::BlockStore>>,
+    policy_store: Option<Arc<database::BlockStore>>,
     spool_budget: Arc<SpoolBudget>,
     disk_cache: Option<disk_cache::DiskCache>,
     direct_cache: Arc<Mutex<ContentCache>>,
@@ -612,6 +613,7 @@ impl Gateway {
             chunk_flights: Default::default(),
             peers,
             block_store: None,
+            policy_store: None,
             disk_cache: None,
             direct_cache: Arc::new(Mutex::new(ContentCache::default())),
             bundle_indexer: None,
@@ -631,6 +633,7 @@ impl Gateway {
             state.source == self.config.trusted_node_url,
             "block index belongs to a different trusted node"
         );
+        self.policy_store = Some(Arc::new(store.reconnect().await?));
         self.block_store = Some(Arc::new(store));
         Ok(self)
     }
@@ -639,7 +642,7 @@ impl Gateway {
         target: &str,
         hash: Option<&str>,
     ) -> Result<Option<String>> {
-        let Some(store) = &self.block_store else {
+        let Some(store) = self.policy_store.as_ref().or(self.block_store.as_ref()) else {
             return Ok(None);
         };
         let name;

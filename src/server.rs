@@ -3671,6 +3671,7 @@ mod tests {
         }))
         .unwrap();
         let mut gateway = Gateway::new(stream_limits()).unwrap();
+        gateway.policy_store = Some(Arc::new(store.reconnect().await.unwrap()));
         gateway.block_store = Some(Arc::new(store));
         for (id, bytes, content_type) in [
             (&manifest_id, manifest.as_slice(), MANIFEST_CONTENT_TYPE),
@@ -3697,6 +3698,7 @@ mod tests {
         .unwrap()
         .with_routing(Some(&manifest_id), None, 3600)
         .unwrap();
+        let serving_store = Arc::clone(gateway.block_store.as_ref().unwrap());
         let state = Arc::new(AppState {
             gateway,
             config,
@@ -3844,6 +3846,39 @@ mod tests {
         let response = client.get(&raw_url).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "hello");
+
+        policy
+            .batch_execute("BEGIN; LOCK TABLE public.block_index_state IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let queued = tokio::spawn(async move { serving_store.state().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let blocked: bool = policy
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                         WHERE datname=current_database() AND wait_event_type='Lock'
+                           AND query LIKE 'SELECT start_height, imported_through, checkpoint_height,%')",
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if blocked {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), client.get(&raw_url).send())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        policy.batch_execute("ROLLBACK").await.unwrap();
+        queued.await.unwrap();
 
         policy
             .batch_execute("BEGIN; LOCK TABLE public.content_blocklist IN ACCESS EXCLUSIVE MODE")
