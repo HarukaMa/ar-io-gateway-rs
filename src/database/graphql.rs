@@ -651,8 +651,8 @@ async fn transactions(
                 );
             } else {
                 candidates.push_str(&format!(
-                    " AND EXISTS (SELECT true FROM public.object_tags matching
-                        WHERE matching.object_key=t.object_key AND {predicate})"
+                    " AND (SELECT true FROM public.object_tags matching
+                        WHERE matching.object_key=t.object_key AND {predicate} LIMIT 1) IS TRUE"
                 ));
             }
         } else {
