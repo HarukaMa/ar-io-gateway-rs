@@ -575,6 +575,12 @@ async fn transactions(
          LEFT JOIN public.item_locations l ON l.key=p.location_key
          LEFT JOIN public.objects parent ON parent.key=l.parent_key
          WHERE o.metadata_complete AND b.timestamp IS NOT NULL");
+    // Keep ID-scoped tag lookups correlated; broad searches can use tag-first plans.
+    let (tag_query_start, tag_query_end) = if filter.ids.is_empty() {
+        ("EXISTS (", ")")
+    } else {
+        ("(", " LIMIT 1) IS TRUE")
+    };
     if !filter.ids.is_empty() {
         let ids = decode_list(&filter.ids)?;
         let prefixes: Vec<i64> = ids
@@ -619,12 +625,12 @@ async fn transactions(
                 .map(String::into_bytes)
                 .collect::<Vec<_>>(),
         );
-        sql.filter(format!("EXISTS (
-            SELECT 1 FROM public.object_tags t WHERE t.object_key=o.key
+        sql.filter(format!("{tag_query_start}
+            SELECT true FROM public.object_tags t WHERE t.object_key=o.key
               AND t.name_key IN (SELECT key FROM public.tag_names
                   WHERE sha256(value)=sha256({name}::bytea) AND value={name})
               AND t.value_key IN (SELECT v.key FROM unnest({values}::bytea[]) wanted(value)
-                  JOIN public.tag_values v ON sha256(v.value)=sha256(wanted.value) AND v.value=wanted.value))"));
+                  JOIN public.tag_values v ON sha256(v.value)=sha256(wanted.value) AND v.value=wanted.value){tag_query_end}"));
     }
     sql.heights("p.block_height", filter.block);
     if let Some(cursor) = filter.after.filter(|v| !v.is_empty()) {

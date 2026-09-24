@@ -1295,8 +1295,18 @@ mod tests {
             "http://budget-first.test".to_owned(),
             "http://budget-second.test".to_owned(),
         ];
-        let first = chunk_slots(&sources[0])?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
-        let second = chunk_slots(&sources[1])?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
+        let first = ChunkPermit {
+            origin: Some(
+                chunk_slots(&sources[0])?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?,
+            ),
+            global: None,
+        };
+        let second = ChunkPermit {
+            origin: Some(
+                chunk_slots(&sources[1])?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?,
+            ),
+            global: None,
+        };
         let request = |source: String| async move {
             if source == "http://budget-first.test" {
                 tokio::time::sleep(Duration::from_secs(4)).await;
