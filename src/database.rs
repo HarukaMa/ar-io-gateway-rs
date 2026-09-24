@@ -2290,8 +2290,8 @@ impl BlockStore {
                 JOIN public.item_locations l ON l.object_key=o.key
                 JOIN public.objects root ON root.key=l.root_key AND root.kind=0 AND root.metadata_complete
                 JOIN public.block_transactions bt ON bt.object_key=l.root_key
-                JOIN public.canonical_blocks cb ON cb.block_hash=bt.block_hash
-                JOIN public.blocks b ON b.hash=cb.block_hash AND b.timestamp IS NOT NULL
+                JOIN public.blocks b ON b.hash=bt.block_hash AND b.timestamp IS NOT NULL
+                JOIN public.canonical_blocks cb ON cb.height=b.height AND cb.block_hash=b.hash
                 JOIN public.block_index_state s
                   ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
                 WHERE public.object_id_prefix(o.id)=public.object_id_prefix($1)
