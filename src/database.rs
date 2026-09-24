@@ -1,3 +1,5 @@
+pub(crate) mod graphql;
+
 use std::{collections::HashSet, net::IpAddr, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -78,6 +80,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "019_object_id_prefix",
         include_str!("../migrations/019_object_id_prefix.sql"),
+    ),
+    (
+        "020_bundle_flags_object_local",
+        include_str!("../migrations/020_bundle_flags_object_local.sql"),
     ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
