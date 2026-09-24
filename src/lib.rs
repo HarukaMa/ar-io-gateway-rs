@@ -1971,20 +1971,19 @@ impl Gateway {
                 block.hash == status.block_indep_hash,
                 "archival status does not match the trusted block index"
             );
-            let mut header = diagnostics::check(
-                "block_authentication",
-                id,
-                self.authenticate_block(block, status.block_height, Some(id)),
-            )
-            .await?;
-
             let remaining = AtomicUsize::new(usize::MAX);
-            let (transaction, mut verified) = diagnostics::check(
-                "transaction_signature",
-                id,
-                self.fetch_transaction(id, status.block_height, &remaining),
-            )
-            .await?;
+            let (mut header, (transaction, mut verified)) = tokio::try_join!(
+                diagnostics::check(
+                    "block_authentication",
+                    id,
+                    self.authenticate_block(block, status.block_height, Some(id)),
+                ),
+                diagnostics::check(
+                    "transaction_signature",
+                    id,
+                    self.fetch_transaction(id, status.block_height, &remaining),
+                ),
+            )?;
             let root_metadata = (self.bundle_indexer.is_some()
                 && require_bundle_tags(&transaction.tags).is_ok())
             .then(|| verified.metadata.clone());
@@ -5789,6 +5788,68 @@ mod tests {
         .unwrap();
         let requested = bundled_item.map_or(id, |(id, _)| id.to_owned());
         (gateway, requested, corrupt_chunk, server, chunk_requests)
+    }
+
+    #[tokio::test]
+    async fn root_metadata_requests_overlap_before_verified_content_is_returned() -> Result<()> {
+        use axum::{Router, response::IntoResponse};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let payload = b"concurrent root authentication";
+        let (fixture, id, _, server, _) = retrieval_fixture(payload, &[], None).await;
+        let _fixture = tokio_util::task::AbortOnDropHandle::new(server);
+        let source = fixture.config.trusted_node_url.clone();
+        let client = fixture.client.clone();
+        let transaction_path = format!("/tx/{id}");
+        let rendezvous = Arc::new(tokio::sync::Barrier::new(2));
+        let corrupt = Arc::new(AtomicBool::new(false));
+        let corrupt_header = corrupt.clone();
+        let app = Router::new().fallback(move |uri: axum::http::Uri| {
+            let client = client.clone();
+            let url = endpoint(&source, uri.path().trim_start_matches('/'));
+            let paired = uri.path().starts_with("/block/hash/") || uri.path() == transaction_path;
+            let rendezvous = rendezvous.clone();
+            let corrupt =
+                corrupt_header.load(Ordering::Relaxed) && uri.path().starts_with("/block/hash/");
+            async move {
+                if paired {
+                    rendezvous.wait().await;
+                }
+                let response = client.get(url).send().await.unwrap();
+                let status = response.status();
+                let body = response.bytes().await.unwrap();
+                if corrupt {
+                    let mut block: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    block["indep_hash"] = serde_json::json!(URL_SAFE_NO_PAD.encode([0; 48]));
+                    return (status, block.to_string()).into_response();
+                }
+                (status, body).into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let _proxy = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let mut config = fixture.config.clone();
+        config.trusted_node_url = url.clone();
+        config.archive_url = url.clone();
+        config.chunk_sources = vec![url];
+        let gateway = Gateway::new(config)?;
+        let data = tokio::time::timeout(Duration::from_secs(5), gateway.retrieve_direct(&id))
+            .await
+            .context("block and transaction requests did not overlap")??;
+        ensure!(data.bytes.read_all(payload.len()).await?.as_ref() == payload);
+        ensure!(data.sha256 == hex(&sha256(&[payload])));
+        corrupt.store(true, Ordering::Relaxed);
+        let rejected = tokio::time::timeout(Duration::from_secs(5), gateway.retrieve_direct(&id))
+            .await
+            .context("invalid block did not terminate retrieval")?;
+        ensure!(
+            rejected.is_err(),
+            "valid transaction metadata bypassed block authentication"
+        );
+        Ok(())
     }
 
     #[tokio::test]
