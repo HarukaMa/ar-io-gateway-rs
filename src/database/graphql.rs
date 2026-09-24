@@ -620,64 +620,103 @@ async fn transactions(
     if filter.tags.len() > 128 {
         return Err("Filter exceeds 128 tags".into());
     }
-    let mut candidates = String::new();
-    for (index, tag) in filter.tags.into_iter().enumerate() {
-        let _ = tag.op;
-        if tag.values.len() > 1000 {
-            return Err("Tag filter exceeds 1000 values".into());
-        }
-        let name = sql.bind(tag.name.into_bytes());
-        let values = sql.bind(
-            tag.values
-                .into_iter()
-                .map(String::into_bytes)
-                .collect::<Vec<_>>(),
-        );
-        let alias = if tag_first && index > 0 {
-            "matching"
-        } else {
-            "t"
-        };
-        let predicate = format!(
-            "{alias}.name_key IN (SELECT key FROM public.tag_names
-                WHERE sha256(value)=sha256({name}::bytea) AND value={name})
-             AND {alias}.value_key IN (SELECT v.key FROM unnest({values}::bytea[]) wanted(value)
-                JOIN public.tag_values v ON sha256(v.value)=sha256(wanted.value) AND v.value=wanted.value)"
-        );
-        if tag_first {
-            if index == 0 {
-                candidates = format!(
-                    "SELECT DISTINCT t.object_key FROM public.object_tags t WHERE {predicate}"
-                );
-            } else {
-                candidates.push_str(&format!(
-                    " AND (SELECT true FROM public.object_tags matching
-                        WHERE matching.object_key=t.object_key AND {predicate} LIMIT 1) IS TRUE"
-                ));
-            }
-        } else {
-            sql.filter(format!(
-                "{tag_query_start} SELECT true FROM public.object_tags t
-                 WHERE t.object_key=o.key AND {predicate}{tag_query_end}"
-            ));
-        }
-    }
-    if tag_first {
-        sql.text.insert_str(
-            0,
-            &format!("WITH matched_tags AS MATERIALIZED ({candidates}) "),
-        );
-        sql.filter("o.key IN (SELECT object_key FROM matched_tags)");
+    if filter.tags.iter().any(|tag| tag.values.len() > 1000) {
+        return Err("Tag filter exceeds 1000 values".into());
     }
     sql.heights("p.block_height", filter.block);
     if let Some(cursor) = filter.after.filter(|v| !v.is_empty()) {
         transaction_cursor(&mut sql, &cursor, filter.sort)?;
     }
+    let request_db = ctx.data::<Arc<RequestDb>>()?;
+    let store = request_db.store().await?;
+    if tag_first {
+        // Concrete dictionary keys let the planner use tag-pair statistics.
+        let mut groups = Vec::with_capacity(filter.tags.len());
+        for tag in &filter.tags {
+            let name = tag.name.as_bytes();
+            let values: Vec<_> = tag.values.iter().map(|value| value.as_bytes()).collect();
+            let rows = store
+                .client
+                .query(
+                    "SELECT n.key,v.key FROM public.tag_names n
+                 CROSS JOIN unnest($2::bytea[]) wanted(value)
+                 JOIN public.tag_values v ON sha256(v.value)=sha256(wanted.value)
+                    AND v.value=wanted.value
+                 WHERE sha256(n.value)=sha256($1::bytea) AND n.value=$1",
+                    &[&name, &values],
+                )
+                .await
+                .map_err(database_error)?;
+            let Some(first) = rows.first() else {
+                return Ok(TransactionConnection {
+                    page_info: PageInfo {
+                        has_next_page: false,
+                    },
+                    edges: Vec::new(),
+                });
+            };
+            let name_key: i64 = first.get(0);
+            let mut value_keys: Vec<i64> = rows.iter().map(|row| row.get(1)).collect();
+            value_keys.sort_unstable();
+            value_keys.dedup();
+            groups.push((name_key, value_keys));
+        }
+        groups.sort_unstable();
+        groups.dedup();
+        let intersect = groups.len() > 1;
+        let mut candidates = String::new();
+        for (index, (name, values)) in groups.into_iter().enumerate() {
+            let alias = if index == 0 { "t" } else { "matching" };
+            let name = sql.bind(name);
+            let values = sql.bind(values);
+            let predicate =
+                format!("{alias}.name_key={name} AND {alias}.value_key=ANY({values}::bigint[])");
+            if !intersect {
+                sql.filter(format!(
+                    "EXISTS (SELECT true FROM public.object_tags t
+                     WHERE t.object_key=o.key AND {predicate})"
+                ));
+            } else if index == 0 {
+                candidates = format!(
+                    "SELECT DISTINCT t.object_key FROM public.object_tags t WHERE {predicate}"
+                );
+            } else {
+                candidates.push_str(&format!(
+                    " AND EXISTS (SELECT true FROM public.object_tags matching
+                        WHERE matching.object_key=t.object_key AND {predicate})"
+                ));
+            }
+        }
+        if intersect {
+            sql.text.insert_str(
+                0,
+                &format!("WITH matched_tags AS MATERIALIZED ({candidates}) "),
+            );
+            sql.filter("o.key IN (SELECT object_key FROM matched_tags)");
+        }
+    } else {
+        for tag in filter.tags {
+            let _ = tag.op;
+            let name = sql.bind(tag.name.into_bytes());
+            let values = sql.bind(
+                tag.values
+                    .into_iter()
+                    .map(String::into_bytes)
+                    .collect::<Vec<_>>(),
+            );
+            sql.filter(format!(
+                "{tag_query_start} SELECT true FROM public.object_tags t WHERE t.object_key=o.key
+                 AND t.name_key IN (SELECT key FROM public.tag_names
+                    WHERE sha256(value)=sha256({name}::bytea) AND value={name})
+                 AND t.value_key IN (SELECT v.key FROM unnest({values}::bytea[]) wanted(value)
+                    JOIN public.tag_values v ON sha256(v.value)=sha256(wanted.value)
+                    AND v.value=wanted.value){tag_query_end}"
+            ));
+        }
+    }
     let direction = filter.sort.sql();
     let limit = sql.bind((filter.first + 1) as i64);
     sql.text.push_str(&format!(" ORDER BY p.block_height {direction},p.position {direction},p.kind {direction},p.id {direction} LIMIT {limit}"));
-    let request_db = ctx.data::<Arc<RequestDb>>()?;
-    let store = request_db.store().await?;
     let stream = store
         .client
         .query_raw(&sql.text, sql.params())

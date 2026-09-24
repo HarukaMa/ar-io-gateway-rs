@@ -410,6 +410,22 @@ async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result
             json!([{"name":app_name,"values":["red","blue"]},{"name":app_name,"values":["blue"]}]),
             vec![object_ids[2].clone(), object_ids[4].clone()],
         ),
+        (
+            json!([{"name":app_name,"values":["red","blue","red"]},{"name":app_name,"values":["blue","red"]}]),
+            ascending[..2].to_vec(),
+        ),
+        (
+            json!([{"name":app_name,"values":["blue","missing"]},{"name":shape_name,"values":["square"]}]),
+            vec![object_ids[2].clone(), object_ids[4].clone()],
+        ),
+        (
+            json!([{"name":app_name,"values":[]},{"name":shape_name,"values":["square"]}]),
+            vec![],
+        ),
+        (
+            json!([{"name":app_name.to_lowercase(),"values":["red"]},{"name":shape_name,"values":["square"]}]),
+            vec![],
+        ),
         (json!([{"name":app_name,"values":[]}]), vec![]),
     ] {
         let result = query(
