@@ -575,7 +575,14 @@ async fn transactions(
          LEFT JOIN public.item_locations l ON l.key=p.location_key
          LEFT JOIN public.objects parent ON parent.key=l.parent_key
          WHERE o.metadata_complete AND b.timestamp IS NOT NULL");
-    // Keep ID-scoped tag lookups correlated; broad searches can use tag-first plans.
+    // Keep selective request constraints ahead of global tag matching.
+    let tag_first = filter.ids.is_empty()
+        && filter.owners.is_empty()
+        && filter.recipients.is_empty()
+        && filter.block.min.is_none()
+        && filter.block.max.is_none()
+        && matches!(&filter.bundled_in, MaybeUndefined::Undefined)
+        && filter.tags.len() > 1;
     let (tag_query_start, tag_query_end) = if filter.ids.is_empty() {
         ("EXISTS (", ")")
     } else {
@@ -613,7 +620,8 @@ async fn transactions(
     if filter.tags.len() > 128 {
         return Err("Filter exceeds 128 tags".into());
     }
-    for tag in filter.tags {
+    let mut candidates = String::new();
+    for (index, tag) in filter.tags.into_iter().enumerate() {
         let _ = tag.op;
         if tag.values.len() > 1000 {
             return Err("Tag filter exceeds 1000 values".into());
@@ -625,12 +633,41 @@ async fn transactions(
                 .map(String::into_bytes)
                 .collect::<Vec<_>>(),
         );
-        sql.filter(format!("{tag_query_start}
-            SELECT true FROM public.object_tags t WHERE t.object_key=o.key
-              AND t.name_key IN (SELECT key FROM public.tag_names
-                  WHERE sha256(value)=sha256({name}::bytea) AND value={name})
-              AND t.value_key IN (SELECT v.key FROM unnest({values}::bytea[]) wanted(value)
-                  JOIN public.tag_values v ON sha256(v.value)=sha256(wanted.value) AND v.value=wanted.value){tag_query_end}"));
+        let alias = if tag_first && index > 0 {
+            "matching"
+        } else {
+            "t"
+        };
+        let predicate = format!(
+            "{alias}.name_key IN (SELECT key FROM public.tag_names
+                WHERE sha256(value)=sha256({name}::bytea) AND value={name})
+             AND {alias}.value_key IN (SELECT v.key FROM unnest({values}::bytea[]) wanted(value)
+                JOIN public.tag_values v ON sha256(v.value)=sha256(wanted.value) AND v.value=wanted.value)"
+        );
+        if tag_first {
+            if index == 0 {
+                candidates = format!(
+                    "SELECT DISTINCT t.object_key FROM public.object_tags t WHERE {predicate}"
+                );
+            } else {
+                candidates.push_str(&format!(
+                    " AND EXISTS (SELECT true FROM public.object_tags matching
+                        WHERE matching.object_key=t.object_key AND {predicate})"
+                ));
+            }
+        } else {
+            sql.filter(format!(
+                "{tag_query_start} SELECT true FROM public.object_tags t
+                 WHERE t.object_key=o.key AND {predicate}{tag_query_end}"
+            ));
+        }
+    }
+    if tag_first {
+        sql.text.insert_str(
+            0,
+            &format!("WITH matched_tags AS MATERIALIZED ({candidates}) "),
+        );
+        sql.filter("o.key IN (SELECT object_key FROM matched_tags)");
     }
     sql.heights("p.block_height", filter.block);
     if let Some(cursor) = filter.after.filter(|v| !v.is_empty()) {

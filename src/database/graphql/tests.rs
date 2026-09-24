@@ -365,6 +365,65 @@ async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result
             "filter semantics differ for {extra}"
         );
     }
+    let tag_page_query = "query($tags:[TagFilter!],$after:String,$sort:SortOrder){transactions(tags:$tags,first:2,after:$after,sort:$sort){pageInfo{hasNextPage} edges{cursor node{id}}}}";
+    let mut tag_groups = vec![
+        json!({"name":app_name,"values":["red","blue"]}),
+        json!({"name":shape_name,"values":["square"]}),
+        json!({"name":app_name,"values":["red","blue"]}),
+    ];
+    for reverse_filters in [false, true] {
+        if reverse_filters {
+            tag_groups.swap(0, 1);
+        }
+        for sort in ["HEIGHT_ASC", "HEIGHT_DESC"] {
+            let mut collected = Vec::new();
+            let mut cursor = Value::Null;
+            loop {
+                let page = query(
+                    &schema,
+                    &db,
+                    tag_page_query,
+                    json!({"tags":tag_groups,"after":cursor,"sort":sort}),
+                )
+                .await?;
+                let page = &page["transactions"];
+                collected.extend(ids(page));
+                ensure!(collected.len() <= 4, "tag pagination repeated an item");
+                if page["pageInfo"]["hasNextPage"] == false {
+                    break;
+                }
+                cursor = page["edges"].as_array().unwrap().last().unwrap()["cursor"].clone();
+            }
+            let mut expected: Vec<_> = ascending
+                .iter()
+                .filter(|id| **id != object_ids[3])
+                .cloned()
+                .collect();
+            if sort == "HEIGHT_DESC" {
+                expected.reverse();
+            }
+            ensure!(collected == expected, "tag intersection pagination differs");
+        }
+    }
+    for (tags, expected) in [
+        (
+            json!([{"name":app_name,"values":["red","blue"]},{"name":app_name,"values":["blue"]}]),
+            vec![object_ids[2].clone(), object_ids[4].clone()],
+        ),
+        (json!([{"name":app_name,"values":[]}]), vec![]),
+    ] {
+        let result = query(
+            &schema,
+            &db,
+            tag_page_query,
+            json!({"tags":tags,"sort":"HEIGHT_ASC"}),
+        )
+        .await?;
+        ensure!(
+            ids(&result["transactions"]) == expected,
+            "tag group semantics differ"
+        );
+    }
     let block_page=query(&schema,&db,"query($ids:[ID!]){blocks(ids:$ids,first:1,sort:HEIGHT_ASC){pageInfo{hasNextPage} edges{cursor node{id height previous timestamp}}}}",json!({"ids":block_ids})).await?;
     ensure!(
         block_page["blocks"]["pageInfo"]["hasNextPage"] == true
