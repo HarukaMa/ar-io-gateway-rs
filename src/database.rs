@@ -2823,6 +2823,7 @@ impl BlockStore {
                         .context("missing tag value")
                 })
                 .collect::<Result<_>>()?;
+            crate::profiling::measure(crate::profiling::Stage::TagInsert, async {
             transaction
                 .execute(
                     "INSERT INTO public.object_tags (object_key, ordinal, name_key, value_key)
@@ -2833,6 +2834,10 @@ impl BlockStore {
                     &[&object_keys, &ordinals, &names, &values, &completed],
                 )
                 .await?;
+                Ok(())
+            })
+            .await?;
+            crate::profiling::measure(crate::profiling::Stage::TagCompare, async {
             let conflict = transaction
                 .query_opt(
                     "SELECT incoming.object_key
@@ -2847,7 +2852,11 @@ impl BlockStore {
                 )
                 .await?;
             ensure!(conflict.is_none(), "conflicting immutable ordered tags");
+                Ok(())
+            })
+            .await?;
         }
+        crate::profiling::measure(crate::profiling::Stage::TagCount, async {
         let tag_counts: Vec<_> = objects
             .iter()
             .map(|object| object.tags.len() as i64)
@@ -2863,6 +2872,9 @@ impl BlockStore {
             )
             .await?;
         ensure!(conflict.is_none(), "conflicting immutable tag count");
+            Ok(())
+        })
+        .await?;
             Ok(())
         })
         .await?;
