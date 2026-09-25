@@ -31,8 +31,16 @@ pub(crate) enum Stage {
     TransactionBody,
     TransactionQueueSend,
     TransactionQueueWait,
+    MetadataAdmission,
+    MetadataObjects,
+    DictionaryLookup,
+    DictionaryLocks,
+    DictionaryWrite,
+    TagWrite,
+    BundlePlacement,
+    MetadataCommit,
 }
-const STAGES: [&str; 17] = [
+const STAGES: [&str; 25] = [
     "chunk_global_admission",
     "chunk_origin_admission",
     "chunk_headers",
@@ -50,6 +58,14 @@ const STAGES: [&str; 17] = [
     "transaction_body",
     "transaction_queue_send",
     "transaction_queue_wait",
+    "metadata_admission",
+    "metadata_objects",
+    "dictionary_lookup",
+    "dictionary_locks",
+    "dictionary_write",
+    "tag_write",
+    "bundle_placement",
+    "metadata_commit",
 ];
 
 #[derive(Default)]

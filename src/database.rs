@@ -1962,66 +1962,72 @@ impl BlockStore {
                 "bundle occurrence has an invalid parent"
             );
         }
-        let transaction = self
-            .client
-            .build_transaction()
-            .isolation_level(IsolationLevel::ReadCommitted)
-            .start()
-            .await?;
-        let checkpoint: i64 = transaction
-            .query_one(
-                "SELECT checkpoint_height FROM public.block_index_state WHERE singleton",
-                &[],
-            )
-            .await?
-            .try_get(0)?;
-        let lookup = bundle_lookup_sql();
-        let mut root = transaction
-            .query_opt(&lookup, &[&root_id])
-            .await?
-            .context("bundle root lacks completed canonical metadata")?;
-        let unstable = root.try_get::<_, i64>(1)? > checkpoint;
-        if unstable {
-            // Exclude rewind's FOR UPDATE while allowing non-key progress updates.
-            transaction
+        let (transaction, root_key, was_complete) =
+            crate::profiling::measure(crate::profiling::Stage::MetadataAdmission, async {
+                let transaction = self
+                    .client
+                    .build_transaction()
+                    .isolation_level(IsolationLevel::ReadCommitted)
+                    .start()
+                    .await?;
+                let checkpoint: i64 = transaction
+                    .query_one(
+                        "SELECT checkpoint_height FROM public.block_index_state WHERE singleton",
+                        &[],
+                    )
+                    .await?
+                    .try_get(0)?;
+                let lookup = bundle_lookup_sql();
+                let mut root = transaction
+                    .query_opt(&lookup, &[&root_id])
+                    .await?
+                    .context("bundle root lacks completed canonical metadata")?;
+                let unstable = root.try_get::<_, i64>(1)? > checkpoint;
+                if unstable {
+                    // Exclude rewind's FOR UPDATE while allowing non-key progress updates.
+                    transaction
                 .query_one(
                     "SELECT singleton FROM public.block_index_state WHERE singleton FOR KEY SHARE",
                     &[],
                 )
                 .await?;
-        }
-        Self::lock_bundle_roots(&transaction, &[root_id]).await?;
-        if unstable {
-            // A reorg may have completed while we waited for the chain guard.
-            root = transaction
-                .query_opt(&lookup, &[&root_id])
-                .await?
-                .context("bundle root lacks completed canonical metadata")?;
-        }
-        let root_key: i64 = root.try_get(5)?;
-        let root_size: u128 = root.try_get::<_, String>(2)?.parse()?;
-        let root_json: bool = root.try_get(4)?;
-        for location in &locations {
-            if location.path.len() == 1 {
-                ensure!(
-                    location.json == root_json
-                        && location
-                            .item_offset
-                            .checked_add(location.item_size)
-                            .is_some_and(|end| end <= root_size),
-                    "bundle occurrence format or root bounds differ"
-                );
-            }
-        }
-        let was_complete: bool = transaction
-            .query_one(
-                "INSERT INTO public.bundle_progress AS stored (root_key) VALUES ($1)
+                }
+                Self::lock_bundle_roots(&transaction, &[root_id]).await?;
+                if unstable {
+                    // A reorg may have completed while we waited for the chain guard.
+                    root = transaction
+                        .query_opt(&lookup, &[&root_id])
+                        .await?
+                        .context("bundle root lacks completed canonical metadata")?;
+                }
+                let root_key: i64 = root.try_get(5)?;
+                let root_size: u128 = root.try_get::<_, String>(2)?.parse()?;
+                let root_json: bool = root.try_get(4)?;
+                for location in &locations {
+                    if location.path.len() == 1 {
+                        ensure!(
+                            location.json == root_json
+                                && location
+                                    .item_offset
+                                    .checked_add(location.item_size)
+                                    .is_some_and(|end| end <= root_size),
+                            "bundle occurrence format or root bounds differ"
+                        );
+                    }
+                }
+                let was_complete: bool = transaction
+                    .query_one(
+                        "INSERT INTO public.bundle_progress AS stored (root_key) VALUES ($1)
              ON CONFLICT (root_key) DO UPDATE SET complete=stored.complete RETURNING complete",
-                &[&root_key],
-            )
-            .await?
-            .try_get(0)?;
+                        &[&root_key],
+                    )
+                    .await?
+                    .try_get(0)?;
+                Ok((transaction, root_key, was_complete))
+            })
+            .await?;
         let keys = Self::write_objects(&transaction, objects).await?;
+        crate::profiling::measure(crate::profiling::Stage::BundlePlacement, async {
         let ids: Vec<_> = locations
             .iter()
             .map(|location| location.id.as_slice())
@@ -2162,8 +2168,14 @@ impl BlockStore {
                 )
                 .await?;
         }
-        transaction.commit().await?;
-        Ok(())
+            Ok(())
+        })
+        .await?;
+        crate::profiling::measure(crate::profiling::Stage::MetadataCommit, async {
+            transaction.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn refresh_bundle_placements(
@@ -2385,6 +2397,9 @@ impl BlockStore {
 
     pub(crate) async fn record_objects(&mut self, objects: &[ObjectMetadata]) -> Result<()> {
         let ids: Vec<_> = objects.iter().map(|object| object.id.as_slice()).collect();
+        let transaction = crate::profiling::measure(
+            crate::profiling::Stage::MetadataAdmission,
+            async {
         let transaction = self
             .client
             .build_transaction()
@@ -2405,9 +2420,16 @@ impl BlockStore {
                 &[&ids],
             )
             .await?;
+                Ok(transaction)
+            },
+        )
+        .await?;
         Self::write_objects(&transaction, objects).await?;
-        transaction.commit().await?;
-        Ok(())
+        crate::profiling::measure(crate::profiling::Stage::MetadataCommit, async {
+            transaction.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn write_objects(
@@ -2421,6 +2443,9 @@ impl BlockStore {
         if objects.is_empty() {
             return Ok(Vec::new());
         }
+        let (objects, completed, keys) = crate::profiling::measure(
+            crate::profiling::Stage::MetadataObjects,
+            async {
         let mut objects: Vec<_> = objects.iter().collect();
         objects.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         for pair in objects.windows(2) {
@@ -2619,7 +2644,14 @@ impl BlockStore {
             .iter()
             .map(|row| row.try_get(0))
             .collect::<std::result::Result<_, _>>()?;
+                Ok((objects, completed, keys))
+            },
+        )
+        .await?;
 
+        let (dictionaries, mut dictionary_keys, mut lock_keys) = crate::profiling::measure(
+            crate::profiling::Stage::DictionaryLookup,
+            async {
         let mut dictionaries =
             [("tag_names", false), ("tag_values", true)].map(|(table, values)| {
                 let bytes: std::collections::BTreeSet<_> = objects
@@ -2682,20 +2714,29 @@ impl BlockStore {
             }
             entries.retain(|(value, _)| !keys.contains_key(value));
         }
-        lock_keys.sort_unstable();
-        lock_keys.dedup();
-        // Acquire the complete cross-dictionary lock set for missing entries before any INSERT.
-        // A new read-committed statement then sees entries committed while locks were awaited.
-        for locks in lock_keys.chunks(ROW_BATCH_SIZE) {
-            transaction
-                .query(
-                    "SELECT pg_advisory_xact_lock(lock_key)
+                Ok((dictionaries, dictionary_keys, lock_keys))
+            },
+        )
+        .await?;
+        crate::profiling::measure(crate::profiling::Stage::DictionaryLocks, async {
+            lock_keys.sort_unstable();
+            lock_keys.dedup();
+            // Acquire the complete cross-dictionary lock set for missing entries before any INSERT.
+            // A new read-committed statement then sees entries committed while locks were awaited.
+            for locks in lock_keys.chunks(ROW_BATCH_SIZE) {
+                transaction
+                    .query(
+                        "SELECT pg_advisory_xact_lock(lock_key)
                      FROM (SELECT lock_key FROM unnest($1::bigint[]) AS locks(lock_key)
                            ORDER BY lock_key) ordered",
-                    &[&locks],
-                )
-                .await?;
-        }
+                        &[&locks],
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+        .await?;
+        crate::profiling::measure(crate::profiling::Stage::DictionaryWrite, async {
         for ((table, entries), keys) in dictionaries.iter().zip(&mut dictionary_keys) {
             let insert = format!(
                 "INSERT INTO public.{table} (value)
@@ -2733,6 +2774,10 @@ impl BlockStore {
                 }
             }
         }
+            Ok(())
+        })
+        .await?;
+        crate::profiling::measure(crate::profiling::Stage::TagWrite, async {
         let mut tags = objects
             .iter()
             .zip(&keys)
@@ -2808,6 +2853,9 @@ impl BlockStore {
             )
             .await?;
         ensure!(conflict.is_none(), "conflicting immutable tag count");
+            Ok(())
+        })
+        .await?;
         Ok(keys)
     }
 
