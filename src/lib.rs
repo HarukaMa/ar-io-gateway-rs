@@ -88,6 +88,8 @@ pub struct Config {
     pub max_spool_bytes: usize,
     /// Concurrent bundle downloads, configured by AR_IO_INDEX_DOWNLOADS.
     pub index_downloads: usize,
+    /// Concurrent bundle metadata commits, configured by AR_IO_INDEX_WRITERS.
+    pub index_writers: usize,
     /// Inclusive background bundle scan floor, configured by AR_IO_BUNDLE_START_HEIGHT.
     pub index_bundle_start_height: u64,
     /// Active and queued bundle bytes, configured by AR_IO_INDEX_MAX_BYTES.
@@ -140,6 +142,7 @@ impl Config {
             max_memory_data_size: max_data_size.min(64 * 1024 * 1024),
             max_spool_bytes: 4 * 1024 * 1024 * 1024,
             index_downloads: 32,
+            index_writers: background::INDEX_WORKERS,
             index_bundle_start_height: 0,
             index_max_bytes: 8 * 1024 * 1024 * 1024,
             index_chain: false,
@@ -204,6 +207,10 @@ impl Config {
             .unwrap_or_else(|_| config.index_downloads.to_string())
             .parse()
             .context("invalid AR_IO_INDEX_DOWNLOADS")?;
+        config.index_writers = env::var("AR_IO_INDEX_WRITERS")
+            .unwrap_or_else(|_| config.index_writers.to_string())
+            .parse()
+            .context("invalid AR_IO_INDEX_WRITERS")?;
         config.index_max_bytes = env::var("AR_IO_INDEX_MAX_BYTES")
             .unwrap_or_else(|_| config.index_max_bytes.to_string())
             .parse()
@@ -559,6 +566,7 @@ pub struct Gateway {
     disk_cache: Option<disk_cache::DiskCache>,
     direct_cache: Arc<Mutex<ContentCache>>,
     bundle_indexer: Option<background::BundleSubmitter>,
+    bundle_writers: Arc<tokio::sync::Semaphore>,
     chunk_cache: Arc<Mutex<ChunkCache>>,
     chunk_flights: shared::Flights<
         (u128, BlockGeometry),
@@ -579,6 +587,11 @@ impl Gateway {
         ensure!(
             (1..=256).contains(&config.index_downloads) && config.index_max_bytes > 0,
             "index downloads must be between 1 and 256 and the byte budget must be positive"
+        );
+        ensure!(
+            (1..=background::INDEX_WORKERS).contains(&config.index_writers),
+            "index writers must be between 1 and {}",
+            background::INDEX_WORKERS
         );
         ensure!(
             config.index_bundle_start_height <= i64::MAX as u64,
@@ -606,6 +619,7 @@ impl Gateway {
         let peers = Arc::new(peers::PeerState::new(&config.trusted_node_url)?);
         Ok(Self {
             spool_budget: Arc::new(SpoolBudget::new(config.max_spool_bytes)),
+            bundle_writers: Arc::new(tokio::sync::Semaphore::new(config.index_writers)),
             config,
             client,
             cache: Arc::new(Mutex::new(ContentCache::default())),

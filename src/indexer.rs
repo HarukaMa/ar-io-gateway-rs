@@ -1712,6 +1712,12 @@ async fn persist_bundle(
         verification_time += started.elapsed();
         let started = Instant::now();
         crate::profiling::measure(crate::profiling::Stage::Persistence, async {
+            // Waiting for a writer must not consume the database commit timeout.
+            let _writer = gateway
+                .bundle_writers
+                .acquire()
+                .await
+                .context("bundle writer admission closed")?;
             timeout(
                 gateway.config.request_timeout,
                 store.commit_bundle_batch(root_id, &objects, &locations, complete),
@@ -1874,6 +1880,128 @@ mod bundle_tests {
             previous = Some(object);
         }
         assert!(traversal.next().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ar_io_rust_test; takes a temporary bundle-progress table lock"]
+    async fn bundle_writer_limit_bounds_commits_and_releases_on_cancel() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let database: String = client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let mut config = crate::Config::new(
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            vec!["http://127.0.0.1:1".into()],
+            Duration::from_secs(10),
+            1,
+            1024,
+        )?;
+        config.index_writers = 2;
+        let gateway = Gateway::new(config)?;
+        let root_id = crate::sha256(&[b"bundle-writer-admission-test"]);
+        let exists: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM public.objects WHERE id=$1)",
+                &[&&root_id[..]],
+            )
+            .await?
+            .get(0);
+        ensure!(!exists, "writer admission fixture ID already exists");
+        let mut stores = Vec::new();
+        for _ in 0..crate::background::INDEX_WORKERS {
+            stores.push(BlockStore::connect(&url).await?);
+        }
+        let lock = client.transaction().await?;
+        lock.batch_execute(
+            "SET LOCAL lock_timeout='1s'; LOCK TABLE public.bundle_progress IN ACCESS EXCLUSIVE MODE",
+        ).await?;
+        let pid: i32 = lock.query_one("SELECT pg_backend_pid()", &[]).await?.get(0);
+        let mut jobs = tokio::task::JoinSet::new();
+        for mut store in stores {
+            let gateway = gateway.clone();
+            jobs.spawn(async move {
+                persist_bundle(
+                    &gateway,
+                    &mut store,
+                    &root_id,
+                    encode_bundle(&[]).into(),
+                    crate::BundleFormat::Binary,
+                    false,
+                    false,
+                )
+                .await
+            });
+        }
+        let observe = async {
+            let mut settling = None;
+            loop {
+                lock.query_one("SELECT pg_stat_clear_snapshot()", &[])
+                    .await?;
+                let blocked: i64 = lock
+                    .query_one(
+                        "SELECT count(*) FROM pg_stat_activity
+                     WHERE $1=ANY(pg_blocking_pids(pid))
+                       AND datname=current_database() AND backend_type='client backend'",
+                        &[&pid],
+                    )
+                    .await?
+                    .get(0);
+                ensure!(
+                    blocked <= 2,
+                    "bundle commits exceeded the configured writer limit"
+                );
+                if blocked == 2 {
+                    let since = settling.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_millis(50) {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::select! {
+            result = jobs.join_next() => anyhow::bail!("bundle commit exited while blocked: {result:?}"),
+            result = timeout(Duration::from_secs(3), observe) => {
+                result.context("configured bundle writers did not enter transactions")??;
+            }
+        }
+        jobs.abort_all();
+        while let Some(result) = jobs.join_next().await {
+            ensure!(
+                result.is_err_and(|error| error.is_cancelled()),
+                "blocked commit was not cancelled"
+            );
+        }
+        lock.rollback().await?;
+        let mut store = BlockStore::connect(&url).await?;
+        let error = timeout(
+            Duration::from_secs(3),
+            persist_bundle(
+                &gateway,
+                &mut store,
+                &root_id,
+                encode_bundle(&[]).into(),
+                crate::BundleFormat::Binary,
+                false,
+                false,
+            ),
+        )
+        .await
+        .context("cancelled commits retained writer admission")?
+        .expect_err("missing bundle root was accepted");
+        ensure!(
+            format!("{error:#}").contains("bundle root lacks completed canonical metadata"),
+            "retry did not reach bundle validation: {error:#}"
+        );
         Ok(())
     }
 

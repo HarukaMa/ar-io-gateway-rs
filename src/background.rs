@@ -1288,7 +1288,7 @@ mod tests {
         let blocked: i64 = transaction
             .query_one(
                 "SELECT count(*) FROM pg_stat_activity
-                 WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%WITH bundle_tags%'",
+                 WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%WITH requested_tags%'",
                 &[&pid],
             )
             .await?
@@ -1304,7 +1304,7 @@ mod tests {
                 let count: i64 = transaction
                     .query_one(
                         "SELECT count(*) FROM pg_stat_activity
-                     WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%WITH bundle_tags%'",
+                     WHERE $1=ANY(pg_blocking_pids(pid)) AND query LIKE '%WITH requested_tags%'",
                         &[&pid],
                     )
                     .await?
