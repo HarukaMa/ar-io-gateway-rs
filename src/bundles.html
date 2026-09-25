@@ -12,8 +12,8 @@
 <body>
 <header><h1>Bundle inspector</h1><a href="/ar-io/diagnostics">Diagnostics</a></header>
 <main>
-<form id="form"><label for="id">Bundle or item ID</label><div class="row"><input id="id" required pattern="[A-Za-z0-9_-]{43}" maxlength="43" autocomplete="off" spellcheck="false"><button type="submit">Inspect</button></div><p>Uses indexed metadata when available. External item metadata and binary bundle headers are shown as unverified. Item payloads are not downloaded.</p><output id="status" aria-live="polite"></output></form>
-<section id="results" hidden><h2 id="heading"></h2><p id="trust"></p><button id="remote" type="button" hidden>Read unverified headers</button><div id="items"></div><nav id="paging" aria-label="Bundle pages"><button id="previous" type="button">Previous</button><span id="position"></span><button id="next" type="button">Next</button></nav></section>
+<form id="form"><label for="id">Bundle or item ID</label><div class="row"><input id="id" required pattern="[A-Za-z0-9_-]{43}" maxlength="43" autocomplete="off" spellcheck="false"><button type="submit">Inspect</button></div><p>Browse indexed metadata or read headers from external sources. External headers aren't verified, and item data isn't downloaded.</p><output id="status" aria-live="polite"></output></form>
+<section id="results" hidden><h2 id="heading" aria-live="polite"></h2><p id="trust"></p><button id="remote" type="button" hidden>Read external headers</button><div id="items"></div><nav id="paging" aria-label="Bundle pages"><button id="previous" type="button">Previous</button><span id="position"></span><button id="next" type="button">Next</button></nav></section>
 </main>
 <noscript>JavaScript is required to inspect bundles.</noscript>
 <script>
@@ -40,6 +40,13 @@ function field(list, name, value) {
 }
 function details(container, item) {
   container.replaceChildren();
+  if (item.source === 'unverified') {
+    const note = document.createElement('p');
+    note.className = 'warning';
+    note.setAttribute('role', 'status');
+    note.textContent = "This header came from an external source. Its signature and payload haven't been checked.";
+    container.append(note);
+  }
   const list = document.createElement('dl');
   for (const [name,key] of [['ID','id'],['Source','source'],['Item offset','item_offset'],['Item bytes','item_size'],['Payload offset within item','data_offset'],['Payload bytes','data_size'],['Signature type','signature_type'],['Owner public key','owner'],['Owner address','owner_address'],['Target','target'],['Anchor','anchor'],['Signature','signature']]) field(list,name,item[key]);
   container.append(list);
@@ -47,7 +54,7 @@ function details(container, item) {
     const link = document.createElement('a'); link.href = '/ar-io/bundles?id=' + encodeURIComponent(item.parent_id);
     link.textContent = 'Inspect parent bundle: ' + item.parent_id; container.append(link);
   } else if (item.index == null) {
-    const note = document.createElement('p'); note.textContent = 'Parent bundle unavailable in this metadata.'; container.append(note);
+    const note = document.createElement('p'); note.textContent = 'No parent bundle listed.'; container.append(note);
   }
   if (item.bundle) {
     const link = document.createElement('a');
@@ -71,8 +78,8 @@ async function inspect(id, position = 0, remote = false) {
     const page = await request({id,start:position,unindexed:remote});
     current = id; start = position; unindexed = page.source === 'unverified';
     const single = page.kind === 'item';
-    el('heading').textContent = single ? 'Item details' : page.format + ' bundle';
-    el('trust').textContent = unindexed ? 'Unverified - item signatures and payloads have not been checked.' : (single ? 'Indexed metadata.' : (page.complete ? 'Indexed metadata. Root bundle indexing is complete.' : 'Indexed metadata. Root bundle indexing is incomplete. This list may omit items.'));
+    el('heading').textContent = single ? 'Item details' : (page.format === 'binary' ? 'Binary bundle' : 'JSON bundle');
+    el('trust').textContent = unindexed ? "These details came from an external source. Item signatures and data haven't been checked." : (single ? "This item's metadata is in the local index." : (page.complete ? 'The root bundle has been indexed.' : 'The root bundle is still being indexed, so this list may be incomplete.'));
     el('trust').className = unindexed || (!single && !page.complete) ? 'warning' : '';
     el('paging').hidden = single;
     el('remote').hidden = unindexed || page.complete || page.format !== 'binary';
@@ -83,23 +90,23 @@ async function inspect(id, position = 0, remote = false) {
       row.open = single;
       if (item.tags) details(content,item);
       else {
-        const load = document.createElement('button'); load.type = 'button'; load.textContent = 'Load unverified header'; content.append(load);
+        const load = document.createElement('button'); load.type = 'button'; load.textContent = 'Read item header'; content.append(load);
         load.addEventListener('click',async () => {
           if (busy) return;
           setBusy(true); el('status').textContent = 'Reading item header...';
           try {
             const result = await request({id:current,start,unindexed:true,item:item.index});
-            if (!result.items.length) throw new Error('Item is unavailable');
-            details(content,result.items[0]); el('status').textContent = 'Header loaded. Data remains unverified.';
+            if (!result.items.length) throw new Error("That item couldn't be found.");
+            details(content,result.items[0]); el('status').textContent = '';
           } catch (error) {el('status').textContent = error.message;} finally {setBusy(false);}
         });
       }
       el('items').append(row);
     }
-    if (!page.items.length) el('items').textContent = 'No visible indexed items or an empty bundle.';
+    if (!page.items.length) el('items').textContent = 'No items found. This bundle may be empty or still being indexed.';
     el('previous').dataset.unavailable = String(start === 0); el('next').dataset.unavailable = String(!page.has_more);
     el('position').textContent = 'Page ' + (Math.floor(start / 25)+1) + (page.total == null ? '' : ' - ' + page.total + ' items');
-    el('results').hidden = false; el('status').textContent = 'Metadata loaded.';
+    el('results').hidden = false; el('status').textContent = '';
   } catch (error) {el('status').textContent = error.message;} finally {setBusy(false);}
 }
 el('form').addEventListener('submit',event => {event.preventDefault(); inspect(el('id').value.trim());});

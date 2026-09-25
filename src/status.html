@@ -18,11 +18,11 @@
 <div><dt>Trusted tip</dt><dd id="tip">-</dd></div>
 <div><dt>Stable checkpoint</dt><dd id="checkpoint">-</dd></div>
 <div><dt>Anchor height</dt><dd id="anchors">-</dd></div>
-</dl><progress id="anchor-progress" aria-label="Anchor coverage"></progress><small id="anchor-percent">Waiting for a snapshot</small><dl>
+</dl><progress id="anchor-progress" aria-label="Anchor coverage"></progress><small id="anchor-percent">Loading coverage...</small><dl>
 <div><dt>Metadata height</dt><dd id="metadata">-</dd></div>
 <div><dt>Metadata lag</dt><dd id="lag">-</dd></div>
-</dl><progress id="metadata-progress" aria-label="Metadata coverage"></progress><small id="metadata-percent">Waiting for a snapshot</small>
-<p class="note">Coverage starts at block <span id="start">-</span>. Percentages describe block heights.</p></section>
+</dl><progress id="metadata-progress" aria-label="Metadata coverage"></progress><small id="metadata-percent">Loading coverage...</small>
+<p class="note">Coverage is measured by block height, starting at <span id="start">-</span>.</p></section>
 <section><h2>Transactions</h2><dl>
 <div><dt>Completed</dt><dd id="transactions">-</dd></div>
 <div><dt>Pending metadata</dt><dd id="pending-transactions">-</dd></div>
@@ -31,7 +31,7 @@
 <section><h2>Bundles <small>Discovered so far</small></h2><dl>
 <div><dt>Latest live scan / metadata height</dt><dd id="bundle-live-height">-</dd></div>
 <div><dt>Live restart checkpoint</dt><dd id="bundle-live-checkpoint">-</dd></div>
-<div><dt>Backfill cursor (descending)</dt><dd id="bundle-backfill-height">-</dd></div>
+<div><dt>Backfill position (newest to oldest)</dt><dd id="bundle-backfill-height">-</dd></div>
 <div><dt>Root bundles</dt><dd id="roots">-</dd></div>
 <div><dt>Completed roots</dt><dd id="completed-roots">-</dd></div>
 <div><dt>Pending roots</dt><dd id="pending-roots">-</dd></div>
@@ -43,7 +43,7 @@
 <div><dt>Items / sec</dt><dd id="bundle-item-rate">-</dd></div>
 <div><dt>Completed roots / sec</dt><dd id="bundle-root-rate">-</dd></div>
 <div><dt>Completed MiB / sec</dt><dd id="bundle-byte-rate">-</dd></div>
-</dl><p id="bundle-status" class="note" aria-live="polite">Collecting bundle totals</p><p class="note">Recognized binary and JSON bundles. Processed bytes count completed roots. Pending bytes include full sizes of partially processed roots.</p></section>
+</dl><p id="bundle-status" class="note" aria-live="polite">Loading bundle totals...</p><p class="note">Counts include binary and JSON bundles. Processed bytes cover completed root bundles. Pending bytes include the full size of roots still being processed.</p></section>
 <section><h2>Worker</h2><dl>
 <div><dt>State</dt><dd id="worker">-</dd></div>
 <div><dt>Chain activity</dt><dd id="chain-activity">-</dd></div>
@@ -58,7 +58,7 @@
 <div><dt>Verifying</dt><dd id="live-verifying">-</dd></div>
 <div><dt>Writing metadata</dt><dd id="live-persisting">-</dd></div>
 <div><dt>Chunk download MiB / sec</dt><dd id="live-download-rate">-</dd></div>
-</dl><p class="note">Received chunk response bytes include retries and duplicate fetches. Activities can overlap.</p>
+</dl><p class="note">Downloaded bytes include retries and duplicate chunks. A bundle can appear in more than one activity.</p>
 <div id="live-jobs" class="bundle-jobs"></div><p id="live-empty" class="note">No active bundles.</p>
 </section>
 <section><h2>HTTP disk cache <small id="http-cache-state"></small></h2><dl>
@@ -67,17 +67,17 @@
 <div><dt>Misses</dt><dd id="http-cache-misses">-</dd></div>
 <div><dt>Errors</dt><dd id="http-cache-errors">-</dd></div>
 <div><dt>Lookup hit rate</dt><dd id="http-cache-rate">-</dd></div>
-</dl><p class="note">Completed disk lookups since startup.</p></section>
+</dl><p class="note">Disk lookups since startup.</p></section>
 <section><h2>Background disk cache <small id="background-cache-state"></small></h2><dl>
 <div><dt>Lookups</dt><dd id="background-cache-lookups">-</dd></div>
 <div><dt>Hits</dt><dd id="background-cache-hits">-</dd></div>
 <div><dt>Misses</dt><dd id="background-cache-misses">-</dd></div>
 <div><dt>Errors</dt><dd id="background-cache-errors">-</dd></div>
 <div><dt>Lookup hit rate</dt><dd id="background-cache-rate">-</dd></div>
-</dl><p class="note">Completed disk lookups since startup.</p></section>
+</dl><p class="note">Disk lookups since startup.</p></section>
 </main>
-<footer><span id="updated">Waiting for status</span><a href="/ar-io/status.json">JSON status</a></footer>
-<noscript><p>JavaScript is required for live updates. Use the JSON status link to read the snapshot.</p></noscript>
+<footer><span id="updated">Waiting for status</span><a href="/ar-io/status.json">View status JSON</a></footer>
+<noscript><p>JavaScript is required for live updates. Use the status JSON link to view the latest snapshot.</p></noscript>
 <script>
 const element = id => document.getElementById(id);
 const text = (id, value) => { element(id).textContent = value; };
@@ -108,7 +108,7 @@ function liveBundles(live) {
   const jobs = (live?.jobs || []).filter(job => job.phase !== 'queued');
   const container = element('live-jobs');
   container.replaceChildren();
-  text('live-empty', live == null ? 'Live bundle activity unavailable.' : 'No active bundles.');
+  text('live-empty', live == null ? "Can't load live bundle activity." : 'No active bundles.');
   element('live-empty').hidden = jobs.length > 0;
   const activities = {queued: 'Queued', preparing: 'Preparing', processing: 'Processing', downloading: 'Downloading', verifying: 'Verifying', persisting: 'Writing metadata'};
   for (const job of jobs) {
@@ -120,9 +120,9 @@ function liveBundles(live) {
     for (const [name, value] of [
       ['Bundle size', bytes(job.data_size)],
       ['Activity', activities[job.activity] || job.activity],
-      ['Elapsed', `${number(job.elapsed_seconds)} sec`],
-      ['Since last progress', `${number(job.progress_age_seconds)} sec`],
-      ['Chunk bytes received', bytes(job.downloaded_bytes)]
+      ['Time spent', `${number(job.elapsed_seconds)} sec`],
+      ['Time since last progress', `${number(job.progress_age_seconds)} sec`],
+      ['Chunk data received', bytes(job.downloaded_bytes)]
     ]) {
       const row = document.createElement('div'), term = document.createElement('dt'), detail = document.createElement('dd');
       term.textContent = name; detail.textContent = value;
@@ -139,8 +139,8 @@ async function refresh() {
     const chain = data.chain || {}, tx = data.transactions || {}, bundles = data.bundles || {};
     const stale = data.sampled_at != null && Date.now() / 1000 - data.sampled_at > 90;
     const stopped = data.worker?.running === false;
-    const labels = {ready: 'Live', starting: 'Collecting status', disabled: 'Database not configured', unavailable: 'Status refresh failed'};
-    text('state', stale ? 'Snapshot stale' : (data.state === 'ready' && stopped ? 'Worker stopped' : (labels[data.state] || 'Status unavailable')));
+    const labels = {ready: 'Live', starting: 'Loading status...', disabled: 'Database not configured', unavailable: "Couldn't load status"};
+    text('state', stale ? 'Status may be out of date' : (data.state === 'ready' && stopped ? 'Worker stopped' : (labels[data.state] || 'Status unavailable')));
     element('state').classList.toggle('warning', stale || data.state === 'unavailable' || stopped);
     text('tip', number(data.trusted_tip)); text('checkpoint', number(chain.checkpoint_height));
     text('anchors', number(chain.anchor_height)); text('metadata', number(chain.metadata_height));
@@ -162,15 +162,15 @@ async function refresh() {
     text('bundle-item-rate', number(stale || data.state !== 'ready' ? null : bundles.items_per_second));
     text('bundle-root-rate', number(totalsStale || bundles.state !== 'ready' ? null : bundles.completed_roots_per_second));
     text('bundle-byte-rate', number(totalsStale || bundles.state !== 'ready' || bundles.completed_bytes_per_second == null ? null : bundles.completed_bytes_per_second / 1024 ** 2));
-    const totalsTime = bundles.sampled_at == null ? '' : ` (${date(bundles.sampled_at)})`;
-    text('bundle-status', (totalsFailed ? 'Bundle totals refresh failed' : totalsStale ? 'Bundle totals stale' : bundles.state === 'ready' ? 'Bundle totals updated' : 'Collecting bundle totals') + totalsTime);
+    const totalsTime = bundles.sampled_at == null ? '' : ` Last updated ${date(bundles.sampled_at)}.`;
+    text('bundle-status', totalsFailed ? "Couldn't update bundle totals." + totalsTime : totalsStale ? 'Bundle totals may be out of date.' + totalsTime : bundles.state === 'ready' ? (bundles.sampled_at == null ? 'Bundle totals available.' : `Bundle totals as of ${date(bundles.sampled_at)}`) : 'Loading bundle totals...');
     element('bundle-status').classList.toggle('warning', totalsFailed || totalsStale);
     text('worker', data.worker == null ? 'Disabled' : (data.worker.running ? 'Running' : 'Stopped'));
     text('chain-activity', data.worker?.chain || '-'); text('bundle-activity', data.worker?.bundles || '-');
     liveBundles(data.worker?.live);
     text('progress-at', date(data.last_progress_at));
     const failure = data.worker?.last_failure;
-    text('failure', failure ? `${failure.message} (${date(failure.at)})` : 'None recorded');
+    text('failure', failure ? `${failure.message} (${date(failure.at)})` : 'No failures recorded');
     for (const source of ['http', 'background']) {
       const cache = data.disk_cache?.[source];
       text(`${source}-cache-state`, data.disk_cache == null ? 'Disabled' : '');
@@ -179,10 +179,10 @@ async function refresh() {
       }
       text(`${source}-cache-rate`, cache?.hit_rate == null ? '-' : `${number(cache.hit_rate * 100)}%`);
     }
-    text('updated', data.sampled_at == null ? 'No snapshot available' : `Snapshot: ${date(data.sampled_at)}`);
+    text('updated', data.sampled_at == null ? 'No status yet' : `Updated ${date(data.sampled_at)}`);
   } catch {
     liveBundles(null);
-    text('state', 'Connection unavailable'); element('state').classList.add('warning');
+    text('state', "Can't connect to the gateway"); element('state').classList.add('warning');
   } finally { setTimeout(refresh, 5000); }
 }
 refresh();

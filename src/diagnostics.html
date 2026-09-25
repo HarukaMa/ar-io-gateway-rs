@@ -20,15 +20,15 @@ code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono"
 <form id="form">
 <label for="input">Site URL, ArNS name or data ID</label>
 <div class="input-row"><input id="input" name="input" required maxlength="8192" autocomplete="off" spellcheck="false" placeholder="Enter a site URL, ArNS name or data ID"><button id="run" type="submit">Run diagnostic</button></div>
-<p class="note">The 64 MiB retrieval limit applies only to this diagnostic tool. Preparation and retrieval each have a one-minute limit. One diagnostic can run at a time.</p>
-<p class="note">URLs are traced through this gateway. For unfamiliar hosts, the first hostname label is used as the ArNS name.</p>
+<p class="note">This tool can retrieve up to 64 MiB of content. Preparation and retrieval each have a one-minute limit. You can run one diagnostic at a time.</p>
+<p class="note">URLs are checked through this gateway. On unfamiliar hosts, the first part of the hostname is treated as an ArNS name.</p>
 <output id="status" aria-live="polite"></output>
 </form>
 <div id="results" hidden>
 <div class="result-head"><h2>Diagnostic report</h2><a id="download" class="download" download="diagnostic.json">Download JSON</a></div>
-<div class="grid"><section><h2>Resolution</h2><dl id="resolution"></dl></section><section><h2>Local state</h2><dl id="local"></dl><p class="note">Cache presence checks file type and size. Retrieval runs fresh verification.</p></section></div>
-<section><h2>Bundle relationships</h2><p class="note">Each section shows one content item's ancestry. Arrows point to parent bundles. Link verification applies to that item.</p><div id="ancestry"></div></section>
-<section><h2>Retrieval and verification</h2><p class="note">Stages appear in start order. Alternative paths can run concurrently.</p><ol id="steps"></ol><p id="truncated" hidden>Stage limit reached. This trace is incomplete.</p></section>
+<div class="grid"><section><h2>Resolution</h2><dl id="resolution"></dl></section><section><h2>Local state</h2><dl id="local"></dl><p class="note">The cache check looks at file type and size. Retrieval verifies the content.</p></section></div>
+<section><h2>Bundle relationships</h2><p class="note">Follow the arrows to each item's parent bundle. Verification is shown for each link.</p><div id="ancestry"></div></section>
+<section><h2>Retrieval and verification</h2><p class="note">Steps are listed in the order they started. Some paths run at the same time.</p><ol id="steps"></ol><p id="truncated" hidden>Only part of the trace is shown because it reached the step limit.</p></section>
 <section id="content-section" hidden><h2>Verified content</h2><dl id="content"></dl></section>
 <details><summary>Raw JSON</summary><pre id="json"></pre></details>
 </div>
@@ -36,24 +36,24 @@ code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono"
 <noscript><p>JavaScript is required to run a diagnostic.</p></noscript>
 <script>
 const element = id => document.getElementById(id);
-const label = value => String(value).replaceAll('_', ' ');
+const label = value => String(value).replaceAll('_', ' ').replace(/\bid\b/gi, 'ID').replace(/^./, first => first.toUpperCase());
 const stageDescriptions = {
   database_connection: 'Connects to the local index database for metadata lookups.',
-  input_resolution: 'Identifies the data ID or ArNS name and path from the input.',
-  manifest_resolution: 'Looks up the requested path in the verified manifest, including index and fallback entries.',
+  input_resolution: 'Finds the data ID or ArNS name and path you entered.',
+  manifest_resolution: 'Finds the requested path in the verified manifest, including index and fallback entries.',
   name_resolution: 'Resolves the ArNS name to a content ID using its ArNS and ANT records.',
-  index_inspection: 'Checks whether this ID has locally indexed metadata and whether that metadata is complete.',
-  cache_inspection: 'Checks for a cached file and compares its type and size with the cache record. Cached bytes are not authenticated here.',
-  verified_retrieval: 'Retrieves the requested content and runs the required authentication checks, including any bundle ancestors.',
-  indexed_bundle_lookup: 'Looks for a locally indexed bundle location. A successful lookup can have no matching record.',
-  bundle_discovery: 'Asks an external index for a possible parent bundle. A successful query can find no parent.',
-  bundle_location: 'Records a possible child-to-parent bundle link. Later checks authenticate the bundle and item.',
+  index_inspection: 'Checks whether this ID has complete metadata in the local index.',
+  cache_inspection: "Checks the cached file's type and size against its record. This step doesn't verify the file's contents.",
+  verified_retrieval: 'Retrieves the content and verifies it, including any parent bundles.',
+  indexed_bundle_lookup: 'Looks for a bundle location in the local index. The lookup can succeed without finding a match.',
+  bundle_discovery: 'Asks an external index for a parent bundle. The query can succeed without finding one.',
+  bundle_location: 'Records a possible link to a parent bundle. Later steps verify the bundle and item.',
   transaction_authentication: 'Looks up this ID as an L1 transaction and checks its chain placement and data boundaries. Bundled items can continue through parent discovery.',
-  block_authentication: 'Authenticates the block against the trusted chain index and checks that it contains the transaction.',
-  transaction_signature: 'Fetches the transaction metadata and verifies its ID, signature, and signed fields.',
-  content_proofs_and_hash: 'Reads the content, verifies its chunk proofs, and computes its SHA-256 hash.',
-  bundle_item_verification: 'Finds the item inside its parent bundle and verifies its ID, signature, metadata, and payload.',
-  canonical_anchor: 'Rechecks the content against the current canonical chain before returning it.'
+  block_authentication: 'Checks the block against the trusted chain index and confirms that it contains the transaction.',
+  transaction_signature: 'Fetches transaction metadata and verifies its ID, signature, and signed fields.',
+  content_proofs_and_hash: 'Reads the content, checks its chunk proofs, and computes its SHA-256 hash.',
+  bundle_item_verification: 'Finds the item in its parent bundle and verifies its ID, signature, metadata, and payload.',
+  canonical_anchor: 'Checks the content against the current canonical chain before returning it.'
 };
 element('input').addEventListener('input', event => {
   event.target.classList.toggle('data-id', /^[A-Za-z0-9_-]{43}$/.test(event.target.value.trim()));
@@ -93,12 +93,12 @@ function renderRelationships(report) {
     const status = document.createElement('p');
     status.className = 'retrieval-status ' + (retrieval?.status || '');
     status.textContent = {
-      passed: 'Content retrieval verified',
-      failed: 'Content retrieval failed',
+      passed: 'Content retrieved and verified',
+      failed: "Couldn't retrieve or verify content",
       unavailable: 'Content unavailable',
       not_found: 'Content not found',
-      running: 'Content retrieval incomplete'
-    }[retrieval?.status] || 'Content retrieval not reached';
+      running: 'Retrieval still running'
+    }[retrieval?.status] || "Retrieval didn't start";
     container.append(heading, status);
     if (retrieval?.error || retrieval?.message) {
       const error = document.createElement('p');
@@ -130,7 +130,7 @@ function renderAncestry(group, links, container, index) {
   const ancestry = [...links.values()].filter(link => nodes.has(link.child));
   if (!ancestry.length) {
     const empty = document.createElement('p');
-    empty.textContent = 'No parent bundle discovered.';
+    empty.textContent = 'No parent bundle found.';
     container.append(empty);
     return;
   }
@@ -164,7 +164,7 @@ function renderAncestry(group, links, container, index) {
     const child = nodes.get(link.child), parent = nodes.get(link.parent);
     const x = child.x + 370, y = child.y + 26, endY = parent.y + 26;
     const color = {passed: '#8bdbc6', failed: '#f19b9b', unavailable: '#edc879'}[link.status] || '#a5b6bb';
-    const status = link.status === 'passed' ? 'item verified' : link.status;
+    const status = link.status === 'passed' ? 'Item verified' : label(link.status);
     const path = svg('path', {
       d: `M ${x} ${y} C ${x + 60} ${y}, ${parent.x - 60} ${endY}, ${parent.x - 4} ${endY}`,
       fill: 'none', stroke: color, 'stroke-width': 2,
@@ -190,7 +190,7 @@ function renderAncestry(group, links, container, index) {
 function render(report) {
   const alternateFailure = report.steps.some(step => step.stage === 'bundle_item_verification' && ['failed', 'unavailable'].includes(step.status));
   element('status').textContent = report.status === 'passed'
-    ? 'Verification passed.' + (alternateFailure ? ' Some alternative bundle attempts failed or were unavailable.' : '')
+    ? 'Content verified.' + (alternateFailure ? ' Some other bundle paths failed or were unavailable.' : '')
     : report.error;
   element('status').className = report.status;
   for (const id of ['resolution', 'local', 'ancestry', 'steps', 'content']) element(id).replaceChildren();
@@ -220,7 +220,7 @@ function render(report) {
     name.className = 'stage-name';
     name.textContent = step.stage === 'bundle_item_verification' ? 'Bundle item retrieval and verification' : label(step.stage);
     const status = document.createElement('span');
-    status.textContent = step.status;
+    status.textContent = label(step.status);
     status.className = step.status;
     heading.append(name, status);
     const id = document.createElement('code');
@@ -293,13 +293,13 @@ element('form').addEventListener('submit', async event => {
   element('run').disabled = true;
   element('results').hidden = true;
   element('status').className = '';
-  element('status').textContent = 'Running diagnostic...';
+  element('status').textContent = 'Checking content...';
   try {
     const response = await fetch('/ar-io/diagnostics/run', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({input: element('input').value.trim()})
     });
-    if (!response.ok) throw new Error(response.status === 429 ? 'A diagnostic is already running. Try again later.' : response.status === 400 || response.status === 422 ? 'Enter a valid HTTP(S) URL, ArNS name or data ID.' : response.status === 403 ? 'Content is blocked.' : 'Diagnostic unavailable. Try again later.');
+    if (!response.ok) throw new Error(response.status === 429 ? 'A diagnostic is already running. Try again later.' : response.status === 400 || response.status === 422 ? 'Enter a valid HTTP(S) URL, ArNS name or data ID.' : response.status === 403 ? 'Content is blocked.' : "Couldn't run the diagnostic. Try again later.");
     render(await response.json());
   } catch (error) {
     element('status').className = 'failed';
