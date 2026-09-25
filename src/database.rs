@@ -2690,12 +2690,17 @@ impl BlockStore {
                 for row in transaction
                     .query(
                         &format!(
-                            "SELECT stored.key, incoming.ordinality,
+                            "WITH candidates AS MATERIALIZED (
+                                 SELECT key, sha256(value) AS digest, value
+                                 FROM public.{table}
+                                 WHERE sha256(value) = ANY($1::bytea[])
+                             )
+                             SELECT stored.key, incoming.ordinality,
                                     CASE WHEN stored.key IS NULL
                                          THEN hashtextextended(encode(incoming.digest, 'hex'), 0) END
                              FROM unnest($1::bytea[], $2::bytea[]) WITH ORDINALITY AS incoming(digest, value, ordinality)
-                             LEFT JOIN public.{table} stored
-                               ON sha256(stored.value)=incoming.digest AND stored.value=incoming.value"
+                             LEFT JOIN candidates stored
+                               ON stored.digest=incoming.digest AND stored.value=incoming.value"
                         ),
                         &[&digests, &values],
                     )
@@ -2748,10 +2753,15 @@ impl BlockStore {
                  )"
             );
             let lookup = format!(
-                "SELECT stored.key, incoming.ordinality
+                "WITH candidates AS MATERIALIZED (
+                     SELECT key, sha256(value) AS digest, value
+                     FROM public.{table}
+                     WHERE sha256(value) = ANY($1::bytea[])
+                 )
+                 SELECT stored.key, incoming.ordinality
                  FROM unnest($1::bytea[], $2::bytea[]) WITH ORDINALITY AS incoming(digest, value, ordinality)
-                 JOIN public.{table} stored
-                   ON sha256(stored.value) = incoming.digest AND stored.value = incoming.value"
+                 JOIN candidates stored
+                   ON stored.digest = incoming.digest AND stored.value = incoming.value"
             );
             for entries in entries.chunks(ROW_BATCH_SIZE) {
                 let digests: Vec<_> = entries
