@@ -35,21 +35,28 @@ type GqlResult<T> = async_graphql::Result<T>;
 struct Service {
     schema: Schema,
     source: Option<Arc<BlockStore>>,
+    tag_search_enabled: bool,
     permits: Semaphore,
 }
 
 pub(crate) fn router<S: Clone + Send + Sync + 'static>(
     source: Option<Arc<BlockStore>>,
-) -> Router<S> {
+) -> anyhow::Result<Router<S>> {
+    let tag_search_enabled = std::env::var("AR_IO_GRAPHQL_TAG_SEARCH")
+        .as_deref()
+        .unwrap_or("true")
+        .parse::<bool>()
+        .map_err(|error| anyhow::anyhow!("invalid AR_IO_GRAPHQL_TAG_SEARCH: {error}"))?;
     let service = Arc::new(Service {
         schema: schema(),
         source,
+        tag_search_enabled,
         permits: Semaphore::new(4),
     });
-    Router::new()
+    Ok(Router::new()
         .route("/graphql", get(get_query).post(post_query))
         .layer(DefaultBodyLimit::max(64 * 1024))
-        .with_state(service)
+        .with_state(service))
 }
 
 fn schema() -> Schema {
@@ -128,6 +135,7 @@ async fn execute(service: Arc<Service>, request: async_graphql::Request) -> Resp
     };
     let db = Arc::new(RequestDb {
         source: service.source.clone(),
+        tag_search_enabled: service.tag_search_enabled,
         connection: Mutex::new(None),
         remaining_bytes: AtomicUsize::new(MAX_RESULT_BYTES),
     });
@@ -148,6 +156,7 @@ async fn execute(service: Arc<Service>, request: async_graphql::Request) -> Resp
 
 struct RequestDb {
     source: Option<Arc<BlockStore>>,
+    tag_search_enabled: bool,
     connection: Mutex<Option<BlockStore>>,
     remaining_bytes: AtomicUsize,
 }
@@ -628,6 +637,9 @@ async fn transactions(
         transaction_cursor(&mut sql, &cursor, filter.sort)?;
     }
     let request_db = ctx.data::<Arc<RequestDb>>()?;
+    if !request_db.tag_search_enabled && !filter.tags.is_empty() {
+        return Err("Tag filtering is temporarily unavailable".into());
+    }
     let store = request_db.store().await?;
     if tag_first {
         // Concrete dictionary keys let the planner use tag-pair statistics.

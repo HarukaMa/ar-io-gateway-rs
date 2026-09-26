@@ -93,6 +93,32 @@ async fn graphql_validation_rejects_unsupported_operations_and_abuse() {
 }
 
 #[tokio::test]
+async fn paused_tag_filters_reject_variables_and_aliases_before_database_access() {
+    let db = Arc::new(RequestDb {
+        source: None,
+        tag_search_enabled: false,
+        connection: Mutex::new(None),
+        remaining_bytes: AtomicUsize::new(MAX_RESULT_BYTES),
+    });
+    let response = schema()
+        .execute(
+            async_graphql::Request::new(
+                "query($tags:[TagFilter!]!){selected:transactions(tags:$tags){edges{node{id}}}}",
+            )
+            .variables(async_graphql::Variables::from_json(
+                json!({"tags":[{"name":"App-Name","values":["test"]}]}),
+            ))
+            .data(db),
+        )
+        .await;
+    assert_eq!(response.errors.len(), 1);
+    assert_eq!(
+        response.errors[0].message,
+        "Tag filtering is temporarily unavailable"
+    );
+}
+
+#[tokio::test]
 #[ignore = "requires ar_io_rust_test; isolated fixture transaction is rolled back"]
 async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result<()> {
     let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
@@ -199,8 +225,9 @@ async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result
             store.client.execute("INSERT INTO public.object_tags(object_key,ordinal,name_key,value_key) VALUES($1,$2,$3,$4)", &[key,&(ordinal as i32),&dictionary[0],&dictionary[1]]).await?;
         }
     }
-    let db = Arc::new(RequestDb {
+    let mut db = Arc::new(RequestDb {
         source: None,
+        tag_search_enabled: true,
         connection: Mutex::new(Some(store)),
         remaining_bytes: AtomicUsize::new(MAX_RESULT_BYTES),
     });
@@ -453,6 +480,20 @@ async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result
             && block_next["blocks"]["pageInfo"]["hasNextPage"] == false,
         "block lookup or final page differs"
     );
+    Arc::get_mut(&mut db).unwrap().tag_search_enabled = false;
+    let paused = query(
+        &schema,
+        &db,
+        "query($id:ID!){transaction(id:$id){id tags{name value}} transactions(ids:[$id],tags:[]){edges{node{id}}}}",
+        json!({"id":object_ids[0]}),
+    )
+    .await?;
+    ensure!(
+        paused["transaction"]["id"] == object_ids[0]
+            && paused["transaction"]["tags"] == tx["tags"]
+            && ids(&paused["transactions"]) == vec![object_ids[0].clone()],
+        "pausing tag filters changed ID lookup or returned tags"
+    );
     let store = db
         .store()
         .await
@@ -514,6 +555,7 @@ async fn graphql_id_only_queries_do_not_wait_for_unrequested_tags() -> Result<()
     let blocker = store.reconnect().await?;
     let db = Arc::new(RequestDb {
         source: Some(Arc::new(store)),
+        tag_search_enabled: true,
         connection: Mutex::new(None),
         remaining_bytes: AtomicUsize::new(MAX_RESULT_BYTES),
     });

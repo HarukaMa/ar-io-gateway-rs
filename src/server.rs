@@ -454,7 +454,7 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     let app = Router::new()
         .merge(crate::database::graphql::router(
             state.gateway.block_store.clone(),
-        ))
+        )?)
         .route("/ar-io/info", get(serve_info))
         .route("/ar-io/healthcheck", get(serve_healthcheck))
         .route("/ar-io/status", get(serve_indexing_page))
