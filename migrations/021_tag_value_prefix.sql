@@ -124,4 +124,5 @@ END;
 $$;
 
 DROP INDEX IF EXISTS public.tag_values_digest_idx;
+ANALYZE public.tag_values;
 INSERT INTO public.ar_io_schema_migrations(version,name) VALUES(21,'021_tag_value_prefix');
