@@ -207,7 +207,14 @@ async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result
                 ("tag_names", name.as_bytes()),
                 ("tag_values", value.as_bytes()),
             ] {
-                let rows = store.client.query(&format!("SELECT key FROM public.{table} WHERE sha256(value)=sha256($1::bytea) AND value=$1"), &[&bytes]).await?;
+                let lookup = if table == "tag_values" {
+                    "SELECT key FROM public.tag_values
+                     WHERE public.object_id_prefix(sha256(value))=public.object_id_prefix(sha256($1::bytea))
+                       AND value=$1"
+                } else {
+                    "SELECT key FROM public.tag_names WHERE sha256(value)=sha256($1::bytea) AND value=$1"
+                };
+                let rows = store.client.query(lookup, &[&bytes]).await?;
                 let key: i64 = if let Some(row) = rows.first() {
                     row.get(0)
                 } else {

@@ -85,6 +85,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "020_bundle_flags_object_local",
         include_str!("../migrations/020_bundle_flags_object_local.sql"),
     ),
+    (
+        "021_tag_value_prefix",
+        include_str!("../migrations/021_tag_value_prefix.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -108,11 +112,13 @@ const BUNDLE_TAGS: &str = "
             AS formats(format, version, json)
         JOIN public.tag_names fn ON translate(encode(fn.value,'escape'),
             'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='bundle-format'
-        JOIN public.tag_values fv ON sha256(fv.value)=sha256(convert_to(formats.format, 'UTF8'))
+        JOIN public.tag_values fv ON public.object_id_prefix(sha256(fv.value))=
+            public.object_id_prefix(sha256(convert_to(formats.format, 'UTF8')))
             AND fv.value=convert_to(formats.format, 'UTF8')
         JOIN public.tag_names vn ON translate(encode(vn.value,'escape'),
             'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='bundle-version'
-        JOIN public.tag_values vv ON sha256(vv.value)=sha256(convert_to(formats.version, 'UTF8'))
+        JOIN public.tag_values vv ON public.object_id_prefix(sha256(vv.value))=
+            public.object_id_prefix(sha256(convert_to(formats.version, 'UTF8')))
             AND vv.value=convert_to(formats.version, 'UTF8')
     )";
 
@@ -691,7 +697,7 @@ impl BlockStore {
             .client
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM public.ar_io_schema_migrations
-                    WHERE version = 15 AND name = '015_bundle_scan_directions')
+                    WHERE version = 21 AND name = '021_tag_value_prefix')
                     AND to_regclass('public.bundle_progress') IS NOT NULL
                     AND to_regclass('public.item_locations') IS NOT NULL
                     AND to_regclass('public.canonical_placements') IS NOT NULL
@@ -702,7 +708,7 @@ impl BlockStore {
             .try_get(0)?;
         ensure!(
             installed,
-            "bundle indexing requires schema migration 015_bundle_scan_directions"
+            "bundle indexing requires schema migration 021_tag_value_prefix"
         );
         Ok(())
     }
@@ -2681,6 +2687,20 @@ impl BlockStore {
         ];
         let mut lock_keys = Vec::new();
         for ((table, entries), keys) in dictionaries.iter_mut().zip(&mut dictionary_keys) {
+            let lookup = if *table == "tag_values" {
+                "SELECT key,ordinality,lock_key FROM public.lookup_tag_values($1,$2)"
+            } else {
+                "WITH candidates AS MATERIALIZED (
+                     SELECT key,sha256(value) AS digest,value FROM public.tag_names
+                     WHERE sha256(value)=ANY($1::bytea[])
+                 )
+                 SELECT stored.key,incoming.ordinality,
+                        CASE WHEN stored.key IS NULL
+                             THEN hashtextextended(encode(incoming.digest,'hex'),0) END
+                 FROM unnest($1::bytea[],$2::bytea[]) WITH ORDINALITY AS incoming(digest,value,ordinality)
+                 LEFT JOIN candidates stored
+                   ON stored.digest=incoming.digest AND stored.value=incoming.value"
+            };
             for entries in entries.chunks(ROW_BATCH_SIZE) {
                 let digests: Vec<_> = entries
                     .iter()
@@ -2689,19 +2709,7 @@ impl BlockStore {
                 let values: Vec<_> = entries.iter().map(|(value, _)| *value).collect();
                 for row in transaction
                     .query(
-                        &format!(
-                            "WITH candidates AS MATERIALIZED (
-                                 SELECT key, sha256(value) AS digest, value
-                                 FROM public.{table}
-                                 WHERE sha256(value) = ANY($1::bytea[])
-                             )
-                             SELECT stored.key, incoming.ordinality,
-                                    CASE WHEN stored.key IS NULL
-                                         THEN hashtextextended(encode(incoming.digest, 'hex'), 0) END
-                             FROM unnest($1::bytea[], $2::bytea[]) WITH ORDINALITY AS incoming(digest, value, ordinality)
-                             LEFT JOIN candidates stored
-                               ON stored.digest=incoming.digest AND stored.value=incoming.value"
-                        ),
+                        lookup,
                         &[&digests, &values],
                     )
                     .await?
@@ -2743,26 +2751,32 @@ impl BlockStore {
         .await?;
         crate::profiling::measure(crate::profiling::Stage::DictionaryWrite, async {
         for ((table, entries), keys) in dictionaries.iter().zip(&mut dictionary_keys) {
+            let digest_match = if *table == "tag_values" {
+                "public.object_id_prefix(sha256(stored.value))=public.object_id_prefix(incoming.digest)"
+            } else {
+                "sha256(stored.value)=incoming.digest"
+            };
             let insert = format!(
                 "INSERT INTO public.{table} (value)
                  SELECT value
                  FROM unnest($1::bytea[], $2::bytea[]) AS incoming(digest, value)
                  WHERE NOT EXISTS (
                      SELECT 1 FROM public.{table} stored
-                     WHERE sha256(stored.value) = incoming.digest AND stored.value = incoming.value
+                     WHERE {digest_match} AND stored.value = incoming.value
                  )"
             );
-            let lookup = format!(
+            let lookup = if *table == "tag_values" {
+                "SELECT key,ordinality FROM public.lookup_tag_values($1,$2) WHERE key IS NOT NULL"
+            } else {
                 "WITH candidates AS MATERIALIZED (
-                     SELECT key, sha256(value) AS digest, value
-                     FROM public.{table}
-                     WHERE sha256(value) = ANY($1::bytea[])
+                     SELECT key,sha256(value) AS digest,value FROM public.tag_names
+                     WHERE sha256(value)=ANY($1::bytea[])
                  )
-                 SELECT stored.key, incoming.ordinality
-                 FROM unnest($1::bytea[], $2::bytea[]) WITH ORDINALITY AS incoming(digest, value, ordinality)
+                 SELECT stored.key,incoming.ordinality
+                 FROM unnest($1::bytea[],$2::bytea[]) WITH ORDINALITY AS incoming(digest,value,ordinality)
                  JOIN candidates stored
-                   ON stored.digest = incoming.digest AND stored.value = incoming.value"
-            );
+                   ON stored.digest=incoming.digest AND stored.value=incoming.value"
+            };
             for entries in entries.chunks(ROW_BATCH_SIZE) {
                 let digests: Vec<_> = entries
                     .iter()
@@ -2770,7 +2784,7 @@ impl BlockStore {
                     .collect();
                 let values: Vec<_> = entries.iter().map(|(value, _)| *value).collect();
                 transaction.execute(&insert, &[&digests, &values]).await?;
-                let rows = transaction.query(&lookup, &[&digests, &values]).await?;
+                let rows = transaction.query(lookup, &[&digests, &values]).await?;
                 ensure!(
                     rows.len() == entries.len(),
                     "tag dictionary lookup is incomplete"
@@ -3098,6 +3112,85 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; run serially"]
+    async fn tag_value_lookup_preserves_exact_matches_and_planner_scope() -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let transaction = store.client.transaction().await?;
+        transaction
+            .batch_execute(
+                "SET LOCAL enable_indexscan=on; SET LOCAL enable_indexonlyscan=on;
+             SET LOCAL enable_bitmapscan=off",
+            )
+            .await?;
+        let present = b"tag-value-prefix-regression-present".as_slice();
+        let absent = b"tag-value-prefix-regression-absent".as_slice();
+        let key: i64 = transaction
+            .query_one(
+                "INSERT INTO public.tag_values(value) VALUES($1) RETURNING key",
+                &[&present],
+            )
+            .await?
+            .get(0);
+        let digest: [u8; 32] = Sha256::digest(present).into();
+        let missing_digest: [u8; 32] = Sha256::digest(absent).into();
+        let mut collision = digest;
+        // Exercise a false candidate with the same indexed prefix.
+        collision[8] ^= 1;
+        let digests = vec![
+            digest.as_slice(),
+            collision.as_slice(),
+            digest.as_slice(),
+            missing_digest.as_slice(),
+            digest.as_slice(),
+        ];
+        let values = vec![present, present, absent, absent, present];
+        let rows = transaction
+            .query(
+                "SELECT key,ordinality FROM public.lookup_tag_values($1,$2) ORDER BY ordinality",
+                &[&digests, &values],
+            )
+            .await?;
+        let resolved = rows
+            .iter()
+            .map(|row| Ok((row.try_get::<_, Option<i64>>(0)?, row.try_get::<_, i64>(1)?)))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            resolved
+                == vec![
+                    (Some(key), 1),
+                    (None, 2),
+                    (None, 3),
+                    (None, 4),
+                    (Some(key), 5)
+                ],
+            "dictionary lookup lost exact matching, missing values, or ordinality"
+        );
+        let settings = transaction.query_one(
+            "SELECT current_setting('enable_indexscan'),current_setting('enable_indexonlyscan'),
+                    current_setting('enable_bitmapscan')", &[],
+        ).await?;
+        ensure!(
+            settings.get::<_, String>(0) == "on"
+                && settings.get::<_, String>(1) == "on"
+                && settings.get::<_, String>(2) == "off",
+            "dictionary lookup changed the caller's planner settings"
+        );
+        transaction.rollback().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires ar_io_rust_test; run serially"]

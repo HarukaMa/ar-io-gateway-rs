@@ -652,7 +652,8 @@ async fn transactions(
                 .query(
                     "SELECT n.key,v.key FROM public.tag_names n
                  CROSS JOIN unnest($2::bytea[]) wanted(value)
-                 JOIN public.tag_values v ON sha256(v.value)=sha256(wanted.value)
+                 JOIN public.tag_values v ON public.object_id_prefix(sha256(v.value))=
+                    public.object_id_prefix(sha256(wanted.value))
                     AND v.value=wanted.value
                  WHERE sha256(n.value)=sha256($1::bytea) AND n.value=$1",
                     &[&name, &values],
@@ -721,7 +722,8 @@ async fn transactions(
                  AND t.name_key IN (SELECT key FROM public.tag_names
                     WHERE sha256(value)=sha256({name}::bytea) AND value={name})
                  AND t.value_key IN (SELECT v.key FROM unnest({values}::bytea[]) wanted(value)
-                    JOIN public.tag_values v ON sha256(v.value)=sha256(wanted.value)
+                    JOIN public.tag_values v ON public.object_id_prefix(sha256(v.value))=
+                       public.object_id_prefix(sha256(wanted.value))
                     AND v.value=wanted.value){tag_query_end}"
             ));
         }
