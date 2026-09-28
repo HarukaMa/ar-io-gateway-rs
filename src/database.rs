@@ -3,7 +3,7 @@ pub(crate) mod graphql;
 use std::{collections::HashSet, net::IpAddr, time::Duration};
 
 use anyhow::{Context, Result, ensure};
-use tokio::{task::JoinHandle, time::timeout};
+use tokio::{sync::OnceCell, task::JoinHandle, time::timeout};
 use tokio_postgres::{Client, Config, IsolationLevel, NoTls, Row, Transaction, config::Host};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -325,6 +325,8 @@ pub struct BlockStore {
     client: Client,
     driver: JoinHandle<()>,
     connection_config: Config,
+    // Connections can open before the cache schema is migrated.
+    cached_chunk_statement: OnceCell<tokio_postgres::Statement>,
 }
 
 impl Drop for BlockStore {
@@ -376,29 +378,54 @@ impl BlockStore {
         offset: u128,
         geometry: crate::BlockGeometry,
     ) -> Result<Option<CachedChunk>> {
-        self.client.query_opt(
-            "SELECT r.hash,r.start_offset::text,r.end_offset::text,r.data_path,t.tx_path,r.source_host
-             FROM public.cache_chunks r
+        // Tuple bounds favor the primary index in generic plans.
+        // Scalar bounds allow a direct offset seek within that index.
+        let statement = self.cached_chunk_statement.get_or_try_init(|| self.client.prepare(
+            "WITH candidates AS MATERIALIZED (
+                 SELECT r.block_hash,r.tx_start,r.hash,r.start_offset,r.end_offset,r.data_path,r.source_host
+                 FROM public.blocks b
+                 JOIN public.cache_chunks r ON r.block_hash=b.hash
+                 WHERE b.tx_root=$2 AND b.weave_size=$3::text::numeric
+                   AND (r.block_hash,r.start_offset) > (b.hash,$1::text::numeric-262144)
+                   AND (r.block_hash,r.start_offset) <= (b.hash,$1::text::numeric)
+                   AND r.start_offset > $1::text::numeric-262144
+                   AND r.start_offset <= $1::text::numeric
+                   AND r.end_offset > $1::text::numeric
+             )
+             SELECT r.hash,r.start_offset::text,r.end_offset::text,r.data_path,t.tx_path,r.source_host
+             FROM candidates r
              JOIN public.cache_transactions t USING(block_hash,tx_start)
              JOIN public.canonical_blocks c ON c.height=t.block_height AND c.block_hash=t.block_hash
-             JOIN public.blocks b ON b.hash=c.block_hash
              JOIN public.canonical_blocks pc ON pc.height=c.height-1
              JOIN public.blocks pb ON pb.hash=pc.block_hash
-             WHERE r.start_offset <= $1::text::numeric AND r.end_offset > $1::text::numeric
-               AND r.start_offset > $1::text::numeric-262144
-               AND b.tx_root=$2 AND b.weave_size=$3::text::numeric AND pb.weave_size=$4::text::numeric
+             WHERE pb.weave_size=$4::text::numeric
              ORDER BY r.start_offset DESC LIMIT 1",
-            &[&offset.to_string(), &geometry.tx_root.as_slice(),
-              &geometry.block_weave_size.to_string(), &geometry.previous_weave_size.to_string()],
-        ).await?.map(|row| {
-            let hash: Vec<u8> = row.try_get(0)?;
-            Ok(CachedChunk {
-                hash: hash.try_into().map_err(|_| anyhow::anyhow!("invalid cached chunk hash"))?,
-                start: row.try_get::<_, String>(1)?.parse()?,
-                end: row.try_get::<_, String>(2)?.parse()?,
-                data_path: row.try_get(3)?, tx_path: row.try_get(4)?, source_host: row.try_get(5)?,
+        )).await?;
+        self.client
+            .query_opt(
+                statement,
+                &[
+                    &offset.to_string(),
+                    &geometry.tx_root.as_slice(),
+                    &geometry.block_weave_size.to_string(),
+                    &geometry.previous_weave_size.to_string(),
+                ],
+            )
+            .await?
+            .map(|row| {
+                let hash: Vec<u8> = row.try_get(0)?;
+                Ok(CachedChunk {
+                    hash: hash
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("invalid cached chunk hash"))?,
+                    start: row.try_get::<_, String>(1)?.parse()?,
+                    end: row.try_get::<_, String>(2)?.parse()?,
+                    data_path: row.try_get(3)?,
+                    tx_path: row.try_get(4)?,
+                    source_host: row.try_get(5)?,
+                })
             })
-        }).transpose()
+            .transpose()
     }
 
     pub(crate) async fn cache_chunk(
@@ -493,6 +520,7 @@ impl BlockStore {
             client,
             driver,
             connection_config: config,
+            cached_chunk_statement: OnceCell::new(),
         })
     }
 
@@ -507,6 +535,7 @@ impl BlockStore {
             client,
             driver,
             connection_config: self.connection_config.clone(),
+            cached_chunk_statement: OnceCell::new(),
         })
     }
 
@@ -5483,7 +5512,10 @@ mod tests {
             "requires dedicated test database"
         );
         store.require_content_cache().await?;
-        store.client.batch_execute("BEGIN").await?;
+        store
+            .client
+            .batch_execute("BEGIN; SET LOCAL plan_cache_mode=force_generic_plan")
+            .await?;
         let result = async {
             let tail = store.client.query_one(
                 "SELECT c.height,b.hash,b.weave_size::text FROM public.block_index_state s
@@ -5638,6 +5670,25 @@ mod tests {
                     data_path: row.data_path.into(), tx_path: row.tx_path.into(),
                 }, offset, &block)?;
                 store.cache_chunk(&placement, &proof, host).await?;
+            }
+            for (offset, expected) in [
+                (previous, None),
+                (previous + 1, Some(hashes[0])),
+                (previous + size as u128, Some(hashes[0])),
+                (previous + size as u128 + 1, Some(hashes[1])),
+                (previous + (2 * size) as u128, Some(hashes[1])),
+                (previous + (2 * size) as u128 + 1, None),
+            ] {
+                ensure!(store.cached_chunk(offset, block).await?.map(|chunk| chunk.hash) == expected,
+                    "cached chunk boundary mismatch at {offset}");
+            }
+            for mismatch in [
+                BlockGeometry { tx_root: [0; 32], ..block },
+                BlockGeometry { block_weave_size: block.block_weave_size + 1, ..block },
+                BlockGeometry { previous_weave_size: previous + 1, ..block },
+            ] {
+                ensure!(store.cached_chunk(previous + 1, mismatch).await?.is_none(),
+                    "cached chunk accepted mismatched block geometry");
             }
             let a = gateway.retrieve_chunk(previous + 1).await?.context("first chunk missing")?;
             let other = gateway.retrieve_chunk(previous + size as u128 + 1).await?.unwrap();
