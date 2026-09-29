@@ -2218,7 +2218,14 @@ impl BlockStore {
         keys: &[i64],
         new_locations: &[i64],
     ) -> Result<()> {
-        transaction.execute(
+        // ponytail: Keep inputs at 128 until the chain join is bounded to batch roots.
+        const PLACEMENT_BATCH_SIZE: usize = 128;
+        for start in (0..keys.len().max(new_locations.len())).step_by(PLACEMENT_BATCH_SIZE) {
+            let end = start + PLACEMENT_BATCH_SIZE;
+            let keys = &keys[start.min(keys.len())..end.min(keys.len())];
+            let new_locations =
+                &new_locations[start.min(new_locations.len())..end.min(new_locations.len())];
+            transaction.execute(
             "WITH candidates AS (
                  SELECT l.object_key, root.block_height AS height, root.position, l.key, l.path
                  FROM public.item_locations l
@@ -2258,6 +2265,7 @@ impl BlockStore {
                        (SELECT path FROM public.item_locations WHERE key=stored.location_key))",
             &[&new_locations, &keys],
         ).await?;
+        }
         Ok(())
     }
 
@@ -4584,6 +4592,93 @@ mod tests {
         .await;
         store.client.batch_execute("ROLLBACK").await?;
         result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires 257 indexed items in ar_io_rust_test; run serially"]
+    async fn bundle_placement_batches_preserve_unequal_inputs() -> Result<()> {
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .try_get(0)?;
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let transaction = store.client.transaction().await?;
+        let rows = transaction
+            .query(
+                "SELECT p.object_key,p.location_key FROM public.canonical_placements p
+             JOIN public.item_locations l ON l.key=p.location_key
+             JOIN public.canonical_placements root ON root.object_key=l.root_key
+             JOIN public.block_index_state s ON s.singleton
+             WHERE p.kind=1 AND root.kind=0
+               AND root.block_height>s.start_height AND root.block_height<=s.imported_through
+             ORDER BY p.object_key LIMIT 257",
+                &[],
+            )
+            .await?;
+        ensure!(rows.len() == 257, "requires 257 indexed items");
+        let keys: Vec<i64> = rows.iter().map(|row| row.get(0)).collect();
+        let mut locations: Vec<i64> = rows.iter().map(|row| row.get(1)).collect();
+        locations.reverse();
+        transaction
+            .execute(
+                "CREATE TEMP TABLE saved_batch_placements ON COMMIT DROP AS
+             SELECT * FROM public.canonical_placements WHERE object_key=ANY($1::bigint[])",
+                &[&keys],
+            )
+            .await?;
+        transaction
+            .execute(
+                "DELETE FROM public.canonical_placements WHERE object_key=ANY($1::bigint[])",
+                &[&keys],
+            )
+            .await?;
+        let started = std::time::Instant::now();
+        BlockStore::refresh_bundle_placements(&transaction, &keys, &locations[..129]).await?;
+        eprintln!(
+            "placement smoke: 257 keys / 129 locations in {:?}",
+            started.elapsed()
+        );
+        let mismatch = "SELECT EXISTS (
+            (SELECT * FROM saved_batch_placements
+             EXCEPT SELECT * FROM public.canonical_placements)
+            UNION ALL
+            (SELECT * FROM public.canonical_placements WHERE object_key=ANY($1::bigint[])
+             EXCEPT SELECT * FROM saved_batch_placements)
+        )";
+        ensure!(
+            !transaction
+                .query_one(mismatch, &[&keys])
+                .await?
+                .get::<_, bool>(0),
+            "placement batching skipped keys or changed earliest occurrences"
+        );
+        transaction
+            .execute(
+                "UPDATE public.canonical_placements SET position=position+1
+             WHERE object_key=ANY($1::bigint[])",
+                &[&keys],
+            )
+            .await?;
+        let started = std::time::Instant::now();
+        BlockStore::refresh_bundle_placements(&transaction, &keys[..129], &locations).await?;
+        eprintln!(
+            "placement smoke: 129 keys / 257 locations in {:?}",
+            started.elapsed()
+        );
+        ensure!(
+            !transaction
+                .query_one(mismatch, &[&keys])
+                .await?
+                .get::<_, bool>(0),
+            "placement batching skipped locations or lost earlier placements"
+        );
+        transaction.rollback().await?;
+        Ok(())
     }
 
     #[tokio::test]
