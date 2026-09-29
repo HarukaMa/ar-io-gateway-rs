@@ -13,7 +13,7 @@
 <header><h1>Bundle inspector</h1><a href="/ar-io/diagnostics">Diagnostics</a></header>
 <main>
 <form id="form"><label for="id">Bundle or item ID</label><div class="row"><input id="id" required pattern="[A-Za-z0-9_-]{43}" maxlength="43" autocomplete="off" spellcheck="false"><button type="submit">Inspect</button></div><p>Browse indexed metadata or read headers from external sources. External headers aren't verified, and item data isn't downloaded.</p><output id="status" aria-live="polite"></output></form>
-<section id="results" hidden><h2 id="heading" aria-live="polite"></h2><p id="trust"></p><button id="remote" type="button" hidden>Read external headers</button><div id="items"></div><nav id="paging" aria-label="Bundle pages"><button id="previous" type="button">Previous</button><span id="position"></span><button id="next" type="button">Next</button></nav></section>
+<section id="results" hidden><h2 id="heading" aria-live="polite"></h2><p id="trust"></p><dl id="counts" hidden></dl><button id="remote" type="button" hidden>Read external headers</button><div id="items"></div><nav id="paging" aria-label="Bundle pages"><button id="previous" type="button">Previous</button><span id="position"></span><button id="next" type="button">Next</button></nav></section>
 </main>
 <noscript>JavaScript is required to inspect bundles.</noscript>
 <script>
@@ -81,6 +81,14 @@ async function inspect(id, position = 0, remote = false) {
     el('heading').textContent = single ? 'Item details' : (page.format === 'binary' ? 'Binary bundle' : 'JSON bundle');
     el('trust').textContent = unindexed ? "These details came from an external source. Item signatures and data haven't been checked." : (single ? "This item's metadata is in the local index." : (page.complete ? 'The root bundle has been indexed.' : 'The root bundle is still being indexed, so this list may be incomplete.'));
     el('trust').className = unindexed || (!single && !page.complete) ? 'warning' : '';
+    el('counts').replaceChildren(); el('counts').hidden = single;
+    if (!single) {
+      if (unindexed) field(el('counts'),'Direct items',page.total.toLocaleString());
+      else {
+        field(el('counts'),page.complete ? 'Direct items' : 'Indexed direct items',page.indexed_children.toLocaleString());
+        field(el('counts'),page.complete ? 'Nested descendants' : 'Indexed nested descendants',page.indexed_descendants.toLocaleString());
+      }
+    }
     el('paging').hidden = single;
     el('remote').hidden = unindexed || page.complete || page.format !== 'binary';
     el('items').replaceChildren();

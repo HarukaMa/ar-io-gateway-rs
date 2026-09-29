@@ -927,6 +927,21 @@ impl BlockStore {
         } else {
             "l.parent_path IS NULL AND $2::text IS NULL"
         };
+        // Locations are committed only after their object metadata is complete.
+        let counts = self
+            .client
+            .query_one(
+                "SELECT count(*) FILTER (
+                 WHERE cardinality(l.path)=coalesce(cardinality($2::text::numeric[]),0)+1),count(*)
+             FROM public.item_locations l
+             WHERE l.root_key=$1 AND ($2::text IS NULL OR (
+                 cardinality(l.path)>cardinality($2::text::numeric[])
+                 AND l.path[1:cardinality($2::text::numeric[])]=$2::text::numeric[]))",
+                &[&root, &path],
+            )
+            .await?;
+        let indexed_children: i64 = counts.get(0);
+        let indexed_descendants = counts.get::<_, i64>(1) - indexed_children;
         let rows = self.client.query(
             &format!("SELECT o.key,o.id,l.item_offset::text,l.item_size::text,l.data_offset::text,
                     o.data_size::text,o.signature_type,owner.public_key,o.target,o.anchor,o.signature,l.json
@@ -937,9 +952,6 @@ impl BlockStore {
              ORDER BY l.parent_path,l.item_offset LIMIT $3 OFFSET $4"),
             &[&root,&path,&((crate::bundle_inspection::PAGE_SIZE + 1) as i64),&(start as i64)],
         ).await?;
-        if rows.is_empty() && !complete {
-            return Ok(None);
-        }
         let mut items = Vec::new();
         for (index, row) in rows
             .iter()
@@ -979,6 +991,8 @@ impl BlockStore {
         Ok(Some(json!({
             "id": URL_SAFE_NO_PAD.encode(id), "source": "indexed", "complete": complete,
             "format": if format == Some(crate::BundleFormat::Binary) { "binary" } else { "json" },
+            "total": complete.then_some(indexed_children),
+            "indexed_children": indexed_children, "indexed_descendants": indexed_descendants,
             "start": start, "has_more": rows.len() > crate::bundle_inspection::PAGE_SIZE, "items": items,
         })))
     }
@@ -3514,6 +3528,175 @@ mod tests {
         }.await;
         store.client.batch_execute("ROLLBACK").await?;
         result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires indexed bundles in ar_io_rust_test; run serially"]
+    async fn bundle_inspection_counts_preserve_subtrees_and_partial_progress() -> Result<()> {
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store.client.batch_execute("BEGIN").await?;
+        let sources = store
+            .client
+            .query(
+                "SELECT DISTINCT ON (kind) kind,key FROM public.objects
+             WHERE metadata_complete AND (kind=0 AND is_bundle OR kind=1 AND NOT is_bundle)
+             ORDER BY kind,key",
+                &[],
+            )
+            .await?;
+        ensure!(sources.len() == 2, "requires a bundle and an indexed item");
+        let root_source: i64 = sources[0].get(1);
+        let item_source: i64 = sources[1].get(1);
+        let ids = [
+            crate::sha256(&[b"inspection-count-root"]),
+            crate::sha256(&[b"inspection-count-nested-a"]),
+            crate::sha256(&[b"inspection-count-nested-b"]),
+            crate::sha256(&[b"inspection-count-leaf"]),
+        ];
+        let mut keys = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            let source = if index == 0 { root_source } else { item_source };
+            let row = store.client.query_one(
+                "INSERT INTO public.objects OVERRIDING SYSTEM VALUE
+                 SELECT copy.* FROM public.objects o
+                 CROSS JOIN LATERAL jsonb_populate_record(NULL::public.objects,to_jsonb(o) ||
+                     jsonb_build_object('key',nextval(pg_get_serial_sequence('public.objects','key')),
+                         'id',$1::bytea)) copy
+                 WHERE o.key=$2 RETURNING key",
+                &[&id.as_slice(),&source],
+            ).await?;
+            keys.push(row.get::<_, i64>(0));
+        }
+        store
+            .client
+            .execute(
+                "INSERT INTO public.object_tags
+             SELECT k,t.ordinal,t.name_key,t.value_key FROM unnest($1::bigint[]) k
+             CROSS JOIN public.object_tags t WHERE t.object_key=$2",
+                &[&&keys[..3], &root_source],
+            )
+            .await?;
+        store
+            .client
+            .execute(
+                "INSERT INTO public.item_locations
+                 (object_key,parent_key,root_key,path,item_offset,item_size,data_offset)
+             VALUES ($2,$1,$1,'{96}',96,10,1),($4,$1,$1,'{196}',196,10,1),
+                    ($3,$1,$1,'{296}',296,10,1),($4,$2,$1,'{96,96}',96,10,1),
+                    ($3,$2,$1,'{96,196}',196,10,1),($4,$3,$1,'{96,196,96}',96,10,1),
+                    ($4,$3,$1,'{296,96}',96,10,1)",
+                &[&keys[0], &keys[1], &keys[2], &keys[3]],
+            )
+            .await?;
+        store
+            .client
+            .execute(
+                "INSERT INTO public.bundle_progress(root_key,complete) VALUES($1,true)",
+                &[&keys[0]],
+            )
+            .await?;
+        let root = store
+            .inspect_bundle(&ids[0], 0)
+            .await?
+            .context("root inspection missing")?;
+        ensure!(
+            root["total"] == 3 && root["indexed_children"] == 3 && root["indexed_descendants"] == 4,
+            "root counts lost occurrences or mixed direct and nested items"
+        );
+        let nested = store
+            .inspect_bundle(&ids[1], 0)
+            .await?
+            .context("nested inspection missing")?;
+        ensure!(
+            nested["total"] == 2
+                && nested["indexed_children"] == 2
+                && nested["indexed_descendants"] == 1,
+            "nested counts included sibling subtrees or the container itself"
+        );
+        let repeated = store
+            .inspect_bundle(&ids[2], 0)
+            .await?
+            .context("repeated bundle inspection missing")?;
+        ensure!(
+            repeated["total"] == 1 && repeated["indexed_descendants"] == 0,
+            "inspection combined separate occurrences of the same bundle"
+        );
+        let later_page = store
+            .inspect_bundle(&ids[0], 25)
+            .await?
+            .context("later page missing")?;
+        ensure!(
+            later_page["total"] == 3 && later_page["indexed_descendants"] == 4,
+            "counts changed with pagination"
+        );
+        store
+            .client
+            .execute(
+                "UPDATE public.bundle_progress SET complete=false WHERE root_key=$1",
+                &[&keys[0]],
+            )
+            .await?;
+        store
+            .client
+            .execute(
+                "DELETE FROM public.item_locations WHERE root_key=$1 AND path[1]=296",
+                &[&keys[0]],
+            )
+            .await?;
+        let partial = store
+            .inspect_bundle(&ids[0], 0)
+            .await?
+            .context("partial inspection missing")?;
+        ensure!(
+            partial["total"].is_null()
+                && partial["indexed_children"] == 2
+                && partial["indexed_descendants"] == 3,
+            "partial counts claimed a total or lost indexed progress"
+        );
+        store
+            .client
+            .execute(
+                "DELETE FROM public.item_locations WHERE root_key=$1",
+                &[&keys[0]],
+            )
+            .await?;
+        let empty = store
+            .inspect_bundle(&ids[0], 0)
+            .await?
+            .context("empty partial inspection missing")?;
+        ensure!(
+            empty["source"] == "indexed"
+                && empty["total"].is_null()
+                && empty["indexed_children"] == 0
+                && empty["indexed_descendants"] == 0,
+            "empty partial bundle lost its indexed progress"
+        );
+        store
+            .client
+            .execute(
+                "UPDATE public.bundle_progress SET complete=true WHERE root_key=$1",
+                &[&keys[0]],
+            )
+            .await?;
+        let complete_empty = store
+            .inspect_bundle(&ids[0], 0)
+            .await?
+            .context("empty complete inspection missing")?;
+        ensure!(
+            complete_empty["total"] == 0 && complete_empty["indexed_descendants"] == 0,
+            "completed empty bundle did not report zero items"
+        );
+        store.client.batch_execute("ROLLBACK").await?;
+        Ok(())
     }
 
     #[tokio::test]
