@@ -1863,17 +1863,29 @@ impl BlockStore {
         scan: &BundleScan,
         start: u64,
     ) -> Result<(BundlePage, bool)> {
+        // Bound each page so long runs of completed roots cannot outlast the statement timeout.
+        const SPAN: u64 = 1_000;
         let boundary = u64::try_from(scan.boundary)?;
         let metadata = self.metadata_height().await?.unwrap_or(0);
         let mut live_scanned_height = None;
         if boundary < metadata && start <= metadata {
+            let low = start.max(boundary + 1);
+            let from = match &scan.live {
+                Some(cursor) => u64::try_from(cursor.height)?.max(low),
+                None => low,
+            };
+            let high = metadata.min(from.saturating_add(SPAN - 1));
             let mut live = self
-                .pending_bundles_after(
-                    scan.live.as_ref(),
-                    Some((start.max(boundary + 1), metadata)),
-                    false,
-                )
+                .pending_bundles_after(scan.live.as_ref(), Some((low, high)), false)
                 .await?;
+            if live.after.is_none() && high < metadata {
+                live.after = Some(BundleCursor {
+                    height: i64::try_from(high)?,
+                    position: i32::MAX,
+                    kind: 1,
+                    id: vec![u8::MAX; 32],
+                });
+            }
             if let Some(after) = &live.after {
                 live.live_scanned_height = Some(u64::try_from(after.height)?);
                 return Ok((live, false));
@@ -1891,12 +1903,24 @@ impl BlockStore {
                 true,
             ));
         }
-        self.pending_bundles_after(scan.backfill.as_ref(), Some((start, end)), true)
-            .await
-            .map(|mut page| {
-                page.live_scanned_height = live_scanned_height;
-                (page, true)
-            })
+        let top = match &scan.backfill {
+            Some(cursor) => u64::try_from(cursor.height)?.min(end),
+            None => end,
+        };
+        let low = start.max(top.saturating_sub(SPAN - 1));
+        let mut page = self
+            .pending_bundles_after(scan.backfill.as_ref(), Some((low, end)), true)
+            .await?;
+        if page.after.is_none() && low > start {
+            page.after = Some(BundleCursor {
+                height: i64::try_from(low)?,
+                position: 0,
+                kind: 0,
+                id: vec![0; 32],
+            });
+        }
+        page.live_scanned_height = live_scanned_height;
+        Ok((page, true))
     }
 
     pub(crate) async fn bundle_status(
