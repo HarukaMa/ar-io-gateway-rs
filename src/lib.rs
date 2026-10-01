@@ -142,7 +142,7 @@ impl Config {
             max_memory_data_size: max_data_size.min(64 * 1024 * 1024),
             max_spool_bytes: 4 * 1024 * 1024 * 1024,
             index_downloads: 32,
-            index_writers: background::INDEX_WORKERS,
+            index_writers: 4,
             index_bundle_start_height: 0,
             index_max_bytes: 8 * 1024 * 1024 * 1024,
             index_chain: false,
