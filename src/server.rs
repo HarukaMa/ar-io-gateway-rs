@@ -538,11 +538,6 @@ const SIGNATURE_TRIGGERS: &[&str] = &[
     "x-ar-io-root-transaction-id",
     "x-arweave-owner-address",
     "x-arweave-tags-truncated",
-    "x-arns-name",
-    "x-arns-resolved-id",
-    "x-arns-ttl-seconds",
-    "x-arns-ant-program-id",
-    "x-arns-ant-id",
     "x-arweave-chunk-data-root",
     "x-arweave-chunk-tx-id",
     "x-ar-io-chunk-source-type",
@@ -561,10 +556,9 @@ impl HttpSigner {
     fn sign(&self, response: &mut Response, method: &Method, path: &str) -> Result<()> {
         response.headers_mut().remove("signature");
         response.headers_mut().remove("signature-input");
-        if !SIGNATURE_TRIGGERS
-            .iter()
-            .any(|name| response.headers().contains_key(*name))
-        {
+        if !response.headers().keys().any(|name| {
+            SIGNATURE_TRIGGERS.contains(&name.as_str()) || name.as_str().starts_with("x-arns-")
+        }) {
             return Ok(());
         }
         let mut covered: Vec<&str> = response
@@ -575,6 +569,7 @@ impl HttpSigner {
                 SIGNATURE_TRIGGERS.contains(name)
                     || SIGNATURE_EXTRA_HEADERS.contains(name)
                     || name.starts_with("x-arweave-tag-")
+                    || name.starts_with("x-arns-")
             })
             .collect();
         covered.sort_unstable();
@@ -4803,6 +4798,62 @@ mod signing_tests {
             .unwrap();
         assert!(!ordinary.headers().contains_key("signature"));
         assert!(!ordinary.headers().contains_key("signature-input"));
+    }
+
+    #[test]
+    fn signs_all_arns_headers_and_rejects_tampering() {
+        let key = SigningKey::from_bytes(&[17; 32]);
+        let signer = HttpSigner {
+            address: bs58::encode(key.verifying_key().as_bytes()).into_string(),
+            key_id: format!(
+                "ed25519:{}",
+                URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes())
+            ),
+            key,
+            bind_request: true,
+        };
+        for name in [
+            "x-arns-name",
+            "x-arns-resolved-id",
+            "x-arns-ttl-seconds",
+            "x-arns-ant-program-id",
+            "x-arns-ant-id",
+            "x-arns-basename",
+            "x-arns-record",
+            "x-arns-resolved-at",
+            "x-arns-undername-limit",
+            "x-arns-record-index",
+        ] {
+            let mut response = Response::builder()
+                .header(name, "original")
+                .body(Body::empty())
+                .unwrap();
+            signer.sign(&mut response, &Method::GET, "/").unwrap();
+            let params = response.headers()["signature-input"]
+                .to_str()
+                .unwrap()
+                .strip_prefix("sig1=")
+                .unwrap();
+            let encoded = response.headers()["signature"]
+                .to_str()
+                .unwrap()
+                .strip_prefix("sig1=:")
+                .unwrap()
+                .strip_suffix(':')
+                .unwrap();
+            let signature = Signature::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+            let base = format!(
+                "\"@status\": 200\n\"{name}\": original\n\"@method\";req: GET\n\"@path\";req: /\n\"@signature-params\": {params}"
+            );
+            let public = signer.key.verifying_key();
+            public.verify_strict(base.as_bytes(), &signature).unwrap();
+            assert!(
+                public
+                    .verify_strict(base.replace("original", "tampered").as_bytes(), &signature)
+                    .is_err(),
+                "{name} was not protected"
+            );
+        }
     }
 
     #[test]

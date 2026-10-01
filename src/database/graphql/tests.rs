@@ -2,6 +2,62 @@ use super::*;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 
+#[tokio::test]
+async fn graphql_http_responses_disable_caching_on_success_and_errors() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/graphql", listener.local_addr().unwrap());
+    let app = router::<()>(None).unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for (request, status) in [
+        (
+            client.get(format!("{url}?query=%7B__typename%7D")),
+            StatusCode::OK,
+        ),
+        (
+            client.post(&url).json(&json!({"query": "{ __typename }"})),
+            StatusCode::OK,
+        ),
+        (client.get(&url), StatusCode::BAD_REQUEST),
+        (
+            client.get(format!("{url}?query=%7B__typename%7D&variables=%5B%5D")),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            client
+                .post(&url)
+                .json(&json!({"query": "{ unknownField }"})),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body("{"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            client
+                .post(&url)
+                .json(&json!({"query": " ".repeat(64 * 1024)})),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            client.request(reqwest::Method::PUT, &url),
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ] {
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    }
+    server.abort();
+    let _ = server.await;
+}
+
 async fn query(
     schema: &Schema,
     db: &Arc<RequestDb>,

@@ -14,7 +14,8 @@ use async_graphql::{
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query as QueryParams, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::CACHE_CONTROL},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -56,6 +57,13 @@ pub(crate) fn router<S: Clone + Send + Sync + 'static>(
     Ok(Router::new()
         .route("/graphql", get(get_query).post(post_query))
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn(|request, next: Next| async move {
+            let mut response = next.run(request).await;
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }))
         .with_state(service))
 }
 
