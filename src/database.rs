@@ -1600,11 +1600,14 @@ impl BlockStore {
                 loop {
                     let keys = transaction
                         .query(
-                            "SELECT DISTINCT l.object_key
-                     FROM public.block_transactions bt
-                     JOIN public.item_locations l ON l.root_key=bt.object_key
-                     WHERE bt.block_hash=$1 AND l.object_key>$2
-                     ORDER BY l.object_key LIMIT 256",
+                            "WITH candidates AS MATERIALIZED (
+                         SELECT l.object_key
+                         FROM public.block_transactions bt
+                         JOIN public.item_locations l ON l.root_key=bt.object_key
+                         WHERE bt.block_hash=$1 AND l.object_key>$2
+                     )
+                     SELECT DISTINCT object_key FROM candidates
+                     ORDER BY object_key LIMIT 256",
                             &[&block.hash, &after],
                         )
                         .await?
@@ -4020,6 +4023,9 @@ mod tests {
             "requires the dedicated test database"
         );
         let transaction = store.client.transaction().await?;
+        transaction
+            .batch_execute("SET LOCAL plan_cache_mode=force_generic_plan")
+            .await?;
         let row = transaction
             .query_one(
                 "SELECT b.height,b.hash,b.previous_hash,b.tx_root,b.weave_size::text,b.timestamp
