@@ -4265,6 +4265,10 @@ fn parse_avro_tags(bytes: &axum::body::Bytes, expected_count: usize) -> Result<V
     let mut cursor = 0;
     let mut tags = Vec::with_capacity(expected_count);
     loop {
+        // arbundles reads past the end as zero, so signers can omit the closing block count.
+        if cursor == bytes.len() {
+            break;
+        }
         let block_count = read_avro_long(bytes, &mut cursor)?;
         if block_count == 0 {
             break;
@@ -7051,6 +7055,31 @@ mod tests {
         }
         assert!(parse_avro_tags(&Bytes::from_static(&[0, 0]), 1).is_err());
         assert!(parse_avro_tags(&Bytes::from_static(&[0, 1]), 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn compatibility_missing_tag_terminator_matches_arbundles() {
+        let bytes = include_bytes!("../tests/fixtures/missing-tag-terminator.bin");
+        let id =
+            decode_fixed::<32>("abosG5_y9UGSxylr5i57vMJrh9deulYrIQRnovhj5xc", "item ID").unwrap();
+        let item = verify_data_item(bytes.to_vec().into(), &id).await.unwrap();
+        assert_eq!(item.tags.len(), 1);
+        assert_eq!(item.tags[0].name.as_ref(), b"Content-Type");
+        assert_eq!(item.tags[0].value.as_ref(), b"application/json");
+        assert!(
+            parse_avro_tags(
+                &Bytes::from_static(b"\x02\x18Content-Type\x20application/js"),
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            parse_avro_tags(
+                &Bytes::from_static(b"\x02\x18Content-Type\x20application/json"),
+                2
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
