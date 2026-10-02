@@ -67,9 +67,15 @@ const MAX_BLOCK_TRANSACTIONS: usize = 1000;
 const MAX_BLOCK_TRANSACTION_BYTES: usize = 64 * 1024 * 1024;
 const BUNDLE_ENTRY_SIZE: usize = 64;
 const MAX_DATA_ITEM_TAGS: usize = 128;
-const MAX_DATA_ITEM_TAG_BYTES: usize = 4096;
-// Type 6 has the largest signature/owner; flags, lengths and tags are bounded.
-const MAX_DATA_ITEM_HEADER_BYTES: usize = 2 + 2_052 + 1_025 + 2 * 33 + 16 + MAX_DATA_ITEM_TAG_BYTES;
+const MAX_DATA_ITEM_TAG_NAME_BYTES: usize = 1024;
+const MAX_DATA_ITEM_TAG_VALUE_BYTES: usize = 3072;
+// Each tag can occupy its own Avro block, with four ten-byte lengths.
+const MAX_DATA_ITEM_TAG_BYTES: usize =
+    MAX_DATA_ITEM_TAGS * (MAX_DATA_ITEM_TAG_NAME_BYTES + MAX_DATA_ITEM_TAG_VALUE_BYTES + 40) + 10;
+// Type 6 has the largest signature/owner; flags and lengths are bounded.
+const MAX_DATA_ITEM_FIXED_HEADER_BYTES: usize = 2 + 2_052 + 1_025 + 2 * 33 + 16;
+const MAX_DATA_ITEM_HEADER_BYTES: usize =
+    MAX_DATA_ITEM_FIXED_HEADER_BYTES + MAX_DATA_ITEM_TAG_BYTES;
 const MAX_BUNDLE_DEPTH: usize = 32;
 const STRICT_DATA_SPLIT_THRESHOLD: u128 = 30_607_159_107_830;
 const MERKLE_REBASE_SUPPORT_THRESHOLD: u128 = 151_066_495_197_430;
@@ -3806,11 +3812,23 @@ impl BundleEntry {
         let Self::Binary { bytes, .. } = self else {
             return Ok(false);
         };
-        if bytes.len() < 514 {
+        if bytes.len() < 2 {
             return Ok(false);
         }
-        let prefix = bytes.read_at(0, 514).await?;
-        Ok(prefix[..2] == [1, 0] && sha256(&[&prefix[2..]]) == *expected_id)
+        let prefix = bytes.read_at(0, bytes.len().min(514)).await?;
+        let signature_type = u16::from_le_bytes(prefix[..2].try_into()?);
+        let Ok((signature_size, _)) = data_item_signature_sizes(signature_type) else {
+            return Ok(false);
+        };
+        if bytes.len() < 2 + signature_size {
+            return Ok(false);
+        }
+        let signature = if 2 + signature_size <= prefix.len() {
+            prefix.slice(2..2 + signature_size)
+        } else {
+            bytes.read_at(2, signature_size).await?
+        };
+        Ok(sha256(&[&signature]) == *expected_id)
     }
 
     async fn verify(self, materialize: Option<&Gateway>) -> Result<Option<VerifiedItem>> {
@@ -4131,7 +4149,7 @@ fn data_item_signature_payload(
 async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Result<VerifiedItem> {
     let item_size = item.len();
     let header = item
-        .read_at(0, item.len().min(MAX_DATA_ITEM_HEADER_BYTES))
+        .read_at(0, item.len().min(MAX_DATA_ITEM_FIXED_HEADER_BYTES))
         .await?;
     // Early binary items omit the type prefix. The signature hash selects
     // their layout even when the first signature bytes resemble a modern type.
@@ -4169,16 +4187,23 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
         tag_bytes_len <= MAX_DATA_ITEM_TAG_BYTES,
         "data item tag bytes exceed limit"
     );
-    let raw_tags = take(&header, &mut cursor, tag_bytes_len, "data item tags")?;
-    let tags = parse_avro_tags(&header.slice_ref(raw_tags), tag_count)?;
+    let tags_end = cursor
+        .checked_add(tag_bytes_len)
+        .context("data item tag offset overflow")?;
+    let raw_tags_bytes = if tags_end <= header.len() {
+        header.slice(cursor..tags_end)
+    } else {
+        item.read_at(cursor, tag_bytes_len)
+            .await
+            .context("data item tags are truncated")?
+    };
+    cursor = tags_end;
+    let raw_tags = raw_tags_bytes.as_ref();
+    let tags = parse_avro_tags(&raw_tags_bytes, tag_count)?;
     let data = item.slice(cursor..item.len())?;
 
     let signed_identity = sha256(&[signature]) == *expected_id;
-    let content_identity = unsigned || (!legacy && signature_type == 1 && !signed_identity);
-    ensure!(
-        content_identity || signed_identity,
-        "data item ID is not the signature hash"
-    );
+    let content_identity = unsigned || (!legacy && !signed_identity);
     let (body_hash, body_sha384) = data.hashes().await?;
     let data_hash = sha384(&[
         &sha384(&[format!("blob{}", data.len()).as_bytes()]),
@@ -4212,7 +4237,7 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
         };
         ensure!(
             sha256(&[&identity_payload]) == *expected_id,
-            "unsigned data item ID does not match its content"
+            "data item content ID does not match its content"
         );
     }
     let (signature_bytes, owner_bytes) = if unsigned {
@@ -4297,8 +4322,16 @@ fn parse_avro_tags(bytes: &axum::body::Bytes, expected_count: usize) -> Result<V
 
         for _ in 0..count {
             let name_len = read_avro_length(bytes, &mut cursor, "Avro tag name")?;
+            ensure!(
+                name_len <= MAX_DATA_ITEM_TAG_NAME_BYTES,
+                "data item tag name exceeds limit"
+            );
             let name = take(bytes, &mut cursor, name_len, "Avro tag name")?;
             let value_len = read_avro_length(bytes, &mut cursor, "Avro tag value")?;
+            ensure!(
+                value_len <= MAX_DATA_ITEM_TAG_VALUE_BYTES,
+                "data item tag value exceeds limit"
+            );
             let value = take(bytes, &mut cursor, value_len, "Avro tag value")?;
             tags.push(ItemTag {
                 name: bytes.slice_ref(name),
@@ -6814,8 +6847,45 @@ mod tests {
             );
             assert_eq!(verified.body_hash, sha256(&[data]));
         }
-
+        let content_id = sha256(&[&data_item_signature_payload(
+            signature_type,
+            &[0; 512],
+            &[],
+            &[],
+            &[0],
+            deep_hash_blob(data),
+        )]);
+        for bytes in [item.clone().into(), spooled_content(&item).await] {
+            let verified = verify_data_item(bytes, &content_id).await.unwrap();
+            assert_eq!(verified.id(&content_id), expected_id);
+            assert_eq!(verified.owner.as_ref(), owner);
+            assert_eq!(
+                verified.data.read_all(data.len()).await.unwrap().as_ref(),
+                data
+            );
+        }
+        let mut bundle = encode_bundle(&[&item]);
+        bundle[64..96].copy_from_slice(&content_id);
+        for offset in [None, Some(96)] {
+            let (verified, at) = verify_bundle_item(
+                bundle.clone().into(),
+                BundleFormat::Binary,
+                &expected_id,
+                offset,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(at, 96);
+            assert_eq!(verified.body_hash, sha256(&[data]));
+        }
         let (signature_size, _) = data_item_signature_sizes(signature_type).unwrap();
+        for at in [2, 2 + signature_size, item.len() - 1] {
+            let mut corrupt = item.clone();
+            corrupt[at] ^= 1;
+            assert!(verify_data_item(corrupt.into(), &content_id).await.is_err());
+        }
+
         let mut wrong_signature = item.clone();
         wrong_signature[2] ^= 1;
         let wrong_id = sha256(&[&wrong_signature[2..2 + signature_size]]);
@@ -6856,6 +6926,89 @@ mod tests {
         assert!(item.metadata(&id).tags.is_empty());
         let inconsistent = encode_data_item(2, &signature, &owner, data, &[], 1);
         assert!(verify_data_item(inconsistent.into(), &id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn large_tag_sections_preserve_tags_and_enforce_individual_bounds() {
+        let name = vec![b'n'; MAX_DATA_ITEM_TAG_NAME_BYTES];
+        let value = vec![b'v'; MAX_DATA_ITEM_TAG_VALUE_BYTES];
+        let tags = vec![(name.as_slice(), value.as_slice()); MAX_DATA_ITEM_TAGS];
+        let data = b"large tag section";
+        let (bytes, id) = signed_data_item(data, &tags);
+        for source in [bytes.clone().into(), spooled_content(&bytes).await] {
+            let item = verify_data_item(source, &id).await.unwrap();
+            assert_eq!(item.data.read_all(data.len()).await.unwrap().as_ref(), data);
+            assert_eq!(
+                item.metadata(&id).tags,
+                vec![(name.clone(), value.clone()); MAX_DATA_ITEM_TAGS]
+            );
+        }
+        for (name_len, value_len, count, error) in [
+            (
+                MAX_DATA_ITEM_TAG_NAME_BYTES + 1,
+                1,
+                1,
+                "data item tag name exceeds limit",
+            ),
+            (
+                1,
+                MAX_DATA_ITEM_TAG_VALUE_BYTES + 1,
+                1,
+                "data item tag value exceeds limit",
+            ),
+            (
+                1,
+                1,
+                MAX_DATA_ITEM_TAGS + 1,
+                "data item tag count exceeds limit",
+            ),
+        ] {
+            let name = vec![b'n'; name_len];
+            let value = vec![b'v'; value_len];
+            let tags = vec![(name.as_slice(), value.as_slice()); count];
+            let (bytes, id) = signed_data_item(data, &tags);
+            assert_eq!(
+                verify_data_item(bytes.into(), &id)
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                error
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieves_solana_ao_items_by_signature_id() {
+        let data = b"Solana AO content";
+        let key = Ed25519SigningKey::from_bytes(&[4; 32]);
+        let owner = key.verifying_key().to_bytes();
+        let payload = data_item_signature_payload(4, &owner, &[], &[], &[0], deep_hash_blob(data));
+        let signature = key.sign(hex(&payload).as_bytes()).to_bytes();
+        let signed_id = sha256(&[&signature]);
+        let encoded_id = URL_SAFE_NO_PAD.encode(signed_id);
+        let content_id = sha256(&[&data_item_signature_payload(
+            4,
+            &[0; 512],
+            &[],
+            &[],
+            &[0],
+            deep_hash_blob(data),
+        )]);
+        let item = encode_data_item(4, &signature, &owner, data, &[0], 0);
+        let mut bundle = encode_bundle(&[&item]);
+        bundle[64..96].copy_from_slice(&content_id);
+        let tags: &[(&[u8], &[u8])] =
+            &[(b"Bundle-Format", b"binary"), (b"Bundle-Version", b"2.0.0")];
+        let (gateway, id, _, server, _) =
+            retrieval_fixture(&bundle, tags, Some((&encoded_id, data.len()))).await;
+        let retrieved = gateway.retrieve(&id).await.unwrap();
+        assert_eq!(retrieved.id, encoded_id);
+        assert_eq!(
+            retrieved.bytes.read_all(data.len()).await.unwrap().as_ref(),
+            data
+        );
+        server.abort();
     }
 
     #[tokio::test]

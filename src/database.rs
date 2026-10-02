@@ -2259,19 +2259,34 @@ impl BlockStore {
         keys: &[i64],
         new_locations: &[i64],
     ) -> Result<()> {
+        if keys.is_empty() && new_locations.is_empty() {
+            return Ok(());
+        }
         // ponytail: Keep inputs at 128 until the chain join is bounded to batch roots.
         const PLACEMENT_BATCH_SIZE: usize = 128;
-        for start in (0..keys.len().max(new_locations.len())).step_by(PLACEMENT_BATCH_SIZE) {
-            let end = start + PLACEMENT_BATCH_SIZE;
-            let keys = &keys[start.min(keys.len())..end.min(keys.len())];
-            let new_locations =
-                &new_locations[start.min(new_locations.len())..end.min(new_locations.len())];
+        // Order the whole target set before slicing, including targets known only by location.
+        let keys: Vec<i64> = transaction
+            .query(
+                "SELECT o.key FROM public.objects o
+                 JOIN (
+                     SELECT unnest($1::bigint[]) AS object_key
+                     UNION
+                     SELECT object_key FROM public.item_locations WHERE key=ANY($2::bigint[])
+                 ) requested ON requested.object_key=o.key
+                 ORDER BY o.id",
+                &[&keys, &new_locations],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        for keys in keys.chunks(PLACEMENT_BATCH_SIZE) {
             transaction.execute(
             "WITH candidates AS (
                  SELECT l.object_key, root.block_height AS height, root.position, l.key, l.path
                  FROM public.item_locations l
                  JOIN public.canonical_placements root ON root.object_key=l.root_key
-                 WHERE l.key=ANY($1::bigint[]) AND EXISTS (
+                 WHERE l.key=ANY($1::bigint[]) AND l.object_key=ANY($2::bigint[]) AND EXISTS (
                      SELECT 1 FROM public.canonical_placements p WHERE p.object_key=l.object_key
                  )
                  UNION ALL
@@ -4805,6 +4820,134 @@ mod tests {
         .await;
         store.client.batch_execute("ROLLBACK").await?;
         result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires 257 indexed items in ar_io_rust_test; run serially"]
+    async fn concurrent_bundle_placements_keep_global_lock_order() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let mut store = BlockStore::connect(&url).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let rows = store
+            .client
+            .query(
+                "SELECT p.object_key,p.location_key FROM public.canonical_placements p
+             JOIN public.objects o ON o.key=p.object_key
+             JOIN public.item_locations l ON l.key=p.location_key
+             JOIN public.canonical_placements root ON root.object_key=l.root_key
+             JOIN public.block_index_state s ON s.singleton
+             WHERE p.kind=1 AND root.kind=0
+               AND root.block_height>s.start_height AND root.block_height<=s.imported_through
+             ORDER BY o.id LIMIT 257",
+                &[],
+            )
+            .await?;
+        ensure!(rows.len() == 257, "requires 257 indexed items");
+        let expected: Vec<(i64, i64)> = rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+        let keys: Vec<i64> = expected.iter().map(|row| row.0).collect();
+        let locations: Vec<i64> = expected.iter().map(|row| row.1).collect();
+        let reversed: Vec<i64> = locations.iter().rev().copied().collect();
+        let mut first = store.reconnect().await?;
+        let mut second = store.reconnect().await?;
+        let observer = store.reconnect().await?;
+        let pids: Vec<i32> = vec![
+            first
+                .client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await?
+                .get(0),
+            second
+                .client
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await?
+                .get(0),
+        ];
+        let barrier = store.client.transaction().await?;
+        barrier
+            .query_one(
+                "SELECT object_key FROM public.canonical_placements WHERE object_key=$1 FOR UPDATE",
+                &[&keys[128]],
+            )
+            .await?;
+        let first_job = async {
+            let transaction = first.client.transaction().await?;
+            let result =
+                BlockStore::refresh_bundle_placements(&transaction, &keys, &reversed).await;
+            if let Err(error) = &result {
+                eprintln!("reverse-order placement failed: {error:#}");
+            }
+            transaction.rollback().await?;
+            result
+        };
+        let second_job = async {
+            let transaction = second.client.transaction().await?;
+            let result =
+                BlockStore::refresh_bundle_placements(&transaction, &keys, &locations).await;
+            if let Err(error) = &result {
+                eprintln!("forward-order placement failed: {error:#}");
+            }
+            transaction.rollback().await?;
+            result
+        };
+        let release = async {
+            let waiting = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    observer
+                        .client
+                        .query_one("SELECT pg_stat_clear_snapshot()", &[])
+                        .await?;
+                    let waiting: i64 = observer
+                        .client
+                        .query_one(
+                            "SELECT count(*) FROM pg_stat_activity
+                         WHERE pid=ANY($1::integer[]) AND cardinality(pg_blocking_pids(pid))>0",
+                            &[&pids],
+                        )
+                        .await?
+                        .get(0);
+                    if waiting == 2 {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .context("placement workers did not reach the lock barrier")?;
+            if let Err(error) = &waiting {
+                eprintln!("placement lock observation failed: {error:#}");
+            }
+            barrier.rollback().await?;
+            waiting
+        };
+        let (first, second, released) = tokio::join!(first_job, second_job, release);
+        released?;
+        first?;
+        second?;
+        let actual: Vec<(i64, i64)> = observer
+            .client
+            .query(
+                "SELECT p.object_key,p.location_key FROM public.canonical_placements p
+             JOIN public.objects o ON o.key=p.object_key
+             WHERE p.object_key=ANY($1::bigint[]) ORDER BY o.id",
+                &[&keys],
+            )
+            .await?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        ensure!(
+            actual == expected,
+            "concurrent placement changed canonical occurrences"
+        );
+        Ok(())
     }
 
     #[tokio::test]

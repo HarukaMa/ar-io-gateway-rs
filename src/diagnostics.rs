@@ -172,7 +172,7 @@ fn error_text(error: &anyhow::Error, public: bool) -> String {
         "transaction ID is not the signature hash",
         "transaction signature verification failed",
         "data item signature verification failed",
-        "data item ID is not the signature hash",
+        "data item content ID does not match its content",
         "JSON item signature hash differs from ID",
         "transaction data size and root disagree",
         "transaction status and verified size differ",
