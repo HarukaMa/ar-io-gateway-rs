@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     net::{IpAddr, SocketAddr},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -354,11 +354,11 @@ impl PeerState {
         &self,
         rpc_url: &Url,
         gar_program_id: &str,
-        wallet: Option<&str>,
+        owned_wallets: &HashSet<[u8; 32]>,
     ) -> Result<()> {
         timeout(
             GATEWAY_REFRESH_TIMEOUT,
-            self.fetch_gateways(rpc_url, gar_program_id, wallet),
+            self.fetch_gateways(rpc_url, gar_program_id, owned_wallets),
         )
         .await
         .context("gateway registry refresh deadline exceeded")?
@@ -368,7 +368,7 @@ impl PeerState {
         &self,
         rpc_url: &Url,
         gar_program_id: &str,
-        wallet: Option<&str>,
+        owned_wallets: &HashSet<[u8; 32]>,
     ) -> Result<()> {
         ensure!(
             matches!(rpc_url.scheme(), "http" | "https"),
@@ -391,9 +391,7 @@ impl PeerState {
         let operators = decode_registry(&registry_data)?;
         let operators: Vec<_> = operators
             .into_iter()
-            .filter(|(_, operator)| {
-                wallet != Some(Pubkey::new_from_array(*operator).to_string().as_str())
-            })
+            .filter(|(_, operator)| !owned_wallets.contains(operator))
             .collect();
         let mut gateways = BTreeMap::new();
         for batch in operators.chunks(GATEWAY_BATCH_SIZE) {
@@ -1069,6 +1067,103 @@ fn etf_integer(bytes: &[u8], cursor: &mut usize) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn registry_discovery_excludes_every_owned_gateway() -> Result<()> {
+        use std::sync::Arc;
+
+        let program = Pubkey::new_from_array([8; 32]);
+        let program_id = program.to_string();
+        let operators = [[1; 32], [2; 32], [7; 32]];
+        let mut registry = vec![0; REGISTRY_SIZE];
+        registry[..8].copy_from_slice(&REGISTRY_DISCRIMINATOR);
+        registry[40..44].copy_from_slice(&3_u32.to_le_bytes());
+        for (index, operator) in operators.iter().enumerate() {
+            registry[48 + index * 56..80 + index * 56].copy_from_slice(operator);
+        }
+        let account = |bytes: Vec<u8>| {
+            json!({
+                "owner": program_id,
+                "executable": false,
+                "space": bytes.len(),
+                "data": [STANDARD.encode(bytes), "base64"],
+            })
+        };
+        let (registry_pda, _) =
+            Pubkey::try_find_program_address(&[b"gateway_registry"], &program).unwrap();
+        let mut accounts = BTreeMap::from([(registry_pda.to_string(), account(registry))]);
+        for (index, (operator, host)) in operators
+            .iter()
+            .zip([
+                "owned-a.example.com",
+                "owned-b.example.com",
+                "peer.example.com",
+            ])
+            .enumerate()
+        {
+            let (pda, bump) =
+                Pubkey::try_find_program_address(&[b"gateway", operator], &program).unwrap();
+            let mut bytes = GATEWAY_DISCRIMINATOR.to_vec();
+            bytes.extend_from_slice(operator);
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&(host.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(host.as_bytes());
+            bytes.extend_from_slice(&443_u16.to_le_bytes());
+            bytes.push(1);
+            bytes.extend_from_slice(&[0; 8 + 16 + 1 + 8]);
+            bytes.push(0);
+            bytes.extend_from_slice(&[0; 8 + 22 + 56 + 1 + 2 + 8 + 1]);
+            bytes.extend_from_slice(&[0, 0]);
+            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+            bytes.extend_from_slice(&[0; 1 + 32 + 16]);
+            bytes.push(bump);
+            bytes.extend_from_slice(&[1, 1, 0]);
+            bytes.resize(GATEWAY_SIZE, 0xab);
+            accounts.insert(pda.to_string(), account(bytes));
+        }
+        let accounts = Arc::new(accounts);
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<Value>| {
+                let accounts = Arc::clone(&accounts);
+                async move {
+                    let values: Vec<_> = request["params"][0]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|address| accounts.get(address.as_str().unwrap()).cloned())
+                        .collect();
+                    axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {"context": {"slot": 42}, "value": values},
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let peers = PeerState::new(&base)?;
+        peers
+            .refresh_gateways(
+                &Url::parse(&base)?,
+                &program_id,
+                &HashSet::from([operators[0], operators[1]]),
+            )
+            .await?;
+        let snapshot = peers.snapshot();
+        let urls: Vec<_> = snapshot["gateways"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|gateway| gateway["url"].as_str().unwrap())
+            .collect();
+        assert_eq!(urls, vec!["https://peer.example.com"]);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn coverage_refresh_preserves_failed_snapshot_and_accepts_new_zero() -> Result<()> {

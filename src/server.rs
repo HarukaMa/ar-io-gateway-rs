@@ -1,8 +1,10 @@
 use std::{
     collections::HashSet,
+    fs,
     future::Future,
     io,
     net::SocketAddr,
+    path::{Path as FilePath, PathBuf},
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll, Waker},
@@ -11,7 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use axum::{
-    Router,
+    Extension, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, State},
     http::{
@@ -66,7 +68,20 @@ const MAX_BYTE_RANGES: usize = 16;
 struct RootHost {
     host: String,
     apex_name: Option<String>,
+    wallet: Option<String>,
+    signer: Option<HttpSigner>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityFileEntry {
+    host: String,
+    wallet: String,
+    keypair_path: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct RequestIdentity(Option<usize>);
 
 pub struct ServerConfig {
     listen_addr: SocketAddr,
@@ -80,9 +95,8 @@ pub struct ServerConfig {
     ant_program_id: String,
     max_concurrent_requests: usize,
     bundler_urls: Vec<String>,
-    wallet: Option<String>,
+    owned_wallets: HashSet<[u8; 32]>,
     max_expected_data_item_indexing_interval_seconds: Option<u64>,
-    signer: Option<HttpSigner>,
 }
 
 impl ServerConfig {
@@ -170,6 +184,8 @@ impl ServerConfig {
                 Ok(RootHost {
                     host,
                     apex_name: None,
+                    wallet: None,
+                    signer: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -197,9 +213,8 @@ impl ServerConfig {
             ant_program_id: ant_program_id.to_owned(),
             max_concurrent_requests,
             bundler_urls: vec!["https://turbo.ardrive.io/".to_owned()],
-            wallet: None,
+            owned_wallets: HashSet::new(),
             max_expected_data_item_indexing_interval_seconds: None,
-            signer: None,
         })
     }
 
@@ -245,14 +260,21 @@ impl ServerConfig {
         Ok(self)
     }
 
-    fn root_host(&self, host: &str) -> Option<&RootHost> {
+    fn root_host_index(&self, host: &str) -> Option<usize> {
         self.arns_root_hosts
             .iter()
-            .filter(|root| {
+            .enumerate()
+            .filter(|(_, root)| {
                 host.strip_suffix(&root.host)
                     .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
             })
-            .max_by_key(|root| root.host.len())
+            .max_by_key(|(_, root)| root.host.len())
+            .map(|(index, _)| index)
+    }
+
+    fn root_host(&self, host: &str) -> Option<&RootHost> {
+        self.root_host_index(host)
+            .map(|index| &self.arns_root_hosts[index])
     }
 
     pub fn with_info(
@@ -260,7 +282,6 @@ impl ServerConfig {
         core_program_id: Option<&str>,
         gar_program_id: Option<&str>,
         bundler_urls: Option<&str>,
-        wallet: Option<&str>,
         max_expected_data_item_indexing_interval_seconds: Option<u64>,
     ) -> Result<Self> {
         if let Some(program_id) = core_program_id {
@@ -291,16 +312,6 @@ impl ServerConfig {
                 })
                 .collect::<Result<Vec<_>>>()?;
         }
-        if let Some(wallet) = wallet {
-            decode_pubkey(wallet, "AR_IO_WALLET")?;
-            ensure!(
-                self.signer
-                    .as_ref()
-                    .is_none_or(|signer| signer.address == wallet),
-                "AR_IO_WALLET does not match the signing wallet"
-            );
-            self.wallet = Some(wallet.to_owned());
-        }
         self.max_expected_data_item_indexing_interval_seconds =
             max_expected_data_item_indexing_interval_seconds;
         Ok(self)
@@ -308,24 +319,80 @@ impl ServerConfig {
 
     pub fn with_signing(
         mut self,
+        host: &str,
         wallet: &str,
         keypair: &[u8; 64],
         bind_request: bool,
     ) -> Result<Self> {
-        let key = SigningKey::from_keypair_bytes(keypair).context("invalid signing keypair")?;
-        let address = bs58::encode(key.verifying_key().as_bytes()).into_string();
-        ensure!(address == wallet, "signing key does not match AR_IO_WALLET");
-        let key_id = format!(
-            "ed25519:{}",
-            URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes())
+        let wallet_key = decode_pubkey(wallet, "gateway wallet")?;
+        let signer = HttpSigner::new(&wallet_key, keypair, bind_request)?;
+        let root = self
+            .arns_root_hosts
+            .iter_mut()
+            .find(|root| root.host == host)
+            .context("signing host is not a configured gateway root")?;
+        ensure!(
+            root.wallet.is_none(),
+            "gateway identity is already configured"
         );
-        self.signer = Some(HttpSigner {
-            key,
-            address,
-            key_id,
-            bind_request,
-        });
-        self.wallet = Some(wallet.to_owned());
+        root.wallet = Some(wallet.to_owned());
+        root.signer = Some(signer);
+        self.owned_wallets.insert(wallet_key);
+        Ok(self)
+    }
+
+    pub fn with_identities_file(
+        mut self,
+        path: &FilePath,
+        sign_responses: bool,
+        bind_request: bool,
+    ) -> Result<Self> {
+        let bytes = fs::read(path).context("cannot read AR_IO_IDENTITIES_FILE")?;
+        let entries: Vec<IdentityFileEntry> =
+            serde_json::from_slice(&bytes).context("invalid AR_IO_IDENTITIES_FILE")?;
+        ensure!(
+            !entries.is_empty(),
+            "AR_IO_IDENTITIES_FILE must not be empty"
+        );
+        self.arns_root_hosts.clear();
+        self.owned_wallets.clear();
+        for entry in entries {
+            let host = entry.host.trim_end_matches('.').to_ascii_lowercase();
+            validate_host(&host)?;
+            ensure!(
+                !self.arns_root_hosts.iter().any(|root| root.host == host),
+                "duplicate gateway identity host"
+            );
+            let wallet_key = decode_pubkey(&entry.wallet, "gateway wallet")?;
+            let signer = if sign_responses {
+                let key_path = if entry.keypair_path.is_absolute() {
+                    entry.keypair_path
+                } else {
+                    path.parent()
+                        .unwrap_or_else(|| FilePath::new("."))
+                        .join(entry.keypair_path)
+                };
+                let mut raw = fs::read(key_path).context("cannot read gateway keypair file")?;
+                let parsed = serde_json::from_slice::<Vec<u8>>(&raw);
+                raw.fill(0);
+                let mut key_bytes =
+                    parsed.map_err(|_| anyhow::anyhow!("invalid gateway keypair file"))?;
+                let result = <&[u8; 64]>::try_from(key_bytes.as_slice())
+                    .context("gateway keypair file must contain 64 bytes")
+                    .and_then(|keypair| HttpSigner::new(&wallet_key, keypair, bind_request));
+                key_bytes.fill(0);
+                Some(result?)
+            } else {
+                None
+            };
+            self.arns_root_hosts.push(RootHost {
+                host,
+                apex_name: None,
+                wallet: Some(entry.wallet),
+                signer,
+            });
+            self.owned_wallets.insert(wallet_key);
+        }
         Ok(self)
     }
 }
@@ -433,7 +500,7 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
                 .refresh_gateways(
                     &gateway_state.config.solana_rpc_url,
                     &gateway_state.config.gar_program_id,
-                    gateway_state.config.wallet.as_deref(),
+                    &gateway_state.config.owned_wallets,
                 )
                 .await
             {
@@ -525,7 +592,6 @@ async fn cors_response(request: Request<Body>, next: Next) -> Response {
 }
 struct HttpSigner {
     key: SigningKey,
-    address: String,
     key_id: String,
     bind_request: bool,
 }
@@ -553,6 +619,23 @@ const SIGNATURE_EXTRA_HEADERS: &[&str] = &[
 ];
 
 impl HttpSigner {
+    fn new(wallet: &[u8; 32], keypair: &[u8; 64], bind_request: bool) -> Result<Self> {
+        let key = SigningKey::from_keypair_bytes(keypair).context("invalid signing keypair")?;
+        ensure!(
+            &key.verifying_key().to_bytes() == wallet,
+            "signing key does not match the gateway wallet"
+        );
+        let key_id = format!(
+            "ed25519:{}",
+            URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes())
+        );
+        Ok(Self {
+            key,
+            key_id,
+            bind_request,
+        })
+    }
+
     fn sign(&self, response: &mut Response, method: &Method, path: &str) -> Result<()> {
         response.headers_mut().remove("signature");
         response.headers_mut().remove("signature-input");
@@ -615,14 +698,22 @@ impl HttpSigner {
 
 async fn sign_response(
     State(state): State<Arc<AppState>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let method = request.method().clone();
-    let path = request.uri().path().to_owned();
+    let identity = RequestIdentity(
+        request_host(request.headers())
+            .as_deref()
+            .and_then(|host| state.config.root_host_index(host)),
+    );
+    request.extensions_mut().insert(identity);
+    let signing = identity
+        .0
+        .and_then(|index| state.config.arns_root_hosts[index].signer.as_ref())
+        .map(|signer| (signer, request.method().clone(), request.uri().clone()));
     let mut response = next.run(request).await;
-    if let Some(signer) = &state.config.signer {
-        if let Err(error) = signer.sign(&mut response, &method, &path) {
+    if let Some((signer, method, uri)) = signing {
+        if let Err(error) = signer.sign(&mut response, &method, uri.path()) {
             eprintln!("response signing failed: {error:#}");
             return empty_error_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -630,7 +721,18 @@ async fn sign_response(
     response
 }
 
-async fn serve_info(State(state): State<Arc<AppState>>) -> Response {
+async fn serve_info(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<RequestIdentity>,
+) -> Response {
+    info_response(&state, identity)
+}
+
+fn info_response(state: &AppState, identity: RequestIdentity) -> Response {
+    let root = identity.0.map(|index| &state.config.arns_root_hosts[index]);
+    if root.is_none() && !state.config.owned_wallets.is_empty() {
+        return empty_error_response(StatusCode::NOT_FOUND);
+    }
     let filter = if state.gateway.bundle_indexer.is_some() {
         serde_json::json!({"always": true})
     } else {
@@ -652,14 +754,16 @@ async fn serve_info(State(state): State<Arc<AppState>>) -> Response {
                 .map(|url| serde_json::json!({"url": url})).collect::<Vec<_>>(),
         },
     });
-    if let Some(wallet) = &state.config.wallet {
-        info["wallet"] = serde_json::json!(wallet);
-    }
-    if let Some(signer) = &state.config.signer {
-        info["httpsig"] = serde_json::json!({
-            "algorithm": "ed25519",
-            "solanaAddress": signer.address,
-        });
+    if let Some(root) = root {
+        if let Some(wallet) = &root.wallet {
+            info["wallet"] = serde_json::json!(wallet);
+            if root.signer.is_some() {
+                info["httpsig"] = serde_json::json!({
+                    "algorithm": "ed25519",
+                    "solanaAddress": wallet,
+                });
+            }
+        }
     }
     json_response(&info)
 }
@@ -1265,7 +1369,12 @@ async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
             && state.config.apex_tx_id.is_some()
     });
     if !apex && arns_name(&headers, &state.config).is_none() {
-        return serve_info(State(state)).await;
+        let identity = RequestIdentity(
+            request_host(&headers)
+                .as_deref()
+                .and_then(|host| state.config.root_host_index(host)),
+        );
+        return info_response(&state, identity);
     }
     let permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
@@ -3964,6 +4073,270 @@ mod tests {
         }
     }
 
+    fn identity_files() -> (PathBuf, PathBuf, [SigningKey; 2]) {
+        let directory = tempfile::tempdir().unwrap().keep();
+        eprintln!("identity fixture directory: {}", directory.display());
+        let keys = [
+            SigningKey::from_bytes(&[17; 32]),
+            SigningKey::from_bytes(&[23; 32]),
+        ];
+        let mut entries = Vec::new();
+        for (index, host) in ["example.com", "deep.example.com"].iter().enumerate() {
+            let key_file = format!("{index}.json");
+            fs::write(
+                directory.join(&key_file),
+                serde_json::to_vec(keys[index].to_keypair_bytes().as_slice()).unwrap(),
+            )
+            .unwrap();
+            entries.push(serde_json::json!({
+                "host": host,
+                "wallet": bs58::encode(keys[index].verifying_key().as_bytes()).into_string(),
+                "keypair_path": key_file,
+            }));
+        }
+        let path = directory.join("identities.json");
+        fs::write(&path, serde_json::to_vec(&entries).unwrap()).unwrap();
+        (directory, path, keys)
+    }
+
+    fn identity_config() -> ServerConfig {
+        ServerConfig::new(
+            "127.0.0.1:0",
+            "unused.invalid",
+            "http://127.0.0.1:1",
+            ARNS_PROGRAM,
+            ANT_PROGRAM,
+            4,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn isolates_hostname_metadata_and_cached_content_signatures() {
+        let (directory, path, keys) = identity_files();
+        let config = identity_config()
+            .with_identities_file(&path, true, true)
+            .unwrap();
+        let mut gateway = Gateway::new(stream_limits()).unwrap();
+        let verified = response_fixture(b"shared verified content");
+        let id = verified.id.clone();
+        Arc::get_mut(&mut gateway.cache)
+            .unwrap()
+            .get_mut()
+            .unwrap()
+            .insert(
+                verified,
+                gateway.config.cache_max_entries,
+                gateway.config.cache_max_bytes,
+            );
+        let state = Arc::new(AppState {
+            gateway,
+            config,
+            request_permits: Arc::new(Semaphore::new(4)),
+            chunk_permits: Arc::new(Semaphore::new(2)),
+            diagnostic_permits: Semaphore::new(1),
+            started_at: Instant::now(),
+            indexing_status: Mutex::new(serde_json::Value::Null),
+        });
+        let app = Router::new()
+            .route("/ar-io/info", get(serve_info))
+            .route("/raw/{id}", get(serve_raw))
+            .route("/{*path}", get(serve_path))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                sign_response,
+            ))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        for (host, index) in [
+            ("example.com", 0),
+            ("PAGE.Example.Com:443", 0),
+            ("DEEP.EXAMPLE.COM.:443", 1),
+            ("page.deep.example.com", 1),
+            ("example.com", 0),
+        ] {
+            let wallet = bs58::encode(keys[index].verifying_key().as_bytes()).into_string();
+            let info: serde_json::Value = client
+                .get(format!("{base}/ar-io/info"))
+                .header(HOST, host)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(info["wallet"], wallet);
+            assert_eq!(info["httpsig"]["solanaAddress"], wallet);
+            for method in [Method::GET, Method::HEAD] {
+                let response = client
+                    .request(method.clone(), format!("{base}/raw/{id}"))
+                    .header(HOST, host)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let params = response.headers()["signature-input"]
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix("sig1=")
+                    .unwrap();
+                assert!(params.contains("\"@method\";req"));
+                assert!(params.contains("\"@path\";req"));
+                assert!(params.contains(&format!(
+                    "keyid=\"ed25519:{}\"",
+                    URL_SAFE_NO_PAD.encode(keys[index].verifying_key().as_bytes())
+                )));
+                let components = params
+                    .split_once(");")
+                    .unwrap()
+                    .0
+                    .strip_prefix('(')
+                    .unwrap();
+                let mut lines = Vec::new();
+                for component in components.split_ascii_whitespace() {
+                    let value = match component {
+                        "\"@status\"" => response.status().as_u16().to_string(),
+                        "\"@method\";req" => method.to_string(),
+                        "\"@path\";req" => format!("/raw/{id}"),
+                        header => response
+                            .headers()
+                            .get_all(header.trim_matches('"'))
+                            .iter()
+                            .map(|value| value.to_str().unwrap())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    };
+                    lines.push(format!("{component}: {value}"));
+                }
+                lines.push(format!("\"@signature-params\": {params}"));
+                let encoded = response.headers()["signature"]
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix("sig1=:")
+                    .unwrap()
+                    .strip_suffix(':')
+                    .unwrap();
+                let signature =
+                    ed25519_dalek::Signature::from_slice(&STANDARD.decode(encoded).unwrap())
+                        .unwrap();
+                let signed = lines.join("\n");
+                keys[index]
+                    .verifying_key()
+                    .verify_strict(signed.as_bytes(), &signature)
+                    .unwrap();
+                assert!(
+                    keys[1 - index]
+                        .verifying_key()
+                        .verify_strict(signed.as_bytes(), &signature)
+                        .is_err()
+                );
+                let bytes = response.bytes().await.unwrap();
+                assert_eq!(
+                    bytes.as_ref(),
+                    if method == Method::HEAD {
+                        b"".as_slice()
+                    } else {
+                        b"shared verified content".as_slice()
+                    }
+                );
+            }
+        }
+        let redirect = client
+            .get(format!("{base}/{id}"))
+            .header(HOST, "deep.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(redirect.status(), StatusCode::FOUND);
+        let target = Url::parse(redirect.headers()["location"].to_str().unwrap()).unwrap();
+        assert!(target.host_str().unwrap().ends_with(".deep.example.com"));
+        let unknown = client
+            .get(format!("{base}/ar-io/info"))
+            .header(HOST, "badexample.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let unsigned = client
+            .get(format!("{base}/raw/{id}"))
+            .header(HOST, "badexample.com")
+            .send()
+            .await
+            .unwrap();
+        assert!(!unsigned.headers().contains_key("signature"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn identity_files_reject_ambiguous_or_mismatched_keys_and_support_diagnostics() {
+        let (directory, path, keys) = identity_files();
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut invalid = entries.clone();
+        invalid[1]["host"] = serde_json::json!("EXAMPLE.COM.");
+        fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(
+            identity_config()
+                .with_identities_file(&path, true, true)
+                .is_err()
+        );
+        invalid = entries.clone();
+        invalid[0]["wallet"] = entries[1]["wallet"].clone();
+        fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(
+            identity_config()
+                .with_identities_file(&path, true, true)
+                .is_err()
+        );
+        fs::write(&path, serde_json::to_vec(&entries).unwrap()).unwrap();
+        let mut corrupt = keys[0].to_keypair_bytes();
+        corrupt[63] ^= 1;
+        fs::write(
+            directory.join("0.json"),
+            serde_json::to_vec(corrupt.as_slice()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            identity_config()
+                .with_identities_file(&path, true, true)
+                .is_err()
+        );
+        invalid = entries;
+        for entry in &mut invalid {
+            entry["keypair_path"] = serde_json::json!("not-installed.json");
+        }
+        fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        let config = identity_config()
+            .with_identities_file(&path, false, true)
+            .unwrap()
+            .with_routing(None, Some("first,second"), 3600)
+            .unwrap();
+        assert_eq!(
+            config
+                .diagnostic_target("https://deep.example.com/")
+                .unwrap()
+                .0,
+            "second"
+        );
+        fs::write(&path, b"[]").unwrap();
+        assert!(
+            identity_config()
+                .with_identities_file(&path, false, true)
+                .is_err()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[tokio::test]
     async fn public_cors_encoding_head_and_invalid_ids() {
         let gateway = Gateway::new(stream_limits()).unwrap();
@@ -4743,7 +5116,6 @@ mod signing_tests {
     fn signs_response_and_request_components_and_rejects_tampering() {
         let key = SigningKey::from_bytes(&[17; 32]);
         let signer = HttpSigner {
-            address: bs58::encode(key.verifying_key().as_bytes()).into_string(),
             key_id: format!(
                 "ed25519:{}",
                 URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes())
@@ -4804,7 +5176,6 @@ mod signing_tests {
     fn signs_all_arns_headers_and_rejects_tampering() {
         let key = SigningKey::from_bytes(&[17; 32]);
         let signer = HttpSigner {
-            address: bs58::encode(key.verifying_key().as_bytes()).into_string(),
             key_id: format!(
                 "ed25519:{}",
                 URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes())
@@ -4872,8 +5243,16 @@ mod signing_tests {
         let key = SigningKey::from_bytes(&[17; 32]);
         let wallet = bs58::encode(key.verifying_key().as_bytes()).into_string();
         let mut bytes = key.to_keypair_bytes();
-        assert!(config().with_signing("wrong-wallet", &bytes, true).is_err());
+        assert!(
+            config()
+                .with_signing("example.com", "wrong-wallet", &bytes, true)
+                .is_err()
+        );
         bytes[63] ^= 1;
-        assert!(config().with_signing(&wallet, &bytes, true).is_err());
+        assert!(
+            config()
+                .with_signing("example.com", &wallet, &bytes, true)
+                .is_err()
+        );
     }
 }

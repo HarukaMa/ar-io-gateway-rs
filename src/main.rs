@@ -1,4 +1,4 @@
-use std::{env, fs};
+use std::env;
 
 use anyhow::{Context, Result, bail};
 use ar_io_gateway::{
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
         }
         let database_url = env::var("DATABASE_URL").ok();
         let cache_directory = env::var_os("AR_IO_DISK_CACHE_DIR").map(std::path::PathBuf::from);
-        let resolver = resolver_config(1)?;
+        let resolver = resolver_config(1, false)?;
         // Poll separately from the CLI's serving and indexing state machine.
         let report = tokio::spawn(async move {
             Box::pin(ar_io_gateway::diagnostics::diagnose(
@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| "128".to_owned())
             .parse()
             .context("invalid AR_IO_MAX_CONCURRENT_REQUESTS")?;
-        let mut config = resolver_config(max_concurrent_requests)?;
+        let mut config = resolver_config(max_concurrent_requests, true)?;
         config = config.with_routing(
             env::var("APEX_TX_ID")
                 .ok()
@@ -126,9 +126,6 @@ async fn main() -> Result<()> {
                 .parse()
                 .context("invalid CACHE_APEX_MAX_AGE")?,
         )?;
-        let wallet = env::var("AR_IO_WALLET")
-            .ok()
-            .filter(|value| !value.is_empty());
         let indexing_interval = env::var("MAX_EXPECTED_DATA_ITEM_INDEXING_INTERVAL_SECONDS")
             .ok()
             .map(|value| value.parse::<u64>())
@@ -138,54 +135,8 @@ async fn main() -> Result<()> {
             env::var("ARIO_CORE_PROGRAM_ID").ok().as_deref(),
             env::var("ARIO_GAR_PROGRAM_ID").ok().as_deref(),
             env::var("BUNDLER_URLS").ok().as_deref(),
-            wallet.as_deref(),
             indexing_interval,
         )?;
-        let key_path = env::var("OBSERVER_KEYPAIR_PATH")
-            .ok()
-            .filter(|value| !value.is_empty());
-        let private_key = env::var("OBSERVER_PRIVATE_KEY")
-            .ok()
-            .filter(|value| !value.is_empty());
-        let signing_requested = wallet.is_some() || key_path.is_some() || private_key.is_some();
-        let enabled = env::var("HTTPSIG_ENABLED")
-            .unwrap_or_else(|_| signing_requested.to_string())
-            .parse::<bool>()
-            .context("invalid HTTPSIG_ENABLED")?;
-        if enabled {
-            let wallet = wallet.context("AR_IO_WALLET is required for signing")?;
-            let mut keypair = match (key_path, private_key) {
-                (Some(path), None) => {
-                    let mut raw = fs::read(path).context("cannot read OBSERVER_KEYPAIR_PATH")?;
-                    let result = serde_json::from_slice::<Vec<u8>>(&raw);
-                    raw.fill(0);
-                    let mut bytes = result
-                        .map_err(|_| anyhow::anyhow!("invalid OBSERVER_KEYPAIR_PATH keypair"))?;
-                    let keypair = <[u8; 64]>::try_from(bytes.as_slice());
-                    bytes.fill(0);
-                    keypair.context("OBSERVER_KEYPAIR_PATH must contain 64 bytes")?
-                }
-                (None, Some(encoded)) => {
-                    let mut bytes = [0_u8; 64];
-                    let result = bs58::decode(&encoded).onto(&mut bytes);
-                    let mut encoded = encoded.into_bytes();
-                    encoded.fill(0);
-                    if !matches!(result, Ok(64)) {
-                        bytes.fill(0);
-                        bail!("invalid OBSERVER_PRIVATE_KEY keypair");
-                    }
-                    bytes
-                }
-                _ => bail!("set exactly one of OBSERVER_KEYPAIR_PATH or OBSERVER_PRIVATE_KEY"),
-            };
-            let bind_request = env::var("HTTPSIG_BIND_REQUEST")
-                .unwrap_or_else(|_| "true".to_owned())
-                .parse::<bool>()
-                .context("invalid HTTPSIG_BIND_REQUEST")?;
-            let result = config.with_signing(&wallet, &keypair, bind_request);
-            keypair.fill(0);
-            config = result?;
-        }
         let worker = if index_bundles {
             let url = env::var("DATABASE_URL")
                 .context("AR_IO_INDEX_BUNDLES=true requires DATABASE_URL")?;
@@ -226,10 +177,38 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolver_config(max_concurrent_requests: usize) -> Result<ServerConfig> {
-    ServerConfig::new(
+fn resolver_config(max_concurrent_requests: usize, load_signing: bool) -> Result<ServerConfig> {
+    let identities_path = env::var_os("AR_IO_IDENTITIES_FILE").filter(|value| !value.is_empty());
+    let enabled = load_signing
+        && env::var("HTTPSIG_ENABLED")
+            .unwrap_or_else(|_| identities_path.is_some().to_string())
+            .parse::<bool>()
+            .context("invalid HTTPSIG_ENABLED")?;
+    if load_signing && identities_path.is_none() {
+        for name in [
+            "AR_IO_WALLET",
+            "OBSERVER_KEYPAIR_PATH",
+            "OBSERVER_PRIVATE_KEY",
+        ] {
+            if env::var_os(name).is_some_and(|value| !value.is_empty()) {
+                bail!(
+                    "set AR_IO_IDENTITIES_FILE for gateway wallets and signing keys; \
+                     global {name} is no longer a Rust serving input"
+                );
+            }
+        }
+        if enabled {
+            bail!("HTTPSIG_ENABLED=true requires AR_IO_IDENTITIES_FILE");
+        }
+    }
+    let roots = if identities_path.is_some() {
+        String::new()
+    } else {
+        env::var("ARNS_ROOT_HOST").unwrap_or_else(|_| "ar.mrx.im".to_owned())
+    };
+    let config = ServerConfig::new(
         &env::var("AR_IO_LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_owned()),
-        &env::var("ARNS_ROOT_HOST").unwrap_or_else(|_| "ar.mrx.im".to_owned()),
+        &roots,
         &env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_owned()),
         &env::var("ARIO_ARNS_PROGRAM_ID")
@@ -237,5 +216,14 @@ fn resolver_config(max_concurrent_requests: usize) -> Result<ServerConfig> {
         &env::var("ARIO_ANT_PROGRAM_ID")
             .unwrap_or_else(|_| "2MWexMHfMhGJwMHv9Qm9YAVCqjUFUJwDJAysW4oCUGk5".to_owned()),
         max_concurrent_requests,
-    )
+    )?;
+    if let Some(path) = identities_path {
+        let bind_request = env::var("HTTPSIG_BIND_REQUEST")
+            .unwrap_or_else(|_| "true".to_owned())
+            .parse::<bool>()
+            .context("invalid HTTPSIG_BIND_REQUEST")?;
+        config.with_identities_file(std::path::Path::new(&path), enabled, bind_request)
+    } else {
+        Ok(config)
+    }
 }
