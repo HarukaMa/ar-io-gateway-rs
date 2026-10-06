@@ -89,6 +89,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "021_tag_value_prefix",
         include_str!("../migrations/021_tag_value_prefix.sql"),
     ),
+    (
+        "022_graphql_filters",
+        include_str!("../migrations/022_graphql_filters.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -661,6 +665,10 @@ impl BlockStore {
     }
 
     pub async fn migrate(&mut self) -> Result<()> {
+        self.migrate_schema(true).await
+    }
+
+    async fn migrate_schema(&mut self, activate_graphql: bool) -> Result<()> {
         let transaction = self
             .client
             .build_transaction()
@@ -707,6 +715,33 @@ impl BlockStore {
             0
         };
         for (name, migration) in &MIGRATIONS[applied..] {
+            if *name == "022_graphql_filters" {
+                let staged: bool = transaction
+                    .query_one(
+                        "SELECT to_regprocedure('public.set_placement_filters()') IS NOT NULL",
+                        &[],
+                    )
+                    .await?
+                    .get(0);
+                if !staged {
+                    ensure!(
+                        !activate_graphql,
+                        "run ar-io-gateway prepare-graphql-index before serving this database"
+                    );
+                    transaction.batch_execute(migration).await?;
+                }
+                if activate_graphql {
+                    let ready: bool = transaction
+                        .query_one(Self::GRAPHQL_INDEXES_READY, &[])
+                        .await?
+                        .get(0);
+                    ensure!(ready, "GraphQL index preparation has not finished");
+                    transaction.execute(
+                        "INSERT INTO public.ar_io_schema_migrations(version,name) VALUES(22,'022_graphql_filters')", &[],
+                    ).await?;
+                }
+                continue;
+            }
             // Plain CREATE statements reject pre-existing, unversioned tables atomically.
             transaction
                 .batch_execute(migration)
@@ -718,6 +753,142 @@ impl BlockStore {
                 })?;
         }
         transaction.commit().await?;
+        Ok(())
+    }
+
+    const GRAPHQL_INDEXES_READY: &str =
+        "SELECT count(*)=2 FROM pg_index WHERE indisvalid AND indrelid='public.canonical_placements'::regclass
+         AND indexrelid IN (to_regclass('public.placement_owner_order'),
+                            to_regclass('public.placement_recipient_order'))";
+
+    pub async fn require_graphql_indexes(&self) -> Result<()> {
+        let ready: bool = self
+            .client
+            .query_one(Self::GRAPHQL_INDEXES_READY, &[])
+            .await?
+            .get(0);
+        ensure!(
+            ready,
+            "run ar-io-gateway prepare-graphql-index before serving this database"
+        );
+        Ok(())
+    }
+
+    pub async fn prepare_graphql_indexes(&mut self) -> Result<()> {
+        self.migrate_schema(false).await?;
+        let locked: bool = self
+            .client
+            .query_one(
+                "SELECT pg_try_advisory_lock(hashtextextended('ar-io-gateway:graphql-index',0))",
+                &[],
+            )
+            .await?
+            .get(0);
+        ensure!(locked, "GraphQL index preparation is already running");
+        self.client
+            .batch_execute(
+                "SET application_name='ar-io-graphql-index-prepare';
+                 SET statement_timeout=0; SET transaction_timeout=0; SET lock_timeout='1s';
+                 SET max_parallel_workers_per_gather=0; SET work_mem='16MB';
+                 SET max_parallel_maintenance_workers=0; SET maintenance_work_mem='256MB'",
+            )
+            .await?;
+        let tablespace: String = self.client.query_one(
+            "SELECT quote_ident(t.spcname) FROM pg_class c
+             JOIN pg_database d ON d.datname=current_database()
+             JOIN pg_tablespace t ON t.oid=CASE WHEN c.reltablespace=0 THEN d.dattablespace ELSE c.reltablespace END
+             WHERE c.oid='public.canonical_placements'::regclass", &[],
+        ).await?.get(0);
+        let high: i64 = self
+            .client
+            .query_one(
+                "SELECT coalesce(max(object_key),0) FROM public.canonical_placements",
+                &[],
+            )
+            .await?
+            .get(0);
+        let mut after = 0_i64;
+        let mut updated_total = 0_u64;
+        let mut reported = tokio::time::Instant::now();
+        loop {
+            let transaction = self.client.transaction().await?;
+            let keys: Vec<i64> = transaction
+                .query(
+                    "SELECT object_key FROM public.canonical_placements
+                 WHERE object_key>$1 AND object_key<=$2 ORDER BY object_key LIMIT 256",
+                    &[&after, &high],
+                )
+                .await?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            let Some(last) = keys.last().copied() else {
+                transaction.commit().await?;
+                break;
+            };
+            transaction
+                .query(
+                    "SELECT object_key FROM public.canonical_placements
+                 WHERE object_key=ANY($1) ORDER BY id FOR UPDATE",
+                    &[&keys],
+                )
+                .await?;
+            let updated = transaction.execute(
+                "UPDATE public.canonical_placements p
+                 SET owner_filter=CASE WHEN o.metadata_complete THEN public.graphql_filter(o.owner_address) END,
+                     recipient_filter=CASE WHEN o.metadata_complete AND o.target<>''::bytea
+                         THEN public.graphql_filter(o.target) END
+                 FROM public.objects o WHERE o.key=p.object_key AND p.object_key=ANY($1)
+                 AND ROW(p.owner_filter,p.recipient_filter) IS DISTINCT FROM ROW(
+                     CASE WHEN o.metadata_complete THEN public.graphql_filter(o.owner_address) END,
+                     CASE WHEN o.metadata_complete AND o.target<>''::bytea THEN public.graphql_filter(o.target) END)",
+                &[&keys],
+            ).await?;
+            transaction.commit().await?;
+            after = last;
+            updated_total += updated;
+            if reported.elapsed() >= Duration::from_secs(5) || after == high {
+                eprintln!("GraphQL filter backfill: key {after}/{high}, updated {updated_total}");
+                reported = tokio::time::Instant::now();
+            }
+        }
+        for (name, column) in [
+            ("placement_owner_order", "owner_filter"),
+            ("placement_recipient_order", "recipient_filter"),
+        ] {
+            let valid: Option<bool> = self
+                .client
+                .query_opt(
+                    "SELECT indisvalid FROM pg_index WHERE indexrelid=to_regclass($1)",
+                    &[&format!("public.{name}")],
+                )
+                .await?
+                .map(|row| row.get(0));
+            if valid == Some(true) {
+                continue;
+            }
+            ensure!(
+                valid.is_none(),
+                "index {name} is invalid; inspect the interrupted build before retrying"
+            );
+            eprintln!("Building {name}");
+            self.client.batch_execute(&format!(
+                "CREATE INDEX CONCURRENTLY {name} ON public.canonical_placements
+                 ({column},block_height,position,kind,id) TABLESPACE {tablespace} WHERE {column} IS NOT NULL"
+            )).await?;
+        }
+        self.client
+            .batch_execute("ANALYZE public.canonical_placements")
+            .await?;
+        self.require_graphql_indexes().await?;
+        self.client
+            .batch_execute(
+                "SELECT pg_advisory_unlock(hashtextextended('ar-io-gateway:graphql-index',0))",
+            )
+            .await?;
+        eprintln!(
+            "GraphQL indexes are ready; retain the old object indexes until serving cutover is verified"
+        );
         Ok(())
     }
 
@@ -3205,6 +3376,71 @@ fn pair_from_row(row: &Row) -> Result<(IndexBlock, IndexBlock)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires prepared ar_io_rust_test; run serially, changes migration readiness"]
+    async fn graphql_preparation_keeps_previous_schema_until_cutover() -> Result<()> {
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store.require_graphql_indexes().await?;
+        store.client.execute(
+            "DELETE FROM public.ar_io_schema_migrations WHERE version=22 AND name='022_graphql_filters'", &[],
+        ).await?;
+        store.migrate_schema(false).await?;
+        let version: i32 = store
+            .client
+            .query_one(
+                "SELECT max(version) FROM public.ar_io_schema_migrations",
+                &[],
+            )
+            .await?
+            .get(0);
+        ensure!(
+            version == 21,
+            "preparation made the previous serving binary reject the schema"
+        );
+        store.client.batch_execute(
+            "ALTER INDEX public.placement_owner_order RENAME TO placement_owner_order_cutover_test"
+        ).await?;
+        ensure!(
+            store.migrate().await.is_err(),
+            "serving accepted incomplete index preparation"
+        );
+        let version: i32 = store
+            .client
+            .query_one(
+                "SELECT max(version) FROM public.ar_io_schema_migrations",
+                &[],
+            )
+            .await?
+            .get(0);
+        ensure!(version == 21, "failed cutover recorded the new schema");
+        store.client.batch_execute(
+            "ALTER INDEX public.placement_owner_order_cutover_test RENAME TO placement_owner_order"
+        ).await?;
+        store.migrate().await?;
+        let version: i32 = store
+            .client
+            .query_one(
+                "SELECT max(version) FROM public.ar_io_schema_migrations",
+                &[],
+            )
+            .await?
+            .get(0);
+        ensure!(
+            version == 22,
+            "successful cutover did not record the new schema"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires ar_io_rust_test; run serially"]

@@ -6,7 +6,7 @@ use ar_io_gateway::{
     server::{self, ServerConfig},
 };
 
-const USAGE: &str = "usage: ar-io-gateway serve\n       ar-io-gateway cache-cleanup\n       ar-io-gateway diagnose <url|arns-name|id>\n       ar-io-gateway <fetch|fetch-bundled> <id> <output-file>";
+const USAGE: &str = "usage: ar-io-gateway serve\n       ar-io-gateway prepare-graphql-index\n       ar-io-gateway cache-cleanup\n       ar-io-gateway diagnose <url|arns-name|id>\n       ar-io-gateway <fetch|fetch-bundled> <id> <output-file>";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -16,6 +16,15 @@ async fn main() -> Result<()> {
     };
     if command == "cache-cleanup" && args.len() != 0 {
         bail!("{USAGE}");
+    }
+    if command == "prepare-graphql-index" {
+        if args.next().is_some() {
+            bail!("{USAGE}");
+        }
+        let url = env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+        let mut store = ar_io_gateway::database::BlockStore::connect(&url).await?;
+        store.prepare_graphql_indexes().await?;
+        return Ok(());
     }
     if command == "serve" && env::var_os("AR_IO_BLOCKLIST_PATH").is_some() {
         bail!(
@@ -66,6 +75,7 @@ async fn main() -> Result<()> {
         if command == "serve" && args.len() == 0 {
             let mut store = ar_io_gateway::database::BlockStore::connect(&url).await?;
             store.migrate().await?;
+            store.require_graphql_indexes().await?;
         }
         gateway = gateway.with_database(&url).await?;
     }

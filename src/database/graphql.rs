@@ -580,18 +580,13 @@ async fn transactions(
     include_tags: bool,
 ) -> GqlResult<TransactionConnection> {
     let mut sql = Sql::new(
-        "SELECT o.key,o.id,o.anchor,o.signature,o.signature_type,o.target,o.owner_address,w.public_key,
-                coalesce(o.reward,0)::text AS fee,coalesce(o.quantity,0)::text AS quantity,
-                o.data_size::text AS data_size,o.content_type,o.indexed_at,
-                p.block_height,p.position,p.kind,b.hash,b.timestamp,b.previous_hash,parent.id AS parent_id
-         FROM public.canonical_placements p
+        "SELECT p.object_key,p.block_height,p.position,p.kind,p.id,p.location_key FROM public.canonical_placements p
          JOIN public.objects o ON o.key=p.object_key
-         JOIN public.canonical_blocks c ON c.height=p.block_height
-         JOIN public.blocks b ON b.height=c.height AND b.hash=c.block_hash
-         JOIN public.owners w ON w.address=o.owner_address
-         LEFT JOIN public.item_locations l ON l.key=p.location_key
-         LEFT JOIN public.objects parent ON parent.key=l.parent_key
-         WHERE o.metadata_complete AND b.timestamp IS NOT NULL");
+         WHERE o.metadata_complete AND (SELECT b.timestamp IS NOT NULL
+             FROM public.canonical_blocks c JOIN public.blocks b
+             ON b.height=c.height AND b.hash=c.block_hash
+             WHERE c.height=p.block_height) IS TRUE",
+    );
     // Keep selective request constraints ahead of global tag matching.
     let tag_first = filter.ids.is_empty()
         && filter.owners.is_empty()
@@ -618,20 +613,27 @@ async fn transactions(
             "public.object_id_prefix(o.id)=ANY({prefixes}::bigint[]) AND o.id=ANY({ids}::bytea[])"
         ));
     }
-    if !filter.owners.is_empty() {
-        let owners = sql.bind(decode_list(&filter.owners)?);
-        sql.filter(format!("o.owner_address IN (SELECT address FROM public.owners WHERE address=ANY({owners}::bytea[]) OR public_key=ANY({owners}::bytea[]))"));
-    }
-    if !filter.recipients.is_empty() {
-        let recipients = sql.bind(decode_list(&filter.recipients)?);
-        sql.filter(format!("o.target=ANY({recipients}::bytea[])"));
-    }
+    let owners = decode_list(&filter.owners)?;
+    let mut recipients = decode_list(&filter.recipients)?;
+    recipients.sort_unstable();
+    recipients.dedup();
+    let empty_recipient = recipients.first().is_some_and(Vec::is_empty);
+    let nonempty_recipient = recipients.iter().any(|value| !value.is_empty());
+    let recipients = if recipients.is_empty() {
+        None
+    } else {
+        let values = sql.bind(recipients);
+        sql.filter(format!("o.target=ANY({values}::bytea[])"));
+        Some(values)
+    };
     match filter.bundled_in {
         MaybeUndefined::Undefined => {}
         MaybeUndefined::Null => sql.filter("p.kind=0"),
         MaybeUndefined::Value(ids) => {
             let ids = sql.bind(decode_list(&ids)?);
-            sql.filter(format!("p.kind=1 AND parent.id=ANY({ids}::bytea[])"));
+            sql.filter(format!("p.kind=1 AND EXISTS (
+                SELECT 1 FROM public.item_locations l JOIN public.objects parent ON parent.key=l.parent_key
+                WHERE l.key=p.location_key AND parent.id=ANY({ids}::bytea[]))"));
         }
     }
     if filter.tags.len() > 128 {
@@ -649,6 +651,31 @@ async fn transactions(
         return Err("Tag filtering is temporarily unavailable".into());
     }
     let store = request_db.store().await?;
+    let owners = if owners.is_empty() {
+        None
+    } else {
+        let resolved = store
+            .client
+            .query(
+                "SELECT DISTINCT address FROM public.owners
+             WHERE address=ANY($1::bytea[]) OR public_key=ANY($1::bytea[])",
+                &[&owners],
+            )
+            .await
+            .map_err(database_error)?;
+        if resolved.is_empty() {
+            return Ok(TransactionConnection {
+                page_info: PageInfo {
+                    has_next_page: false,
+                },
+                edges: Vec::new(),
+            });
+        }
+        let addresses: Vec<Vec<u8>> = resolved.iter().map(|row| row.get(0)).collect();
+        let values = sql.bind(addresses);
+        sql.filter(format!("o.owner_address=ANY({values}::bytea[])"));
+        Some(values)
+    };
     if tag_first {
         // Concrete dictionary keys let the planner use tag-pair statistics.
         let mut groups = Vec::with_capacity(filter.tags.len());
@@ -738,7 +765,64 @@ async fn transactions(
     }
     let direction = filter.sort.sql();
     let limit = sql.bind((filter.first + 1) as i64);
-    sql.text.push_str(&format!(" ORDER BY p.block_height {direction},p.position {direction},p.kind {direction},p.id {direction} LIMIT {limit}"));
+    let order = format!(
+        "p.block_height {direction},p.position {direction},p.kind {direction},p.id {direction}"
+    );
+    let base = std::mem::take(&mut sql.text);
+    let page = if filter.ids.is_empty() && (owners.is_some() || recipients.is_some()) {
+        let (column, full_column, values, empty, nonempty) = if let Some(values) = owners {
+            ("owner_filter", "owner_address", values, false, true)
+        } else {
+            (
+                "recipient_filter",
+                "target",
+                recipients.unwrap(),
+                empty_recipient,
+                nonempty_recipient,
+            )
+        };
+        let mut branches = Vec::with_capacity(2);
+        if nonempty {
+            let wanted = if full_column == "target" {
+                format!(
+                    "SELECT value FROM unnest({values}::bytea[]) v(value) WHERE value<>''::bytea"
+                )
+            } else {
+                format!("SELECT value FROM unnest({values}::bytea[]) v(value)")
+            };
+            branches.push(format!(
+                "SELECT candidate.* FROM ({wanted}) wanted
+                 CROSS JOIN LATERAL ({base} AND p.{column}=public.graphql_filter(wanted.value)
+                     AND o.{full_column}=wanted.value ORDER BY {order} LIMIT {limit}) candidate"
+            ));
+        }
+        if empty {
+            branches.push(format!(
+                "SELECT candidate.* FROM ({base} AND o.target=''::bytea
+                 ORDER BY {order} LIMIT {limit}) candidate"
+            ));
+        }
+        format!(
+            "SELECT p.* FROM ({}) p ORDER BY {order} LIMIT {limit}",
+            branches.join(" UNION ALL ")
+        )
+    } else {
+        format!("{base} ORDER BY {order} LIMIT {limit}")
+    };
+    sql.text = format!(
+        "WITH page AS MATERIALIZED ({page})
+         SELECT o.key,o.id,o.anchor,o.signature,o.signature_type,o.target,o.owner_address,w.public_key,
+                coalesce(o.reward,0)::text AS fee,coalesce(o.quantity,0)::text AS quantity,
+                o.data_size::text AS data_size,o.content_type,o.indexed_at,
+                p.block_height,p.position,p.kind,b.hash,b.timestamp,b.previous_hash,parent.id AS parent_id
+         FROM page p JOIN public.objects o ON o.key=p.object_key
+         JOIN public.canonical_blocks c ON c.height=p.block_height
+         JOIN public.blocks b ON b.height=c.height AND b.hash=c.block_hash
+         JOIN public.owners w ON w.address=o.owner_address
+         LEFT JOIN public.item_locations l ON l.key=p.location_key
+         LEFT JOIN public.objects parent ON parent.key=l.parent_key
+         ORDER BY {order}"
+    );
     let stream = store
         .client
         .query_raw(&sql.text, sql.params())

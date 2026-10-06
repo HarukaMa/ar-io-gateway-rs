@@ -543,6 +543,203 @@ async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result
             && block_next["blocks"]["pageInfo"]["hasNextPage"] == false,
         "block lookup or final page differs"
     );
+    {
+        let store = db.store().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        store
+            .client
+            .execute(
+                "UPDATE public.objects SET metadata_complete=false WHERE key=$1",
+                &[&keys[0]],
+            )
+            .await?;
+        let row = store.client.query_one(
+            "SELECT owner_filter,recipient_filter FROM public.canonical_placements WHERE object_key=$1",
+            &[&keys[0]],
+        ).await?;
+        ensure!(
+            row.get::<_, Option<i64>>(0).is_none() && row.get::<_, Option<i64>>(1).is_none(),
+            "incomplete metadata retained searchable fingerprints"
+        );
+    }
+    let owner_page =
+        "query($owners:[String!]){transactions(owners:$owners,sort:HEIGHT_ASC){edges{node{id}}}}";
+    let incomplete = query(
+        &schema,
+        &db,
+        owner_page,
+        json!({"owners":[URL_SAFE_NO_PAD.encode(&owner)]}),
+    )
+    .await?;
+    ensure!(
+        ids(&incomplete["transactions"])
+            == ascending
+                .iter()
+                .filter(|id| **id != object_ids[0])
+                .cloned()
+                .collect::<Vec<_>>(),
+        "incomplete metadata remained visible"
+    );
+    {
+        let store = db.store().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        store
+            .client
+            .execute(
+                "UPDATE public.objects SET metadata_complete=true WHERE key=$1",
+                &[&keys[0]],
+            )
+            .await?;
+        store
+            .client
+            .execute(
+                "UPDATE public.objects SET target=''::bytea WHERE key=$1",
+                &[&keys[2]],
+            )
+            .await?;
+        let empty: bool = store.client.query_one(
+            "SELECT recipient_filter IS NULL FROM public.canonical_placements WHERE object_key=$1", &[&keys[2]],
+        ).await?.get(0);
+        ensure!(empty, "empty recipient consumed a fingerprint index entry");
+    }
+    let resumed = query(
+        &schema,
+        &db,
+        owner_page,
+        json!({"owners":[URL_SAFE_NO_PAD.encode(&public_key)]}),
+    )
+    .await?;
+    ensure!(
+        ids(&resumed["transactions"]) == ascending,
+        "metadata completion or owner alias lost placement"
+    );
+    let mixed_query = "query($recipients:[String!],$tags:[TagFilter!],$after:String,$sort:SortOrder){
+        transactions(recipients:$recipients,tags:$tags,after:$after,sort:$sort,first:1){
+            pageInfo{hasNextPage} edges{cursor node{id signature owner{address key} tags{name value}}}}}";
+    for sort in ["HEIGHT_ASC", "HEIGHT_DESC"] {
+        let mut collected = Vec::new();
+        let mut cursor = Value::Null;
+        loop {
+            let page = query(&schema,&db,mixed_query,json!({
+                "recipients":["",URL_SAFE_NO_PAD.encode(&recipient),"",URL_SAFE_NO_PAD.encode(&recipient)],
+                "tags":[{"name":app_name,"values":["red","blue"]}],"after":cursor,"sort":sort
+            })).await?;
+            let page = &page["transactions"];
+            for edge in page["edges"].as_array().unwrap() {
+                ensure!(
+                    edge["node"]["signature"] == edge["node"]["id"]
+                        && edge["node"]["owner"]["key"] == URL_SAFE_NO_PAD.encode(&public_key),
+                    "filtered page lost full metadata"
+                );
+            }
+            collected.extend(ids(page));
+            ensure!(
+                collected.len() <= ascending.len(),
+                "mixed filter repeated a page"
+            );
+            if page["pageInfo"]["hasNextPage"] == false {
+                break;
+            }
+            let next = page["edges"][0]["cursor"].clone();
+            ensure!(next != cursor, "mixed cursor did not advance");
+            cursor = next;
+        }
+        let expected: Vec<_> = if sort == "HEIGHT_ASC" {
+            ascending.clone()
+        } else {
+            ascending.iter().rev().cloned().collect()
+        };
+        ensure!(
+            collected == expected,
+            "mixed-recipient ordering, deduplication, or lookahead differs"
+        );
+    }
+    {
+        let store = db.store().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let other = crate::sha256(&[&nonce, b"other-owner"]).to_vec();
+        store
+            .client
+            .execute(
+                "INSERT INTO public.owners(address,public_key) VALUES($1,$1)",
+                &[&other],
+            )
+            .await?;
+        store
+            .client
+            .execute(
+                "UPDATE public.objects SET owner_address=$2,target=$2 WHERE key=$1",
+                &[&keys[4], &other],
+            )
+            .await?;
+        store
+            .client
+            .execute(
+                "UPDATE public.canonical_placements SET owner_filter=public.graphql_filter($2),
+             recipient_filter=public.graphql_filter($3) WHERE object_key=$1",
+                &[&keys[4], &owner, &recipient],
+            )
+            .await?;
+    }
+    for (field, value) in [
+        ("owners", URL_SAFE_NO_PAD.encode(&owner)),
+        ("recipients", URL_SAFE_NO_PAD.encode(&recipient)),
+    ] {
+        let text = format!(
+            "query($values:[String!],$tags:[TagFilter!]){{transactions({field}:$values,tags:$tags,first:1,sort:HEIGHT_DESC){{pageInfo{{hasNextPage}} edges{{node{{id}}}}}}}}"
+        );
+        let page = query(
+            &schema,
+            &db,
+            &text,
+            json!({"values":[value],"tags":[{"name":app_name,"values":["red","blue"]}]}),
+        )
+        .await?;
+        ensure!(
+            ids(&page["transactions"]) == vec![object_ids[1].clone()]
+                && page["transactions"]["pageInfo"]["hasNextPage"] == true,
+            "fingerprint collision was accepted or filtered after the page limit"
+        );
+    }
+    {
+        let store = db.store().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        store
+            .client
+            .execute(
+                "UPDATE public.objects SET owner_address=$2,target=$3 WHERE key=$1",
+                &[&keys[4], &owner, &recipient],
+            )
+            .await?;
+        store
+            .client
+            .execute(
+                "UPDATE public.blocks SET timestamp=NULL WHERE height=$1",
+                &[&(height + 1)],
+            )
+            .await?;
+    }
+    let ready = query(
+        &schema,
+        &db,
+        owner_page,
+        json!({"owners":[URL_SAFE_NO_PAD.encode(&owner)]}),
+    )
+    .await?;
+    ensure!(
+        ids(&ready["transactions"])
+            == ascending
+                .iter()
+                .filter(|id| **id != object_ids[4])
+                .cloned()
+                .collect::<Vec<_>>(),
+        "block without a timestamp entered the page"
+    );
+    db.store()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?
+        .client
+        .execute(
+            "UPDATE public.blocks SET timestamp=1000001 WHERE height=$1",
+            &[&(height + 1)],
+        )
+        .await?;
     Arc::get_mut(&mut db).unwrap().tag_search_enabled = false;
     let paused = query(
         &schema,
@@ -579,6 +776,17 @@ async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result
     ensure!(
         ids(&removed["transactions"]) == vec![object_ids[4].clone()],
         "fork removal left stale transactions or items"
+    );
+    let removed_owner = query(
+        &schema,
+        &db,
+        owner_page,
+        json!({"owners":[URL_SAFE_NO_PAD.encode(&owner)]}),
+    )
+    .await?;
+    ensure!(
+        ids(&removed_owner["transactions"]) == vec![object_ids[4].clone()],
+        "owner index retained a reorged placement"
     );
     db.store()
         .await
