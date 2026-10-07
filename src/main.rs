@@ -86,11 +86,12 @@ async fn main() -> Result<()> {
         if args.next().is_some() {
             bail!("{USAGE}");
         }
-        let index_bundles = index_chain
-            || env::var("AR_IO_INDEX_BUNDLES")
-                .unwrap_or_else(|_| "false".to_owned())
-                .parse::<bool>()
-                .context("invalid AR_IO_INDEX_BUNDLES")?;
+        let index_bundles = env::var("AR_IO_INDEX_BUNDLES")
+            .ok()
+            .map(|value| value.parse::<bool>())
+            .transpose()
+            .context("invalid AR_IO_INDEX_BUNDLES")?
+            .unwrap_or(index_chain);
         for name in ["ANS104_UNBUNDLE_FILTER", "ANS104_INDEX_FILTER"] {
             if let Ok(value) = env::var(name) {
                 let filter: serde_json::Value =
@@ -137,10 +138,10 @@ async fn main() -> Result<()> {
             env::var("BUNDLER_URLS").ok().as_deref(),
             indexing_interval,
         )?;
-        let worker = if index_bundles {
-            let url = env::var("DATABASE_URL")
-                .context("AR_IO_INDEX_BUNDLES=true requires DATABASE_URL")?;
-            let (indexed_gateway, worker) = gateway.with_bundle_indexing(&url).await?;
+        let worker = if index_chain || index_bundles {
+            let url = env::var("DATABASE_URL").context("indexing requires DATABASE_URL")?;
+            let (indexed_gateway, worker) =
+                gateway.with_bundle_indexing(&url, index_bundles).await?;
             gateway = indexed_gateway;
             Some(worker)
         } else {
