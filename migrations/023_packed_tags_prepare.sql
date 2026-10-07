@@ -1,4 +1,5 @@
 SET LOCAL lock_timeout='1s';
+LOCK TABLE public.objects IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE public.object_tags IN SHARE ROW EXCLUSIVE MODE;
 
 CREATE FUNCTION public.decode_tag_refs(refs bytea)
