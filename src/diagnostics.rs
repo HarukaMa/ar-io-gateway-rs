@@ -35,6 +35,7 @@ pub(crate) struct Failure {
     context: &'static str,
     message: &'static str,
     details: Vec<FailureDetail>,
+    unavailable: bool,
 }
 
 impl std::fmt::Display for Failure {
@@ -71,6 +72,7 @@ pub(crate) fn wrong_item(expected: &str, received: &str) -> Failure {
     Failure {
         context: "discovery returned the wrong data item",
         message: "The discovery response returned a different item from the one requested.",
+        unavailable: false,
         details: vec![
             id_detail("Requested item ID", expected),
             id_detail("Returned item ID", received),
@@ -87,6 +89,7 @@ pub(crate) fn size_mismatch(
     Failure {
         context,
         message: "The payload size reported by discovery differs from the verified item size.",
+        unavailable: false,
         details: vec![
             id_detail("Item ID", &URL_SAFE_NO_PAD.encode(id)),
             size_detail("Reported payload size", reported),
@@ -99,10 +102,24 @@ pub(crate) fn size_limit(size: u128, limit: usize) -> Failure {
     Failure {
         context: "transaction exceeds configured data size limit",
         message: "The content size exceeds this gateway's retrieval limit.",
+        unavailable: false,
         details: vec![
             size_detail("Content size", size),
             size_detail("Retrieval limit", limit as u128),
         ],
+    }
+}
+
+pub(crate) fn missing_chunk(offset: u128) -> Failure {
+    Failure {
+        context: "streaming chunk not found",
+        message: "The required chunk is unavailable from upstream nodes.",
+        unavailable: true,
+        details: vec![FailureDetail {
+            label: "Chunk offset",
+            value: offset.to_string(),
+            monospace: true,
+        }],
     }
 }
 
@@ -523,6 +540,8 @@ fn retrieval_unavailable(error: &anyhow::Error) -> bool {
                 || http.is_request()
         } else if let Some(attempts) = cause.downcast_ref::<crate::AttemptFailures>() {
             !attempts.errors.is_empty() && attempts.errors.iter().all(retrieval_unavailable)
+        } else if let Some(failure) = cause.downcast_ref::<Failure>() {
+            failure.unavailable
         } else {
             cause.is::<tokio::time::error::Elapsed>()
         }
@@ -574,7 +593,10 @@ where
                 step.details = error.map(error_details).unwrap_or_default();
                 if matches!(
                     stage,
-                    "bundle_item_verification" | "verified_retrieval" | "content_proofs_and_hash"
+                    "bundle_item_verification"
+                        | "verified_retrieval"
+                        | "content_proofs_and_hash"
+                        | "chunk_retrieval"
                 ) && error.is_some_and(retrieval_unavailable)
                 {
                     step.status = "unavailable";
@@ -602,6 +624,17 @@ where
         .try_with(|_| URL_SAFE_NO_PAD.encode(id))
         .unwrap_or_default();
     check("bundle_item_verification", &id, operation)
+}
+
+pub(crate) fn check_chunk<T, F>(
+    offset: u128,
+    operation: F,
+) -> impl Future<Output = Result<T>> + use<T, F>
+where
+    F: Future<Output = Result<T>>,
+{
+    let id = TRACE.try_with(|_| offset.to_string()).unwrap_or_default();
+    check("chunk_retrieval", &id, operation)
 }
 
 pub(crate) fn location(id: &str, parent: &str, source: &str) {
@@ -1205,6 +1238,136 @@ mod tests {
             let url = reqwest::Url::parse(&format!("https://arweave.net{path}")).unwrap();
             assert!(chunk_offset(&url).is_none(), "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn missing_stream_chunk_reports_the_offset_and_upstream_404() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!(
+            "http://user:password@arweave.net:{}/private-key",
+            address.port()
+        );
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                "private upstream response",
+            )
+        });
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let mut gateway = Gateway::new(
+            Config::new(
+                &url,
+                &url,
+                vec![url.clone()],
+                Duration::from_secs(2),
+                1,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        gateway.client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("arweave.net", address)
+            .build()
+            .unwrap();
+        let offset = 253736678629623;
+        let source = crate::streaming::ChunkSource::new(
+            &gateway,
+            crate::Geometry {
+                tx_root: [0; 32],
+                data_root: [0; 32],
+                block_weave_size: offset + 64,
+                previous_weave_size: offset,
+                first_offset: offset,
+                end_offset: offset + 64,
+                data_size: 64,
+            },
+        );
+        let content = crate::content::Content::streamed(source, 64);
+        TRACE
+            .scope(
+                RefCell::new(Trace {
+                    public_errors: true,
+                    ..Trace::default()
+                }),
+                async {
+                    let result = in_bundle(
+                        &[2; 32],
+                        check_item(&[3; 32], async {
+                            content
+                                .read_at(0, 32)
+                                .await
+                                .context("Could not read bundle header")
+                        }),
+                    )
+                    .await;
+                    let error = result.unwrap_err();
+                    let steps =
+                        TRACE.with(|trace| serde_json::to_value(&trace.borrow().steps).unwrap());
+                    let verification = steps
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|step| step["stage"] == "bundle_item_verification")
+                        .unwrap();
+                    assert_eq!(verification["status"], "unavailable");
+                    assert!(
+                        verification["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("The required chunk is unavailable from upstream nodes")
+                    );
+                    assert!(
+                        verification["details"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|detail| detail["label"] == "Chunk offset"
+                                && detail["value"] == offset.to_string())
+                    );
+                    let fetch = steps
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|step| step["stage"] == "chunk_retrieval")
+                        .unwrap();
+                    assert_eq!(fetch["id"], offset.to_string());
+                    assert_eq!(fetch["status"], "unavailable");
+                    assert_eq!(fetch["error"], "Upstream returned HTTP 404 Not Found");
+                    assert_eq!(fetch["attempt_parent_id"], URL_SAFE_NO_PAD.encode([2; 32]));
+                    let upstream = format!(
+                        "http://arweave.net:{}: Upstream returned HTTP 404 Not Found",
+                        address.port()
+                    );
+                    assert!(
+                        fetch["details"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|detail| detail["label"] == "Upstream request"
+                                && detail["value"] == upstream)
+                    );
+                    let serialized = serde_json::to_string(&steps).unwrap();
+                    assert!(
+                        !serialized.contains("password")
+                            && !serialized.contains("private-key")
+                            && !serialized.contains("private upstream response")
+                    );
+                    let shared: anyhow::Error = crate::RetrievalFailure::from(error).into();
+                    assert!(retrieval_unavailable(&shared));
+                    let public = public_error_text(&shared);
+                    assert!(public.contains(&format!("Chunk offset: {offset}")));
+                    assert!(
+                        !public.contains("127.0.0.1")
+                            && !public.contains("private upstream response")
+                    );
+                },
+            )
+            .await;
     }
 
     #[tokio::test]
