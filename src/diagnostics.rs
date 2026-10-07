@@ -106,30 +106,164 @@ pub(crate) fn size_limit(size: u128, limit: usize) -> Failure {
     }
 }
 
+fn public_ipv4(address: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !address.is_private()
+        && !address.is_loopback()
+        && !address.is_link_local()
+        && !address.is_broadcast()
+        && !address.is_documentation()
+        && a != 0
+        && a < 224
+        && !(a == 100 && (64..=127).contains(&b))
+        && !(a == 192 && b == 0 && c == 0)
+        && !(a == 198 && (18..=19).contains(&b))
+}
+
+fn public_upstream(url: &reqwest::Url) -> Option<String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = url.host_str()?.trim_matches(['[', ']']);
+    let public = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => public_ipv4(address),
+        Ok(std::net::IpAddr::V6(address)) => {
+            if let Some(address) = address.to_ipv4_mapped() {
+                public_ipv4(address)
+            } else {
+                let segments = address.segments();
+                segments[0] & 0xe000 == 0x2000
+                    && segments[..2] != [0x2001, 0xdb8]
+                    && !(segments[0] == 0x2001 && segments[1] < 0x200)
+            }
+        }
+        Err(_) => {
+            let host = host.trim_end_matches('.');
+            host.contains('.')
+                && ![
+                    ".localhost",
+                    ".local",
+                    ".localdomain",
+                    ".internal",
+                    ".intranet",
+                    ".lan",
+                    ".home",
+                    ".test",
+                    ".invalid",
+                    ".example",
+                    ".onion",
+                ]
+                .iter()
+                .any(|suffix| host.ends_with(suffix))
+        }
+    };
+    // Endpoint paths and queries can contain credentials, even on public services.
+    public.then(|| url.origin().ascii_serialization())
+}
+
+fn chunk_offset(url: &reqwest::Url) -> Option<u128> {
+    let path = url
+        .path()
+        .strip_prefix("/chunk2/")
+        .or_else(|| url.path().strip_prefix("/chunk/"))?;
+    if !path.is_empty() && path.bytes().all(|byte| byte.is_ascii_digit()) {
+        path.parse().ok()
+    } else {
+        None
+    }
+}
+
+fn http_error_text(error: &reqwest::Error) -> String {
+    if let Some(status) = error.status() {
+        return format!("Upstream returned HTTP {status}");
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        if cause.to_string() == "connection closed before message completed" {
+            return "Upstream connection closed before the response completed".to_owned();
+        }
+        source = cause.source();
+    }
+    if error.is_timeout() {
+        "Upstream request timed out"
+    } else if error.is_connect() {
+        "Could not connect to the upstream service"
+    } else if error.is_body() || error.is_decode() {
+        "Could not read the upstream response body"
+    } else if error.is_request() {
+        "Could not send the upstream request or receive response headers"
+    } else if error.is_redirect() {
+        "Upstream redirect failed"
+    } else if error.is_builder() {
+        "Could not construct the upstream request"
+    } else {
+        "Upstream HTTP operation failed"
+    }
+    .to_owned()
+}
+
 fn error_details(error: &anyhow::Error) -> Vec<FailureDetail> {
-    fn collect(error: &anyhow::Error, details: &mut Vec<FailureDetail>) {
+    fn add(details: &mut Vec<FailureDetail>, detail: FailureDetail) {
+        if details.len() <= 32 && !details.contains(&detail) {
+            details.push(detail);
+        }
+    }
+    fn collect(error: &anyhow::Error, details: &mut Vec<FailureDetail>, depth: usize) {
+        if depth == 16 {
+            add(
+                details,
+                FailureDetail {
+                    label: "Additional details",
+                    value: "Further nested causes were omitted.".to_owned(),
+                    monospace: false,
+                },
+            );
+            return;
+        }
         for cause in error.chain() {
+            if details.len() > 32 {
+                return;
+            }
             if let Some(failure) = cause.downcast_ref::<Failure>() {
                 for detail in &failure.details {
-                    if details.len() > 32 {
-                        return;
-                    }
-                    if !details.contains(detail) {
-                        details.push(detail.clone());
-                    }
+                    add(details, detail.clone());
                 }
             } else if let Some(attempts) = cause.downcast_ref::<crate::AttemptFailures>() {
                 for error in &attempts.errors {
                     if details.len() > 32 {
                         return;
                     }
-                    collect(error, details);
+                    collect(error, details, depth + 1);
+                }
+            } else if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+                let reason = http_error_text(http);
+                let upstream = http.url().and_then(public_upstream);
+                add(
+                    details,
+                    FailureDetail {
+                        label: "Upstream request",
+                        value: match upstream {
+                            Some(upstream) => format!("{upstream}: {reason}"),
+                            None => reason,
+                        },
+                        monospace: false,
+                    },
+                );
+                if let Some(offset) = http.url().and_then(chunk_offset) {
+                    add(
+                        details,
+                        FailureDetail {
+                            label: "Chunk offset",
+                            value: offset.to_string(),
+                            monospace: true,
+                        },
+                    );
                 }
             }
         }
     }
     let mut details = Vec::new();
-    collect(error, &mut details);
+    collect(error, &mut details, 0);
     if details.len() > 32 {
         details.truncate(32);
         details.push(FailureDetail {
@@ -159,6 +293,14 @@ fn error_text(error: &anyhow::Error, public: bool) -> String {
         "invalid manifest JSON",
         "diagnostic preparation timed out",
         "verified retrieval timed out",
+        "Could not read bundle header",
+        "HTTP request failed",
+        "HTTP source rejected request",
+        "empty bundle contains trailing data",
+        "bundle contains an empty item",
+        "bundle item sizes do not consume the parent",
+        "bundle item offset overflow",
+        "invalid bundle item ID length",
         "verified bundle retrieval timed out",
         "chunk request timed out",
         "content spool budget exhausted",
@@ -225,71 +367,93 @@ fn error_text(error: &anyhow::Error, public: bool) -> String {
         "duplicate ANT record",
         "block index has not been initialized",
     ];
-    let mut details = Vec::new();
-    let mut add = |detail: String| {
-        if details.len() < 6 && !details.contains(&detail) {
-            details.push(detail);
+    fn collect(error: &anyhow::Error, details: &mut Vec<String>, depth: usize) {
+        if depth == 16 || details.len() == 6 {
+            return;
         }
-    };
-    for cause in error.chain() {
-        if let Some(attempts) = cause.downcast_ref::<crate::AttemptFailures>() {
-            for error in &attempts.errors {
-                add(error_text(error, true));
+        for cause in error.chain() {
+            if details.len() == 6 {
+                return;
             }
-            continue;
-        }
-        if let Some(failure) = cause.downcast_ref::<Failure>() {
-            add(failure.message.to_owned());
-            continue;
-        }
-        if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
-            if let Some(status) = http.status() {
-                add(format!("Upstream returned HTTP {status}"));
-            } else if http.is_timeout() {
-                add("Upstream request timed out".to_owned());
-            } else if http.is_connect() {
-                add("Could not connect to the upstream service".to_owned());
-            } else if http.is_body() || http.is_decode() {
-                add("Could not read the upstream response body".to_owned());
-            }
-        } else if cause.is::<tokio::time::error::Elapsed>() {
-            add("The operation exceeded its time limit".to_owned());
-        } else if let Some(json) = cause.downcast_ref::<serde_json::Error>() {
-            add(format!(
-                "Invalid JSON ({:?}, line {}, column {})",
-                json.classify(),
-                json.line(),
-                json.column()
-            ));
-        } else if let Some(database) = cause.downcast_ref::<tokio_postgres::Error>() {
-            add(match database.as_db_error() {
-                Some(error) => {
-                    format!("Database request failed (SQLSTATE {})", error.code().code())
+            if let Some(attempts) = cause.downcast_ref::<crate::AttemptFailures>() {
+                for error in &attempts.errors {
+                    collect(error, details, depth + 1);
                 }
-                None => "Database connection or communication failed".to_owned(),
-            });
-        } else if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            add(format!("I/O operation failed ({:?})", io.kind()));
-        } else if cause.is::<crate::ContentNotFound>() {
-            add("No L1 transaction was found for this ID".to_owned());
-        }
-        // Some retrieval paths aggregate attempt errors into a single context string.
-        for part in cause.to_string().split([':', ';']).map(str::trim) {
-            if SAFE_REASONS.contains(&part) {
-                add(part.to_owned());
-            } else if part.starts_with("unsupported ANS-104 signature type ") {
-                add("The data item's signature type is unsupported".to_owned());
-            } else if part.starts_with("nested bundle exceeds maximum depth ") {
-                add("Bundle nesting exceeds the supported depth".to_owned());
+                continue;
+            }
+            let message = if let Some(failure) = cause.downcast_ref::<Failure>() {
+                Some(failure.message.to_owned())
+            } else if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
+                Some(http_error_text(http))
+            } else if cause.is::<tokio::time::error::Elapsed>() {
+                Some("The operation exceeded its time limit".to_owned())
+            } else if let Some(json) = cause.downcast_ref::<serde_json::Error>() {
+                Some(format!(
+                    "Invalid JSON ({:?}, line {}, column {})",
+                    json.classify(),
+                    json.line(),
+                    json.column()
+                ))
+            } else if let Some(database) = cause.downcast_ref::<tokio_postgres::Error>() {
+                Some(match database.as_db_error() {
+                    Some(error) => {
+                        format!("Database request failed (SQLSTATE {})", error.code().code())
+                    }
+                    None => "Database connection or communication failed".to_owned(),
+                })
+            } else if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                Some(format!("I/O operation failed ({:?})", io.kind()))
+            } else if cause.is::<crate::ContentNotFound>() {
+                Some("No L1 transaction was found for this ID".to_owned())
+            } else {
+                None
+            };
+            if let Some(message) = message {
+                if !details.contains(&message) {
+                    details.push(message);
+                }
+                continue;
+            }
+            for part in cause.to_string().split([':', ';']).map(str::trim) {
+                let message = if SAFE_REASONS.contains(&part) {
+                    Some(part)
+                } else if part.starts_with("unsupported ANS-104 signature type ") {
+                    Some("The data item's signature type is unsupported")
+                } else if part.starts_with("nested bundle exceeds maximum depth ") {
+                    Some("Bundle nesting exceeds the supported depth")
+                } else {
+                    None
+                };
+                if let Some(message) = message {
+                    if details.len() == 6 {
+                        return;
+                    }
+                    if !details.iter().any(|detail| detail == message) {
+                        details.push(message.to_owned());
+                    }
+                }
             }
         }
     }
+    let mut details = Vec::new();
+    collect(error, &mut details, 0);
     if details.is_empty() {
         "The operation failed. Further details are available in the local CLI diagnostic."
             .to_owned()
     } else {
         details.join(". ")
     }
+}
+
+pub(crate) fn public_error_text(error: &anyhow::Error) -> String {
+    let mut text = error_text(error, true);
+    for detail in error_details(error) {
+        text.push('\n');
+        text.push_str(detail.label);
+        text.push_str(": ");
+        text.push_str(&detail.value);
+    }
+    text
 }
 
 #[derive(Serialize)]
@@ -352,7 +516,11 @@ pub(crate) async fn in_bundle<T>(parent: &[u8], operation: impl Future<Output = 
 fn retrieval_unavailable(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         if let Some(http) = cause.downcast_ref::<reqwest::Error>() {
-            http.is_status() || http.is_connect() || http.is_timeout() || http.is_body()
+            http.is_status()
+                || http.is_connect()
+                || http.is_timeout()
+                || http.is_body()
+                || http.is_request()
         } else if let Some(attempts) = cause.downcast_ref::<crate::AttemptFailures>() {
             !attempts.errors.is_empty() && attempts.errors.iter().all(retrieval_unavailable)
         } else {
@@ -404,7 +572,11 @@ where
                 step.status = if error.is_none() { "passed" } else { "failed" };
                 step.error = error.map(|error| error_text(error, public_errors));
                 step.details = error.map(error_details).unwrap_or_default();
-                if stage == "bundle_item_verification" && error.is_some_and(retrieval_unavailable) {
+                if matches!(
+                    stage,
+                    "bundle_item_verification" | "verified_retrieval" | "content_proofs_and_hash"
+                ) && error.is_some_and(retrieval_unavailable)
+                {
                     step.status = "unavailable";
                 }
                 if stage == "transaction_authentication"
@@ -540,8 +712,16 @@ pub(crate) async fn diagnose_public(
             if let Some(message) = step.get("message").cloned() {
                 step["error"] = message;
             }
-            if step.get("source").is_some_and(|source| source != "index") {
-                step["source"] = json!("external");
+            if let Some(source) = step.get("source").and_then(Value::as_str) {
+                if source != "index" {
+                    step["source"] = json!(
+                        reqwest::Url::parse(source)
+                            .ok()
+                            .as_ref()
+                            .and_then(public_upstream)
+                            .unwrap_or_else(|| "external".to_owned())
+                    );
+                }
             }
         }
     }
@@ -655,8 +835,16 @@ async fn run(
             }
             Err(error) => Err(error),
         };
-        report["status"] = json!(if result.is_ok() { "passed" } else { "failed" });
-        report["error"] = json!(result.err().map(|error| error_text(&error, public_errors)));
+        let error = result.as_ref().err();
+        report["status"] = json!(if error.is_some_and(retrieval_unavailable) {
+            "unavailable"
+        } else if error.is_some() {
+            "failed"
+        } else {
+            "passed"
+        });
+        report["error"] = json!(error.map(|error| error_text(error, public_errors)));
+        report["error_details"] = json!(error.map(error_details).unwrap_or_default());
         TRACE.with(|trace| {
             let trace = trace.borrow();
             report["steps"] = json!(trace.steps);
@@ -965,6 +1153,156 @@ mod tests {
     }
 
     #[test]
+    fn public_upstream_details_remove_credentials_and_private_locations() {
+        for (input, expected) in [
+            (
+                "http://38.29.227.75:1984/chunk2/123?key=secret",
+                "http://38.29.227.75:1984",
+            ),
+            (
+                "https://user:password@arweave.net/private-key?api-key=secret#secret",
+                "https://arweave.net",
+            ),
+            ("https://arweave.net./rpc", "https://arweave.net."),
+            (
+                "https://[2606:4700:4700::1111]/private-key",
+                "https://[2606:4700:4700::1111]",
+            ),
+        ] {
+            let url = reqwest::Url::parse(input).unwrap();
+            assert_eq!(public_upstream(&url).as_deref(), Some(expected), "{input}");
+        }
+        for host in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "192.0.2.1",
+            "[::1]",
+            "[fd00::1]",
+            "[fe80::1]",
+            "[::ffff:127.0.0.1]",
+            "[2001:db8::1]",
+            "localhost",
+            "private",
+            "rpc.local",
+            "rpc.internal",
+            "private.invalid",
+        ] {
+            let url = reqwest::Url::parse(&format!("http://{host}/secret")).unwrap();
+            assert!(public_upstream(&url).is_none(), "{host}");
+        }
+        for path in [
+            "/chunk/123/secret",
+            "/private-key",
+            "/chunk2/secret",
+            "/chunk2/+1",
+        ] {
+            let url = reqwest::Url::parse(&format!("https://arweave.net{path}")).unwrap();
+            assert!(chunk_offset(&url).is_none(), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_http_headers_report_the_public_node_and_unavailable_verification() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                tokio::io::AsyncReadExt::read(&mut socket, &mut request)
+                    .await
+                    .unwrap();
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut socket,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n",
+                )
+                .await
+                .unwrap();
+                tokio::io::AsyncWriteExt::shutdown(&mut socket)
+                    .await
+                    .unwrap();
+            }
+        }));
+        let http = reqwest::Client::new()
+            .get(url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(http.is_request(), "{http:?}");
+        let http = http.with_url(
+            reqwest::Url::parse(
+                "http://user:password@38.29.227.75:1984/chunk2/253736678629623?api-key=secret",
+            )
+            .unwrap(),
+        );
+        let error: anyhow::Error = crate::AttemptFailures {
+            context: "all chunk candidates failed",
+            errors: vec![http.into()],
+        }
+        .into();
+        let error: anyhow::Error = crate::RetrievalFailure::from(error).into();
+        let error: anyhow::Error = crate::AttemptFailures {
+            context: "all discovered bundle paths failed",
+            errors: vec![error.context("Could not read bundle header")],
+        }
+        .into();
+        let details = public_error_text(&error);
+        assert!(
+            details.contains("Could not read bundle header"),
+            "{details}"
+        );
+        assert!(
+            details.contains("Upstream connection closed before the response completed"),
+            "{details}"
+        );
+        assert!(details.contains("http://38.29.227.75:1984"), "{details}");
+        assert!(
+            details.contains("Chunk offset: 253736678629623"),
+            "{details}"
+        );
+        assert!(!details.contains("password") && !details.contains("secret"));
+        assert!(!details.contains("127.0.0.1"));
+        TRACE
+            .scope(
+                RefCell::new(Trace {
+                    public_errors: true,
+                    ..Trace::default()
+                }),
+                async {
+                    let result: Result<()> = check_item(&[7; 32], async { Err(error) }).await;
+                    let steps =
+                        TRACE.with(|trace| serde_json::to_value(&trace.borrow().steps).unwrap());
+                    assert_eq!(steps[0]["status"], "unavailable");
+                    assert!(
+                        steps[0]["details"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|detail| detail["label"] == "Chunk offset"
+                                && detail["value"] == "253736678629623")
+                    );
+                    let mixed: anyhow::Error = crate::AttemptFailures {
+                        context: "mixed bundle failures",
+                        errors: vec![
+                            result.unwrap_err(),
+                            anyhow::anyhow!("data item signature verification failed"),
+                        ],
+                    }
+                    .into();
+                    assert!(!retrieval_unavailable(&mixed));
+                },
+            )
+            .await;
+    }
+
+    #[test]
     fn failure_details_are_safe_deduplicated_and_bounded() {
         let error: anyhow::Error = wrong_item(
             &URL_SAFE_NO_PAD.encode([7; 32]),
@@ -1121,7 +1459,7 @@ mod tests {
         )
         .unwrap();
         let report = diagnose(config, resolver, "example", None, None).await;
-        assert_eq!(report["status"], "failed", "{report}");
+        assert_eq!(report["status"], "unavailable", "{report}");
         assert!(
             report["error"]
                 .as_str()

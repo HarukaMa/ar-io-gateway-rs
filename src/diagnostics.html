@@ -23,6 +23,7 @@ code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono"
 <p class="note">This tool can retrieve up to 64 MiB of content. Preparation and retrieval each have a one-minute limit. You can run one diagnostic at a time.</p>
 <p class="note">URLs are checked through this gateway. On unfamiliar hosts, the first part of the hostname is treated as an ArNS name.</p>
 <output id="status" aria-live="polite"></output>
+<div id="error-details"></div>
 </form>
 <div id="results" hidden>
 <div class="result-head"><h2>Diagnostic report</h2><a id="download" class="download" download="diagnostic.json">Download JSON</a></div>
@@ -69,6 +70,19 @@ function field(list, name, value, monospace = false) {
   term.textContent = name;
   description.textContent = value == null ? '-' : String(value);
   list.append(term, description);
+}
+function errorDetails(container, entries, parentId, source) {
+  if (!entries?.length && !parentId && !source) return;
+  const disclosure = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = entries?.length ? 'Error details' : 'Details';
+  const list = document.createElement('dl');
+  list.className = 'failure-details';
+  if (parentId) field(list, 'Attempted parent ID', parentId, true);
+  if (source) field(list, 'Discovery source', source, true);
+  for (const detail of entries || []) field(list, detail.label, detail.value, detail.monospace);
+  disclosure.append(summary, list);
+  container.append(disclosure);
 }
 function renderRelationships(report) {
   const links = new Map();
@@ -193,7 +207,8 @@ function render(report) {
     ? 'Content verified.' + (alternateFailure ? ' Some other bundle paths failed or were unavailable.' : '')
     : report.error;
   element('status').className = report.status;
-  for (const id of ['resolution', 'local', 'ancestry', 'steps', 'content']) element(id).replaceChildren();
+  for (const id of ['error-details', 'resolution', 'local', 'ancestry', 'steps', 'content']) element(id).replaceChildren();
+  errorDetails(element('error-details'), report.error_details);
   field(element('resolution'), 'Input', report.input, /^[A-Za-z0-9_-]{43}$/.test(report.input));
   field(element('resolution'), 'Resolved ID', report.resolved_id, true);
   if (report.root_id && report.root_id !== report.resolved_id) field(element('resolution'), 'Root ID', report.root_id, true);
@@ -269,13 +284,7 @@ function render(report) {
       error.textContent = step.message || step.error;
       item.append(error);
     }
-    if (step.attempt_parent_id || step.details?.length) {
-      const details = document.createElement('dl');
-      details.className = 'failure-details';
-      if (step.attempt_parent_id) field(details, 'Attempted parent ID', step.attempt_parent_id, true);
-      for (const detail of step.details || []) field(details, detail.label, detail.value, detail.monospace);
-      item.append(details);
-    }
+    errorDetails(item, step.details, step.attempt_parent_id, step.source);
     element('steps').append(item);
   }
   element('truncated').hidden = !report.trace_truncated;
@@ -292,6 +301,7 @@ element('form').addEventListener('submit', async event => {
   event.preventDefault();
   element('run').disabled = true;
   element('results').hidden = true;
+  element('error-details').replaceChildren();
   element('status').className = '';
   element('status').textContent = 'Checking content...';
   try {
