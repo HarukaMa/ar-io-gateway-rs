@@ -43,4 +43,5 @@ CREATE TRIGGER completed_placement_filters AFTER UPDATE ON public.objects
     REFERENCING OLD TABLE AS old_objects NEW TABLE AS new_objects
     FOR EACH STATEMENT EXECUTE FUNCTION public.complete_placement_filters();
 
--- The serving cutover records version 22 after both indexes are ready.
+ALTER TABLE public.canonical_placements DISABLE TRIGGER placement_filters;
+ALTER TABLE public.objects DISABLE TRIGGER completed_placement_filters;

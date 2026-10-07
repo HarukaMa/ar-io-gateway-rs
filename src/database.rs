@@ -1,4 +1,5 @@
 pub(crate) mod graphql;
+mod packed_tags;
 
 use std::{collections::HashSet, net::IpAddr, time::Duration};
 
@@ -93,6 +94,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "022_graphql_filters",
         include_str!("../migrations/022_graphql_filters.sql"),
     ),
+    (
+        "023_packed_tags",
+        include_str!("../migrations/023_packed_tags.sql"),
+    ),
+    (
+        "024_graphql_index_state",
+        include_str!("../migrations/024_graphql_index_state.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 const ROW_BATCH_SIZE: usize = 1_000;
@@ -129,11 +138,13 @@ const BUNDLE_TAGS: &str = "
 #[cfg(test)]
 const BUNDLE_CANDIDATES: &str = "
     , matched_bundles AS MATERIALIZED (
-        SELECT f.object_key, criteria.json FROM bundle_tags criteria
-        JOIN public.object_tags f ON f.name_key=criteria.format_name AND f.value_key=criteria.format_value
+        SELECT p.object_key, criteria.json FROM public.object_tags p
+        CROSS JOIN LATERAL public.decode_tag_refs(p.refs) f CROSS JOIN bundle_tags criteria
+        WHERE f.name_key=criteria.format_name AND f.value_key=criteria.format_value
         INTERSECT
-        SELECT v.object_key, criteria.json FROM bundle_tags criteria
-        JOIN public.object_tags v ON v.name_key=criteria.version_name AND v.value_key=criteria.version_value
+        SELECT p.object_key, criteria.json FROM public.object_tags p
+        CROSS JOIN LATERAL public.decode_tag_refs(p.refs) v CROSS JOIN bundle_tags criteria
+        WHERE v.name_key=criteria.version_name AND v.value_key=criteria.version_value
     ), bundle_candidates AS MATERIALIZED (
         SELECT object_key, bool_or(json) AS json FROM matched_bundles
         GROUP BY object_key HAVING count(*)=1
@@ -170,7 +181,7 @@ fn bundle_lookup_sql() -> String {
                     'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') AS name,
                 v.value
             FROM public.objects requested
-            JOIN public.object_tags t ON t.object_key=requested.key
+            JOIN LATERAL public.read_object_tags(requested.key) t ON true
             JOIN public.tag_names n ON n.key=t.name_key
             JOIN public.tag_values v ON v.key=t.value_key
             WHERE public.object_id_prefix(requested.id)=public.object_id_prefix($1) AND requested.id=$1
@@ -714,6 +725,19 @@ impl BlockStore {
         } else {
             0
         };
+        // Preparation stages readiness while the previous serving schema stays active.
+        let readiness_staged: bool = transaction
+            .query_one(
+                "SELECT to_regclass('public.graphql_index_state') IS NOT NULL",
+                &[],
+            )
+            .await?
+            .get(0);
+        if !readiness_staged {
+            transaction
+                .batch_execute(include_str!("../migrations/024_graphql_index_state.sql"))
+                .await?;
+        }
         for (name, migration) in &MIGRATIONS[applied..] {
             if *name == "022_graphql_filters" {
                 let staged: bool = transaction
@@ -724,21 +748,47 @@ impl BlockStore {
                     .await?
                     .get(0);
                 if !staged {
-                    ensure!(
-                        !activate_graphql,
-                        "run ar-io-gateway prepare-graphql-index before serving this database"
-                    );
                     transaction.batch_execute(migration).await?;
                 }
                 if activate_graphql {
-                    let ready: bool = transaction
-                        .query_one(Self::GRAPHQL_INDEXES_READY, &[])
-                        .await?
-                        .get(0);
-                    ensure!(ready, "GraphQL index preparation has not finished");
                     transaction.execute(
                         "INSERT INTO public.ar_io_schema_migrations(version,name) VALUES(22,'022_graphql_filters')", &[],
                     ).await?;
+                }
+                continue;
+            }
+            if *name == "023_packed_tags" {
+                if !activate_graphql {
+                    break;
+                }
+                let staged: bool = transaction
+                    .query_one(
+                        "SELECT to_regclass('public.packed_tag_preparation') IS NOT NULL",
+                        &[],
+                    )
+                    .await?
+                    .get(0);
+                if !staged {
+                    let populated: bool = transaction
+                        .query_one("SELECT EXISTS(SELECT 1 FROM public.object_tags)", &[])
+                        .await?
+                        .get(0);
+                    ensure!(
+                        !populated,
+                        "run ar-io-gateway prepare-packed-tags before serving this database"
+                    );
+                    transaction.batch_execute(packed_tags::PREPARE).await?;
+                }
+            }
+            if *name == "024_graphql_index_state" {
+                if activate_graphql {
+                    transaction
+                        .execute(
+                            "INSERT INTO public.ar_io_schema_migrations(version,name)
+                         VALUES(24,'024_graphql_index_state')",
+                            &[],
+                        )
+                        .await?;
                 }
                 continue;
             }
@@ -756,10 +806,15 @@ impl BlockStore {
         Ok(())
     }
 
-    const GRAPHQL_INDEXES_READY: &str =
-        "SELECT count(*)=2 FROM pg_index WHERE indisvalid AND indrelid='public.canonical_placements'::regclass
-         AND indexrelid IN (to_regclass('public.placement_owner_order'),
-                            to_regclass('public.placement_recipient_order'))";
+    const GRAPHQL_INDEXES_READY: &str = "SELECT
+         coalesce((SELECT ready FROM public.graphql_index_state WHERE singleton),false)
+         AND (SELECT count(*)=2 FROM pg_index
+            WHERE indisvalid AND indrelid='public.canonical_placements'::regclass
+            AND indexrelid IN (to_regclass('public.placement_owner_order'),
+                               to_regclass('public.placement_recipient_order')))
+         AND (SELECT count(*)=2 FROM pg_trigger WHERE tgenabled='O'
+            AND ((tgrelid='public.canonical_placements'::regclass AND tgname='placement_filters')
+              OR (tgrelid='public.objects'::regclass AND tgname='completed_placement_filters')))";
 
     pub async fn require_graphql_indexes(&self) -> Result<()> {
         let ready: bool = self
@@ -771,6 +826,49 @@ impl BlockStore {
             ready,
             "run ar-io-gateway prepare-graphql-index before serving this database"
         );
+        Ok(())
+    }
+
+    pub async fn pause_graphql_index_maintenance(&mut self) -> Result<()> {
+        let transaction = self.client.transaction().await?;
+        transaction
+            .batch_execute("SET LOCAL lock_timeout='1s'")
+            .await?;
+        let locked: bool = transaction.query_one(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended('ar-io-gateway:graphql-index',0))",
+            &[],
+        ).await?.get(0);
+        ensure!(
+            locked,
+            "stop GraphQL preparation before pausing maintenance"
+        );
+        transaction
+            .execute(
+                "UPDATE public.graphql_index_state SET ready=false WHERE singleton",
+                &[],
+            )
+            .await?;
+        for (table, name) in [
+            ("canonical_placements", "placement_filters"),
+            ("objects", "completed_placement_filters"),
+        ] {
+            let enabled: bool = transaction
+                .query_one(
+                    "SELECT tgenabled<>'D' FROM pg_trigger
+                 WHERE tgrelid=to_regclass($1) AND tgname=$2",
+                    &[&format!("public.{table}"), &name],
+                )
+                .await?
+                .get(0);
+            if enabled {
+                transaction
+                    .batch_execute(&format!(
+                        "ALTER TABLE public.{table} DISABLE TRIGGER {name}"
+                    ))
+                    .await?;
+            }
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -793,6 +891,20 @@ impl BlockStore {
                  SET max_parallel_maintenance_workers=0; SET maintenance_work_mem='256MB'",
             )
             .await?;
+        let transaction = self.client.transaction().await?;
+        transaction
+            .execute(
+                "UPDATE public.graphql_index_state SET ready=false WHERE singleton",
+                &[],
+            )
+            .await?;
+        transaction
+            .batch_execute(
+                "ALTER TABLE public.canonical_placements ENABLE TRIGGER placement_filters;
+             ALTER TABLE public.objects ENABLE TRIGGER completed_placement_filters",
+            )
+            .await?;
+        transaction.commit().await?;
         let tablespace: String = self.client.query_one(
             "SELECT quote_ident(t.spcname) FROM pg_class c
              JOIN pg_database d ON d.datname=current_database()
@@ -880,7 +992,22 @@ impl BlockStore {
         self.client
             .batch_execute("ANALYZE public.canonical_placements")
             .await?;
-        self.require_graphql_indexes().await?;
+        let transaction = self.client.transaction().await?;
+        transaction
+            .execute(
+                "UPDATE public.graphql_index_state SET ready=true WHERE singleton",
+                &[],
+            )
+            .await?;
+        let ready: bool = transaction
+            .query_one(Self::GRAPHQL_INDEXES_READY, &[])
+            .await?
+            .get(0);
+        ensure!(
+            ready,
+            "GraphQL helper maintenance or indexes became unavailable"
+        );
+        transaction.commit().await?;
         self.client
             .batch_execute(
                 "SELECT pg_advisory_unlock(hashtextextended('ar-io-gateway:graphql-index',0))",
@@ -1021,10 +1148,10 @@ impl BlockStore {
         let tags = self
             .client
             .query(
-                "SELECT n.value,v.value FROM public.object_tags t
+                "SELECT n.value,v.value FROM public.read_object_tags($1) t
              JOIN public.tag_names n ON n.key=t.name_key
              JOIN public.tag_values v ON v.key=t.value_key
-             WHERE t.object_key=$1 ORDER BY t.ordinal",
+             ORDER BY t.ordinal",
                 &[&key],
             )
             .await?;
@@ -1133,10 +1260,10 @@ impl BlockStore {
             let tags = self
                 .client
                 .query(
-                    "SELECT n.value,v.value FROM public.object_tags t
+                    "SELECT n.value,v.value FROM public.read_object_tags($1) t
                  JOIN public.tag_names n ON n.key=t.name_key
                  JOIN public.tag_values v ON v.key=t.value_key
-                 WHERE t.object_key=$1 ORDER BY t.ordinal",
+                 ORDER BY t.ordinal",
                     &[&object],
                 )
                 .await?;
@@ -2378,7 +2505,7 @@ impl BlockStore {
                          'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz') AS name,
                      v.value
                  FROM (SELECT DISTINCT parent_key FROM selected_locations) parents
-                 JOIN public.object_tags t ON t.object_key=parents.parent_key
+                 JOIN LATERAL public.read_object_tags(parents.parent_key) t ON true
                  JOIN public.tag_names n ON n.key=t.name_key
                  JOIN public.tag_values v ON v.key=t.value_key
              ), formats AS ({BUNDLE_FORMAT_FLAGS})
@@ -3066,96 +3193,35 @@ impl BlockStore {
         })
         .await?;
         crate::profiling::measure(crate::profiling::Stage::TagWrite, async {
-        let mut tags = objects
-            .iter()
-            .zip(&keys)
-            .flat_map(|(object, key)| object.tags.iter().enumerate().zip(std::iter::repeat(*key)));
-        loop {
-            let batch: Vec<_> = tags
-                .by_ref()
-                .take(ROW_BATCH_SIZE)
-                .map(|((ordinal, (name, value)), key)| {
-                    (key, ordinal as i32, name.as_slice(), value.as_slice())
-                })
-                .collect();
-            if batch.is_empty() {
-                break;
+            for (batch, object_keys) in objects.chunks(METADATA_BATCH_SIZE)
+                .zip(keys.chunks(METADATA_BATCH_SIZE))
+            {
+                let refs = batch.iter()
+                    .map(|object| packed_tags::pack_refs(object, &dictionary_keys))
+                    .collect::<Result<Vec<_>>>()?;
+                crate::profiling::measure(crate::profiling::Stage::TagInsert, async {
+                    transaction.execute(
+                        "INSERT INTO public.object_tags(object_key,refs)
+                         SELECT * FROM unnest($1::bigint[],$2::bytea[]) incoming(object_key,refs)
+                         WHERE object_key=ANY($3::bigint[]) AND octet_length(refs)>0
+                         ON CONFLICT(object_key) DO NOTHING",
+                        &[&object_keys, &refs, &completed],
+                    ).await?;
+                    Ok(())
+                }).await?;
+                crate::profiling::measure(crate::profiling::Stage::TagCompare, async {
+                    let conflict = transaction.query_opt(
+                        "SELECT incoming.object_key FROM unnest($1::bigint[],$2::bytea[]) incoming(object_key,refs)
+                         LEFT JOIN public.object_tags stored USING(object_key)
+                         WHERE incoming.refs IS DISTINCT FROM coalesce(stored.refs,''::bytea) LIMIT 1",
+                        &[&object_keys, &refs],
+                    ).await?;
+                    ensure!(conflict.is_none(), "conflicting immutable ordered tags");
+                    Ok(())
+                }).await?;
             }
-            let object_keys: Vec<_> = batch.iter().map(|tag| tag.0).collect();
-            let ordinals: Vec<_> = batch.iter().map(|tag| tag.1).collect();
-            let names: Vec<_> = batch
-                .iter()
-                .map(|tag| {
-                    dictionary_keys[0]
-                        .get(tag.2)
-                        .copied()
-                        .context("missing tag name")
-                })
-                .collect::<Result<_>>()?;
-            let values: Vec<_> = batch
-                .iter()
-                .map(|tag| {
-                    dictionary_keys[1]
-                        .get(tag.3)
-                        .copied()
-                        .context("missing tag value")
-                })
-                .collect::<Result<_>>()?;
-            crate::profiling::measure(crate::profiling::Stage::TagInsert, async {
-            transaction
-                .execute(
-                    "INSERT INTO public.object_tags (object_key, ordinal, name_key, value_key)
-                     SELECT * FROM unnest($1::bigint[], $2::integer[], $3::bigint[], $4::bigint[])
-                       AS incoming(object_key, ordinal, name_key, value_key)
-                     WHERE object_key = ANY($5::bigint[])
-                     ON CONFLICT (object_key, ordinal) DO NOTHING",
-                    &[&object_keys, &ordinals, &names, &values, &completed],
-                )
-                .await?;
-                Ok(())
-            })
-            .await?;
-            crate::profiling::measure(crate::profiling::Stage::TagCompare, async {
-            let conflict = transaction
-                .query_opt(
-                    "SELECT incoming.object_key
-                     FROM unnest($1::bigint[], $2::integer[], $3::bigint[], $4::bigint[])
-                       AS incoming(object_key, ordinal, name_key, value_key)
-                     LEFT JOIN public.object_tags stored
-                       ON stored.object_key = incoming.object_key AND stored.ordinal = incoming.ordinal
-                     WHERE ROW(stored.name_key, stored.value_key)
-                         IS DISTINCT FROM ROW(incoming.name_key, incoming.value_key)
-                     LIMIT 1",
-                    &[&object_keys, &ordinals, &names, &values],
-                )
-                .await?;
-            ensure!(conflict.is_none(), "conflicting immutable ordered tags");
-                Ok(())
-            })
-            .await?;
-        }
-        crate::profiling::measure(crate::profiling::Stage::TagCount, async {
-        let tag_counts: Vec<_> = objects
-            .iter()
-            .map(|object| object.tags.len() as i64)
-            .collect();
-        let conflict = transaction
-            .query_opt(
-                "SELECT incoming.object_key
-                 FROM unnest($1::bigint[], $2::bigint[]) AS incoming(object_key, tag_count)
-                 WHERE incoming.tag_count <> (
-                     SELECT count(*) FROM public.object_tags tags WHERE tags.object_key = incoming.object_key
-                 ) LIMIT 1",
-                &[&keys, &tag_counts],
-            )
-            .await?;
-        ensure!(conflict.is_none(), "conflicting immutable tag count");
             Ok(())
-        })
-        .await?;
-            Ok(())
-        })
-        .await?;
+        }).await?;
         Ok(keys)
     }
 
@@ -3378,67 +3444,139 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires prepared ar_io_rust_test; run serially, changes migration readiness"]
-    async fn graphql_preparation_keeps_previous_schema_until_cutover() -> Result<()> {
+    #[ignore = "requires prepared ar_io_rust_test; run serially, changes index readiness"]
+    async fn graphql_helpers_can_pause_without_blocking_schema_migrations() -> Result<()> {
         let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
-        let database: String = store
-            .client
-            .query_one("SELECT current_database()", &[])
-            .await?
-            .get(0);
         ensure!(
-            database == "ar_io_rust_test",
+            store
+                .client
+                .query_one("SELECT current_database()", &[])
+                .await?
+                .get::<_, String>(0)
+                == "ar_io_rust_test",
             "requires the dedicated test database"
         );
         store.require_graphql_indexes().await?;
-        store.client.execute(
-            "DELETE FROM public.ar_io_schema_migrations WHERE version=22 AND name='022_graphql_filters'", &[],
-        ).await?;
-        store.migrate_schema(false).await?;
-        let version: i32 = store
-            .client
-            .query_one(
-                "SELECT max(version) FROM public.ar_io_schema_migrations",
-                &[],
-            )
-            .await?
-            .get(0);
+        store.pause_graphql_index_maintenance().await?;
         ensure!(
-            version == 21,
-            "preparation made the previous serving binary reject the schema"
+            store.require_graphql_indexes().await.is_err(),
+            "disabled maintenance accepted"
         );
         store.client.batch_execute(
-            "ALTER INDEX public.placement_owner_order RENAME TO placement_owner_order_cutover_test"
+            "ALTER INDEX public.placement_owner_order RENAME TO placement_owner_order_pause_test"
         ).await?;
-        ensure!(
-            store.migrate().await.is_err(),
-            "serving accepted incomplete index preparation"
-        );
-        let version: i32 = store
-            .client
-            .query_one(
-                "SELECT max(version) FROM public.ar_io_schema_migrations",
-                &[],
-            )
-            .await?
-            .get(0);
-        ensure!(version == 21, "failed cutover recorded the new schema");
+        let migrated = store.migrate().await;
+        let ready = store.require_graphql_indexes().await;
         store.client.batch_execute(
-            "ALTER INDEX public.placement_owner_order_cutover_test RENAME TO placement_owner_order"
+            "ALTER INDEX public.placement_owner_order_pause_test RENAME TO placement_owner_order"
         ).await?;
-        store.migrate().await?;
-        let version: i32 = store
+        migrated?;
+        ensure!(ready.is_err(), "missing helper index accepted");
+        store.prepare_graphql_indexes().await?;
+        store.require_graphql_indexes().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires prepared ar_io_rust_test; run serially, interrupts helper preparation"]
+    async fn interrupted_graphql_resume_keeps_existing_indexes_unready() -> Result<()> {
+        let mut store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        ensure!(
+            store
+                .client
+                .query_one("SELECT current_database()", &[])
+                .await?
+                .get::<_, String>(0)
+                == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store.require_graphql_indexes().await?;
+        store.pause_graphql_index_maintenance().await?;
+        let key: i64 = store.client.query_one(
+            "SELECT p.object_key FROM public.canonical_placements p JOIN public.objects o ON o.key=p.object_key
+             WHERE o.metadata_complete AND octet_length(o.owner_address)>0 ORDER BY p.object_key LIMIT 1", &[],
+        ).await?.get(0);
+        store
+            .client
+            .execute(
+                "UPDATE public.canonical_placements SET owner_filter=NULL WHERE object_key=$1",
+                &[&key],
+            )
+            .await?;
+        let mut blocker = store.reconnect().await?;
+        let blocked = blocker.client.transaction().await?;
+        blocked
+            .query_one(
+                "SELECT object_key FROM public.canonical_placements WHERE object_key=$1 FOR UPDATE",
+                &[&key],
+            )
+            .await?;
+        let mut actor = store.reconnect().await?;
+        let pid: i32 = actor
+            .client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        let cancel = actor.client.cancel_token();
+        let worker = tokio::spawn(async move {
+            let outcome = actor.prepare_graphql_indexes().await;
+            (actor, outcome)
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = store.client.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND wait_event_type='Lock')",
+                    &[&pid],
+                ).await?.get(0);
+                if waiting { break; }
+                tokio::task::yield_now().await;
+            }
+            Ok::<_,anyhow::Error>(())
+        }).await.context("helper preparation did not reach the blocked backfill")??;
+        let triggers: i64 = store
             .client
             .query_one(
-                "SELECT max(version) FROM public.ar_io_schema_migrations",
+                "SELECT count(*) FROM pg_trigger WHERE tgenabled='O'
+             AND ((tgrelid='public.canonical_placements'::regclass AND tgname='placement_filters')
+               OR (tgrelid='public.objects'::regclass AND tgname='completed_placement_filters'))",
                 &[],
             )
             .await?
             .get(0);
         ensure!(
-            version == 22,
-            "successful cutover did not record the new schema"
+            triggers == 2,
+            "preparation did not commit maintenance re-enablement"
         );
+        let premature = store.require_graphql_indexes().await;
+        cancel.cancel_query(NoTls).await?;
+        let (actor, outcome) = worker.await?;
+        ensure!(outcome.is_err(), "blocked preparation was not interrupted");
+        actor
+            .client
+            .query_one(
+                "SELECT pg_advisory_unlock(hashtextextended('ar-io-gateway:graphql-index',0))",
+                &[],
+            )
+            .await?;
+        blocked.commit().await?;
+        premature.expect_err("stale helper fingerprints were accepted during resumption");
+        ensure!(
+            store.require_graphql_indexes().await.is_err(),
+            "interrupted preparation became ready"
+        );
+        store.prepare_graphql_indexes().await?;
+        store.require_graphql_indexes().await?;
+        let restored: bool = store
+            .client
+            .query_one(
+                "SELECT p.owner_filter=public.graphql_filter(o.owner_address)
+             FROM public.canonical_placements p JOIN public.objects o ON o.key=p.object_key
+             WHERE p.object_key=$1",
+                &[&key],
+            )
+            .await?
+            .get(0);
+        ensure!(restored, "resumption skipped the stale fingerprint");
         Ok(())
     }
 
@@ -3776,7 +3914,7 @@ mod tests {
                     "SELECT is_bundle FROM public.objects WHERE key=$1", &[&key],
                 ).await?.get(0);
                 ensure!(!recognized, "bundle flag survived removal of all tags");
-                for (ordinal, (name, value)) in tags.iter().enumerate() {
+                for (name, value) in *tags {
                     let mut keys = [0_i64; 2];
                     for (index, (table, bytes)) in [("tag_names", name), ("tag_values", value)].into_iter().enumerate() {
                         let row = store.client.query_one(&format!(
@@ -3790,8 +3928,9 @@ mod tests {
                         keys[index] = row.get(0);
                     }
                     store.client.execute(
-                        "INSERT INTO public.object_tags(object_key,ordinal,name_key,value_key) VALUES($1,$2,$3,$4)",
-                        &[&key, &i32::try_from(ordinal)?, &keys[0], &keys[1]],
+                        "INSERT INTO public.object_tags(object_key,refs) VALUES($1,int8send($2::bigint)||int8send($3::bigint))
+                         ON CONFLICT(object_key) DO UPDATE SET refs=object_tags.refs||EXCLUDED.refs",
+                        &[&key, &keys[0], &keys[1]],
                     ).await?;
                 }
                 let actual = store.bundle_status(&id).await?
@@ -3858,7 +3997,7 @@ mod tests {
             .client
             .execute(
                 "INSERT INTO public.object_tags
-             SELECT k,t.ordinal,t.name_key,t.value_key FROM unnest($1::bigint[]) k
+             SELECT k,t.refs FROM unnest($1::bigint[]) k
              CROSS JOIN public.object_tags t WHERE t.object_key=$2",
                 &[&&keys[..3], &root_source],
             )
@@ -4578,7 +4717,7 @@ mod tests {
             let keys: Vec<i64> = clones.iter().map(|row| row.get(0)).collect();
             store.client.execute(
                 "INSERT INTO public.object_tags
-                 SELECT k,t.ordinal,t.name_key,t.value_key FROM unnest($1::bigint[]) k
+                 SELECT k,t.refs FROM unnest($1::bigint[]) k
                  CROSS JOIN public.object_tags t JOIN public.objects o ON o.key=t.object_key
                  WHERE o.id=$2", &[&keys,&roots[0].0]
             ).await?;
@@ -5729,10 +5868,10 @@ mod tests {
         let tags = store
             .client
             .query(
-                "SELECT n.value, v.value FROM public.object_tags t
+                "SELECT n.value, v.value FROM public.read_object_tags($1) t
              JOIN public.tag_names n ON n.key=t.name_key
              JOIN public.tag_values v ON v.key=t.value_key
-             WHERE t.object_key=$1 ORDER BY t.ordinal",
+             ORDER BY t.ordinal",
                 &[&key],
             )
             .await?
@@ -5763,7 +5902,7 @@ mod tests {
         };
         let counts = "SELECT ARRAY[
             (SELECT count(*) FROM public.objects), (SELECT count(*) FROM public.owners),
-            (SELECT count(*) FROM public.object_tags), (SELECT count(*) FROM public.tag_names),
+            (SELECT coalesce(sum(octet_length(refs)/16),0)::bigint FROM public.object_tags), (SELECT count(*) FROM public.tag_names),
             (SELECT count(*) FROM public.tag_values)]";
         let before: Vec<i64> = store.client.query_one(counts, &[]).await?.get(0);
         let mut other = store.reconnect().await?;

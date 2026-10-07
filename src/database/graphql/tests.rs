@@ -153,6 +153,7 @@ async fn paused_tag_filters_reject_variables_and_aliases_before_database_access(
     let db = Arc::new(RequestDb {
         source: None,
         tag_search_enabled: false,
+        filter_indexes_enabled: false,
         connection: Mutex::new(None),
         remaining_bytes: AtomicUsize::new(MAX_RESULT_BYTES),
     });
@@ -250,13 +251,12 @@ async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result
     for (i, key) in keys.iter().enumerate() {
         let color = if i == 2 || i == 4 { "blue" } else { "red" };
         let shape = if i == 3 { "circle" } else { "square" };
-        for (ordinal, (name, value)) in [
+        for (name, value) in [
             (app_name.as_str(), color),
             (shape_name.as_str(), shape),
             (app_name.as_str(), color),
         ]
         .into_iter()
-        .enumerate()
         {
             let mut dictionary = Vec::new();
             for (table, bytes) in [
@@ -285,12 +285,17 @@ async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result
                 };
                 dictionary.push(key);
             }
-            store.client.execute("INSERT INTO public.object_tags(object_key,ordinal,name_key,value_key) VALUES($1,$2,$3,$4)", &[key,&(ordinal as i32),&dictionary[0],&dictionary[1]]).await?;
+            store.client.execute(
+                "INSERT INTO public.object_tags(object_key,refs) VALUES($1,int8send($2::bigint)||int8send($3::bigint))
+                 ON CONFLICT(object_key) DO UPDATE SET refs=object_tags.refs||EXCLUDED.refs",
+                &[key,&dictionary[0],&dictionary[1]],
+            ).await?;
         }
     }
     let mut db = Arc::new(RequestDb {
         source: None,
         tag_search_enabled: true,
+        filter_indexes_enabled: true,
         connection: Mutex::new(Some(store)),
         remaining_bytes: AtomicUsize::new(MAX_RESULT_BYTES),
     });
@@ -614,44 +619,75 @@ async fn graphql_filters_cursors_and_metadata_match_gateway_contract() -> Result
     let mixed_query = "query($recipients:[String!],$tags:[TagFilter!],$after:String,$sort:SortOrder){
         transactions(recipients:$recipients,tags:$tags,after:$after,sort:$sort,first:1){
             pageInfo{hasNextPage} edges{cursor node{id signature owner{address key} tags{name value}}}}}";
-    for sort in ["HEIGHT_ASC", "HEIGHT_DESC"] {
-        let mut collected = Vec::new();
-        let mut cursor = Value::Null;
-        loop {
-            let page = query(&schema,&db,mixed_query,json!({
+    for indexes_enabled in [true, false] {
+        Arc::get_mut(&mut db).unwrap().filter_indexes_enabled = indexes_enabled;
+        if !indexes_enabled {
+            db.store()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                .client
+                .execute(
+                    "UPDATE public.canonical_placements SET owner_filter=NULL,recipient_filter=NULL
+                 WHERE object_key=ANY($1)",
+                    &[&keys],
+                )
+                .await?;
+            for alias in [&owner, &public_key] {
+                let page=query(&schema,&db,
+                    "query($owners:[String!]){transactions(owners:$owners,first:25,sort:HEIGHT_ASC){edges{node{id}}}}",
+                    json!({"owners":[URL_SAFE_NO_PAD.encode(alias)]})
+                ).await?;
+                ensure!(
+                    ids(&page["transactions"]) == ascending,
+                    "disabled helper mode lost owner matches with stale fingerprints"
+                );
+            }
+        }
+        for sort in ["HEIGHT_ASC", "HEIGHT_DESC"] {
+            let mut collected = Vec::new();
+            let mut cursor = Value::Null;
+            loop {
+                let page = query(&schema,&db,mixed_query,json!({
                 "recipients":["",URL_SAFE_NO_PAD.encode(&recipient),"",URL_SAFE_NO_PAD.encode(&recipient)],
                 "tags":[{"name":app_name,"values":["red","blue"]}],"after":cursor,"sort":sort
             })).await?;
-            let page = &page["transactions"];
-            for edge in page["edges"].as_array().unwrap() {
+                let page = &page["transactions"];
+                for edge in page["edges"].as_array().unwrap() {
+                    ensure!(
+                        edge["node"]["signature"] == edge["node"]["id"]
+                            && edge["node"]["owner"]["key"] == URL_SAFE_NO_PAD.encode(&public_key),
+                        "filtered page lost full metadata"
+                    );
+                }
+                collected.extend(ids(page));
                 ensure!(
-                    edge["node"]["signature"] == edge["node"]["id"]
-                        && edge["node"]["owner"]["key"] == URL_SAFE_NO_PAD.encode(&public_key),
-                    "filtered page lost full metadata"
+                    collected.len() <= ascending.len(),
+                    "mixed filter repeated a page"
                 );
+                if page["pageInfo"]["hasNextPage"] == false {
+                    break;
+                }
+                let next = page["edges"][0]["cursor"].clone();
+                ensure!(next != cursor, "mixed cursor did not advance");
+                cursor = next;
             }
-            collected.extend(ids(page));
+            let expected: Vec<_> = if sort == "HEIGHT_ASC" {
+                ascending.clone()
+            } else {
+                ascending.iter().rev().cloned().collect()
+            };
             ensure!(
-                collected.len() <= ascending.len(),
-                "mixed filter repeated a page"
+                collected == expected,
+                "mixed-recipient ordering, deduplication, or lookahead differs"
             );
-            if page["pageInfo"]["hasNextPage"] == false {
-                break;
-            }
-            let next = page["edges"][0]["cursor"].clone();
-            ensure!(next != cursor, "mixed cursor did not advance");
-            cursor = next;
         }
-        let expected: Vec<_> = if sort == "HEIGHT_ASC" {
-            ascending.clone()
-        } else {
-            ascending.iter().rev().cloned().collect()
-        };
-        ensure!(
-            collected == expected,
-            "mixed-recipient ordering, deduplication, or lookahead differs"
-        );
     }
+    Arc::get_mut(&mut db).unwrap().filter_indexes_enabled = true;
+    db.store().await.map_err(|e|anyhow::anyhow!("{e:?}"))?.client.execute(
+        "UPDATE public.canonical_placements p SET owner_filter=public.graphql_filter(o.owner_address),
+         recipient_filter=CASE WHEN o.target<>''::bytea THEN public.graphql_filter(o.target) END
+         FROM public.objects o WHERE o.key=p.object_key AND p.object_key=ANY($1)", &[&keys]
+    ).await?;
     {
         let store = db.store().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let other = crate::sha256(&[&nonce, b"other-owner"]).to_vec();
@@ -827,6 +863,7 @@ async fn graphql_id_only_queries_do_not_wait_for_unrequested_tags() -> Result<()
     let db = Arc::new(RequestDb {
         source: Some(Arc::new(store)),
         tag_search_enabled: true,
+        filter_indexes_enabled: false,
         connection: Mutex::new(None),
         remaining_bytes: AtomicUsize::new(MAX_RESULT_BYTES),
     });
@@ -872,8 +909,8 @@ async fn graphql_id_only_queries_do_not_wait_for_unrequested_tags() -> Result<()
     let rows = store
         .client
         .query(
-            "SELECT n.value,v.value FROM public.object_tags t
-         JOIN public.objects o ON o.key=t.object_key
+            "SELECT n.value,v.value FROM public.objects o
+         JOIN LATERAL public.read_object_tags(o.key) t ON true
          JOIN public.tag_names n ON n.key=t.name_key JOIN public.tag_values v ON v.key=t.value_key
          WHERE o.id=$1 ORDER BY t.ordinal",
             &[&URL_SAFE_NO_PAD.decode(&id)?],

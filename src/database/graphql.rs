@@ -37,6 +37,7 @@ struct Service {
     schema: Schema,
     source: Option<Arc<BlockStore>>,
     tag_search_enabled: bool,
+    filter_indexes_enabled: bool,
     permits: Semaphore,
 }
 
@@ -48,10 +49,16 @@ pub(crate) fn router<S: Clone + Send + Sync + 'static>(
         .unwrap_or("true")
         .parse::<bool>()
         .map_err(|error| anyhow::anyhow!("invalid AR_IO_GRAPHQL_TAG_SEARCH: {error}"))?;
+    let filter_indexes_enabled = std::env::var("AR_IO_GRAPHQL_FILTER_INDEXES")
+        .as_deref()
+        .unwrap_or("false")
+        .parse::<bool>()
+        .map_err(|error| anyhow::anyhow!("invalid AR_IO_GRAPHQL_FILTER_INDEXES: {error}"))?;
     let service = Arc::new(Service {
         schema: schema(),
         source,
         tag_search_enabled,
+        filter_indexes_enabled,
         permits: Semaphore::new(4),
     });
     Ok(Router::new()
@@ -144,6 +151,7 @@ async fn execute(service: Arc<Service>, request: async_graphql::Request) -> Resp
     let db = Arc::new(RequestDb {
         source: service.source.clone(),
         tag_search_enabled: service.tag_search_enabled,
+        filter_indexes_enabled: service.filter_indexes_enabled,
         connection: Mutex::new(None),
         remaining_bytes: AtomicUsize::new(MAX_RESULT_BYTES),
     });
@@ -165,6 +173,7 @@ async fn execute(service: Arc<Service>, request: async_graphql::Request) -> Resp
 struct RequestDb {
     source: Option<Arc<BlockStore>>,
     tag_search_enabled: bool,
+    filter_indexes_enabled: bool,
     connection: Mutex<Option<BlockStore>>,
     remaining_bytes: AtomicUsize,
 }
@@ -196,6 +205,12 @@ impl RequestDb {
                 )
                 .await
                 .map_err(database_error)?;
+            if self.filter_indexes_enabled {
+                store
+                    .require_graphql_indexes()
+                    .await
+                    .map_err(database_error)?;
+            }
             *guard = Some(store);
         }
         Ok(MutexGuard::map(guard, |store| store.as_mut().unwrap()))
@@ -677,7 +692,6 @@ async fn transactions(
         Some(values)
     };
     if tag_first {
-        // Concrete dictionary keys let the planner use tag-pair statistics.
         let mut groups = Vec::with_capacity(filter.tags.len());
         for tag in &filter.tags {
             let name = tag.name.as_bytes();
@@ -721,17 +735,17 @@ async fn transactions(
                 format!("{alias}.name_key={name} AND {alias}.value_key=ANY({values}::bigint[])");
             if !intersect {
                 sql.filter(format!(
-                    "EXISTS (SELECT true FROM public.object_tags t
-                     WHERE t.object_key=o.key AND {predicate})"
+                    "EXISTS (SELECT true FROM public.read_object_tags(o.key) t WHERE {predicate})"
                 ));
             } else if index == 0 {
                 candidates = format!(
-                    "SELECT DISTINCT t.object_key FROM public.object_tags t WHERE {predicate}"
+                    "SELECT DISTINCT p.object_key FROM public.object_tags p
+                     CROSS JOIN LATERAL public.decode_tag_refs(p.refs) t WHERE {predicate}"
                 );
             } else {
                 candidates.push_str(&format!(
-                    " AND EXISTS (SELECT true FROM public.object_tags matching
-                        WHERE matching.object_key=t.object_key AND {predicate})"
+                    " AND EXISTS (SELECT true FROM public.read_object_tags(p.object_key) matching
+                        WHERE {predicate})"
                 ));
             }
         }
@@ -753,8 +767,8 @@ async fn transactions(
                     .collect::<Vec<_>>(),
             );
             sql.filter(format!(
-                "{tag_query_start} SELECT true FROM public.object_tags t WHERE t.object_key=o.key
-                 AND t.name_key IN (SELECT key FROM public.tag_names
+                "{tag_query_start} SELECT true FROM public.read_object_tags(o.key) t
+                 WHERE t.name_key IN (SELECT key FROM public.tag_names
                     WHERE sha256(value)=sha256({name}::bytea) AND value={name})
                  AND t.value_key IN (SELECT v.key FROM unnest({values}::bytea[]) wanted(value)
                     JOIN public.tag_values v ON public.object_id_prefix(sha256(v.value))=
@@ -769,7 +783,10 @@ async fn transactions(
         "p.block_height {direction},p.position {direction},p.kind {direction},p.id {direction}"
     );
     let base = std::mem::take(&mut sql.text);
-    let page = if filter.ids.is_empty() && (owners.is_some() || recipients.is_some()) {
+    let page = if request_db.filter_indexes_enabled
+        && filter.ids.is_empty()
+        && (owners.is_some() || recipients.is_some())
+    {
         let (column, full_column, values, empty, nonempty) = if let Some(values) = owners {
             ("owner_filter", "owner_address", values, false, true)
         } else {
@@ -891,9 +908,10 @@ async fn transactions(
         let positions: HashMap<i64, usize> =
             keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
         let stream = store.client.query_raw(
-            "SELECT t.object_key,n.value,v.value FROM public.object_tags t
+            "SELECT t.object_key,n.value,v.value FROM unnest($1::bigint[]) requested(key)
+             CROSS JOIN LATERAL public.read_object_tags(requested.key) t
              JOIN public.tag_names n ON n.key=t.name_key JOIN public.tag_values v ON v.key=t.value_key
-             WHERE t.object_key=ANY($1) ORDER BY t.object_key,t.ordinal", [&keys as &(dyn ToSql + Sync)]
+             ORDER BY t.object_key,t.ordinal", [&keys as &(dyn ToSql + Sync)]
         ).await.map_err(database_error)?;
         tokio::pin!(stream);
         while let Some(row) = stream.try_next().await.map_err(database_error)? {

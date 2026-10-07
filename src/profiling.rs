@@ -41,9 +41,8 @@ pub(crate) enum Stage {
     MetadataCommit,
     TagInsert,
     TagCompare,
-    TagCount,
 }
-const STAGES: [&str; 28] = [
+const STAGES: [&str; 27] = [
     "chunk_global_admission",
     "chunk_origin_admission",
     "chunk_headers",
@@ -71,7 +70,6 @@ const STAGES: [&str; 28] = [
     "metadata_commit",
     "tag_insert",
     "tag_compare",
-    "tag_count",
 ];
 
 #[derive(Default)]

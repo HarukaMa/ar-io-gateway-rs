@@ -2084,7 +2084,7 @@ mod bundle_tests {
         let counts = "SELECT ARRAY[
             (SELECT count(*) FROM public.objects), (SELECT count(*) FROM public.owners),
             (SELECT count(*) FROM public.tag_names), (SELECT count(*) FROM public.tag_values),
-            (SELECT count(*) FROM public.object_tags), (SELECT count(*) FROM public.item_locations),
+            (SELECT coalesce(sum(octet_length(refs)/16),0)::bigint FROM public.object_tags), (SELECT count(*) FROM public.item_locations),
             (SELECT count(*) FROM public.bundle_progress), (SELECT count(*) FROM public.canonical_placements),
             (SELECT count(*) FROM public.block_transactions)]";
         let before: Vec<i64> = client.query_one(counts, &[]).await?.get(0);
@@ -2220,14 +2220,26 @@ mod bundle_tests {
             .into_iter()
             .map(|row| row.get(0))
             .collect();
-        let new_names: Vec<i64> = cleanup.query(
-            "SELECT DISTINCT name_key FROM public.object_tags WHERE object_key=ANY($1::bigint[]) AND name_key>$2",
-            &[&fixture_keys,&name_limit]
-        ).await?.into_iter().map(|row| row.get(0)).collect();
-        let new_values: Vec<i64> = cleanup.query(
-            "SELECT DISTINCT value_key FROM public.object_tags WHERE object_key=ANY($1::bigint[]) AND value_key>$2",
-            &[&fixture_keys,&value_limit]
-        ).await?.into_iter().map(|row| row.get(0)).collect();
+        let new_names: Vec<i64> = cleanup
+            .query(
+                "SELECT DISTINCT t.name_key FROM unnest($1::bigint[]) k(key)
+             CROSS JOIN LATERAL public.read_object_tags(k.key) t WHERE t.name_key>$2",
+                &[&fixture_keys, &name_limit],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
+        let new_values: Vec<i64> = cleanup
+            .query(
+                "SELECT DISTINCT t.value_key FROM unnest($1::bigint[]) k(key)
+             CROSS JOIN LATERAL public.read_object_tags(k.key) t WHERE t.value_key>$2",
+                &[&fixture_keys, &value_limit],
+            )
+            .await?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect();
         cleanup
             .execute(
                 "DELETE FROM public.canonical_placements WHERE object_key=ANY($1::bigint[])",
@@ -2280,8 +2292,8 @@ mod bundle_tests {
                 )
                 .await?;
         }
-        cleanup.execute("DELETE FROM public.tag_names n WHERE key=ANY($1::bigint[]) AND NOT EXISTS(SELECT 1 FROM public.object_tags WHERE name_key=n.key)", &[&new_names]).await?;
-        cleanup.execute("DELETE FROM public.tag_values v WHERE key=ANY($1::bigint[]) AND NOT EXISTS(SELECT 1 FROM public.object_tags WHERE value_key=v.key)", &[&new_values]).await?;
+        cleanup.execute("DELETE FROM public.tag_names n WHERE key=ANY($1::bigint[]) AND NOT EXISTS(SELECT 1 FROM public.object_tags p CROSS JOIN LATERAL public.decode_tag_refs(p.refs) t WHERE t.name_key=n.key)", &[&new_names]).await?;
+        cleanup.execute("DELETE FROM public.tag_values v WHERE key=ANY($1::bigint[]) AND NOT EXISTS(SELECT 1 FROM public.object_tags p CROSS JOIN LATERAL public.decode_tag_refs(p.refs) t WHERE t.value_key=v.key)", &[&new_values]).await?;
         cleanup.commit().await?;
         ensure!(
             client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == before,
