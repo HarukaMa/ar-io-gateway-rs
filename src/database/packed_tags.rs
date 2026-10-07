@@ -4,6 +4,16 @@ pub(super) const PREPARE: &str = include_str!("../../migrations/023_packed_tags_
 
 impl BlockStore {
     pub async fn prepare_packed_tags(&mut self) -> Result<()> {
+        let batch_size = std::env::var("AR_IO_PACKED_TAG_BATCH_SIZE")
+            .ok()
+            .map(|value| value.parse::<i64>())
+            .transpose()
+            .context("invalid AR_IO_PACKED_TAG_BATCH_SIZE")?
+            .unwrap_or(256);
+        ensure!(
+            (1..=16_384).contains(&batch_size),
+            "AR_IO_PACKED_TAG_BATCH_SIZE must be between 1 and 16384"
+        );
         self.migrate_schema(false).await?;
         self.client
             .batch_execute(
@@ -94,8 +104,8 @@ impl BlockStore {
             let keys: Vec<i64> = transaction
                 .query(
                     "SELECT DISTINCT object_key FROM public.object_tags
-                 WHERE object_key>$1 AND object_key<=$2 ORDER BY object_key LIMIT 256",
-                    &[&after, &high],
+                 WHERE object_key>$1 AND object_key<=$2 ORDER BY object_key LIMIT $3",
+                    &[&after, &high, &batch_size],
                 )
                 .await?
                 .into_iter()
@@ -148,7 +158,7 @@ impl BlockStore {
             reported_parent_time += parent_time;
             if reported.elapsed() >= Duration::from_secs(5) || next == high {
                 eprintln!(
-                    "Packed-tag backfill: key {next}/{high}, bitmap={bitmap_reads}, batches={reported_batches}, objects={reported_objects}, elapsed_ms={}, parent_ms={}",
+                    "Packed-tag backfill: key {next}/{high}, bitmap={bitmap_reads}, batch_size={batch_size}, batches={reported_batches}, objects={reported_objects}, elapsed_ms={}, parent_ms={}",
                     reported.elapsed().as_millis(),
                     reported_parent_time.as_millis()
                 );
