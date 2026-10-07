@@ -180,7 +180,7 @@ impl ChunkSource {
                         },
                     )
                     .await?
-                    .context("streaming chunk not found")?;
+                    .ok_or_else(|| crate::diagnostics::missing_chunk(absolute))?;
                 let proof = &fetched.proof;
                 crate::check_chunk_geometry(proof, position as u128, &self.geometry)?;
                 Ok((
