@@ -104,6 +104,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
+pub(crate) const MAX_BUNDLE_BATCH_SIZE: usize = 4096;
 const ROW_BATCH_SIZE: usize = 1_000;
 
 const BUNDLE_OVERLAP: &str = "
@@ -2276,8 +2277,8 @@ impl BlockStore {
     ) -> Result<()> {
         ensure!(root_id.len() == 32, "bundle root ID must be 32 bytes");
         ensure!(
-            locations.len() <= METADATA_BATCH_SIZE && objects.len() <= METADATA_BATCH_SIZE,
-            "bundle batch exceeds 256 occurrences or objects"
+            locations.len() <= MAX_BUNDLE_BATCH_SIZE && objects.len() <= MAX_BUNDLE_BATCH_SIZE,
+            "bundle batch exceeds {MAX_BUNDLE_BATCH_SIZE} occurrences or objects"
         );
         let mut locations: Vec<_> = locations.iter().collect();
         locations.sort_unstable_by(|a, b| a.path.cmp(&b.path));
@@ -2834,8 +2835,8 @@ impl BlockStore {
         objects: &[ObjectMetadata],
     ) -> Result<Vec<i64>> {
         ensure!(
-            objects.len() <= METADATA_BATCH_SIZE,
-            "metadata batch exceeds 256 objects"
+            objects.len() <= MAX_BUNDLE_BATCH_SIZE,
+            "metadata batch exceeds {MAX_BUNDLE_BATCH_SIZE} objects"
         );
         if objects.is_empty() {
             return Ok(Vec::new());
