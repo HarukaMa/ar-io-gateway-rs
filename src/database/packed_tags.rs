@@ -12,6 +12,24 @@ impl BlockStore {
              SET max_parallel_workers_per_gather=0",
             )
             .await?;
+        let bitmap_reads = std::env::var("AR_IO_PACKED_TAG_BITMAP_READS")
+            .ok()
+            .map(|value| value.parse::<bool>())
+            .transpose()
+            .context("invalid AR_IO_PACKED_TAG_BITMAP_READS")?
+            .unwrap_or(false);
+        let scans = if bitmap_reads {
+            let settings = self
+                .client
+                .query_one(
+                    "SELECT current_setting('enable_indexscan'),current_setting('enable_bitmapscan')",
+                    &[],
+                )
+                .await?;
+            Some((settings.get::<_, String>(0), settings.get::<_, String>(1)))
+        } else {
+            None
+        };
         let locked: bool = self
             .client
             .query_one(
@@ -59,6 +77,9 @@ impl BlockStore {
         }
         transaction.commit().await?;
         let mut reported = tokio::time::Instant::now();
+        let mut reported_batches = 0_u64;
+        let mut reported_objects = 0_usize;
+        let mut reported_parent_time = Duration::ZERO;
         loop {
             let transaction = self.client.transaction().await?;
             let state = transaction.query_one(
@@ -80,12 +101,27 @@ impl BlockStore {
                 .into_iter()
                 .map(|row| row.get(0))
                 .collect();
+            let parent_started = tokio::time::Instant::now();
+            if bitmap_reads {
+                transaction
+                    .batch_execute("SET LOCAL enable_indexscan=off; SET LOCAL enable_bitmapscan=on")
+                    .await?;
+            }
             transaction
                 .query(
                     "SELECT key FROM public.objects WHERE key=ANY($1) ORDER BY id FOR UPDATE",
                     &[&keys],
                 )
                 .await?;
+            if let Some((indexscan, bitmapscan)) = &scans {
+                transaction
+                    .query_one(
+                        "SELECT set_config('enable_indexscan',$1,true),set_config('enable_bitmapscan',$2,true)",
+                        &[indexscan, bitmapscan],
+                    )
+                    .await?;
+            }
+            let parent_time = parent_started.elapsed();
             let gap = transaction.query_opt(
                 "SELECT object_key FROM public.object_tags WHERE object_key=ANY($1)
                  GROUP BY object_key HAVING min(ordinal)<>0 OR max(ordinal)::bigint<>count(*)-1 LIMIT 1",
@@ -107,8 +143,18 @@ impl BlockStore {
                 )
                 .await?;
             transaction.commit().await?;
+            reported_batches += 1;
+            reported_objects += keys.len();
+            reported_parent_time += parent_time;
             if reported.elapsed() >= Duration::from_secs(5) || next == high {
-                eprintln!("Packed-tag backfill: key {next}/{high}");
+                eprintln!(
+                    "Packed-tag backfill: key {next}/{high}, bitmap={bitmap_reads}, batches={reported_batches}, objects={reported_objects}, elapsed_ms={}, parent_ms={}",
+                    reported.elapsed().as_millis(),
+                    reported_parent_time.as_millis()
+                );
+                reported_batches = 0;
+                reported_objects = 0;
+                reported_parent_time = Duration::ZERO;
                 reported = tokio::time::Instant::now();
             }
         }
