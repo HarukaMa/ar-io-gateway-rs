@@ -1297,7 +1297,8 @@ impl Gateway {
             }
         }
         let request = |source: String| async move {
-            let (chunk, headers, body) = self.fetch_chunk(&source, offset).await?;
+            let (chunk, headers, body) =
+                diagnostics::check_chunk(offset, self.fetch_chunk(&source, offset)).await?;
             let proof = cpu_work(move || verify_chunk_proof(chunk, offset, &geometry)).await?;
             Ok::<_, anyhow::Error>((proof, headers, body))
         };

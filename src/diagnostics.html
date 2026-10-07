@@ -53,6 +53,7 @@ const stageDescriptions = {
   block_authentication: 'Checks the block against the trusted chain index and confirms that it contains the transaction.',
   transaction_signature: 'Fetches transaction metadata and verifies its ID, signature, and signed fields.',
   content_proofs_and_hash: 'Reads the content, checks its chunk proofs, and computes its SHA-256 hash.',
+  chunk_retrieval: "Downloads a required chunk from an upstream node. A 404 means that node didn't return the chunk.",
   bundle_item_verification: 'Finds the item in its parent bundle and verifies its ID, signature, metadata, and payload.',
   canonical_anchor: 'Checks the content against the current canonical chain before returning it.'
 };
