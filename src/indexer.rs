@@ -1693,16 +1693,14 @@ async fn persist_bundle(
         let started = Instant::now();
         let (objects, locations, complete) =
             crate::profiling::measure(crate::profiling::Stage::Traversal, async {
-                let mut objects = Vec::with_capacity(256);
-                let mut locations = Vec::with_capacity(256);
-                let mut metadata_bytes = 0usize;
+                let mut objects = Vec::with_capacity(gateway.config.bundle_batch_size);
+                let mut locations = Vec::with_capacity(gateway.config.bundle_batch_size);
                 let mut complete = false;
-                while locations.len() < 256 && metadata_bytes < crate::MAX_JSON_BYTES {
+                while locations.len() < gateway.config.bundle_batch_size {
                     let Some((object, location)) = traversal.next().await? else {
                         complete = true;
                         break;
                     };
-                    metadata_bytes = metadata_bytes.saturating_add(object.heap_bytes());
                     objects.push(object);
                     locations.push(location);
                 }

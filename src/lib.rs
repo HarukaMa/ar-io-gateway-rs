@@ -96,6 +96,8 @@ pub struct Config {
     pub index_downloads: usize,
     /// Concurrent bundle metadata commits, configured by AR_IO_INDEX_WRITERS.
     pub index_writers: usize,
+    /// Maximum items per bundle commit, configured by AR_IO_BUNDLE_BATCH_SIZE.
+    pub bundle_batch_size: usize,
     /// Inclusive background bundle scan floor, configured by AR_IO_BUNDLE_START_HEIGHT.
     pub index_bundle_start_height: u64,
     /// Active and queued bundle bytes, configured by AR_IO_INDEX_MAX_BYTES.
@@ -149,6 +151,7 @@ impl Config {
             max_spool_bytes: 4 * 1024 * 1024 * 1024,
             index_downloads: 32,
             index_writers: 4,
+            bundle_batch_size: 256,
             index_bundle_start_height: 0,
             index_max_bytes: 8 * 1024 * 1024 * 1024,
             index_chain: false,
@@ -217,6 +220,10 @@ impl Config {
             .unwrap_or_else(|_| config.index_writers.to_string())
             .parse()
             .context("invalid AR_IO_INDEX_WRITERS")?;
+        config.bundle_batch_size = env::var("AR_IO_BUNDLE_BATCH_SIZE")
+            .unwrap_or_else(|_| config.bundle_batch_size.to_string())
+            .parse()
+            .context("invalid AR_IO_BUNDLE_BATCH_SIZE")?;
         config.index_max_bytes = env::var("AR_IO_INDEX_MAX_BYTES")
             .unwrap_or_else(|_| config.index_max_bytes.to_string())
             .parse()
@@ -598,6 +605,11 @@ impl Gateway {
             (1..=background::INDEX_WORKERS).contains(&config.index_writers),
             "index writers must be between 1 and {}",
             background::INDEX_WORKERS
+        );
+        ensure!(
+            (1..=database::MAX_BUNDLE_BATCH_SIZE).contains(&config.bundle_batch_size),
+            "bundle batch size must be between 1 and {}",
+            database::MAX_BUNDLE_BATCH_SIZE
         );
         ensure!(
             config.index_bundle_start_height <= i64::MAX as u64,
