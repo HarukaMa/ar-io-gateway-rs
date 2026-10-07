@@ -755,10 +755,11 @@ impl Gateway {
     pub async fn with_bundle_indexing(
         mut self,
         database_url: &str,
+        index_bundles: bool,
     ) -> Result<(Self, background::BundleWorker)> {
         ensure!(
-            self.block_store.is_some(),
-            "bundle indexing requires an initialized database"
+            self.block_store.is_some() && (self.config.index_chain || index_bundles),
+            "background indexing requires an initialized database and an enabled indexing mode"
         );
         let (submitter, worker) = background::start(
             self.config.clone(),
@@ -766,6 +767,7 @@ impl Gateway {
             database_url.to_owned(),
             Arc::clone(&self.direct_cache),
             Arc::clone(&self.peers),
+            index_bundles,
         )
         .await?;
         self.bundle_indexer = Some(submitter);

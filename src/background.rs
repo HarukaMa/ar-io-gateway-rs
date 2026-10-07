@@ -339,7 +339,9 @@ impl BundleSubmitter {
         serde_json::json!({
             "running": !self.is_closed(),
             "chain": status.chain,
-            "bundles": if self.admission.paused.load(Ordering::Relaxed) {
+            "bundles": if status.bundles == "disabled" {
+                "disabled"
+            } else if self.admission.paused.load(Ordering::Relaxed) {
                 "waiting for chain"
             } else if status.bundles == "idle" && !profiles.is_empty() {
                 "fetching or queued"
@@ -410,6 +412,7 @@ pub(crate) async fn start(
     database_url: String,
     direct_cache: Arc<std::sync::Mutex<ContentCache>>,
     peers: Arc<crate::peers::PeerState>,
+    index_bundles: bool,
 ) -> Result<(BundleSubmitter, BundleWorker)> {
     let admission = Admission::new(
         config.index_max_bytes,
@@ -421,9 +424,12 @@ pub(crate) async fn start(
     } else {
         "disabled"
     };
+    if !index_bundles {
+        admission.status.lock().bundles = "disabled";
+    }
     admission
         .paused
-        .store(config.index_chain, Ordering::Relaxed);
+        .store(config.index_chain || !index_bundles, Ordering::Relaxed);
     let (sender, receiver) = mpsc::channel(MAX_JOBS);
     let (cancel, mut cancelled) = oneshot::channel();
     let (ready, readiness) = oneshot::channel();
@@ -450,10 +456,15 @@ pub(crate) async fn start(
                         let store = BlockStore::connect(&database_url).await?;
                         // Fail startup if the bundle schema is absent. Never migrate here.
                         store.require_bundle_schema().await?;
-                        let chain_store = if gateway.config.index_chain {
+                        let chain_store = if gateway.config.index_chain && index_bundles {
                             Some(BlockStore::connect(&database_url).await?)
                         } else {
                             None
+                        };
+                        let (store, chain_store) = if index_bundles {
+                            (Some(store), chain_store)
+                        } else {
+                            (None, Some(store))
                         };
                         Ok::<_, anyhow::Error>((Arc::new(gateway), store, chain_store))
                     };
@@ -474,16 +485,18 @@ pub(crate) async fn start(
                         loop {
                             worker_admission.status.lock().chain = "indexing";
                             let result = crate::indexer::follow_chain_step(&gateway, store, |caught_up| {
-                                let was_paused = worker_admission.paused.swap(!caught_up, Ordering::Relaxed);
-                                if was_paused && caught_up {
+                                let was_paused = worker_admission.paused.swap(!caught_up || !index_bundles, Ordering::Relaxed);
+                                if index_bundles && was_paused && caught_up {
                                     worker_admission.live_pending.store(true, Ordering::Relaxed);
                                     worker_admission.changed.notify_one();
                                 }
                             }).await;
                             match result {
                                 Ok(true) => {
-                                    worker_admission.live_pending.store(true, Ordering::Relaxed);
-                                    worker_admission.changed.notify_one();
+                                    if index_bundles {
+                                        worker_admission.live_pending.store(true, Ordering::Relaxed);
+                                        worker_admission.changed.notify_one();
+                                    }
                                     tokio::task::yield_now().await;
                                 }
                                 result => {
@@ -501,7 +514,9 @@ pub(crate) async fn start(
                     tokio::select! {
                         biased;
                         _ = &mut cancelled => Ok(()),
-                        result = run(Arc::clone(&gateway), store, Some(receiver), Arc::clone(&worker_admission), None) => result.map(|_| ()),
+                        result = async {
+                            run(Arc::clone(&gateway), store.unwrap(), Some(receiver), Arc::clone(&worker_admission), None).await.map(|_| ())
+                        }, if index_bundles => result,
                         result = follow_chain => result,
                     }
                 }));
@@ -1024,6 +1039,129 @@ mod tests {
     use super::*;
     use crate::content::{ContentWriter, SpoolBudget};
     use crate::{Tag, VerifiedData, content::Content};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ar_io_rust_test; run serially; temporarily changes the trusted source"]
+    async fn chain_catch_up_keeps_disabled_bundles_paused() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let database: String = client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let original = client.query_one(
+            "SELECT source,start_height,imported_through FROM public.block_index_state WHERE singleton", &[]
+        ).await?;
+        let source: String = original.get(0);
+        let start_height: i64 = original.get(1);
+        let through = u64::try_from(
+            original
+                .get::<_, Option<i64>>(2)
+                .context("requires an imported chain fixture")?,
+        )?;
+        let store = BlockStore::connect(&url).await?;
+        ensure!(
+            store
+                .pending_metadata_blocks(0, through, 1)
+                .await?
+                .first()
+                .is_none_or(|block| block.height > 0)
+                && store
+                    .pending_transactions(0, through, 1, &[])
+                    .await?
+                    .first()
+                    .is_none_or(|(_, height)| *height > 0),
+            "fixture must allow chain catch-up at safe height zero"
+        );
+        drop(store);
+        let info_requests = Arc::new(AtomicU64::new(0));
+        let requests = Arc::clone(&info_requests);
+        let node = axum::Router::new()
+            .route(
+                "/info",
+                axum::routing::get(move || {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    async { axum::Json(serde_json::json!({"height": crate::CONSENSUS_DEPTH})) }
+                }),
+            )
+            .fallback(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let mock_source = format!("http://{}", listener.local_addr()?);
+        let _node = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, node).await.unwrap();
+        }));
+        client
+            .execute(
+                "UPDATE public.block_index_state SET source=$1,start_height=0 WHERE singleton",
+                &[&mock_source],
+            )
+            .await?;
+        let result = async {
+            let mut config = Config::new(
+                &mock_source,
+                &mock_source,
+                vec![mock_source.clone()],
+                Duration::from_secs(5),
+                1,
+                1024,
+            )?;
+            config.index_chain = true;
+            let gateway = Gateway::new(config)?.with_database(&url).await?;
+            let (gateway, worker) = gateway.with_bundle_indexing(&url, false).await?;
+            let submitter = gateway
+                .bundle_indexer
+                .as_ref()
+                .context("missing indexing status")?;
+            let observed = timeout(Duration::from_secs(5), async {
+                while submitter.status()["chain"] != "retrying" {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                ensure!(
+                    info_requests.load(Ordering::Relaxed) >= 2,
+                    "chain follower did not reach catch-up"
+                );
+                ensure!(
+                    worker.admission.paused.load(Ordering::Relaxed),
+                    "chain catch-up enabled bundles"
+                );
+                ensure!(
+                    !worker.admission.live_pending.load(Ordering::Relaxed),
+                    "disabled bundle scan was scheduled"
+                );
+                submitter.submit(&root(241, vec![0; 64].into()));
+                ensure!(
+                    worker.admission.state.lock().ids.is_empty(),
+                    "disabled worker accepted a bundle"
+                );
+                ensure!(
+                    submitter.status()["bundles"] == "disabled",
+                    "disabled bundle status was lost"
+                );
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("chain follower did not run");
+            worker.shutdown().await?;
+            observed?
+        }
+        .await;
+        if result.is_ok() {
+            client.execute(
+                "UPDATE public.block_index_state SET source=$1,start_height=$2 WHERE singleton AND source=$3",
+                &[&source,&start_height,&mock_source]
+            ).await?;
+        } else {
+            eprintln!(
+                "Preserved failed fixture. Original source={source:?}, start_height={start_height}"
+            );
+        }
+        result
+    }
 
     #[test]
     fn live_status_tracks_active_jobs_and_retains_downloads_after_completion() {
