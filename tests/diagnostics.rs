@@ -28,7 +28,7 @@ fn diagnostic_retrieval_failure_returns_json_and_a_failure_exit_code() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["status"], "failed");
+    assert_eq!(report["status"], "unavailable");
     assert_eq!(report["resolved_id"], id);
     assert!(report["content"].is_null());
     assert!(
@@ -95,7 +95,7 @@ async fn public_id_diagnostic_returns_a_report_without_crashing_the_server() {
     assert!(running, "diagnostic crashed the gateway");
     let report = result.unwrap();
     assert_eq!(report["resolved_id"], id);
-    assert_eq!(report["status"], "failed");
+    assert_eq!(report["status"], "unavailable");
     assert!(report["content"].is_null());
     assert!(
         report["steps"]

@@ -1965,6 +1965,13 @@ fn arns_is_active(end_timestamp: i64, grace_period: i64, now: u64) -> Result<boo
     Ok(i64::try_from(now).context("system time is too large")? < expires_at)
 }
 
+fn solana_request_error(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<reqwest::Error>() {
+        Ok(error) => anyhow::Error::new(error.without_url()).context("Solana RPC request failed"),
+        Err(_) => anyhow::anyhow!("Solana RPC request failed"),
+    }
+}
+
 async fn account_info(
     gateway: &Gateway,
     rpc_url: &Url,
@@ -1987,7 +1994,7 @@ async fn account_info(
                 })),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Solana RPC request failed"))?;
+        .map_err(solana_request_error)?;
     let Some(account) = response.into_result()?.value else {
         return Ok(None);
     };
@@ -2030,7 +2037,7 @@ async fn ant_undername(
                 })),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Solana RPC request failed"))?;
+        .map_err(solana_request_error)?;
     select_ant_record(response.into_result()?, program_id, mint, undername)
 }
 
@@ -2755,7 +2762,10 @@ fn upstream_error_response(context: &str, error: anyhow::Error) -> Response {
     eprintln!("{context}: {error:#}");
     let mut response = html_error_response(
         StatusCode::SERVICE_UNAVAILABLE,
-        &format!("{context}: {error:#}"),
+        &format!(
+            "{context}: {}",
+            crate::diagnostics::public_error_text(&error)
+        ),
     );
     response
         .headers_mut()
@@ -3203,7 +3213,7 @@ mod tests {
         let text = std::str::from_utf8(&body).unwrap();
         assert!(!text.contains("127.0.0.1") && !text.contains("private"));
         let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(report["status"], "failed");
+        assert_eq!(report["status"], "unavailable");
         assert!(report["content"].is_null());
         assert!(
             report["steps"]
@@ -4501,8 +4511,8 @@ mod tests {
             response.headers()[CACHE_CONTROL],
             "public, max-age=60, must-revalidate"
         );
-        let invalid = anyhow::anyhow!("invalid chunk proof <script>alert('x')</script>")
-            .context("http://127.0.0.1:1984/chunk/123");
+        let invalid = anyhow::anyhow!("chunk hash does not match data_path")
+            .context("http://user:secret@127.0.0.1:1984/private-key <script>alert('x')</script>");
         let response = retrieval_error_response(invalid);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
@@ -4514,8 +4524,12 @@ mod tests {
             .await
             .unwrap();
         let body = std::str::from_utf8(&body).unwrap();
-        assert!(body.contains("http://127.0.0.1:1984/chunk/123: invalid chunk proof"));
-        assert!(body.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"));
+        assert!(body.contains("chunk hash does not match data_path"));
+        assert!(
+            !body.contains("127.0.0.1")
+                && !body.contains("secret")
+                && !body.contains("private-key")
+        );
         assert!(!body.contains("<script>"));
         let unmatched = unmatched_response(&Method::GET, &"/unknown".parse().unwrap());
         assert!(!unmatched.headers().contains_key(CACHE_CONTROL));

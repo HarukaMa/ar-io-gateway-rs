@@ -3939,7 +3939,7 @@ impl BinaryBundleItems {
         let header = bundle
             .read_at(0, 32)
             .await
-            .context("bundle item count is truncated")?;
+            .context("Could not read bundle header")?;
         let count = read_u256_usize(&header, "bundle item count")?;
         let cursor = 32;
         ensure!(
