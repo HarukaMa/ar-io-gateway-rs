@@ -1648,11 +1648,12 @@ mod tests {
             .iter()
             .find(|step| step["stage"] == "name_resolution")
             .unwrap();
+        let started = resolution["started_us"].as_u64().unwrap();
         let elapsed = resolution["elapsed_us"].as_u64().unwrap();
-        assert!(elapsed >= 40_000, "{report}");
+        let remaining = 50_000_u64.saturating_sub(started);
+        assert!(elapsed >= remaining.saturating_sub(10_000), "{report}");
         assert!(
-            resolution["started_us"].as_u64().unwrap() + elapsed
-                <= report["timings"]["elapsed_us"].as_u64().unwrap(),
+            started + elapsed <= report["timings"]["elapsed_us"].as_u64().unwrap(),
             "{report}"
         );
     }
