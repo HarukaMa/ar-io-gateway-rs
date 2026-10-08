@@ -6120,7 +6120,8 @@ mod tests {
                 let proof = crate::verify_chunk_proof(crate::Chunk {
                     chunk: payloads[part].clone().into(),
                     data_path: row.data_path.into(), tx_path: row.tx_path.into(),
-                }, offset, &block)?;
+                    packing: crate::packing::Packing::Unpacked,
+                }, offset, &block, None)?;
                 store.cache_chunk(&placement, &proof, host).await?;
             }
             for (offset, expected) in [

@@ -33,3 +33,6 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["test-util"] }
+
+[build-dependencies]
+cmake = "0.1.58"

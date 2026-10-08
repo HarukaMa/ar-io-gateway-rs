@@ -7,6 +7,7 @@ mod disk_cache;
 mod historical;
 pub mod indexer;
 mod json_bundle;
+mod packing;
 mod peers;
 mod profiling;
 pub mod server;
@@ -1275,9 +1276,11 @@ impl Gateway {
                             chunk: bytes,
                             data_path: entry.data_path.clone().into(),
                             tx_path: entry.tx_path.clone().into(),
+                            packing: packing::Packing::Unpacked,
                         };
                         let proof =
-                            cpu_work(move || verify_chunk_proof(chunk, offset, &geometry)).await?;
+                            cpu_work(move || verify_chunk_proof(chunk, offset, &geometry, None))
+                                .await?;
                         ensure!(
                             proof.first_offset.checked_add(proof.data.start) == Some(entry.start)
                                 && proof.first_offset.checked_add(proof.data.end)
@@ -1311,7 +1314,18 @@ impl Gateway {
         let request = |source: String| async move {
             let (chunk, headers, body) =
                 diagnostics::check_chunk(offset, self.fetch_chunk(&source, offset)).await?;
-            let proof = cpu_work(move || verify_chunk_proof(chunk, offset, &geometry)).await?;
+            let cancellation = (chunk.packing != packing::Packing::Unpacked)
+                .then(tokio_util::sync::CancellationToken::new);
+            let _cancelled = cancellation
+                .as_ref()
+                .map(|token| token.clone().drop_guard());
+            let job = match cancellation {
+                Some(token) => Some(packing::Job::acquire(token).await?),
+                None => None,
+            };
+            let proof =
+                cpu_work(move || verify_chunk_proof(chunk, offset, &geometry, job.as_ref()))
+                    .await?;
             Ok::<_, anyhow::Error>((proof, headers, body))
         };
         let fetches = peers::hedged_requests(
@@ -2502,7 +2516,7 @@ async fn chunk_request(
     let configured = configured
         .iter()
         .any(|url| url.trim_end_matches('/') == source.trim_end_matches('/'));
-    let request = |binary| {
+    let request = |binary, packing| {
         let path = format!("{}/{offset}", if binary { "chunk2" } else { "chunk" });
         let request = if configured {
             client.get(endpoint(source, &path))
@@ -2510,24 +2524,34 @@ async fn chunk_request(
             peers.get(endpoint(source, &path))
         };
         request
-            .header("x-packing", "unpacked")
+            .header("x-packing", packing)
             .header("accept-encoding", if binary { "identity" } else { "gzip" })
     };
     let started = Instant::now();
     let mut binary = !configured;
-    let mut response = request(binary).timeout(timeout).send().await?;
+    let mut response = request(binary, "unpacked").timeout(timeout).send().await?;
     if binary && response.status() == reqwest::StatusCode::NOT_FOUND {
         drop(response);
         let remaining = timeout.saturating_sub(started.elapsed());
         ensure!(!remaining.is_zero(), "chunk peer deadline exceeded");
         binary = false;
-        response = request(binary).timeout(remaining).send().await?;
+        response = request(binary, "unpacked")
+            .timeout(remaining)
+            .send()
+            .await?;
+    }
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        drop(response);
+        let remaining = timeout.saturating_sub(started.elapsed());
+        ensure!(!remaining.is_zero(), "chunk peer deadline exceeded");
+        binary = false;
+        response = request(binary, "any").timeout(remaining).send().await?;
     }
     Ok((response.error_for_status()?, binary))
 }
 
 const MAX_BINARY_CHUNK_BYTES: usize =
-    MAX_CHUNK_SIZE as usize + 2 * MAX_PROOF_BYTES + 3 * 3 + 1 + b"unpacked".len();
+    MAX_CHUNK_SIZE as usize + 2 * MAX_PROOF_BYTES + 3 * 3 + 1 + packing::MAX_PACKING_LEN;
 
 async fn read_chunk_response(response: reqwest::Response, binary: bool) -> Result<Chunk> {
     let timer = profiling::start(profiling::Stage::ChunkBody);
@@ -2596,17 +2620,28 @@ fn decode_binary_chunk(body: Bytes) -> Result<Chunk> {
     let chunk = field(3, MAX_CHUNK_SIZE as usize)?;
     let tx_path = field(3, MAX_PROOF_BYTES)?;
     let data_path = field(3, MAX_PROOF_BYTES)?;
-    let packing = field(1, b"unpacked".len())?;
-    ensure!(packing == b"unpacked"[..], "binary chunk is not unpacked");
+    let packing = field(1, packing::MAX_PACKING_LEN)?;
+    let packing = packing::Packing::parse(
+        std::str::from_utf8(&packing).context("invalid chunk packing encoding")?,
+    )?;
     ensure!(
         cursor == body.len(),
         "binary chunk response has trailing bytes"
     );
+    let (data_path, tx_path) = if packing == packing::Packing::Unpacked {
+        (data_path, tx_path)
+    } else {
+        (
+            Bytes::copy_from_slice(&data_path),
+            Bytes::copy_from_slice(&tx_path),
+        )
+    };
     // Cached payloads must not retain the response's proof buffers or spare capacity.
     Ok(Chunk {
         chunk: Bytes::copy_from_slice(&chunk),
         data_path,
         tx_path,
+        packing,
     })
 }
 
@@ -3444,6 +3479,8 @@ struct Chunk {
     data_path: Bytes,
     #[serde(deserialize_with = "deserialize_chunk_bytes")]
     tx_path: Bytes,
+    #[serde(default)]
+    packing: packing::Packing,
 }
 
 fn deserialize_chunk_bytes<'de, D: serde::Deserializer<'de>>(
@@ -3524,6 +3561,7 @@ fn verify_chunk_range(
             block_weave_size: geometry.block_weave_size,
             previous_weave_size: geometry.previous_weave_size,
         },
+        None,
     )?;
     check_chunk_geometry(&proof, relative_offset, geometry)?;
     Ok(proof)
@@ -3561,11 +3599,13 @@ fn verify_chunk_proof(
     chunk: Chunk,
     absolute_offset: u128,
     geometry: &BlockGeometry,
+    job: Option<&packing::Job>,
 ) -> Result<ProvenChunk> {
     let Chunk {
         chunk: bytes,
         data_path: data_path_bytes,
         tx_path: tx_path_bytes,
+        packing,
     } = chunk;
     ensure!(
         bytes.len() <= MAX_CHUNK_SIZE as usize,
@@ -3610,6 +3650,21 @@ fn verify_chunk_proof(
         "data_path ends after transaction"
     );
     let proven_size = usize::try_from(data.end - data.start).context("chunk size overflow")?;
+    let bytes = match packing {
+        packing::Packing::Unpacked => bytes,
+        packing::Packing::Replica29(address) => {
+            let absolute_end = first_offset
+                .checked_add(data.end - 1)
+                .context("replica chunk end offset overflow")?;
+            packing::unpack(
+                &bytes,
+                &address,
+                absolute_end,
+                proven_size,
+                job.context("replica unpacking not admitted")?,
+            )?
+        }
+    };
     ensure!(
         bytes.len() == proven_size,
         "chunk length does not match data_path"
@@ -7334,6 +7389,7 @@ mod tests {
             chunk: Bytes::copy_from_slice(body),
             data_path: Bytes::copy_from_slice(&data_path),
             tx_path: Bytes::copy_from_slice(&tx_path),
+            packing: packing::Packing::Unpacked,
         };
         let mut geometry = Geometry {
             tx_root,
@@ -7360,6 +7416,7 @@ mod tests {
                 block_weave_size: 1_145,
                 previous_weave_size: 1_000,
             },
+            None,
         )
         .unwrap();
         assert_eq!(proof.relative_offset, 5);

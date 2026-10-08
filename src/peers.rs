@@ -1736,12 +1736,13 @@ mod tests {
                 if request.uri().path().starts_with("/chunk/")
                     || request.uri().path().starts_with("/chunk2/")
                 {
-                    if request
-                        .headers()
-                        .get("x-packing")
-                        .and_then(|v| v.to_str().ok())
-                        != Some("unpacked")
-                    {
+                    if !matches!(
+                        request
+                            .headers()
+                            .get("x-packing")
+                            .and_then(|v| v.to_str().ok()),
+                        Some("unpacked" | "any")
+                    ) {
                         return (axum::http::StatusCode::BAD_REQUEST, Vec::new());
                     }
                     counted.fetch_add(1, Ordering::Relaxed);
