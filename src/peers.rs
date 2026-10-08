@@ -1,12 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     net::{IpAddr, SocketAddr},
-    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use parking_lot::Mutex;
 use reqwest::{Client, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,6 +16,7 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 
+use crate::packing::FootprintOffset;
 use crate::take;
 
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,6 +30,7 @@ const MAX_INFO_BYTES: usize = 64 * 1024;
 const MAX_BUCKET_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BUCKETS: usize = 65_536;
 const DEFAULT_BUCKET_SIZE: u64 = 10_000_000_000;
+const DEFAULT_FOOTPRINT_BUCKET_SIZE: u64 = 37_888;
 const MAX_GATEWAYS: usize = 3000;
 const GATEWAY_BATCH_SIZE: usize = 100;
 const REGISTRY_SIZE: usize = 168_056;
@@ -227,8 +229,40 @@ struct ArweavePeer {
     blocks: u64,
     height: u64,
     last_seen: u64,
-    coverage: Option<Coverage>,
+    byte_coverage: Option<Coverage>,
+    footprint_coverage: Option<FootprintCoverage>,
     weight: u8,
+}
+
+impl ArweavePeer {
+    fn coverage_share(
+        &self,
+        byte_offset: u128,
+        footprint_offset: Option<FootprintOffset>,
+        now: u64,
+    ) -> Option<f64> {
+        let bytes = self
+            .byte_coverage
+            .as_ref()
+            .and_then(|coverage| coverage.ranked_share(byte_offset, now));
+        let footprints = self.footprint_coverage.as_ref().and_then(|coverage| {
+            footprint_offset.and_then(|offset| coverage.ranked_share(offset, now))
+        });
+        match (bytes, footprints) {
+            (Some(bytes), Some(footprints)) => Some(bytes.max(footprints)),
+            (bytes, footprints) => bytes.or(footprints),
+        }
+    }
+}
+
+struct FootprintCoverage {
+    buckets: Coverage,
+}
+
+impl FootprintCoverage {
+    fn ranked_share(&self, offset: FootprintOffset, now: u64) -> Option<f64> {
+        self.buckets.ranked_share(offset.0, now)
+    }
 }
 
 struct Coverage {
@@ -250,8 +284,15 @@ impl Coverage {
             .map_or(0.0, |index| self.buckets[index].1)
     }
 
-    fn covers(&self, offset: u128) -> bool {
-        self.share(offset) > 0.0
+    fn ranked_share(&self, offset: u128, now: u64) -> Option<f64> {
+        let share = self.share(offset);
+        if share == 0.0 {
+            return None;
+        }
+        // After missed refreshes, converge toward the unknown-coverage prior.
+        let age = now.saturating_sub(self.updated);
+        let confidence = 1.0 / (1.0 + age.saturating_sub(600_000) as f64 / 600_000.0);
+        Some(confidence * share + (1.0 - confidence) * 0.5)
     }
 }
 
@@ -328,12 +369,15 @@ impl PeerState {
             addresses.is_empty() || !nodes.is_empty(),
             "no Arweave peer answered with valid node information"
         );
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         for (key, node) in &mut nodes {
             if let Some(previous) = state.nodes.get_mut(key) {
                 node.weight = previous.weight;
-                if node.coverage.is_none() {
-                    node.coverage = previous.coverage.take();
+                if node.byte_coverage.is_none() {
+                    node.byte_coverage = previous.byte_coverage.take();
+                }
+                if node.footprint_coverage.is_none() {
+                    node.footprint_coverage = previous.footprint_coverage.take();
                 }
             }
         }
@@ -423,7 +467,7 @@ impl PeerState {
                 );
             }
         }
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         for (key, gateway) in &mut gateways {
             if let Some(previous) = state
                 .gateways
@@ -484,15 +528,19 @@ impl PeerState {
     }
 
     pub(crate) fn snapshot(&self) -> Value {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock();
         let nodes: serde_json::Map<_, _> = state.nodes.iter().map(|(key, peer)| {
             let mut value = json!({
                 "url": peer.url, "blocks": peer.blocks, "height": peer.height,
                 "lastSeen": peer.last_seen,
-                "bucketCount": peer.coverage.as_ref().map_or(0, |coverage| coverage.bucket_count),
+                "bucketCount": peer.byte_coverage.as_ref().map_or(0, |coverage| coverage.bucket_count),
+                "footprintBucketCount": peer.footprint_coverage.as_ref().map_or(0, |coverage| coverage.buckets.bucket_count),
             });
-            if let Some(coverage) = &peer.coverage {
+            if let Some(coverage) = &peer.byte_coverage {
                 value["bucketsLastUpdated"] = json!(coverage.updated);
+            }
+            if let Some(coverage) = &peer.footprint_coverage {
+                value["footprintBucketsLastUpdated"] = json!(coverage.buckets.updated);
             }
             (key.clone(), value)
         }).collect();
@@ -504,28 +552,17 @@ impl PeerState {
         offset: u128,
         configured: &[String],
     ) -> Result<Vec<String>> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let mut pool: BTreeMap<String, Option<f64>> = configured
             .iter()
             .map(|url| (url.trim_end_matches('/').to_owned(), None))
             .collect();
+        let footprint_offset = crate::packing::footprint_offset(offset);
+        let now = now_millis();
         for peer in state.nodes.values() {
-            if !peer
-                .coverage
-                .as_ref()
-                .is_some_and(|coverage| coverage.covers(offset))
-            {
-                continue;
+            if let Some(share) = peer.coverage_share(offset, footprint_offset, now) {
+                pool.insert(peer.url.clone(), Some(share));
             }
-            pool.insert(
-                peer.url.clone(),
-                peer.coverage.as_ref().map(|coverage| {
-                    // After missed refreshes, converge toward the unknown-coverage prior.
-                    let age = now_millis().saturating_sub(coverage.updated);
-                    let confidence = 1.0 / (1.0 + age.saturating_sub(600_000) as f64 / 600_000.0);
-                    confidence * coverage.share(offset) + (1.0 - confidence) * 0.5
-                }),
-            );
         }
         state.chunk_stats.retain(|url, _| pool.contains_key(url));
         let mut ranked = Vec::with_capacity(pool.len());
@@ -574,7 +611,7 @@ impl PeerState {
         sample: Option<(Duration, Duration, usize)>,
     ) {
         self.record_result(url, sample.is_some());
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let Some(stats) = state.chunk_stats.get_mut(url.trim_end_matches('/')) else {
             return;
         };
@@ -606,9 +643,11 @@ impl PeerState {
         if limit == 0 {
             return Vec::new();
         }
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let rotation = state.selection;
         state.selection = state.selection.wrapping_add(1);
+        let footprint_offset = offset.and_then(crate::packing::footprint_offset);
+        let now = now_millis();
         let mut ranked: Vec<_> = state
             .nodes
             .values()
@@ -619,9 +658,7 @@ impl PeerState {
             })
             .map(|peer| {
                 let covered = offset.is_some_and(|offset| {
-                    peer.coverage
-                        .as_ref()
-                        .is_some_and(|coverage| coverage.covers(offset))
+                    peer.coverage_share(offset, footprint_offset, now).is_some()
                 });
                 (covered, peer.weight, peer.url.as_str())
             })
@@ -652,7 +689,7 @@ impl PeerState {
     }
 
     pub(crate) fn record_result(&self, url: &str, success: bool) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if let Some(peer) = state
             .nodes
             .values_mut()
@@ -715,14 +752,20 @@ async fn observe_node(client: &Client, address: SocketAddr) -> Result<(String, A
     .context("Arweave peer info deadline exceeded")??;
     let info: Info = serde_json::from_slice(&info).context("invalid Arweave peer info")?;
     let last_seen = now_millis();
-    let coverage = timeout_at(deadline, async {
+    let bytes = timeout_at(deadline, async {
         let bytes =
             response_bytes(client.get(format!("{url}/sync_buckets")), MAX_BUCKET_BYTES).await?;
         decode_buckets(&bytes)
-    })
-    .await
-    .ok()
-    .and_then(Result::ok);
+    });
+    let footprints = timeout_at(deadline, async {
+        let bytes = response_bytes(
+            client.get(format!("{url}/footprint_buckets")),
+            MAX_BUCKET_BYTES,
+        )
+        .await?;
+        decode_footprint_buckets(&bytes)
+    });
+    let (byte_coverage, footprint_coverage) = tokio::join!(bytes, footprints);
     Ok((
         address.to_string(),
         ArweavePeer {
@@ -730,7 +773,8 @@ async fn observe_node(client: &Client, address: SocketAddr) -> Result<(String, A
             blocks: info.blocks,
             height: info.height,
             last_seen,
-            coverage,
+            byte_coverage: byte_coverage.ok().and_then(Result::ok),
+            footprint_coverage: footprint_coverage.ok().and_then(Result::ok),
             weight: 50,
         },
     ))
@@ -982,6 +1026,16 @@ fn borsh_option(bytes: &[u8], cursor: &mut usize, size: usize) -> Result<()> {
 }
 
 fn decode_buckets(bytes: &[u8]) -> Result<Coverage> {
+    decode_bucket_map(bytes, DEFAULT_BUCKET_SIZE)
+}
+
+fn decode_footprint_buckets(bytes: &[u8]) -> Result<FootprintCoverage> {
+    Ok(FootprintCoverage {
+        buckets: decode_bucket_map(bytes, DEFAULT_FOOTPRINT_BUCKET_SIZE)?,
+    })
+}
+
+fn decode_bucket_map(bytes: &[u8], minimum_bucket_size: u64) -> Result<Coverage> {
     ensure!(
         bytes.len() <= MAX_BUCKET_BYTES,
         "sync buckets exceed size limit"
@@ -993,7 +1047,7 @@ fn decode_buckets(bytes: &[u8]) -> Result<Coverage> {
     );
     let bucket_size = etf_integer(bytes, &mut cursor)?;
     ensure!(
-        (DEFAULT_BUCKET_SIZE..=DEFAULT_BUCKET_SIZE * 4096).contains(&bucket_size),
+        (minimum_bucket_size..=minimum_bucket_size * 4096).contains(&bucket_size),
         "invalid sync bucket size"
     );
     ensure!(
@@ -1179,10 +1233,24 @@ mod tests {
                 let body = match request.uri().path() {
                     "/trusted/peers" => br#"["8.8.4.4:1984"]"#.to_vec(),
                     "/info" => br#"{"height":51,"blocks":51}"#.to_vec(),
-                    "/sync_buckets" if mode == 1 => {
+                    "/sync_buckets" if matches!(mode, 1 | 3) => {
                         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new());
                     }
                     "/sync_buckets" => bucket_frame(&[(0, if mode == 0 { 0.25 } else { 0.0 })]),
+                    "/footprint_buckets" if mode == 2 => {
+                        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Vec::new());
+                    }
+                    "/footprint_buckets" => footprint_frame(
+                        DEFAULT_FOOTPRINT_BUCKET_SIZE as u32,
+                        &[(
+                            0,
+                            match mode {
+                                0 => 0.75,
+                                3 => 0.0,
+                                _ => 0.5,
+                            },
+                        )],
+                    ),
                     _ => return (axum::http::StatusCode::NOT_FOUND, Vec::new()),
                 };
                 (axum::http::StatusCode::OK, body)
@@ -1199,29 +1267,41 @@ mod tests {
             .build()?;
         peers.refresh_arweave().await?;
         let initial = {
-            let state = peers.state.lock().unwrap();
-            let coverage = state.nodes["8.8.4.4:1984"].coverage.as_ref().unwrap();
-            assert_eq!(coverage.share(1), 0.25);
-            coverage.updated
+            let state = peers.state.lock();
+            let node = &state.nodes["8.8.4.4:1984"];
+            let bytes = node.byte_coverage.as_ref().unwrap();
+            let footprints = &node.footprint_coverage.as_ref().unwrap().buckets;
+            assert_eq!(bytes.share(1), 0.25);
+            assert_eq!(footprints.share(1), 0.75);
+            bytes.updated
         };
         mode.store(1, Ordering::Relaxed);
         peers.refresh_arweave().await?;
         {
-            let state = peers.state.lock().unwrap();
-            let coverage = state.nodes["8.8.4.4:1984"].coverage.as_ref().unwrap();
-            assert_eq!(coverage.share(1), 0.25);
-            assert_eq!(coverage.updated, initial);
+            let state = peers.state.lock();
+            let node = &state.nodes["8.8.4.4:1984"];
+            let bytes = node.byte_coverage.as_ref().unwrap();
+            assert_eq!(bytes.share(1), 0.25);
+            assert_eq!(bytes.updated, initial);
+            assert_eq!(
+                node.footprint_coverage.as_ref().unwrap().buckets.share(1),
+                0.5
+            );
         }
         mode.store(2, Ordering::Relaxed);
         peers.refresh_arweave().await?;
-        assert_eq!(
-            peers.state.lock().unwrap().nodes["8.8.4.4:1984"]
-                .coverage
-                .as_ref()
-                .unwrap()
-                .share(1),
-            0.0
-        );
+        {
+            let state = peers.state.lock();
+            let node = &state.nodes["8.8.4.4:1984"];
+            assert_eq!(node.byte_coverage.as_ref().unwrap().share(1), 0.0);
+            assert_eq!(
+                node.footprint_coverage.as_ref().unwrap().buckets.share(1),
+                0.5
+            );
+        }
+        mode.store(3, Ordering::Relaxed);
+        peers.refresh_arweave().await?;
+        assert!(peers.chunk_candidates(262144, &[])?.is_empty());
         Ok(())
     }
 
@@ -1279,21 +1359,22 @@ mod tests {
             ("http://unknown.test", None),
             ("http://unadvertised.test", None),
         ] {
-            peers.state.lock().unwrap().nodes.insert(
+            peers.state.lock().nodes.insert(
                 url.to_owned(),
                 ArweavePeer {
                     url: url.to_owned(),
                     blocks: 1,
                     height: 1,
                     last_seen: now_millis(),
-                    coverage: share
+                    byte_coverage: share
                         .map(|share| decode_buckets(&bucket_frame(&[(0, share)])))
                         .transpose()?,
+                    footprint_coverage: None,
                     weight: 50,
                 },
             );
         }
-        peers.state.lock().unwrap().chunk_selection = 1;
+        peers.state.lock().chunk_selection = 1;
         assert_eq!(
             peers.chunk_candidates(1, &configured)?,
             vec![
@@ -1303,12 +1384,12 @@ mod tests {
             ]
         );
         {
-            let mut state = peers.state.lock().unwrap();
+            let mut state = peers.state.lock();
             state
                 .nodes
                 .get_mut("http://empty.test")
                 .unwrap()
-                .coverage
+                .byte_coverage
                 .as_mut()
                 .unwrap()
                 .updated = 0;
@@ -1469,14 +1550,15 @@ mod tests {
         let configured = vec!["https://slow".to_owned(), "https://new".to_owned()];
         let fast = "http://8.8.8.8:1984";
         for url in [configured[0].as_str(), configured[1].as_str(), fast] {
-            peers.state.lock().unwrap().nodes.insert(
+            peers.state.lock().nodes.insert(
                 url.to_owned(),
                 ArweavePeer {
                     url: url.to_owned(),
                     blocks: 1,
                     height: 1,
                     last_seen: 0,
-                    coverage: Some(decode_buckets(&bucket_frame(&[(0, 0.5)]))?),
+                    byte_coverage: Some(decode_buckets(&bucket_frame(&[(0, 0.5)]))?),
+                    footprint_coverage: None,
                     weight: 50,
                 },
             );
@@ -1536,12 +1618,80 @@ mod tests {
         bytes
     }
 
+    fn footprint_frame(size: u32, entries: &[(u32, f64)]) -> Vec<u8> {
+        let mut bytes = vec![131, 104, 2, 98];
+        bytes.extend_from_slice(&size.to_be_bytes());
+        bytes.push(116);
+        bytes.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for (bucket, share) in entries {
+            bytes.push(98);
+            bytes.extend_from_slice(&bucket.to_be_bytes());
+            bytes.push(70);
+            bytes.extend_from_slice(&share.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn byte_and_footprint_advertisements_keep_separate_coordinates() -> Result<()> {
+        let peers = PeerState::new("http://127.0.0.1:1984")?;
+        let bytes_url = "http://8.8.4.4:1984";
+        let footprints_url = "http://8.8.8.8:1984";
+        let byte_frame = bucket_frame(&[(0, 1.0)]);
+        let fp_frame = footprint_frame(303104, &[(3214, 0.9989640519425677)]);
+        assert!(decode_buckets(&fp_frame).is_err());
+        assert!(decode_footprint_buckets(&byte_frame).is_err());
+        for size in [
+            DEFAULT_FOOTPRINT_BUCKET_SIZE as u32 - 1,
+            (DEFAULT_FOOTPRINT_BUCKET_SIZE * 4096) as u32 + 1,
+        ] {
+            assert!(decode_footprint_buckets(&footprint_frame(size, &[(0, 1.0)])).is_err());
+        }
+        let mut nodes = peers.state.lock();
+        nodes.nodes.insert(
+            bytes_url.to_owned(),
+            ArweavePeer {
+                url: bytes_url.to_owned(),
+                blocks: 1,
+                height: 1,
+                last_seen: now_millis(),
+                byte_coverage: Some(decode_buckets(&byte_frame)?),
+                footprint_coverage: None,
+                weight: 50,
+            },
+        );
+        nodes.nodes.insert(
+            footprints_url.to_owned(),
+            ArweavePeer {
+                url: footprints_url.to_owned(),
+                blocks: 1,
+                height: 1,
+                last_seen: now_millis(),
+                byte_coverage: None,
+                footprint_coverage: Some(decode_footprint_buckets(&fp_frame)?),
+                weight: 50,
+            },
+        );
+        drop(nodes);
+        assert_eq!(peers.chunk_candidates(1, &[])?, vec![bytes_url]);
+        assert_eq!(
+            peers.chunk_candidates(253_736_678_629_623, &[])?,
+            vec![footprints_url]
+        );
+        assert!(peers.chunk_candidates(11_000_000_000, &[])?.is_empty());
+        assert_eq!(
+            peers.candidates(Some(253_736_678_629_623), 1, &[]),
+            vec![footprints_url]
+        );
+        Ok(())
+    }
+
     #[test]
     fn sync_bucket_boundaries_reject_corrupt_etf_and_preserve_advertised_size() {
         let bytes = bucket_frame(&[(2, 0.5), (1, 0.0)]);
         let coverage = decode_buckets(&bytes).unwrap();
-        assert!(coverage.covers(u128::from(DEFAULT_BUCKET_SIZE) * 2));
-        assert!(!coverage.covers(u128::from(DEFAULT_BUCKET_SIZE) * 2 - 1));
+        assert_eq!(coverage.share(u128::from(DEFAULT_BUCKET_SIZE) * 2), 0.5);
+        assert_eq!(coverage.share(u128::from(DEFAULT_BUCKET_SIZE) * 2 - 1), 0.0);
         assert_eq!(coverage.bucket_count, 2);
         for end in 0..bytes.len() {
             assert!(decode_buckets(&bytes[..end]).is_err());

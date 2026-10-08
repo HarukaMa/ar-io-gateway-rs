@@ -10,6 +10,25 @@ pub(crate) const MAX_PACKING_LEN: usize = 12 + 43;
 const SUB_CHUNK_SIZE: usize = 8192;
 const PARTITION_SIZE: u128 = 3_600_000_000_000;
 const SECTOR_SIZE: u128 = 429_184 * SUB_CHUNK_SIZE as u128;
+const FOOTPRINT_SIZE: u128 = 1024;
+const FOOTPRINTS_PER_PARTITION: u128 = SECTOR_SIZE / crate::MAX_CHUNK_SIZE;
+const CHUNKS_PER_PARTITION: u128 =
+    PARTITION_SIZE.div_ceil(crate::MAX_CHUNK_SIZE * FOOTPRINT_SIZE) * FOOTPRINT_SIZE;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FootprintOffset(pub(crate) u128);
+
+pub(crate) fn footprint_offset(offset: u128) -> Option<FootprintOffset> {
+    let (padded, bucket) = chunk_bucket(offset).ok()?;
+    let partition = bucket / PARTITION_SIZE;
+    let relative =
+        ((padded - partition * PARTITION_SIZE) / crate::MAX_CHUNK_SIZE).checked_sub(1)?;
+    let footprint = relative % FOOTPRINTS_PER_PARTITION;
+    let within = relative / FOOTPRINTS_PER_PARTITION;
+    Some(FootprintOffset(
+        partition * CHUNKS_PER_PARTITION + footprint * FOOTPRINT_SIZE + within + 1,
+    ))
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Packing {
@@ -164,7 +183,7 @@ pub(crate) fn unpack(
     Ok(output.into())
 }
 
-fn position(absolute_end: u128) -> Result<(u128, u128, usize)> {
+fn chunk_bucket(absolute_end: u128) -> Result<(u128, u128)> {
     ensure!(absolute_end > 0, "invalid replica chunk end offset");
     let threshold = crate::STRICT_DATA_SPLIT_THRESHOLD;
     let chunk_size = crate::MAX_CHUNK_SIZE;
@@ -178,9 +197,15 @@ fn position(absolute_end: u128) -> Result<(u128, u128, usize)> {
         absolute_end
     };
     let bucket = padded.saturating_sub(chunk_size) / chunk_size * chunk_size;
+    Ok((padded, bucket))
+}
+
+fn position(absolute_end: u128) -> Result<(u128, u128, usize)> {
+    let (_, bucket) = chunk_bucket(absolute_end)?;
+    let chunk_size = crate::MAX_CHUNK_SIZE;
     let partition = bucket / PARTITION_SIZE;
     let relative = bucket % PARTITION_SIZE;
-    let slice_index = ((relative / SECTOR_SIZE) % 1024) as usize;
+    let slice_index = ((relative / SECTOR_SIZE) % FOOTPRINT_SIZE) as usize;
     let first_entropy = (relative % SECTOR_SIZE) / chunk_size * 32;
     Ok((partition, first_entropy, slice_index))
 }
@@ -236,6 +261,28 @@ mod tests {
         assert_eq!(position(524288).unwrap(), (0, 32, 0));
         assert!(position(0).is_err());
         assert!(position(u128::MAX).is_err());
+    }
+
+    #[test]
+    fn footprint_coordinates_preserve_sector_and_partition_layout() {
+        assert_eq!(footprint_offset(262144), Some(FootprintOffset(1)));
+        assert_eq!(footprint_offset(524288), Some(FootprintOffset(1025)));
+        assert_eq!(
+            footprint_offset(13_412 * 262_144),
+            Some(FootprintOffset(13_732_865))
+        );
+        assert_eq!(footprint_offset(13_413 * 262_144), Some(FootprintOffset(2)));
+        assert_eq!(
+            footprint_offset(253_736_678_629_623),
+            Some(FootprintOffset(974_466_542))
+        );
+        assert_eq!(
+            footprint_offset(253_736_678_753_340),
+            Some(FootprintOffset(974_466_542))
+        );
+        assert_eq!(footprint_offset(0), None);
+        assert_eq!(footprint_offset(1), None);
+        assert_eq!(footprint_offset(u128::MAX), None);
     }
 
     #[tokio::test]
