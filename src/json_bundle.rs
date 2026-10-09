@@ -30,6 +30,29 @@ use crate::{
 };
 
 const DECODE_BLOCK: usize = 64 * 1024;
+// Encoded byte caps for fields serde buffers before validation. Data is
+// streamed by span and never buffered here. Every character may legally be
+// written as a six-byte \u escape, and a value may start with whitespace.
+const MAX_JSON_KEY_BYTES: usize = 256;
+const JSON_ESCAPE_FACTOR: usize = 6;
+const MAX_JSON_NONCE_BYTES: usize = 4096 * JSON_ESCAPE_FACTOR + MAX_JSON_KEY_BYTES;
+const MAX_JSON_TAGS_BYTES: usize =
+    MAX_DATA_ITEM_TAGS * 8192 * JSON_ESCAPE_FACTOR + MAX_JSON_KEY_BYTES;
+
+const fn quoted_base64_cap(bytes: usize) -> usize {
+    (bytes.div_ceil(3) * 4 + 2) * JSON_ESCAPE_FACTOR + MAX_JSON_KEY_BYTES
+}
+
+fn field_cap(key: &str) -> usize {
+    match key {
+        "id" | "target" => quoted_base64_cap(32),
+        "owner" => quoted_base64_cap(1025),
+        "signature" => quoted_base64_cap(2052),
+        "nonce" => MAX_JSON_NONCE_BYTES,
+        _ => MAX_JSON_TAGS_BYTES,
+    }
+}
+
 type ByteStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
 
 #[derive(Debug)]
@@ -58,6 +81,7 @@ impl JsonBundle {
         tokio::task::spawn_blocking(move || {
             let state = Rc::new(ParseState {
                 position: Cell::new(0),
+                limit: Cell::new(usize::MAX),
             });
             let reader = CountedReader {
                 inner: io::BufReader::with_capacity(DECODE_BLOCK, bridge),
@@ -107,6 +131,16 @@ impl Drop for JsonBundle {
 
 struct ParseState {
     position: Cell<usize>,
+    limit: Cell<usize>,
+}
+
+impl ParseState {
+    fn bound(&self, cap: usize) {
+        self.limit.set(self.position.get().saturating_add(cap));
+    }
+    fn unbound(&self) {
+        self.limit.set(usize::MAX);
+    }
 }
 
 struct CountedReader<R> {
@@ -122,6 +156,9 @@ impl<R: Read> Read for CountedReader<R> {
         }
         let read = self.inner.read(bytes)?;
         self.state.position.set(self.state.position.get() + read);
+        if self.state.position.get() > self.state.limit.get() {
+            return Err(io::Error::other("JSON bundle field exceeds size limit"));
+        }
         Ok(read)
     }
 }
@@ -149,7 +186,9 @@ impl<'de> Visitor<'de> for RootSeed<'_> {
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<(), A::Error> {
         let mut found = false;
+        self.state.bound(MAX_JSON_KEY_BYTES);
         while let Some(key) = map.next_key::<String>()? {
+            self.state.unbound();
             if key == "items" {
                 if found {
                     return Err(serde::de::Error::duplicate_field("items"));
@@ -163,7 +202,9 @@ impl<'de> Visitor<'de> for RootSeed<'_> {
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
+            self.state.bound(MAX_JSON_KEY_BYTES);
         }
+        self.state.unbound();
         if !found {
             return Err(serde::de::Error::missing_field("items"));
         }
@@ -230,9 +271,11 @@ impl<'de> DeserializeSeed<'de> for EntrySeed {
         self,
         decoder: D,
     ) -> std::result::Result<JsonEntry, D::Error> {
+        self.state.bound(MAX_JSON_KEY_BYTES);
         let fields = decoder.deserialize_any(EntryVisitor {
             state: Rc::clone(&self.state),
         })?;
+        self.state.unbound();
         let end = self.state.position.get();
         let id = fields
             .values
@@ -257,11 +300,14 @@ impl<'de> Visitor<'de> for EntryVisitor {
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Fields, A::Error> {
         // deserialize_map has consumed the opening brace at this point.
+        self.state.unbound();
         let mut fields = Fields {
             offset: self.state.position.get() - 1,
             ..Fields::default()
         };
+        self.state.bound(MAX_JSON_KEY_BYTES);
         while let Some(key) = map.next_key::<String>()? {
+            self.state.unbound();
             if key == "data" {
                 fields.invalid |= fields.data.is_some();
                 fields.data = Some(map.next_value_seed(DataSeed {
@@ -271,15 +317,19 @@ impl<'de> Visitor<'de> for EntryVisitor {
                 key.as_str(),
                 "id" | "owner" | "target" | "nonce" | "tags" | "signature"
             ) {
+                self.state.bound(field_cap(&key));
                 let value = map.next_value::<Box<RawValue>>()?;
                 fields.invalid |= fields.values.insert(key, value).is_some();
             } else {
                 map.next_value::<IgnoredAny>()?;
             }
+            self.state.bound(MAX_JSON_KEY_BYTES);
         }
+        self.state.unbound();
         Ok(fields)
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Fields, A::Error> {
+        self.state.unbound();
         while seq.next_element::<IgnoredAny>()?.is_some() {}
         Ok(Fields {
             invalid: true,
@@ -741,7 +791,35 @@ mod tests {
             .map(|b| format!("\\u{b:04x}"))
             .collect();
         let escaped = encoded_json.replacen(encoded, &(escaped_prefix + &encoded[24..]), 1);
-        for bytes in [FIXTURE.to_vec(), escaped.into_bytes()] {
+        // Every non-data string fully \u-escaped and pretty-printed, which is
+        // the largest valid encoding of the buffered fields.
+        let mut fully_escaped = serde_json::to_string_pretty(&fixture)?;
+        for value in fixture["items"][0]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| *k != "data")
+            .flat_map(|(_, v)| match v {
+                serde_json::Value::String(s) => vec![s.as_str()],
+                serde_json::Value::Array(tags) => tags
+                    .iter()
+                    .flat_map(|t| t.as_object().unwrap().values())
+                    .map(|v| v.as_str().unwrap())
+                    .collect(),
+                _ => vec![],
+            })
+        {
+            let escaped: String = value.bytes().map(|b| format!("\\u{b:04x}")).collect();
+            fully_escaped =
+                fully_escaped.replace(&format!("\"{value}\""), &format!("\"{escaped}\""));
+        }
+        assert!(!fully_escaped.contains(fixture["items"][0]["owner"].as_str().unwrap()));
+        assert!(!fully_escaped.contains(ITEM_ID));
+        for bytes in [
+            FIXTURE.to_vec(),
+            escaped.into_bytes(),
+            fully_escaped.into_bytes(),
+        ] {
             let mut bundle = JsonBundle::new(bytes.clone().into()).await?;
             let entry = bundle
                 .next()
@@ -820,7 +898,7 @@ mod tests {
         let valid = serde_json::to_string(&fixture["items"][0])?;
         let large = "A".repeat(2 * 1024 * 1024);
         let whitespace = " ".repeat(2 * 1024 * 1024);
-        let valid = valid.replace("\"tags\":[", &format!("\"tags\":[{whitespace}"));
+        let valid = valid.replace("\"data\":\"", &format!("\"data\":{whitespace}\""));
         let document = format!(
             "{{\"extra\":\"{large}\",\"items\":[{{\"data\":[\"{large}\"]}},{whitespace}{valid}]}}"
         );
@@ -841,6 +919,23 @@ mod tests {
             )?])
         );
         assert!(bundle.next().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_buffered_field_stops_parsing() -> Result<()> {
+        let fixture: serde_json::Value = serde_json::from_slice(FIXTURE)?;
+        let mut item = fixture["items"][0].clone();
+        item["owner"] = serde_json::Value::String("A".repeat(64 * 1024 * 1024));
+        let document = serde_json::to_vec(&serde_json::json!({"items": [item]}))?;
+        let mut bundle = JsonBundle::new(document.into()).await?;
+        let Err(error) = bundle.next().await else {
+            panic!("oversized owner was parsed");
+        };
+        assert!(
+            error.to_string().contains("exceeds size limit"),
+            "{error:#}"
+        );
         Ok(())
     }
 }

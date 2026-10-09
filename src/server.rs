@@ -1397,8 +1397,12 @@ async fn serve_raw(
     if !is_data_id_shape(&id) {
         return unmatched_response(&method, &uri);
     }
-    if decode_fixed::<32>(&id, "data ID").is_err() {
-        return invalid_id_response(&id);
+    let decoded_id = match decode_fixed::<32>(&id, "data ID") {
+        Ok(decoded_id) => decoded_id,
+        Err(_) => return invalid_id_response(&id),
+    };
+    if let Some(response) = sandbox_redirect(&state, &decoded_id, &uri, &headers) {
+        return response;
     }
     if let Some(response) = blocked_response(&state.gateway, &id, None).await {
         return response;
@@ -1432,6 +1436,29 @@ async fn serve_raw(
     }
 }
 
+fn sandbox_redirect(
+    state: &AppState,
+    decoded_id: &[u8; 32],
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let host = request_host(headers);
+    let root = host
+        .as_deref()
+        .and_then(|host| state.config.root_host(host))
+        .or_else(|| state.config.arns_root_hosts.first())?;
+    let sandbox_host = format!("{}.{}", sandbox_name(decoded_id), root.host);
+    if host.as_deref() == Some(sandbox_host.as_str()) {
+        return None;
+    }
+    let location = format!(
+        "https://{sandbox_host}{}?{}",
+        uri.path(),
+        uri.query().unwrap_or("")
+    );
+    Some(redirect_response(StatusCode::FOUND, location, headers))
+}
+
 async fn serve_path(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
@@ -1445,21 +1472,8 @@ async fn serve_path(
     };
     let (id, manifest_path) = path.split_once('/').unwrap_or((&path, ""));
     if let Ok(decoded_id) = decode_fixed::<32>(id, "data ID") {
-        let host = request_host(&headers);
-        let root = host
-            .as_deref()
-            .and_then(|host| state.config.root_host(host))
-            .or_else(|| state.config.arns_root_hosts.first());
-        if let Some(root) = root {
-            let sandbox_host = format!("{}.{}", sandbox_name(&decoded_id), root.host);
-            if host.as_deref() != Some(sandbox_host.as_str()) {
-                let location = format!(
-                    "https://{sandbox_host}{}?{}",
-                    uri.path(),
-                    uri.query().unwrap_or("")
-                );
-                return redirect_response(StatusCode::FOUND, location, &headers);
-            }
+        if let Some(response) = sandbox_redirect(&state, &decoded_id, &uri, &headers) {
+            return response;
         }
         return retrieve_response(
             &state,
@@ -3885,12 +3899,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let sandbox_host = |byte: u8| format!("{}.example.com", sandbox_name(&[byte; 32]));
         for (host, path) in [
-            ("deep.example.com", "/blocked".to_owned()),
-            ("deep.example.com", "/missing".to_owned()),
-            ("example.com", format!("/raw/{blocked_id}")),
-            ("example.com", format!("/raw/{hashed_id}")),
-            ("blocked-name.deep.example.com", "/".to_owned()),
+            ("deep.example.com".to_owned(), "/blocked".to_owned()),
+            ("deep.example.com".to_owned(), "/missing".to_owned()),
+            (sandbox_host(3), format!("/raw/{blocked_id}")),
+            (sandbox_host(4), format!("/raw/{hashed_id}")),
+            ("blocked-name.deep.example.com".to_owned(), "/".to_owned()),
         ] {
             let response = client
                 .get(format!("{base}{path}"))
@@ -3928,7 +3943,19 @@ mod tests {
                 sandbox_name(&[2; 32])
             )
         );
+        let response = client
+            .get(format!("{base}/raw/{good_id}"))
+            .header(HOST, "example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers()["location"],
+            format!("https://{}/raw/{good_id}?", sandbox_host(2))
+        );
         let raw_url = format!("{base}/raw/{good_id}");
+        let raw_host = sandbox_host(2);
         let reason = "Reported phishing <script>alert('x')</script> & fraud";
         policy
             .execute(
@@ -3937,7 +3964,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let response = client.get(&raw_url).send().await.unwrap();
+        let response = client
+            .get(&raw_url)
+            .header(HOST, &raw_host)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
         let body = response.text().await.unwrap();
@@ -3950,7 +3982,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let response = client.get(&raw_url).send().await.unwrap();
+        let response = client
+            .get(&raw_url)
+            .header(HOST, &raw_host)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
         assert!(!response.text().await.unwrap().contains("Reason:"));
         policy
@@ -3960,7 +3997,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let response = client.get(&raw_url).send().await.unwrap();
+        let response = client
+            .get(&raw_url)
+            .header(HOST, &raw_host)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "hello");
 
@@ -3989,10 +4031,13 @@ mod tests {
         })
         .await
         .unwrap();
-        let response = tokio::time::timeout(Duration::from_secs(2), client.get(&raw_url).send())
-            .await
-            .unwrap()
-            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.get(&raw_url).header(HOST, &raw_host).send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         policy.batch_execute("ROLLBACK").await.unwrap();
         queued.await.unwrap();
@@ -4001,7 +4046,12 @@ mod tests {
             .batch_execute("BEGIN; LOCK TABLE public.content_blocklist IN ACCESS EXCLUSIVE MODE")
             .await
             .unwrap();
-        let response = client.get(&raw_url).send().await.unwrap();
+        let response = client
+            .get(&raw_url)
+            .header(HOST, &raw_host)
+            .send()
+            .await
+            .unwrap();
         policy.batch_execute("ROLLBACK").await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
@@ -4187,10 +4237,15 @@ mod tests {
                 .unwrap();
             assert_eq!(info["wallet"], wallet);
             assert_eq!(info["httpsig"]["solanaAddress"], wallet);
+            let raw_host = format!(
+                "{}.{}",
+                sandbox_name(&decode_fixed::<32>(&id, "data ID").unwrap()),
+                ["example.com", "deep.example.com"][index]
+            );
             for method in [Method::GET, Method::HEAD] {
                 let response = client
                     .request(method.clone(), format!("{base}/raw/{id}"))
-                    .header(HOST, host)
+                    .header(HOST, &raw_host)
                     .send()
                     .await
                     .unwrap();
@@ -4354,6 +4409,10 @@ mod tests {
         verified.content_encoding = Some("gzip".to_owned());
         let id = verified.id.clone();
         let etag = verified.etag.clone();
+        let raw_host = format!(
+            "{}.example.com",
+            sandbox_name(&decode_fixed::<32>(&id, "data ID").unwrap())
+        );
         gateway.cache.lock().unwrap().insert(
             verified,
             gateway.config.cache_max_entries,
@@ -4439,7 +4498,12 @@ mod tests {
             assert_eq!(response.headers()["access-control-allow-origin"], "*");
             assert_eq!(response.headers()["access-control-expose-headers"], "*");
         }
-        let response = client.get(format!("{base}/raw/{id}")).send().await.unwrap();
+        let response = client
+            .get(format!("{base}/raw/{id}"))
+            .header(HOST, &raw_host)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-encoding"], "gzip");
         assert_eq!(
@@ -4457,6 +4521,7 @@ mod tests {
         assert_eq!(response.bytes().await.unwrap().as_ref(), GZIP_HELLO);
         let resumed = client
             .get(format!("{base}/raw/{id}"))
+            .header(HOST, &raw_host)
             .header("range", "bytes=0-1,2-3")
             .header("if-range", "\"old\"")
             .send()
@@ -4467,6 +4532,7 @@ mod tests {
         assert_eq!(resumed.bytes().await.unwrap().as_ref(), GZIP_HELLO);
         let head = client
             .head(format!("{base}/raw/{id}"))
+            .header(HOST, &raw_host)
             .header("range", "bytes=0-1,2-3")
             .header("if-range", &etag)
             .send()
@@ -4483,6 +4549,7 @@ mod tests {
         assert!(head.bytes().await.unwrap().is_empty());
         let conditional = client
             .get(format!("{base}/raw/{id}"))
+            .header(HOST, &raw_host)
             .header("if-none-match", etag)
             .send()
             .await
