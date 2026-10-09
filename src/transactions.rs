@@ -458,7 +458,32 @@ pub(super) fn verify_rsa_pss(
     payload: &[u8],
     label: &str,
 ) -> Result<()> {
+    if standard_rsa_pss(owner, signature, payload) {
+        return Ok(());
+    }
     verify_rsa_pss_digest(owner, signature, &sha256(&[payload]), false, label)
+}
+
+// Fast path for standard salt-32 PSS with byte-aligned 2048..4096-bit keys. For these the
+// standard encoding width equals ours, so aws-lc only accepts signatures the variable-salt
+// verifier also accepts. Callers fall back to that verifier whenever this returns false.
+fn standard_rsa_pss(owner: &[u8], signature: &[u8], payload: &[u8]) -> bool {
+    if !(256..=512).contains(&owner.len())
+        || (owner[0] & 0x80) == 0
+        || signature.len() != owner.len()
+    {
+        return false;
+    }
+    let key = aws_lc_rs::signature::RsaPublicKeyComponents {
+        n: owner,
+        e: &[1u8, 0, 1][..],
+    };
+    key.verify(
+        &aws_lc_rs::signature::RSA_PSS_2048_8192_SHA256,
+        payload,
+        signature,
+    )
+    .is_ok()
 }
 
 fn verify_rsa_pss_digest(
@@ -1039,6 +1064,28 @@ mod tests {
         assert!(verify_rsa_pss(&owner, &signature, b"changed", "fixture").is_err());
         assert!(verify_rsa_pss(&owner, &owner, &payload, "fixture").is_err());
         assert!(verify_rsa_pss(&[1; 513], &signature, &payload, "fixture").is_err());
+    }
+
+    #[test]
+    fn standard_pss_fast_path_agrees_with_variable_salt_verifier() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/rsa-pss-salts.json")).unwrap();
+        let field = |name: &str| decode_b64(fixture[name].as_str().unwrap(), name).unwrap();
+        let (owner, payload) = (field("owner"), field("payload"));
+        let (salt_32, salt_64) = (field("signature_salt_32"), field("signature_salt_64"));
+        let digest = sha256(&[&payload]);
+        // Fast-path acceptance must imply acceptance by the variable-salt verifier.
+        assert!(standard_rsa_pss(&owner, &salt_32, &payload));
+        verify_rsa_pss_digest(&owner, &salt_32, &digest, false, "fixture").unwrap();
+        // Other salts miss the fast path and must still verify through the fallback.
+        assert!(!standard_rsa_pss(&owner, &salt_64, &payload));
+        verify_rsa_pss(&owner, &salt_64, &payload, "fixture").unwrap();
+        for signature in [&salt_32, &salt_64] {
+            assert!(verify_rsa_pss(&owner, signature, b"changed", "fixture").is_err());
+        }
+        let mut tampered = salt_32.clone();
+        tampered[100] ^= 1;
+        assert!(verify_rsa_pss(&owner, &tampered, &payload, "fixture").is_err());
     }
 
     #[test]
