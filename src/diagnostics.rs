@@ -599,9 +599,7 @@ where
                 step.details = error.map(error_details).unwrap_or_default();
                 if matches!(
                     stage,
-                    "bundle_item_verification"
-                        | "verified_retrieval"
-                        | "content_proofs_and_hash"
+                    "bundle_item_verification" | "verified_retrieval" | "content_proofs_and_hash"
                 ) && error.is_some_and(retrieval_unavailable)
                 {
                     step.status = "unavailable";
@@ -732,24 +730,22 @@ impl ChunkAttempt {
 
 impl Drop for ChunkAttempt {
     fn drop(&mut self) {
-        self.update(|step, _| {
-            match step.status {
-                "verified" => step.status = "unused",
-                "downloading" | "downloaded" | "verifying" => {
-                    step.details.push(FailureDetail {
-                        label: "Stopped during",
-                        value: match step.status {
-                            "downloading" => "Download",
-                            "downloaded" => "Waiting for verification",
-                            _ => "Unpacking and verification",
-                        }
-                        .to_owned(),
-                        monospace: false,
-                    });
-                    step.status = "cancelled";
-                }
-                _ => {}
+        self.update(|step, _| match step.status {
+            "verified" => step.status = "unused",
+            "downloading" | "downloaded" | "verifying" => {
+                step.details.push(FailureDetail {
+                    label: "Stopped during",
+                    value: match step.status {
+                        "downloading" => "Download",
+                        "downloaded" => "Waiting for verification",
+                        _ => "Unpacking and verification",
+                    }
+                    .to_owned(),
+                    monospace: false,
+                });
+                step.status = "cancelled";
             }
+            _ => {}
         });
     }
 }
@@ -1511,7 +1507,13 @@ mod tests {
             let invalid = invalid.clone();
             let barrier = Arc::clone(&barrier);
             async move {
-                let host = request.headers().get("host").unwrap().to_str().unwrap().to_owned();
+                let host = request
+                    .headers()
+                    .get("host")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
                 barrier.wait().await;
                 if host.starts_with("stalled.example.com") {
                     std::future::pending::<()>().await;
@@ -1530,52 +1532,98 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         }));
         let sources = vec![
-            format!("http://user:password@invalid.example.com:{}/private-key?api-key=secret", address.port()),
+            format!(
+                "http://user:password@invalid.example.com:{}/private-key?api-key=secret",
+                address.port()
+            ),
             format!("http://valid.example.com:{}", address.port()),
             format!("http://stalled.example.com:{}", address.port()),
         ];
-        let mut gateway = Gateway::new(Config::new(
-            &sources[1], &sources[1], sources.clone(),
-            std::time::Duration::from_secs(20), 3, 1024,
-        ).unwrap()).unwrap();
+        let mut gateway = Gateway::new(
+            Config::new(
+                &sources[1],
+                &sources[1],
+                sources.clone(),
+                std::time::Duration::from_secs(20),
+                3,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         gateway.client = reqwest::Client::builder()
             .no_proxy()
             .resolve("invalid.example.com", address)
             .resolve("valid.example.com", address)
             .resolve("stalled.example.com", address)
-            .build().unwrap();
+            .build()
+            .unwrap();
         let geometry = crate::BlockGeometry {
             tx_root,
             block_weave_size: 1100,
             previous_weave_size: 1000,
         };
-        TRACE.scope(RefCell::new(Trace {
-            public_errors: true,
-            ..Trace::default()
-        }), async {
-            let fetched = gateway.fetch_verified_chunk_inner(1001, geometry).await.unwrap().unwrap();
-            assert_eq!(fetched.proof.bytes.as_ref(), payload);
-            let steps = TRACE.with(|trace| serde_json::to_value(&trace.borrow().steps).unwrap());
-            let attempt = |name: &str| {
-                steps.as_array().unwrap().iter().find(|step| {
-                    step["details"].as_array().unwrap().iter().any(|detail| {
-                        detail["label"] == "Node" && detail["value"].as_str().unwrap().contains(name)
-                    })
-                }).unwrap()
-            };
-            assert_eq!(attempt("invalid.example.com")["status"], "failed");
-            assert!(attempt("invalid.example.com")["details"].as_array().unwrap().iter()
-                .any(|detail| detail["label"] == "Packing" && detail["value"] == "unpacked"));
-            assert_eq!(attempt("valid.example.com")["status"], "selected");
-            assert!(attempt("valid.example.com")["details"].as_array().unwrap().iter()
-                .any(|detail| detail["label"] == "Verified bytes" && detail["value"] == payload.len().to_string()));
-            assert_eq!(attempt("stalled.example.com")["status"], "cancelled");
-            assert!(attempt("stalled.example.com")["details"].as_array().unwrap().iter()
-                .any(|detail| detail["label"] == "Stopped during" && detail["value"] == "Download"));
-            let serialized = serde_json::to_string(&steps).unwrap();
-            assert!(!serialized.contains("password") && !serialized.contains("secret"));
-            assert!(!serialized.contains("private-key"));
-        }).await;
+        TRACE
+            .scope(
+                RefCell::new(Trace {
+                    public_errors: true,
+                    ..Trace::default()
+                }),
+                async {
+                    let fetched = gateway
+                        .fetch_verified_chunk_inner(1001, geometry)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(fetched.proof.bytes.as_ref(), payload);
+                    let steps =
+                        TRACE.with(|trace| serde_json::to_value(&trace.borrow().steps).unwrap());
+                    let attempt = |name: &str| {
+                        steps
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|step| {
+                                step["details"].as_array().unwrap().iter().any(|detail| {
+                                    detail["label"] == "Node"
+                                        && detail["value"].as_str().unwrap().contains(name)
+                                })
+                            })
+                            .unwrap()
+                    };
+                    assert_eq!(attempt("invalid.example.com")["status"], "failed");
+                    assert!(
+                        attempt("invalid.example.com")["details"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|detail| detail["label"] == "Packing"
+                                && detail["value"] == "unpacked")
+                    );
+                    assert_eq!(attempt("valid.example.com")["status"], "selected");
+                    assert!(
+                        attempt("valid.example.com")["details"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|detail| detail["label"] == "Verified bytes"
+                                && detail["value"] == payload.len().to_string())
+                    );
+                    assert_eq!(attempt("stalled.example.com")["status"], "cancelled");
+                    assert!(
+                        attempt("stalled.example.com")["details"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|detail| detail["label"] == "Stopped during"
+                                && detail["value"] == "Download")
+                    );
+                    let serialized = serde_json::to_string(&steps).unwrap();
+                    assert!(!serialized.contains("password") && !serialized.contains("secret"));
+                    assert!(!serialized.contains("private-key"));
+                },
+            )
+            .await;
     }
 
     #[tokio::test]
