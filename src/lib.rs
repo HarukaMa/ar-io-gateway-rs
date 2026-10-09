@@ -1312,21 +1312,32 @@ impl Gateway {
             }
         }
         let request = |source: String| async move {
-            let (chunk, headers, body) =
-                diagnostics::check_chunk(offset, self.fetch_chunk(&source, offset)).await?;
+            let attempt = diagnostics::ChunkAttempt::new(offset, &source);
+            let (chunk, headers, body) = self
+                .fetch_chunk(&source, offset)
+                .await
+                .inspect_err(|error| attempt.failed(error))?;
+            attempt.downloaded(chunk.packing, chunk.chunk.len());
             let cancellation = (chunk.packing != packing::Packing::Unpacked)
                 .then(tokio_util::sync::CancellationToken::new);
             let _cancelled = cancellation
                 .as_ref()
                 .map(|token| token.clone().drop_guard());
             let job = match cancellation {
-                Some(token) => Some(packing::Job::acquire(token).await?),
+                Some(token) => Some(
+                    packing::Job::acquire(token)
+                        .await
+                        .inspect_err(|error| attempt.failed(error))?,
+                ),
                 None => None,
             };
+            attempt.verifying();
             let proof =
                 cpu_work(move || verify_chunk_proof(chunk, offset, &geometry, job.as_ref()))
-                    .await?;
-            Ok::<_, anyhow::Error>((proof, headers, body))
+                    .await
+                    .inspect_err(|error| attempt.failed(error))?;
+            attempt.verified(proof.bytes.len());
+            Ok::<_, anyhow::Error>((proof, headers, body, attempt))
         };
         let fetches = peers::hedged_requests(
             &self.peers,
@@ -1339,7 +1350,7 @@ impl Gateway {
         let mut invalid = Vec::new();
         while let Some((source, result)) = fetches.next().await {
             match result {
-                Ok((proof, headers, body)) => {
+                Ok((proof, headers, body, attempt)) => {
                     self.peers
                         .record_chunk_result(&source, Some((headers, body, proof.bytes.len())));
                     let fetched = ChunkFetch {
@@ -1350,6 +1361,7 @@ impl Gateway {
                             .to_owned(),
                         cache_hit: false,
                     };
+                    attempt.selected();
                     if shared::cache_requested() {
                         if let Err(error) = self.publish_chunk(&fetched, offset, geometry).await {
                             eprintln!("chunk cache admission failed: {error:#}");

@@ -11,6 +11,7 @@ code,.data-id{font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono"
 .stage-tooltip{white-space:normal}
 .failure-details{margin:12px 0 0;padding-left:12px;border-left:2px solid #60777c}.failure-details dt{margin-top:10px}.failure-details dd{font-size:14px}
 .unavailable{color:#edc879}.relationship-graph{overflow-x:auto;padding-bottom:8px}.relationship-graph svg{display:block}.relationship-graph text{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;fill:#e6edef}.relationship-graph .link-label{font:12px system-ui,sans-serif}
+.selected,.verified{color:#8bdbc6}.cancelled,.unused{color:#a5b6bb}
 .relationship-group+.relationship-group{border-top:1px solid #304044;margin-top:24px;padding-top:24px}.relationship-group h3{margin:0 0 8px;font-size:16px}.relationship-group p{margin:8px 0}.relationship-group .retrieval-status{font-weight:600}
 </style>
 </head>
@@ -53,7 +54,7 @@ const stageDescriptions = {
   block_authentication: 'Checks the block against the trusted chain index and confirms that it contains the transaction.',
   transaction_signature: 'Fetches transaction metadata and verifies its ID, signature, and signed fields.',
   content_proofs_and_hash: 'Reads the content, checks its chunk proofs, and computes its SHA-256 hash.',
-  chunk_retrieval: "Downloads a required chunk from an upstream node. A 404 means that node didn't return the chunk.",
+  chunk_retrieval: 'Tries a node for this chunk, then unpacks and verifies its response. Used marks the response accepted for this read. Other attempts can be rejected, unused, or cancelled.',
   bundle_item_verification: 'Finds the item in its parent bundle and verifies its ID, signature, metadata, and payload.',
   canonical_anchor: 'Checks the content against the current canonical chain before returning it.'
 };
@@ -72,11 +73,12 @@ function field(list, name, value, monospace = false) {
   description.textContent = value == null ? '-' : String(value);
   list.append(term, description);
 }
-function errorDetails(container, entries, parentId, source) {
+function errorDetails(container, entries, parentId, source, title, expanded = false) {
   if (!entries?.length && !parentId && !source) return;
   const disclosure = document.createElement('details');
+  disclosure.open = expanded;
   const summary = document.createElement('summary');
-  summary.textContent = entries?.length ? 'Error details' : 'Details';
+  summary.textContent = title || (entries?.length ? 'Error details' : 'Details');
   const list = document.createElement('dl');
   list.className = 'failure-details';
   if (parentId) field(list, 'Attempted parent ID', parentId, true);
@@ -234,9 +236,11 @@ function render(report) {
     heading.className = 'stage';
     const name = document.createElement('div');
     name.className = 'stage-name';
-    name.textContent = step.stage === 'bundle_item_verification' ? 'Bundle item retrieval and verification' : label(step.stage);
+    name.textContent = step.stage === 'bundle_item_verification' ? 'Bundle item retrieval and verification' : step.stage === 'chunk_retrieval' ? 'Chunk attempt' : label(step.stage);
     const status = document.createElement('span');
-    status.textContent = label(step.status);
+    status.textContent = step.stage === 'chunk_retrieval'
+      ? ({selected: 'Used', unused: 'Verified, unused', failed: 'Rejected'}[step.status] || label(step.status))
+      : label(step.status);
     status.className = step.status;
     heading.append(name, status);
     const id = document.createElement('code');
@@ -248,7 +252,7 @@ function render(report) {
       const button = document.createElement('button');
       button.type = 'button';
       button.textContent = '?';
-      button.setAttribute('aria-label', 'About ' + label(step.stage));
+      button.setAttribute('aria-label', 'About ' + name.textContent);
       const description = document.createElement('div');
       description.className = 'stage-tooltip';
       description.id = 'stage-help-' + element('steps').children.length;
@@ -285,7 +289,8 @@ function render(report) {
       error.textContent = step.message || step.error;
       item.append(error);
     }
-    errorDetails(item, step.details, step.attempt_parent_id, step.source);
+    const chunkAttempt = step.stage === 'chunk_retrieval';
+    errorDetails(item, step.details, step.attempt_parent_id, step.source, chunkAttempt ? 'Attempt details' : undefined, chunkAttempt);
     element('steps').append(item);
   }
   element('truncated').hidden = !report.trace_truncated;

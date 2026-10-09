@@ -512,6 +512,36 @@ struct StepTimer {
     started: Instant,
 }
 
+impl StepTimer {
+    fn start(stage: &'static str, id: impl FnOnce() -> String) -> Option<Self> {
+        TRACE
+            .try_with(|trace| {
+                let started = Instant::now();
+                let mut trace = trace.borrow_mut();
+                let started_us = started
+                    .duration_since(*trace.started.get_or_insert(started))
+                    .as_micros() as u64;
+                trace
+                    .push(Step {
+                        stage,
+                        id: id(),
+                        status: "incomplete",
+                        started_us,
+                        elapsed_us: None,
+                        error: None,
+                        details: Vec::new(),
+                        message: None,
+                        parent_id: None,
+                        source: None,
+                        attempt_parent_id: ATTEMPT_PARENT.try_with(Clone::clone).ok(),
+                    })
+                    .map(|index| Self { index, started })
+            })
+            .ok()
+            .flatten()
+    }
+}
+
 impl Drop for StepTimer {
     fn drop(&mut self) {
         let _ = TRACE.try_with(|trace| {
@@ -556,31 +586,7 @@ pub(crate) fn check<T, F>(
 where
     F: Future<Output = Result<T>>,
 {
-    let timer = TRACE
-        .try_with(|trace| {
-            let started = Instant::now();
-            let mut trace = trace.borrow_mut();
-            let started_us = started
-                .duration_since(*trace.started.get_or_insert(started))
-                .as_micros() as u64;
-            trace
-                .push(Step {
-                    stage,
-                    id: id.to_owned(),
-                    status: "incomplete",
-                    started_us,
-                    elapsed_us: None,
-                    error: None,
-                    details: Vec::new(),
-                    message: None,
-                    parent_id: None,
-                    source: None,
-                    attempt_parent_id: ATTEMPT_PARENT.try_with(Clone::clone).ok(),
-                })
-                .map(|index| StepTimer { index, started })
-        })
-        .ok()
-        .flatten();
+    let timer = StepTimer::start(stage, || id.to_owned());
     operation.inspect(move |result| {
         if let Some(timer) = timer {
             let _ = TRACE.try_with(|trace| {
@@ -596,7 +602,6 @@ where
                     "bundle_item_verification"
                         | "verified_retrieval"
                         | "content_proofs_and_hash"
-                        | "chunk_retrieval"
                 ) && error.is_some_and(retrieval_unavailable)
                 {
                     step.status = "unavailable";
@@ -626,15 +631,127 @@ where
     check("bundle_item_verification", &id, operation)
 }
 
-pub(crate) fn check_chunk<T, F>(
-    offset: u128,
-    operation: F,
-) -> impl Future<Output = Result<T>> + use<T, F>
-where
-    F: Future<Output = Result<T>>,
-{
-    let id = TRACE.try_with(|_| offset.to_string()).unwrap_or_default();
-    check("chunk_retrieval", &id, operation)
+pub(crate) struct ChunkAttempt {
+    timer: Option<StepTimer>,
+}
+
+impl ChunkAttempt {
+    pub(crate) fn new(offset: u128, source: &str) -> Self {
+        let attempt = Self {
+            timer: StepTimer::start("chunk_retrieval", || offset.to_string()),
+        };
+        attempt.update(|step, public| {
+            step.status = "downloading";
+            let node = if public {
+                reqwest::Url::parse(source)
+                    .ok()
+                    .and_then(|url| public_upstream(&url))
+                    .unwrap_or_else(|| "Private upstream".to_owned())
+            } else {
+                source.to_owned()
+            };
+            step.details.push(FailureDetail {
+                label: "Node",
+                value: node,
+                monospace: true,
+            });
+        });
+        attempt
+    }
+
+    fn update(&self, operation: impl FnOnce(&mut Step, bool)) {
+        if let Some(timer) = &self.timer {
+            let _ = TRACE.try_with(|trace| {
+                let mut trace = trace.borrow_mut();
+                let public = trace.public_errors;
+                operation(&mut trace.steps[timer.index], public);
+            });
+        }
+    }
+
+    pub(crate) fn downloaded(&self, packing: crate::packing::Packing, bytes: usize) {
+        self.update(|step, _| {
+            step.status = "downloaded";
+            step.details.push(FailureDetail {
+                label: "Packing",
+                value: match packing {
+                    crate::packing::Packing::Unpacked => "unpacked",
+                    crate::packing::Packing::Replica29(_) => "replica_2_9",
+                }
+                .to_owned(),
+                monospace: true,
+            });
+            step.details.push(FailureDetail {
+                label: "Chunk bytes received",
+                value: bytes.to_string(),
+                monospace: false,
+            });
+        });
+    }
+
+    pub(crate) fn verifying(&self) {
+        self.update(|step, _| step.status = "verifying");
+    }
+
+    pub(crate) fn verified(&self, bytes: usize) {
+        self.update(|step, _| {
+            step.status = "verified";
+            step.details.push(FailureDetail {
+                label: "Chunk verification",
+                value: "Passed".to_owned(),
+                monospace: false,
+            });
+            step.details.push(FailureDetail {
+                label: "Verified bytes",
+                value: bytes.to_string(),
+                monospace: false,
+            });
+        });
+    }
+
+    pub(crate) fn failed(&self, error: &anyhow::Error) {
+        self.update(|step, public| {
+            step.status = if retrieval_unavailable(error) {
+                "unavailable"
+            } else {
+                "failed"
+            };
+            step.error = Some(error_text(error, public));
+            for detail in error_details(error) {
+                if !step.details.contains(&detail) {
+                    step.details.push(detail);
+                }
+            }
+        });
+    }
+
+    pub(crate) fn selected(self) {
+        self.update(|step, _| step.status = "selected");
+    }
+}
+
+impl Drop for ChunkAttempt {
+    fn drop(&mut self) {
+        self.update(|step, _| {
+            match step.status {
+                "verified" => step.status = "unused",
+                "downloading" | "downloaded" | "verifying" => {
+                    step.details.push(FailureDetail {
+                        label: "Stopped during",
+                        value: match step.status {
+                            "downloading" => "Download",
+                            "downloaded" => "Waiting for verification",
+                            _ => "Unpacking and verification",
+                        }
+                        .to_owned(),
+                        monospace: false,
+                    });
+                    step.status = "cancelled";
+                }
+                _ => {}
+            }
+        });
+    }
 }
 
 pub(crate) fn location(id: &str, parent: &str, source: &str) {
@@ -1368,6 +1485,97 @@ mod tests {
                 },
             )
             .await;
+    }
+
+    #[tokio::test]
+    async fn chunk_attempts_show_rejected_used_and_cancelled_responses() {
+        use std::sync::Arc;
+        let payload = b"verified chunk bytes";
+        let mut end = [0; 32];
+        end[16..].copy_from_slice(&(payload.len() as u128).to_be_bytes());
+        let hash = crate::sha256(&[payload]);
+        let data_root = crate::hash_leaf(&hash, &end);
+        let tx_root = crate::hash_leaf(&data_root, &end);
+        let response = |hash: [u8; 32]| {
+            serde_json::to_vec(&json!({
+                "chunk": crate::URL_SAFE_NO_PAD.encode(payload),
+                "data_path": crate::URL_SAFE_NO_PAD.encode([hash.as_slice(), end.as_slice()].concat()),
+                "tx_path": crate::URL_SAFE_NO_PAD.encode([data_root.as_slice(), end.as_slice()].concat()),
+            })).unwrap()
+        };
+        let valid = response(hash);
+        let invalid = response([0; 32]);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let valid = valid.clone();
+            let invalid = invalid.clone();
+            let barrier = Arc::clone(&barrier);
+            async move {
+                let host = request.headers().get("host").unwrap().to_str().unwrap().to_owned();
+                barrier.wait().await;
+                if host.starts_with("stalled.example.com") {
+                    std::future::pending::<()>().await;
+                }
+                if host.starts_with("valid.example.com") {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    (axum::http::StatusCode::OK, valid)
+                } else {
+                    (axum::http::StatusCode::OK, invalid)
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let sources = vec![
+            format!("http://user:password@invalid.example.com:{}/private-key?api-key=secret", address.port()),
+            format!("http://valid.example.com:{}", address.port()),
+            format!("http://stalled.example.com:{}", address.port()),
+        ];
+        let mut gateway = Gateway::new(Config::new(
+            &sources[1], &sources[1], sources.clone(),
+            std::time::Duration::from_secs(20), 3, 1024,
+        ).unwrap()).unwrap();
+        gateway.client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("invalid.example.com", address)
+            .resolve("valid.example.com", address)
+            .resolve("stalled.example.com", address)
+            .build().unwrap();
+        let geometry = crate::BlockGeometry {
+            tx_root,
+            block_weave_size: 1100,
+            previous_weave_size: 1000,
+        };
+        TRACE.scope(RefCell::new(Trace {
+            public_errors: true,
+            ..Trace::default()
+        }), async {
+            let fetched = gateway.fetch_verified_chunk_inner(1001, geometry).await.unwrap().unwrap();
+            assert_eq!(fetched.proof.bytes.as_ref(), payload);
+            let steps = TRACE.with(|trace| serde_json::to_value(&trace.borrow().steps).unwrap());
+            let attempt = |name: &str| {
+                steps.as_array().unwrap().iter().find(|step| {
+                    step["details"].as_array().unwrap().iter().any(|detail| {
+                        detail["label"] == "Node" && detail["value"].as_str().unwrap().contains(name)
+                    })
+                }).unwrap()
+            };
+            assert_eq!(attempt("invalid.example.com")["status"], "failed");
+            assert!(attempt("invalid.example.com")["details"].as_array().unwrap().iter()
+                .any(|detail| detail["label"] == "Packing" && detail["value"] == "unpacked"));
+            assert_eq!(attempt("valid.example.com")["status"], "selected");
+            assert!(attempt("valid.example.com")["details"].as_array().unwrap().iter()
+                .any(|detail| detail["label"] == "Verified bytes" && detail["value"] == payload.len().to_string()));
+            assert_eq!(attempt("stalled.example.com")["status"], "cancelled");
+            assert!(attempt("stalled.example.com")["details"].as_array().unwrap().iter()
+                .any(|detail| detail["label"] == "Stopped during" && detail["value"] == "Download"));
+            let serialized = serde_json::to_string(&steps).unwrap();
+            assert!(!serialized.contains("password") && !serialized.contains("secret"));
+            assert!(!serialized.contains("private-key"));
+        }).await;
     }
 
     #[tokio::test]
