@@ -998,12 +998,12 @@ async fn serve_bundle_inspection(
     let mut report = match task.await {
         Ok(Ok(Ok(report))) => report,
         Ok(Ok(Err(error))) => {
-            return upstream_error_response("Bundle inspection failed", error);
+            return inspection_error_response("Bundle inspection failed", error);
         }
         Ok(Err(_)) => {
             return error_response(StatusCode::GATEWAY_TIMEOUT, "Bundle inspection timed out");
         }
-        Err(error) => return upstream_error_response("Bundle inspection failed", error.into()),
+        Err(error) => return inspection_error_response("Bundle inspection failed", error.into()),
     };
     if let Some(items) = report["items"].as_array_mut() {
         let mut visible = Vec::with_capacity(items.len());
@@ -1015,7 +1015,7 @@ async fn serve_bundle_inspection(
                 Ok(None) => visible.push(item),
                 Ok(Some(_)) => {}
                 Err(error) => {
-                    return upstream_error_response("Blocking policy lookup failed", error);
+                    return inspection_error_response("Blocking policy lookup failed", error);
                 }
             }
         }
@@ -2781,6 +2781,21 @@ fn upstream_error_response(context: &str, error: anyhow::Error) -> Response {
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+// The inspector page shows this body verbatim, so keep it plain text.
+fn inspection_error_response(context: &str, error: anyhow::Error) -> Response {
+    eprintln!("{context}: {error:#}");
+    let body = format!(
+        "{context}: {}",
+        crate::diagnostics::public_error_text(&error)
+    );
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header(CACHE_CONTROL, "no-store")
+        .body(Body::from(body))
+        .unwrap()
 }
 
 fn invalid_id_response(id: &str) -> Response {
