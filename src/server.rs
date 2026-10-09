@@ -971,8 +971,15 @@ async fn serve_bundle_inspection(
     let Ok((target, _)) = state.config.diagnostic_target(&request.id) else {
         return error_response(StatusCode::BAD_REQUEST, "Enter a valid bundle ID");
     };
-    if let Some(response) = blocked_response(&state.gateway, &target, None).await {
-        return response;
+    match state.gateway.blocking_reason(&target, None).await {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            return plain_error_response(
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+                blocked_message(&target, &reason),
+            );
+        }
+        Err(error) => return inspection_error_response("Blocking policy lookup failed", error),
     }
     let _diagnostic = match state.diagnostic_permits.try_acquire() {
         Ok(permit) => permit,
@@ -998,12 +1005,12 @@ async fn serve_bundle_inspection(
     let mut report = match task.await {
         Ok(Ok(Ok(report))) => report,
         Ok(Ok(Err(error))) => {
-            return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
+            return inspection_error_response("Bundle inspection failed", error);
         }
         Ok(Err(_)) => {
             return error_response(StatusCode::GATEWAY_TIMEOUT, "Bundle inspection timed out");
         }
-        Err(error) => return upstream_error_response("Bundle inspection failed", error.into()),
+        Err(error) => return inspection_error_response("Bundle inspection failed", error.into()),
     };
     if let Some(items) = report["items"].as_array_mut() {
         let mut visible = Vec::with_capacity(items.len());
@@ -1015,7 +1022,7 @@ async fn serve_bundle_inspection(
                 Ok(None) => visible.push(item),
                 Ok(Some(_)) => {}
                 Err(error) => {
-                    return upstream_error_response("Blocking policy lookup failed", error);
+                    return inspection_error_response("Blocking policy lookup failed", error);
                 }
             }
         }
@@ -1348,7 +1355,17 @@ async fn serve_chunk_response(
     let Ok(offset) = offset.parse::<u128>() else {
         return error_response(StatusCode::BAD_REQUEST, "Invalid offset");
     };
-    match state.gateway.retrieve_chunk(offset).await {
+    let gateway = state.gateway.clone();
+    // Keep admission slots until retrieval finishes, even if the client disconnects.
+    let retrieval = tokio::spawn(crate::HTTP_CACHE_LOOKUP.scope((), async move {
+        let result = gateway.retrieve_chunk(offset).await;
+        (result, permit)
+    }));
+    let (result, permit) = match retrieval.await {
+        Ok(result) => result,
+        Err(error) => return upstream_error_response("chunk retrieval task failed", error.into()),
+    };
+    match result {
         Ok(Some(chunk)) => chunk_response(chunk, raw, headers, &state.gateway.config, permit)
             .await
             .unwrap_or_else(|error| {
@@ -2787,6 +2804,27 @@ fn upstream_error_response(context: &str, error: anyhow::Error) -> Response {
     response
 }
 
+// The inspector page shows these bodies verbatim, so keep them plain text.
+fn plain_error_response(status: StatusCode, body: String) -> Response {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header(CACHE_CONTROL, "no-store")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn inspection_error_response(context: &str, error: anyhow::Error) -> Response {
+    eprintln!("{context}: {error:#}");
+    plain_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "{context}: {}",
+            crate::diagnostics::public_error_text(&error)
+        ),
+    )
+}
+
 fn invalid_id_response(id: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -2839,14 +2877,21 @@ async fn blocked_response(gateway: &Gateway, id: &str, hash: Option<&str>) -> Op
     }
 }
 
-fn blocked_page(id: &str, reason: &str) -> Response {
+fn blocked_message(id: &str, reason: &str) -> String {
     let mut message =
         format!("Requested content blocked by this node's content policy. Blocked ID: {id}");
     if !reason.is_empty() {
         message.push_str("\nReason: ");
         message.push_str(reason);
     }
-    let mut response = html_error_response(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, &message);
+    message
+}
+
+fn blocked_page(id: &str, reason: &str) -> Response {
+    let mut response = html_error_response(
+        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+        &blocked_message(id, reason),
+    );
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -3734,6 +3779,150 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_chunk_request_keeps_capacity_until_verified_cache_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let payload = b"continued cold chunk";
+        let mut end = [0; 32];
+        end[16..].copy_from_slice(&(payload.len() as u128).to_be_bytes());
+        let hash = crate::sha256(&[payload]);
+        let data_root = crate::hash_leaf(&hash, &end);
+        let tx_root = crate::hash_leaf(&data_root, &end);
+        let reply = serde_json::json!({
+            "chunk": URL_SAFE_NO_PAD.encode(payload),
+            "data_path": URL_SAFE_NO_PAD.encode([hash.as_slice(), &end].concat()),
+            "tx_path": URL_SAFE_NO_PAD.encode([data_root.as_slice(), &end].concat()),
+        });
+        let index_entry = |weave: u128, root: [u8; 32]| {
+            let mut bytes = vec![0; 48];
+            bytes.extend_from_slice(&16_u16.to_be_bytes());
+            bytes.extend_from_slice(&weave.to_be_bytes());
+            bytes.push(32);
+            bytes.extend_from_slice(&root);
+            bytes
+        };
+        let previous = index_entry(1000, [0; 32]);
+        let current = index_entry(1000 + payload.len() as u128, tx_root);
+        let replies = Arc::new(std::collections::BTreeMap::from([
+            ("/info", br#"{"height":51}"#.to_vec()),
+            ("/block_index2/0/0", previous.clone()),
+            ("/block_index2/1/1", current.clone()),
+            ("/block_index2/0/1", [previous, current].concat()),
+        ]));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let upstream = Router::new().fallback({
+            let started = started.clone();
+            let release = release.clone();
+            let fetches = fetches.clone();
+            move |request: axum::extract::Request| {
+                let replies = replies.clone();
+                let reply = reply.clone();
+                let started = started.clone();
+                let release = release.clone();
+                let fetches = fetches.clone();
+                async move {
+                    if request.uri().path() == "/chunk/1001" {
+                        fetches.fetch_add(1, Ordering::Relaxed);
+                        started.notify_one();
+                        release.notified().await;
+                        return (StatusCode::OK, serde_json::to_vec(&reply).unwrap());
+                    }
+                    match replies.get(request.uri().path()) {
+                        Some(body) => (StatusCode::OK, body.clone()),
+                        None => (StatusCode::NOT_FOUND, Vec::new()),
+                    }
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+        let _upstream = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        }));
+        let state = Arc::new(AppState {
+            gateway: Gateway::new(
+                Config::new(
+                    &upstream_url,
+                    &upstream_url,
+                    vec![upstream_url.clone()],
+                    Duration::from_secs(5),
+                    1,
+                    1024,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            config: ServerConfig::new(
+                "127.0.0.1:0",
+                "example.com",
+                &upstream_url,
+                ARNS_PROGRAM,
+                ANT_PROGRAM,
+                2,
+            )
+            .unwrap(),
+            request_permits: Arc::new(Semaphore::new(2)),
+            chunk_permits: Arc::new(Semaphore::new(1)),
+            diagnostic_permits: Semaphore::new(1),
+            started_at: Instant::now(),
+            indexing_status: Mutex::new(serde_json::Value::Null),
+        });
+        let caller = tokio::spawn({
+            let state = state.clone();
+            async move {
+                serve_chunk_response(
+                    &state,
+                    "1001",
+                    &HeaderMap::new(),
+                    false,
+                    &Method::GET,
+                    &Uri::from_static("/chunk/1001"),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        let app = Router::new()
+            .route("/chunk/{offset}", get(serve_chunk))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/chunk/1001", listener.local_addr().unwrap());
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let saturated = tokio::time::timeout(Duration::from_secs(1), client.get(&url).send())
+            .await
+            .expect("cancelled retrieval released its capacity")
+            .unwrap();
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        release.notify_one();
+        let available = tokio::time::timeout(Duration::from_secs(5), state.chunk_permits.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(available);
+        let cached = client.get(&url).send().await.unwrap();
+        assert_eq!(cached.status(), StatusCode::OK);
+        assert_eq!(cached.headers()["x-cache"], "HIT");
+        let body: serde_json::Value = cached.json().await.unwrap();
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(body["chunk"].as_str().unwrap())
+                .unwrap(),
+            payload
+        );
+        assert_eq!(fetches.load(Ordering::Relaxed), 1);
     }
 
     fn stream_limits() -> Config {
