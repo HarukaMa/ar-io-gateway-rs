@@ -998,7 +998,7 @@ async fn serve_bundle_inspection(
     let mut report = match task.await {
         Ok(Ok(Ok(report))) => report,
         Ok(Ok(Err(error))) => {
-            return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
+            return upstream_error_response("Bundle inspection failed", error);
         }
         Ok(Err(_)) => {
             return error_response(StatusCode::GATEWAY_TIMEOUT, "Bundle inspection timed out");
