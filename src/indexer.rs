@@ -1686,48 +1686,37 @@ async fn persist_bundle(
         profile.phase(2);
     }
     let mut traversal = BundleTraversal::new(content, root_id, format).await?;
+    let batch_size = gateway.config.bundle_batch_size;
     let mut occurrences = 0;
-    let mut verification_time = Duration::ZERO;
+    let started = Instant::now();
+    let mut batch = next_bundle_batch(&mut traversal, batch_size).await?;
+    let mut verification_time = started.elapsed();
     let mut persistence_time = Duration::ZERO;
     loop {
-        let started = Instant::now();
-        let (objects, locations, complete) =
-            crate::profiling::measure(crate::profiling::Stage::Traversal, async {
-                let mut objects = Vec::with_capacity(gateway.config.bundle_batch_size);
-                let mut locations = Vec::with_capacity(gateway.config.bundle_batch_size);
-                let mut complete = false;
-                while locations.len() < gateway.config.bundle_batch_size {
-                    let Some((object, location)) = traversal.next().await? else {
-                        complete = true;
-                        break;
-                    };
-                    objects.push(object);
-                    locations.push(location);
-                }
-                Ok((objects, locations, complete))
+        let (objects, locations, complete) = batch;
+        let commit = async {
+            let started = Instant::now();
+            crate::profiling::measure(crate::profiling::Stage::Persistence, async {
+                // Waiting for a writer must not consume the database commit timeout.
+                let _writer = gateway
+                    .bundle_writers
+                    .acquire()
+                    .await
+                    .context("bundle writer admission closed")?;
+                timeout(
+                    gateway.config.request_timeout,
+                    store.commit_bundle_batch(root_id, &objects, &locations, complete),
+                )
+                .await
+                .context("committing bundle metadata timed out")??;
+                Ok(())
             })
             .await?;
-        verification_time += started.elapsed();
-        let started = Instant::now();
-        crate::profiling::measure(crate::profiling::Stage::Persistence, async {
-            // Waiting for a writer must not consume the database commit timeout.
-            let _writer = gateway
-                .bundle_writers
-                .acquire()
-                .await
-                .context("bundle writer admission closed")?;
-            timeout(
-                gateway.config.request_timeout,
-                store.commit_bundle_batch(root_id, &objects, &locations, complete),
-            )
-            .await
-            .context("committing bundle metadata timed out")??;
-            Ok(())
-        })
-        .await?;
-        persistence_time += started.elapsed();
-        occurrences += locations.len() as u64;
+            Ok::<_, anyhow::Error>(started.elapsed())
+        };
         if complete {
+            persistence_time += commit.await?;
+            occurrences += locations.len() as u64;
             eprintln!(
                 "indexed bundle {encoded_id}: occurrences={occurrences} cache_hit={cache_hit} reused_root_facts={reused_facts} item_verification_ms={} persistence_ms={}",
                 verification_time.as_millis(),
@@ -1735,7 +1724,39 @@ async fn persist_bundle(
             );
             return Ok(occurrences);
         }
+        // Verify the next batch while this one commits. Commits stay ordered on one store.
+        let verify = async {
+            let started = Instant::now();
+            let next = next_bundle_batch(&mut traversal, batch_size).await?;
+            Ok::<_, anyhow::Error>((next, started.elapsed()))
+        };
+        let (committed, (next, verified)) = tokio::try_join!(commit, verify)?;
+        persistence_time += committed;
+        verification_time += verified;
+        occurrences += locations.len() as u64;
+        batch = next;
     }
+}
+
+async fn next_bundle_batch(
+    traversal: &mut BundleTraversal,
+    batch_size: usize,
+) -> Result<(Vec<ObjectMetadata>, Vec<BundleLocation>, bool)> {
+    crate::profiling::measure(crate::profiling::Stage::Traversal, async {
+        let mut objects = Vec::with_capacity(batch_size);
+        let mut locations = Vec::with_capacity(batch_size);
+        let mut complete = false;
+        while locations.len() < batch_size {
+            let Some((object, location)) = traversal.next().await? else {
+                complete = true;
+                break;
+            };
+            objects.push(object);
+            locations.push(location);
+        }
+        Ok((objects, locations, complete))
+    })
+    .await
 }
 
 struct BundleFrame {
@@ -2139,7 +2160,21 @@ mod bundle_tests {
                 ensure!(client.query_one(counts, &[]).await?.get::<_, Vec<i64>>(0) == before_parent_checks,
                     "rejected parent format changed stored rows");
             }
-            store.commit_bundle_batch(&root_id, &objects, &locations, true).await?;
+            // Batch size 1 pipelines the nested parent and its child through separate commits.
+            let mut config = crate::Config::new(
+                "http://127.0.0.1:1",
+                "http://127.0.0.1:1",
+                vec!["http://127.0.0.1:1".into()],
+                Duration::from_secs(10),
+                1,
+                1024,
+            )?;
+            config.bundle_batch_size = 1;
+            let gateway = Gateway::new(config)?;
+            let occurrences = persist_bundle(&gateway, &mut store, &root_id, bytes.clone().into(),
+                crate::BundleFormat::Json, false, false).await?;
+            ensure!(occurrences == locations.len() as u64 && locations.len() >= 2,
+                "pipelined batches reported {occurrences} of {} occurrences", locations.len());
             let indexed = store.bundle_location(&leaf_id).await?.context("JSON child has no indexed location")?;
             let item = verify_indexed_bundle(bytes.clone().into(), crate::BundleFormat::Json, leaf_id.as_slice().try_into()?, &indexed, None).await?;
             ensure!(item.data.read_all(1024).await?.as_ref() == b"JSON to binary nested payload", "indexed JSON child payload differs");
