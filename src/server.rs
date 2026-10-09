@@ -971,8 +971,15 @@ async fn serve_bundle_inspection(
     let Ok((target, _)) = state.config.diagnostic_target(&request.id) else {
         return error_response(StatusCode::BAD_REQUEST, "Enter a valid bundle ID");
     };
-    if let Some(response) = blocked_response(&state.gateway, &target, None).await {
-        return response;
+    match state.gateway.blocking_reason(&target, None).await {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            return plain_error_response(
+                StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+                blocked_message(&target, &reason),
+            );
+        }
+        Err(error) => return inspection_error_response("Blocking policy lookup failed", error),
     }
     let _diagnostic = match state.diagnostic_permits.try_acquire() {
         Ok(permit) => permit,
@@ -2783,19 +2790,25 @@ fn upstream_error_response(context: &str, error: anyhow::Error) -> Response {
     response
 }
 
-// The inspector page shows this body verbatim, so keep it plain text.
-fn inspection_error_response(context: &str, error: anyhow::Error) -> Response {
-    eprintln!("{context}: {error:#}");
-    let body = format!(
-        "{context}: {}",
-        crate::diagnostics::public_error_text(&error)
-    );
+// The inspector page shows these bodies verbatim, so keep them plain text.
+fn plain_error_response(status: StatusCode, body: String) -> Response {
     Response::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .status(status)
         .header("content-type", "text/plain; charset=utf-8")
         .header(CACHE_CONTROL, "no-store")
         .body(Body::from(body))
         .unwrap()
+}
+
+fn inspection_error_response(context: &str, error: anyhow::Error) -> Response {
+    eprintln!("{context}: {error:#}");
+    plain_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "{context}: {}",
+            crate::diagnostics::public_error_text(&error)
+        ),
+    )
 }
 
 fn invalid_id_response(id: &str) -> Response {
@@ -2850,14 +2863,21 @@ async fn blocked_response(gateway: &Gateway, id: &str, hash: Option<&str>) -> Op
     }
 }
 
-fn blocked_page(id: &str, reason: &str) -> Response {
+fn blocked_message(id: &str, reason: &str) -> String {
     let mut message =
         format!("Requested content blocked by this node's content policy. Blocked ID: {id}");
     if !reason.is_empty() {
         message.push_str("\nReason: ");
         message.push_str(reason);
     }
-    let mut response = html_error_response(StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS, &message);
+    message
+}
+
+fn blocked_page(id: &str, reason: &str) -> Response {
+    let mut response = html_error_response(
+        StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+        &blocked_message(id, reason),
+    );
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
