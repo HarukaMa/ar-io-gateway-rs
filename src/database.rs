@@ -2569,6 +2569,22 @@ impl BlockStore {
         }
         // ponytail: Keep inputs at 128 until the chain join is bounded to batch roots.
         const PLACEMENT_BATCH_SIZE: usize = 128;
+        // Each chunk receives only its own new locations; probing the whole batch per chunk dominated.
+        let mut chunk_locations: std::collections::HashMap<i64, Vec<i64>> =
+            std::collections::HashMap::new();
+        for row in transaction
+            .query(
+                "SELECT key,object_key FROM public.item_locations WHERE key=ANY($1::bigint[])",
+                &[&new_locations],
+            )
+            .await?
+        {
+            chunk_locations
+                .entry(row.try_get(1)?)
+                .or_default()
+                .push(row.try_get(0)?);
+        }
+        let located: Vec<i64> = chunk_locations.keys().copied().collect();
         // Order the whole target set before slicing, including targets known only by location.
         let keys: Vec<i64> = transaction
             .query(
@@ -2576,16 +2592,22 @@ impl BlockStore {
                  JOIN (
                      SELECT unnest($1::bigint[]) AS object_key
                      UNION
-                     SELECT object_key FROM public.item_locations WHERE key=ANY($2::bigint[])
+                     SELECT unnest($2::bigint[])
                  ) requested ON requested.object_key=o.key
                  ORDER BY o.id",
-                &[&keys, &new_locations],
+                &[&keys, &located],
             )
             .await?
             .into_iter()
             .map(|row| row.get(0))
             .collect();
         for keys in keys.chunks(PLACEMENT_BATCH_SIZE) {
+            let new_locations: Vec<i64> = keys
+                .iter()
+                .filter_map(|key| chunk_locations.get(key))
+                .flatten()
+                .copied()
+                .collect();
             transaction.execute(
             "WITH candidates AS (
                  SELECT l.object_key, root.block_height AS height, root.position, l.key, l.path
