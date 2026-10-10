@@ -35,7 +35,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-graphql",
- "aws-lc-rs",
+ "aws-lc-sys",
  "axum",
  "base64",
  "bs58",

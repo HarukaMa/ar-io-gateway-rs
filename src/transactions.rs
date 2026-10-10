@@ -464,26 +464,49 @@ pub(super) fn verify_rsa_pss(
     verify_rsa_pss_digest(owner, signature, &sha256(&[payload]), false, label)
 }
 
-// Fast path for standard salt-32 PSS with byte-aligned 2048..4096-bit keys. For these the
+// Fast path for PSS with byte-aligned 2048..4096-bit keys and any salt length. For these the
 // standard encoding width equals ours, so aws-lc only accepts signatures the variable-salt
 // verifier also accepts. Callers fall back to that verifier whenever this returns false.
 fn standard_rsa_pss(owner: &[u8], signature: &[u8], payload: &[u8]) -> bool {
+    // aws-lc's RSA_PSS_SALTLEN_AUTO: recover the salt length from the signature.
+    const SALT_LEN_AUTO: std::ffi::c_int = -2;
     if !(256..=512).contains(&owner.len())
         || (owner[0] & 0x80) == 0
         || signature.len() != owner.len()
     {
         return false;
     }
-    let key = aws_lc_rs::signature::RsaPublicKeyComponents {
-        n: owner,
-        e: &[1u8, 0, 1][..],
-    };
-    key.verify(
-        &aws_lc_rs::signature::RSA_PSS_2048_8192_SHA256,
-        payload,
-        signature,
-    )
-    .is_ok()
+    let digest = sha256(&[payload]);
+    // SAFETY: every pointer refers to a live slice with its exact length, the BIGNUMs are freed
+    // after RSA_new_public_key copies them, and the RSA object is freed exactly once.
+    unsafe {
+        use aws_lc_sys::*;
+        let n = BN_bin2bn(owner.as_ptr(), owner.len(), std::ptr::null_mut());
+        let e = BN_bin2bn([1u8, 0, 1].as_ptr(), 3, std::ptr::null_mut());
+        let rsa = if n.is_null() || e.is_null() {
+            std::ptr::null_mut()
+        } else {
+            RSA_new_public_key(n, e)
+        };
+        BN_free(n);
+        BN_free(e);
+        let valid = !rsa.is_null()
+            && RSA_verify_pss_mgf1(
+                rsa,
+                digest.as_ptr(),
+                digest.len(),
+                EVP_sha256(),
+                std::ptr::null(),
+                SALT_LEN_AUTO,
+                signature.as_ptr(),
+                signature.len(),
+            ) == 1;
+        RSA_free(rsa);
+        if !valid {
+            ERR_clear_error();
+        }
+        valid
+    }
 }
 
 fn verify_rsa_pss_digest(
@@ -1072,20 +1095,28 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/rsa-pss-salts.json")).unwrap();
         let field = |name: &str| decode_b64(fixture[name].as_str().unwrap(), name).unwrap();
         let (owner, payload) = (field("owner"), field("payload"));
-        let (salt_32, salt_64) = (field("signature_salt_32"), field("signature_salt_64"));
         let digest = sha256(&[&payload]);
-        // Fast-path acceptance must imply acceptance by the variable-salt verifier.
-        assert!(standard_rsa_pss(&owner, &salt_32, &payload));
-        verify_rsa_pss_digest(&owner, &salt_32, &digest, false, "fixture").unwrap();
-        // Other salts miss the fast path and must still verify through the fallback.
-        assert!(!standard_rsa_pss(&owner, &salt_64, &payload));
-        verify_rsa_pss(&owner, &salt_64, &payload, "fixture").unwrap();
-        for signature in [&salt_32, &salt_64] {
-            assert!(verify_rsa_pss(&owner, signature, b"changed", "fixture").is_err());
+        for salt in [0, 32, 64, 478] {
+            let signature = field(&format!("signature_salt_{salt}"));
+            // Fast-path acceptance must imply acceptance by the variable-salt verifier.
+            assert!(
+                standard_rsa_pss(&owner, &signature, &payload),
+                "salt {salt}"
+            );
+            verify_rsa_pss_digest(&owner, &signature, &digest, false, "fixture").unwrap();
+            assert!(
+                !standard_rsa_pss(&owner, &signature, b"changed"),
+                "salt {salt}"
+            );
+            assert!(verify_rsa_pss(&owner, &signature, b"changed", "fixture").is_err());
+            let mut tampered = signature.clone();
+            tampered[100] ^= 1;
+            assert!(
+                !standard_rsa_pss(&owner, &tampered, &payload),
+                "salt {salt}"
+            );
+            assert!(verify_rsa_pss(&owner, &tampered, &payload, "fixture").is_err());
         }
-        let mut tampered = salt_32.clone();
-        tampered[100] ^= 1;
-        assert!(verify_rsa_pss(&owner, &tampered, &payload, "fixture").is_err());
     }
 
     #[test]
