@@ -356,4 +356,103 @@ mod tests {
         transaction.rollback().await?;
         Ok(())
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ar_io_rust_test; run serially; briefly locks object_tags"]
+    async fn batch_transactions_hold_no_dictionary_locks() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let mut holder = BlockStore::connect(&url).await?;
+        ensure!(
+            holder
+                .client
+                .query_one("SELECT current_database()", &[])
+                .await?
+                .get::<_, String>(0)
+                == "ar_io_rust_test",
+            "wrong database"
+        );
+        let id =
+            crate::decode_fixed::<32>("z8dH98cY5MvVjBWm7DC6-NjuJOFMZxZeQjh_7hUuK54", "parent ID")?;
+        let item = crate::verify_data_item(
+            include_bytes!("../../tests/fixtures/ao-unsigned-parent.bin")
+                .to_vec()
+                .into(),
+            &id,
+        )
+        .await?;
+        let mut object = item.metadata(&crate::sha256(&[b"interned-tag-regression"]));
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+        let value = format!("interned-tag-{}", nanos.as_nanos()).into_bytes();
+        object.tags = vec![(b"timestamp".to_vec(), value.clone())];
+
+        let mut writer = BlockStore::connect(&url).await?;
+        let pid: i32 = writer
+            .client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        let lock = holder.client.transaction().await?;
+        lock.batch_execute(
+            "SET LOCAL lock_timeout='5s'; LOCK TABLE public.object_tags IN SHARE MODE",
+        )
+        .await?;
+        let batch_object = object.clone();
+        let batch = tokio::spawn(async move {
+            writer
+                .record_objects(std::slice::from_ref(&batch_object))
+                .await
+        });
+        let observer = BlockStore::connect(&url).await?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let blocked: bool = observer
+                .client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1
+                     AND wait_event_type='Lock' AND query LIKE 'INSERT INTO public.object_tags%')",
+                    &[&pid],
+                )
+                .await?
+                .get(0);
+            if blocked {
+                break;
+            }
+            ensure!(
+                !batch.is_finished(),
+                "batch finished before reaching tag writes"
+            );
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "batch never reached tag writes"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let held: i64 = observer
+            .client
+            .query_one(
+                "SELECT count(*) FROM pg_locks l,
+                     (SELECT hashtextextended(encode(sha256($2::bytea),'hex'),0) AS k) d
+                 WHERE l.pid=$1 AND l.locktype='advisory' AND l.granted AND l.objsubid=1
+                   AND l.classid::bigint=((d.k>>32)&4294967295) AND l.objid::bigint=(d.k&4294967295)",
+                &[&pid, &value],
+            )
+            .await?
+            .get(0);
+        batch.abort();
+        let _ = batch.await;
+        lock.rollback().await?;
+        let removed = observer
+            .client
+            .execute("DELETE FROM public.tag_values WHERE value=$1", &[&value])
+            .await?;
+        ensure!(
+            held == 0,
+            "batch transaction held {held} dictionary advisory locks"
+        );
+        ensure!(
+            removed == 1,
+            "interned value was not committed before the batch"
+        );
+        Ok(())
+    }
 }

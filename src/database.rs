@@ -2337,6 +2337,7 @@ impl BlockStore {
                 "bundle occurrence has an invalid parent"
             );
         }
+        self.intern_tags(objects).await?;
         let (transaction, root_key, was_complete) =
             crate::profiling::measure(crate::profiling::Stage::MetadataAdmission, async {
                 let transaction = self
@@ -2795,6 +2796,7 @@ impl BlockStore {
 
     pub(crate) async fn record_objects(&mut self, objects: &[ObjectMetadata]) -> Result<()> {
         let ids: Vec<_> = objects.iter().map(|object| object.id.as_slice()).collect();
+        self.intern_tags(objects).await?;
         let transaction = crate::profiling::measure(
             crate::profiling::Stage::MetadataAdmission,
             async {
@@ -3047,6 +3049,44 @@ impl BlockStore {
         )
         .await?;
 
+        let dictionary_keys = Self::resolve_tags(transaction, &objects).await?;
+        crate::profiling::measure(crate::profiling::Stage::TagWrite, async {
+            for (batch, object_keys) in objects.chunks(METADATA_BATCH_SIZE)
+                .zip(keys.chunks(METADATA_BATCH_SIZE))
+            {
+                let refs = batch.iter()
+                    .map(|object| packed_tags::pack_refs(object, &dictionary_keys))
+                    .collect::<Result<Vec<_>>>()?;
+                crate::profiling::measure(crate::profiling::Stage::TagInsert, async {
+                    transaction.execute(
+                        "INSERT INTO public.object_tags(object_key,refs)
+                         SELECT * FROM unnest($1::bigint[],$2::bytea[]) incoming(object_key,refs)
+                         WHERE object_key=ANY($3::bigint[]) AND octet_length(refs)>0
+                         ON CONFLICT(object_key) DO NOTHING",
+                        &[&object_keys, &refs, &completed],
+                    ).await?;
+                    Ok(())
+                }).await?;
+                crate::profiling::measure(crate::profiling::Stage::TagCompare, async {
+                    let conflict = transaction.query_opt(
+                        "SELECT incoming.object_key FROM unnest($1::bigint[],$2::bytea[]) incoming(object_key,refs)
+                         LEFT JOIN public.object_tags stored USING(object_key)
+                         WHERE incoming.refs IS DISTINCT FROM coalesce(stored.refs,''::bytea) LIMIT 1",
+                        &[&object_keys, &refs],
+                    ).await?;
+                    ensure!(conflict.is_none(), "conflicting immutable ordered tags");
+                    Ok(())
+                }).await?;
+            }
+            Ok(())
+        }).await?;
+        Ok(keys)
+    }
+
+    async fn resolve_tags<'a>(
+        transaction: &Transaction<'_>,
+        objects: &[&'a ObjectMetadata],
+    ) -> Result<[std::collections::BTreeMap<&'a [u8], i64>; 2]> {
         let (dictionaries, mut dictionary_keys, mut lock_keys) = crate::profiling::measure(
             crate::profiling::Stage::DictionaryLookup,
             async {
@@ -3193,37 +3233,25 @@ impl BlockStore {
             Ok(())
         })
         .await?;
-        crate::profiling::measure(crate::profiling::Stage::TagWrite, async {
-            for (batch, object_keys) in objects.chunks(METADATA_BATCH_SIZE)
-                .zip(keys.chunks(METADATA_BATCH_SIZE))
-            {
-                let refs = batch.iter()
-                    .map(|object| packed_tags::pack_refs(object, &dictionary_keys))
-                    .collect::<Result<Vec<_>>>()?;
-                crate::profiling::measure(crate::profiling::Stage::TagInsert, async {
-                    transaction.execute(
-                        "INSERT INTO public.object_tags(object_key,refs)
-                         SELECT * FROM unnest($1::bigint[],$2::bytea[]) incoming(object_key,refs)
-                         WHERE object_key=ANY($3::bigint[]) AND octet_length(refs)>0
-                         ON CONFLICT(object_key) DO NOTHING",
-                        &[&object_keys, &refs, &completed],
-                    ).await?;
-                    Ok(())
-                }).await?;
-                crate::profiling::measure(crate::profiling::Stage::TagCompare, async {
-                    let conflict = transaction.query_opt(
-                        "SELECT incoming.object_key FROM unnest($1::bigint[],$2::bytea[]) incoming(object_key,refs)
-                         LEFT JOIN public.object_tags stored USING(object_key)
-                         WHERE incoming.refs IS DISTINCT FROM coalesce(stored.refs,''::bytea) LIMIT 1",
-                        &[&object_keys, &refs],
-                    ).await?;
-                    ensure!(conflict.is_none(), "conflicting immutable ordered tags");
-                    Ok(())
-                }).await?;
-            }
-            Ok(())
-        }).await?;
-        Ok(keys)
+        Ok(dictionary_keys)
+    }
+
+    // Commit new dictionary entries before the batch transaction so their advisory locks are
+    // released in milliseconds. Unreferenced entries left by a failed batch are reused on retry.
+    async fn intern_tags(&mut self, objects: &[ObjectMetadata]) -> Result<()> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let transaction = self
+            .client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
+        let objects: Vec<_> = objects.iter().collect();
+        Self::resolve_tags(&transaction, &objects).await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub async fn block_pair(&self, height: u64) -> Result<Option<(IndexBlock, IndexBlock)>> {
