@@ -110,6 +110,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "026_inline_tag_ref_decode",
         include_str!("../migrations/026_inline_tag_ref_decode.sql"),
     ),
+    (
+        "027_set_based_object_id_check",
+        include_str!("../migrations/027_set_based_object_id_check.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 pub(crate) const MAX_BUNDLE_BATCH_SIZE: usize = 4096;
@@ -3882,6 +3886,63 @@ mod tests {
             .batch_execute("ROLLBACK TO SAVEPOINT duplicate_update")
             .await?;
         transaction.rollback().await?;
+        // Duplicates within one statement are visible to the statement-level check.
+        let mut fresh_id = first_id;
+        fresh_id[0] ^= 0xff;
+        let error = store
+            .client
+            .execute(
+                "INSERT INTO public.objects(id,kind) VALUES($1,$2),($1,$2)",
+                &[&fresh_id.as_slice(), &first.kind],
+            )
+            .await
+            .expect_err("duplicate IDs in one statement accepted");
+        ensure!(
+            error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
+            "same-statement duplicate did not report a uniqueness violation"
+        );
+        // Writers that skip the explicit prefix locks still serialize on the trigger.
+        let mut racer = store.reconnect().await?;
+        let leader = store.client.transaction().await?;
+        leader
+            .execute(
+                "INSERT INTO public.objects(id,kind) VALUES($1,$2)",
+                &[&fresh_id.as_slice(), &first.kind],
+            )
+            .await?;
+        let follower = racer.client.transaction().await?;
+        let fresh = fresh_id.as_slice();
+        let parameters: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&fresh, &first.kind];
+        let error = {
+            let racing = follower.execute(
+                "INSERT INTO public.objects(id,kind) VALUES($1,$2)",
+                &parameters,
+            );
+            tokio::pin!(racing);
+            ensure!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut racing)
+                    .await
+                    .is_err(),
+                "concurrent insert bypassed the prefix lock"
+            );
+            leader.commit().await?;
+            tokio::time::timeout(std::time::Duration::from_secs(5), racing)
+                .await?
+                .expect_err("concurrent duplicate ID accepted")
+        };
+        ensure!(
+            error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
+            "concurrent duplicate did not report a uniqueness violation"
+        );
+        follower.rollback().await?;
+        store
+            .client
+            .execute(
+                "DELETE FROM public.objects
+                 WHERE public.object_id_prefix(id)=public.object_id_prefix($1) AND id=$1",
+                &[&fresh_id.as_slice()],
+            )
+            .await?;
         let transaction = store.client.transaction().await?;
         let keys: Vec<i64> = rows.iter().map(|row| row.get(1)).collect();
         transaction
