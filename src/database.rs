@@ -2346,7 +2346,7 @@ impl BlockStore {
                 "bundle occurrence has an invalid parent"
             );
         }
-        self.intern_tags(objects).await?;
+        let dictionary_keys = self.intern_tags(objects).await?;
         let (transaction, root_key, was_complete) =
             crate::profiling::measure(crate::profiling::Stage::MetadataAdmission, async {
                 let transaction = self
@@ -2411,7 +2411,8 @@ impl BlockStore {
                 Ok((transaction, root_key, was_complete))
             })
             .await?;
-        let keys = Self::write_objects(&transaction, objects).await?;
+        let keys =
+            Self::write_objects_with_keys(&transaction, objects, Some(dictionary_keys)).await?;
         crate::profiling::measure(crate::profiling::Stage::BundlePlacement, async {
         let ids: Vec<_> = locations
             .iter()
@@ -2827,7 +2828,7 @@ impl BlockStore {
 
     pub(crate) async fn record_objects(&mut self, objects: &[ObjectMetadata]) -> Result<()> {
         let ids: Vec<_> = objects.iter().map(|object| object.id.as_slice()).collect();
-        self.intern_tags(objects).await?;
+        let dictionary_keys = self.intern_tags(objects).await?;
         let transaction = crate::profiling::measure(
             crate::profiling::Stage::MetadataAdmission,
             async {
@@ -2855,7 +2856,7 @@ impl BlockStore {
             },
         )
         .await?;
-        Self::write_objects(&transaction, objects).await?;
+        Self::write_objects_with_keys(&transaction, objects, Some(dictionary_keys)).await?;
         crate::profiling::measure(crate::profiling::Stage::MetadataCommit, async {
             transaction.commit().await?;
             Ok(())
@@ -2866,6 +2867,15 @@ impl BlockStore {
     async fn write_objects(
         transaction: &Transaction<'_>,
         objects: &[ObjectMetadata],
+    ) -> Result<Vec<i64>> {
+        Self::write_objects_with_keys(transaction, objects, None).await
+    }
+
+    // `dictionary_keys` must come from resolve_tags over these same objects.
+    async fn write_objects_with_keys<'a>(
+        transaction: &Transaction<'_>,
+        objects: &'a [ObjectMetadata],
+        dictionary_keys: Option<[std::collections::BTreeMap<&'a [u8], i64>; 2]>,
     ) -> Result<Vec<i64>> {
         ensure!(
             objects.len() <= MAX_BUNDLE_BATCH_SIZE,
@@ -3080,7 +3090,10 @@ impl BlockStore {
         )
         .await?;
 
-        let dictionary_keys = Self::resolve_tags(transaction, &objects).await?;
+        let dictionary_keys = match dictionary_keys {
+            Some(keys) => keys,
+            None => Self::resolve_tags(transaction, &objects).await?,
+        };
         crate::profiling::measure(crate::profiling::Stage::TagWrite, async {
             for (batch, object_keys) in objects.chunks(METADATA_BATCH_SIZE)
                 .zip(keys.chunks(METADATA_BATCH_SIZE))
@@ -3269,9 +3282,12 @@ impl BlockStore {
 
     // Commit new dictionary entries before the batch transaction so their advisory locks are
     // released in milliseconds. Unreferenced entries left by a failed batch are reused on retry.
-    async fn intern_tags(&mut self, objects: &[ObjectMetadata]) -> Result<()> {
+    async fn intern_tags<'a>(
+        &mut self,
+        objects: &'a [ObjectMetadata],
+    ) -> Result<[std::collections::BTreeMap<&'a [u8], i64>; 2]> {
         if objects.is_empty() {
-            return Ok(());
+            return Ok(Default::default());
         }
         let transaction = self
             .client
@@ -3280,9 +3296,9 @@ impl BlockStore {
             .start()
             .await?;
         let objects: Vec<_> = objects.iter().collect();
-        Self::resolve_tags(&transaction, &objects).await?;
+        let dictionary_keys = Self::resolve_tags(&transaction, &objects).await?;
         transaction.commit().await?;
-        Ok(())
+        Ok(dictionary_keys)
     }
 
     pub async fn block_pair(&self, height: u64) -> Result<Option<(IndexBlock, IndexBlock)>> {
@@ -5507,10 +5523,10 @@ mod tests {
         let tags = store
             .client
             .query(
-                "SELECT n.value, v.value FROM public.object_tags t
+                "SELECT n.value, v.value FROM public.read_object_tags($1) t
              JOIN public.tag_names n ON n.key=t.name_key
              JOIN public.tag_values v ON v.key=t.value_key
-             WHERE t.object_key=$1 ORDER BY t.ordinal",
+             ORDER BY t.ordinal",
                 &[&key],
             )
             .await?
@@ -5548,10 +5564,10 @@ mod tests {
             data_offset: row.try_get::<_, String>(15)?.parse()?,
             json: false,
         };
+        // Dictionary entries are committed before the batch and may outlive a failed batch.
         let snapshot = "SELECT ARRAY[
             (SELECT count(*) FROM public.objects), (SELECT count(*) FROM public.owners),
-            (SELECT count(*) FROM public.object_tags), (SELECT count(*) FROM public.tag_names),
-            (SELECT count(*) FROM public.tag_values), (SELECT count(*) FROM public.item_locations),
+            (SELECT count(*) FROM public.object_tags), (SELECT count(*) FROM public.item_locations),
             (SELECT count(*) FROM public.canonical_placements), (SELECT count(*) FROM public.bundle_progress)],
             (SELECT complete FROM public.bundle_progress WHERE root_key=$1)";
         let before = store.client.query_one(snapshot, &[&root_key]).await?;
@@ -5960,10 +5976,10 @@ mod tests {
             data_root: row.try_get(15)?,
             tags,
         };
+        // Dictionary entries are committed before the batch and may outlive a failed write.
         let counts = "SELECT ARRAY[
             (SELECT count(*) FROM public.objects), (SELECT count(*) FROM public.owners),
-            (SELECT coalesce(sum(octet_length(refs)/16),0)::bigint FROM public.object_tags), (SELECT count(*) FROM public.tag_names),
-            (SELECT count(*) FROM public.tag_values)]";
+            (SELECT coalesce(sum(octet_length(refs)/16),0)::bigint FROM public.object_tags)]";
         let before: Vec<i64> = store.client.query_one(counts, &[]).await?.get(0);
         let mut other = store.reconnect().await?;
         let owner_lock = other.client.transaction().await?;
