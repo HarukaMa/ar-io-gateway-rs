@@ -61,10 +61,10 @@ impl BlockStore {
             .await?
             .get(0);
         ensure!(
-            matches!(version, Some(21 | 22 | 23 | 24)),
-            "packed tags require schema 21 through 24"
+            matches!(version, Some(21..=25)),
+            "packed tags require schema 21 through 25"
         );
-        if matches!(version, Some(23 | 24)) {
+        if matches!(version, Some(23..=25)) {
             transaction.commit().await?;
             self.client
                 .query_one(
@@ -452,6 +452,125 @@ mod tests {
         ensure!(
             removed == 1,
             "interned value was not committed before the batch"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ar_io_rust_test; run serially; migrates it and briefly locks object_tags"]
+    async fn tag_refs_skip_row_locks_and_racing_deletes_fail_closed() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let mut setup = BlockStore::connect(&url).await?;
+        ensure!(
+            setup
+                .client
+                .query_one("SELECT current_database()", &[])
+                .await?
+                .get::<_, String>(0)
+                == "ar_io_rust_test",
+            "wrong database"
+        );
+        setup.migrate_schema(true).await?;
+        let id =
+            crate::decode_fixed::<32>("z8dH98cY5MvVjBWm7DC6-NjuJOFMZxZeQjh_7hUuK54", "parent ID")?;
+        let item = crate::verify_data_item(
+            include_bytes!("../../tests/fixtures/ao-unsigned-parent.bin")
+                .to_vec()
+                .into(),
+            &id,
+        )
+        .await?;
+        let mut object = item.metadata(&crate::sha256(&[b"tag-ref-validation-regression"]));
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+        let value = format!("tag-ref-validation-{}", nanos.as_nanos()).into_bytes();
+        object.tags = vec![(b"timestamp".to_vec(), value.clone())];
+        setup
+            .client
+            .execute("INSERT INTO public.tag_values(value) VALUES($1)", &[&value])
+            .await?;
+
+        let mut writer = BlockStore::connect(&url).await?;
+        let transaction = writer
+            .client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .start()
+            .await?;
+        BlockStore::write_objects(&transaction, std::slice::from_ref(&object)).await?;
+        let xmax: String = transaction
+            .query_one(
+                "SELECT xmax::text FROM public.tag_values WHERE value=$1",
+                &[&value],
+            )
+            .await?
+            .get(0);
+        transaction.rollback().await?;
+
+        let pid: i32 = writer
+            .client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await?
+            .get(0);
+        let deleter = setup.client.transaction().await?;
+        let deleted = deleter
+            .execute("DELETE FROM public.tag_values WHERE value=$1", &[&value])
+            .await?;
+        let batch_object = object.clone();
+        let batch = tokio::spawn(async move {
+            let transaction = writer
+                .client
+                .build_transaction()
+                .isolation_level(IsolationLevel::ReadCommitted)
+                .start()
+                .await?;
+            BlockStore::write_objects(&transaction, std::slice::from_ref(&batch_object))
+                .await
+                .map(|_| ())
+        });
+        let observer = BlockStore::connect(&url).await?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let blocked: bool = observer
+                .client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1
+                     AND wait_event_type='Lock' AND query LIKE 'INSERT INTO public.object_tags%')",
+                    &[&pid],
+                )
+                .await?
+                .get(0);
+            if blocked {
+                break;
+            }
+            ensure!(
+                !batch.is_finished(),
+                "tag write finished before the delete committed"
+            );
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "tag write never waited for the delete"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        deleter.commit().await?;
+        let error = batch
+            .await?
+            .expect_err("tag write referenced a deleted dictionary key");
+        let code = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<tokio_postgres::Error>())
+            .and_then(|error| error.code().map(|code| code.code().to_owned()));
+        ensure!(
+            xmax == "0",
+            "tag write row-locked dictionary value (xmax {xmax})"
+        );
+        ensure!(
+            deleted == 1,
+            "unreferenced dictionary value was not deleted"
+        );
+        ensure!(
+            code.as_deref() == Some("23503"),
+            "racing delete was not rejected as a missing reference: {error:#}"
         );
         Ok(())
     }

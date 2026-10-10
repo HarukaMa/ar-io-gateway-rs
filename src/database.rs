@@ -102,6 +102,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "024_graphql_index_state",
         include_str!("../migrations/024_graphql_index_state.sql"),
     ),
+    (
+        "025_tag_ref_validation",
+        include_str!("../migrations/025_tag_ref_validation.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 pub(crate) const MAX_BUNDLE_BATCH_SIZE: usize = 4096;
@@ -782,15 +786,16 @@ impl BlockStore {
                 }
             }
             if *name == "024_graphql_index_state" {
-                if activate_graphql {
-                    transaction
-                        .execute(
-                            "INSERT INTO public.ar_io_schema_migrations(version,name)
-                         VALUES(24,'024_graphql_index_state')",
-                            &[],
-                        )
-                        .await?;
+                if !activate_graphql {
+                    break;
                 }
+                transaction
+                    .execute(
+                        "INSERT INTO public.ar_io_schema_migrations(version,name)
+                         VALUES(24,'024_graphql_index_state')",
+                        &[],
+                    )
+                    .await?;
                 continue;
             }
             // Plain CREATE statements reject pre-existing, unversioned tables atomically.
