@@ -106,6 +106,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "025_tag_ref_validation",
         include_str!("../migrations/025_tag_ref_validation.sql"),
     ),
+    (
+        "026_inline_tag_ref_decode",
+        include_str!("../migrations/026_inline_tag_ref_decode.sql"),
+    ),
 ];
 const METADATA_BATCH_SIZE: usize = 256;
 pub(crate) const MAX_BUNDLE_BATCH_SIZE: usize = 4096;

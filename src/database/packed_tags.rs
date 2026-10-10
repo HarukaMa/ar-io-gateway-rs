@@ -61,10 +61,10 @@ impl BlockStore {
             .await?
             .get(0);
         ensure!(
-            matches!(version, Some(21..=25)),
-            "packed tags require schema 21 through 25"
+            matches!(version, Some(21..=26)),
+            "packed tags require schema 21 through 26"
         );
-        if matches!(version, Some(23..=25)) {
+        if matches!(version, Some(23..=26)) {
             transaction.commit().await?;
             self.client
                 .query_one(
