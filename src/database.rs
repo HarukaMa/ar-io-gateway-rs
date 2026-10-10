@@ -2572,8 +2572,8 @@ impl BlockStore {
         if keys.is_empty() && new_locations.is_empty() {
             return Ok(());
         }
-        // ponytail: Keep inputs at 128 until the chain join is bounded to batch roots.
-        const PLACEMENT_BATCH_SIZE: usize = 128;
+        // The chain join is bounded to the batch's distinct roots, so one chunk covers a full batch.
+        const PLACEMENT_BATCH_SIZE: usize = MAX_BUNDLE_BATCH_SIZE;
         // Each chunk receives only its own new locations; probing the whole batch per chunk dominated.
         let mut chunk_locations: std::collections::HashMap<i64, Vec<i64>> =
             std::collections::HashMap::new();
@@ -2614,7 +2614,24 @@ impl BlockStore {
                 .copied()
                 .collect();
             transaction.execute(
-            "WITH candidates AS (
+            "WITH pending AS MATERIALIZED (
+                 SELECT k FROM unnest($2::bigint[]) k
+                 WHERE NOT EXISTS (SELECT 1 FROM public.canonical_placements p WHERE p.object_key=k)
+             ), roots AS MATERIALIZED (
+                 SELECT DISTINCT l.root_key FROM public.item_locations l
+                 WHERE l.object_key IN (SELECT k FROM pending)
+             ), chain AS MATERIALIZED (
+                 SELECT roots.root_key, member.height, member.position FROM roots
+                 CROSS JOIN LATERAL (
+                     SELECT cb.height, bt.position
+                     FROM public.block_transactions bt
+                     JOIN public.blocks b ON b.hash=bt.block_hash AND b.timestamp IS NOT NULL
+                     JOIN public.canonical_blocks cb ON cb.height=b.height AND cb.block_hash=b.hash
+                     JOIN public.block_index_state s
+                       ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
+                     WHERE bt.object_key=roots.root_key
+                 ) member
+             ), candidates AS (
                  SELECT l.object_key, root.block_height AS height, root.position, l.key, l.path
                  FROM public.item_locations l
                  JOIN public.canonical_placements root ON root.object_key=l.root_key
@@ -2622,19 +2639,10 @@ impl BlockStore {
                      SELECT 1 FROM public.canonical_placements p WHERE p.object_key=l.object_key
                  )
                  UNION ALL
-                 SELECT l.object_key, cb.height, bt.position, l.key, l.path
+                 SELECT l.object_key, chain.height, chain.position, l.key, l.path
                  FROM public.item_locations l
-                 JOIN public.block_transactions bt ON bt.object_key=l.root_key
-                 JOIN public.blocks b ON b.hash=bt.block_hash AND b.timestamp IS NOT NULL
-                 JOIN public.canonical_blocks cb ON cb.height=b.height AND cb.block_hash=b.hash
-                 JOIN public.block_index_state s
-                   ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
-                 WHERE l.object_key IN (
-                     SELECT k FROM unnest($2::bigint[]) k
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM public.canonical_placements p WHERE p.object_key=k
-                     )
-                 )
+                 JOIN chain ON chain.root_key=l.root_key
+                 WHERE l.object_key IN (SELECT k FROM pending)
              )
              INSERT INTO public.canonical_placements AS stored
                 (object_key, block_height, position, location_key, kind, id)
