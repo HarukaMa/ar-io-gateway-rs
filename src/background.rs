@@ -193,11 +193,17 @@ impl Admission {
         }
     }
 
-    fn failed(&self, message: &'static str) {
-        self.status.lock().last_failure = Some(serde_json::json!({
+    fn failed(&self, message: &'static str, root: Option<(&str, u64)>, error: &anyhow::Error) {
+        let mut failure = serde_json::json!({
             "message": message,
+            "reason": crate::diagnostics::error_text(error, true),
             "at": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-        }));
+        });
+        if let Some((id, height)) = root {
+            failure["root"] = id.into();
+            failure["height"] = height.into();
+        }
+        self.status.lock().last_failure = Some(failure);
     }
 }
 
@@ -245,6 +251,16 @@ enum JobContent {
     Complete(Arc<VerifiedRoot>),
     Streamed { height: u64 },
     Partial(Arc<crate::AuthenticatedRoot>),
+}
+
+impl JobContent {
+    fn height(&self) -> u64 {
+        match self {
+            Self::Complete(root) => root.data.block_height,
+            Self::Streamed { height } => *height,
+            Self::Partial(root) => root.block_height,
+        }
+    }
 }
 
 struct Job {
@@ -504,7 +520,7 @@ pub(crate) async fn start(
                                     if let Err(error) = result {
                                         worker_admission.paused.store(true, Ordering::Relaxed);
                                         eprintln!("following chain failed: {error:#}");
-                                        worker_admission.failed("Chain indexing failed");
+                                        worker_admission.failed("Couldn't follow the chain", None, &error);
                                     }
                                     tokio::time::sleep(RETRY_INTERVAL).await;
                                 }
@@ -614,7 +630,8 @@ async fn run(
                     continue;
                 }
                 Some(result) = indexing.join_next(), if !indexing.is_empty() => {
-                    let (store, id, result) = result.context("bundle indexing task failed")?;
+                    let (store, id, height, result): (BlockStore, String, u64, Result<u64>) =
+                        result.context("bundle indexing task failed")?;
                     stores.push(store);
                     admission.status.lock().bundles = if indexing.is_empty() { "idle" } else { "indexing" };
                     match result {
@@ -624,7 +641,7 @@ async fn run(
                         }
                         Err(error) if range.is_some() => return Err(error),
                         Err(error) => {
-                            admission.failed("Bundle indexing failed");
+                            admission.failed("Couldn't index bundle", Some((id.as_str(), height)), &error);
                             eprintln!("indexing bundle {id} failed: {error:#}");
                         }
                     }
@@ -646,12 +663,13 @@ async fn run(
                 }
             };
             let id = URL_SAFE_NO_PAD.encode(job.reservation.id);
+            let height = job.root.height();
             admission.status.lock().bundles = "indexing";
             let mut store = stores.pop().expect("available bundle writer");
             let gateway = Arc::clone(&gateway);
             indexing.spawn(crate::BACKGROUND_CPU.scope((), async move {
                 let result = process_job(&gateway, &mut store, job).await;
-                (store, id, result)
+                (store, id, height, result)
             }));
         }
         Ok((roots, occurrences))
@@ -696,28 +714,21 @@ async fn download_pending(
     let mut pending: Option<(Vec<u8>, u64, u128)> = None;
     let mut candidates = Vec::<(Vec<u8>, u64, u128)>::new().into_iter();
     let mut discovery = None;
+    let mut discovery_poll_at = Instant::now();
+    let mut rewind_live = false;
     let mut exhausted = false;
     let mut next_poll = Instant::now();
     loop {
         let paused = admission.paused.load(Ordering::Relaxed);
         if !paused && (admission.live_pending.swap(false, Ordering::Relaxed) || was_paused) {
-            // Reconsider live work before admitting the rest of a historical page.
-            if pending.is_some() || candidates.len() > 0 {
-                cursor = page_start.as_deref().cloned();
-                pending = None;
-                candidates = Vec::new().into_iter();
-            }
-            if let Some(scan) = cursor.as_mut()
-                && let Some(state) =
-                    timeout(gateway.config.request_timeout, checkpoint_store.state())
-                        .await
-                        .context("loading live scan checkpoint timed out")??
-            {
-                // Revisit the unstable window after metadata changes or a restart.
-                scan.rewind_live(i64::try_from(state.checkpoint.height)?);
-            }
-            discovery = None;
+            // Pick up live work at the next page boundary instead of discarding admitted
+            // candidates or a running discovery query.
+            rewind_live = true;
             next_poll = Instant::now();
+            if Instant::now() < discovery_poll_at {
+                // Still sleeping before its query, so nothing is lost.
+                discovery = None;
+            }
         }
         was_paused = paused;
         if !paused && range.is_none() && cursor.is_none() {
@@ -762,7 +773,7 @@ async fn download_pending(
                     Ok(()) => saved_cursor = checkpoint,
                     Err(error) => {
                         eprintln!("saving bundle scan cursor failed: {error:#}");
-                        admission.failed("Bundle checkpoint failed");
+                        admission.failed("Couldn't save the bundle scan position", None, &error);
                         checkpoint_at = Instant::now() + RETRY_INTERVAL;
                     }
                 }
@@ -809,6 +820,7 @@ async fn download_pending(
                         if streamed {
                             return (
                                 encoded,
+                                height,
                                 Ok(Some(Job {
                                     root: JobContent::Streamed { height },
                                     reservation,
@@ -854,7 +866,7 @@ async fn download_pending(
                                 Err(error)
                             }
                         };
-                        (encoded, result)
+                        (encoded, height, result)
                     });
                 } else {
                     pending = Some((root_id, height, data_size));
@@ -874,6 +886,19 @@ async fn download_pending(
             && downloads.len() < gateway.config.index_downloads
             && (!exhausted || range.is_none())
         {
+            if rewind_live {
+                if let Some(scan) = cursor.as_mut()
+                    && let Some(state) =
+                        timeout(gateway.config.request_timeout, checkpoint_store.state())
+                            .await
+                            .context("loading live scan checkpoint timed out")??
+                {
+                    // Revisit the unstable window after metadata changes or a restart.
+                    scan.rewind_live(i64::try_from(state.checkpoint.height)?);
+                }
+                rewind_live = false;
+            }
+            discovery_poll_at = next_poll;
             let after = cursor.clone();
             let bounded_after = range_cursor.clone();
             let poll_at = next_poll;
@@ -901,13 +926,13 @@ async fn download_pending(
         }
         tokio::select! {
             result = downloads.next(), if !downloads.is_empty() => {
-                let (id, result) = result.expect("nonempty downloads");
+                let (id, height, result) = result.expect("nonempty downloads");
                 match result {
                     Ok(Some(job)) => sender.send(job).await.map_err(|_| anyhow::anyhow!("bundle writer stopped"))?,
                     Ok(None) => {}
                     Err(error) if range.is_some() => return Err(error),
                     Err(error) => {
-                        admission.failed("Bundle retrieval failed");
+                        admission.failed("Couldn't download bundle", Some((id.as_str(), height)), &error);
                         eprintln!("retrieving scheduled bundle {id} failed: {error:#}");
                     }
                 }
@@ -950,7 +975,7 @@ async fn download_pending(
                     Err(error) if range.is_some() => return Err(error),
                     Err(error) => {
                         eprintln!("discovering pending bundles failed: {error:#}");
-                        admission.failed("Bundle discovery failed");
+                        admission.failed("Couldn't find pending bundles", None, &error);
                         next_poll = Instant::now() + RETRY_INTERVAL;
                     }
                 }

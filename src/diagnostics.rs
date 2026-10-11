@@ -292,7 +292,7 @@ fn error_details(error: &anyhow::Error) -> Vec<FailureDetail> {
     details
 }
 
-fn error_text(error: &anyhow::Error, public: bool) -> String {
+pub(crate) fn error_text(error: &anyhow::Error, public: bool) -> String {
     if !public {
         return format!("{error:#}");
     }

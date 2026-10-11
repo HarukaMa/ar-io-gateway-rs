@@ -2065,9 +2065,13 @@ impl BlockStore {
         let start = range.map(|(start, _)| sql_height(start)).transpose()?;
         let end = range.map(|(_, end)| sql_height(end)).transpose()?;
         // Limit each canonical block before advancing; nested items never drive this scan.
+        // bundle_totals counts the same roots, so fully completed heights skip the per-tx walk.
         const FORWARD: &str =
             "SELECT roots.id,c.height AS block_height,roots.position,0::smallint AS kind,roots.data_size
-             FROM public.canonical_blocks c
+             FROM (SELECT t.height FROM public.bundle_totals t
+                 WHERE ($5::bigint IS NULL OR t.height BETWEEN $5 AND $6)
+                 GROUP BY t.height HAVING sum(t.roots)>sum(t.completed)) pending
+             JOIN public.canonical_blocks c ON c.height=pending.height
              JOIN public.blocks b ON b.hash=c.block_hash AND b.height=c.height AND b.timestamp IS NOT NULL
              CROSS JOIN LATERAL (
                  SELECT p.id,bt.position,o.data_size::text AS data_size
