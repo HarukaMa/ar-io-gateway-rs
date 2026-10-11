@@ -748,7 +748,8 @@ fn info_response(state: &AppState, identity: RequestIdentity) -> Response {
         "ans104UnbundleFilter": filter,
         "ans104IndexFilter": filter,
         "supportedManifestVersions": ["0.1.0", "0.2.0"],
-        "release": env!("CARGO_PKG_VERSION"),
+        // The upstream ar-io-node release whose feature set this build tracks.
+        "release": "85-pre-rs",
         "services": {
             "bundlers": state.config.bundler_urls.iter()
                 .map(|url| serde_json::json!({"url": url})).collect::<Vec<_>>(),
@@ -1181,10 +1182,22 @@ async fn serve_offsets(State(state): State<Arc<AppState>>, Path(id): Path<String
         if let Some(content_type) = indexed.content_type {
             offsets["contentType"] = serde_json::json!(content_type);
         }
-        Ok::<_, anyhow::Error>(Some(offsets))
+        Ok::<_, anyhow::Error>(Some((root_id, offsets)))
     };
     match tokio::time::timeout(state.gateway.config.retrieval_timeout, lookup).await {
-        Ok(Ok(Some(offsets))) => json_response(&offsets),
+        // The root transaction header triggers HTTPSIG, binding the body via Content-Digest.
+        Ok(Ok(Some((root_id, offsets)))) => {
+            let body = serde_json::to_vec(&offsets).expect("response contains only JSON values");
+            let digest = format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(&body)));
+            Response::builder()
+                .header("content-type", "application/json; charset=utf-8")
+                .header("content-length", body.len().to_string())
+                .header("cache-control", "public, max-age=30")
+                .header("x-ar-io-root-transaction-id", root_id)
+                .header("content-digest", digest)
+                .body(Body::from(body))
+                .unwrap()
+        }
         Ok(Ok(None)) => {
             let mut response = error_response(StatusCode::NOT_FOUND, "Offsets not found");
             response.headers_mut().insert(
@@ -1386,6 +1399,17 @@ async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
             && state.config.apex_tx_id.is_some()
     });
     if !apex && arns_name(&headers, &state.config).is_none() {
+        if let Some(id) = request_sandbox_id(&headers, &state.config) {
+            let _permit = match request_permit(&state.request_permits) {
+                Ok(permit) => permit,
+                Err(response) => return response,
+            };
+            let id = URL_SAFE_NO_PAD.encode(id);
+            return match blocked_response(&state.gateway, &id, None).await {
+                Some(response) => response,
+                None => error_response(StatusCode::NOT_FOUND, "Not found"),
+            };
+        }
         let identity = RequestIdentity(
             request_host(&headers)
                 .as_deref()
@@ -1794,6 +1818,36 @@ fn sandbox_name(id: &[u8; 32]) -> String {
         encoded.push(ALPHABET[usize::from((buffer << (5 - bits)) & 31)] as char);
     }
     encoded
+}
+
+/// The ID a sandbox host's label encodes, if the label is a canonical one.
+fn request_sandbox_id(headers: &HeaderMap, config: &ServerConfig) -> Option<[u8; 32]> {
+    let host = request_host(headers)?;
+    let root = config.root_host(&host)?;
+    let label = host.strip_suffix(&root.host)?.strip_suffix('.')?;
+    let label = label.split('.').next()?;
+    if label.len() != 52 {
+        return None;
+    }
+    let mut id = [0_u8; 32];
+    let (mut buffer, mut bits, mut written) = (0_u16, 0_u8, 0);
+    for byte in label.bytes() {
+        let value = match byte {
+            b'a'..=b'z' => byte - b'a',
+            b'2'..=b'7' => byte - b'2' + 26,
+            _ => return None,
+        };
+        buffer = (buffer << 5) | u16::from(value);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            id[written] = (buffer >> bits) as u8;
+            written += 1;
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    // Nonzero trailing bits would map a second label onto the same ID.
+    (buffer == 0).then_some(id)
 }
 
 fn redirect_response(status: StatusCode, location: String, headers: &HeaderMap) -> Response {
@@ -2529,6 +2583,20 @@ async fn response_body(
     )))
 }
 
+/// The Content-Encoding to declare for a body tagged `tagged`: a single coding
+/// clients can decode, dropped when the body's leading bytes rule it out.
+async fn served_content_encoding(tagged: &str, body: &Content) -> Result<Option<&'static str>> {
+    let (coding, magic): (&'static str, &[u8]) = match tagged.trim().to_ascii_lowercase().as_str() {
+        "gzip" => ("gzip", &[0x1f, 0x8b]),
+        "zstd" => ("zstd", &[0x28, 0xb5, 0x2f, 0xfd]),
+        "br" => ("br", &[]),
+        "deflate" => ("deflate", &[]),
+        _ => return Ok(None),
+    };
+    let head = body.read_at(0, body.len().min(magic.len())).await?;
+    Ok((head[..] == magic[..head.len()]).then_some(coding))
+}
+
 async fn verified_response(
     verified: VerifiedData,
     resolution: Option<&Resolution>,
@@ -2554,9 +2622,14 @@ async fn verified_response(
         "verified digest has the wrong size"
     );
     let content_digest = format!("sha-256=:{}:", STANDARD.encode(digest_bytes));
+    // A re-pointed name serving identical bytes must not revalidate as 304.
+    let etag = match resolution {
+        Some(resolution) => format!("\"{digest}.{}\"", resolution.resolved_id),
+        None => verified.etag.clone(),
+    };
     let mut builder = Response::builder()
         .header("accept-ranges", "bytes")
-        .header("etag", verified.etag.as_str())
+        .header("etag", etag.as_str())
         .header("content-digest", content_digest)
         .header("x-ar-io-data-id", verified.id.as_str())
         .header("x-ar-io-digest", digest)
@@ -2597,7 +2670,7 @@ async fn verified_response(
         .filter(|_| {
             request_headers
                 .get("if-range")
-                .is_none_or(|value| value.as_bytes() == verified.etag.as_bytes())
+                .is_none_or(|value| value.as_bytes() == etag.as_bytes())
         })
         .map(|value| {
             value
@@ -2630,15 +2703,17 @@ async fn verified_response(
 
     if request_headers
         .get("if-none-match")
-        .is_some_and(|value| value.as_bytes() == verified.etag.as_bytes())
+        .is_some_and(|value| value.as_bytes() == etag.as_bytes())
     {
         return builder
             .status(StatusCode::NOT_MODIFIED)
             .body(Body::empty())
             .context("failed to construct not-modified response");
     }
-    if let Some(encoding) = &verified.content_encoding {
-        builder = builder.header("content-encoding", encoding.as_str());
+    if let Some(tagged) = verified.content_encoding.as_deref()
+        && let Some(encoding) = served_content_encoding(tagged, &verified.bytes).await?
+    {
+        builder = builder.header("content-encoding", encoding);
     }
     if let Some(ranges) = &range
         && ranges.len() > 1
@@ -4095,6 +4170,7 @@ mod tests {
             (sandbox_host(3), format!("/raw/{blocked_id}")),
             (sandbox_host(4), format!("/raw/{hashed_id}")),
             ("blocked-name.deep.example.com".to_owned(), "/".to_owned()),
+            (sandbox_host(3), "/".to_owned()),
         ] {
             let response = client
                 .get(format!("{base}{path}"))
@@ -4118,6 +4194,17 @@ mod tests {
             assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
             assert!(response.text().await.unwrap().contains("Blocked ID: "));
         }
+        let response = client
+            .get(format!("{base}/"))
+            .header(HOST, sandbox_host(2))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            "public, max-age=60, must-revalidate"
+        );
         let response = client
             .get(format!("{base}/{good_id}"))
             .header(HOST, "deep.example.com")
@@ -4926,7 +5013,7 @@ mod tests {
         )
         .unwrap();
         let response = verified_response(
-            verified,
+            verified.clone(),
             Some(&resolution),
             &config,
             &HeaderMap::new(),
@@ -4943,10 +5030,64 @@ mod tests {
         assert_eq!(headers["x-arns-record"], "@");
         assert_eq!(headers["x-arns-ttl-seconds"], "3600");
         assert_eq!(headers["cache-control"], "public, max-age=3600");
+        let composite = format!("\"{digest_url}.{}\"", resolution.resolved_id);
+        assert_eq!(headers["etag"], composite.as_str());
+        for (validator, status) in [
+            (format!("\"{digest_url}\""), StatusCode::OK),
+            (composite, StatusCode::NOT_MODIFIED),
+        ] {
+            let mut conditional = HeaderMap::new();
+            conditional.insert("if-none-match", validator.parse().unwrap());
+            let response = verified_response(
+                verified.clone(),
+                Some(&resolution),
+                &config,
+                &conditional,
+                &stream_limits(),
+                request_permit(&Arc::new(Semaphore::new(1))).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), status);
+        }
 
         let mut host_headers = HeaderMap::new();
         host_headers.insert(HOST, "lolcchekc.ar.mrx.im:3000".parse().unwrap());
         assert_eq!(arns_name(&host_headers, &config).unwrap(), "lolcchekc");
+        let id = decode_fixed::<32>(&verified.id, "data ID").unwrap();
+        let label = sandbox_name(&id);
+        host_headers.insert(HOST, format!("{label}.ar.mrx.im").parse().unwrap());
+        assert_eq!(request_sandbox_id(&host_headers, &config), Some(id));
+        // Same ID bits with nonzero trailing padding is not a canonical label.
+        let alias = format!("{}{}", &label[..51], (label.as_bytes()[51] + 1) as char);
+        host_headers.insert(HOST, format!("{alias}.ar.mrx.im").parse().unwrap());
+        assert_eq!(request_sandbox_id(&host_headers, &config), None);
+    }
+
+    #[tokio::test]
+    async fn declares_only_decodable_encodings_matching_the_body() {
+        let gzip = Content::from(GZIP_HELLO.to_vec());
+        let plain = Content::from(b"hello".to_vec());
+        for (tagged, body, expected) in [
+            ("gzip", &gzip, Some("gzip")),
+            (" GZIP ", &gzip, Some("gzip")),
+            ("gzip", &plain, None),
+            ("zstd", &plain, None),
+            ("br", &plain, Some("br")),
+            ("gzip, br", &gzip, None),
+            ("x-custom", &plain, None),
+        ] {
+            assert_eq!(
+                served_content_encoding(tagged, body).await.unwrap(),
+                expected,
+                "{tagged}"
+            );
+        }
+        let empty = Content::from(Vec::new());
+        assert_eq!(
+            served_content_encoding("gzip", &empty).await.unwrap(),
+            Some("gzip")
+        );
     }
 
     #[test]
