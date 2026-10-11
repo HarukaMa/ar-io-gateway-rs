@@ -2066,12 +2066,10 @@ impl BlockStore {
         let end = range.map(|(_, end)| sql_height(end)).transpose()?;
         // Limit each canonical block before advancing; nested items never drive this scan.
         // bundle_totals counts the same roots, so fully completed heights skip the per-tx walk.
+        // A per-height filter keeps the ordered block scan so LIMIT stops early in dense spans.
         const FORWARD: &str =
             "SELECT roots.id,c.height AS block_height,roots.position,0::smallint AS kind,roots.data_size
-             FROM (SELECT t.height FROM public.bundle_totals t
-                 WHERE ($5::bigint IS NULL OR t.height BETWEEN $5 AND $6)
-                 GROUP BY t.height HAVING sum(t.roots)>sum(t.completed)) pending
-             JOIN public.canonical_blocks c ON c.height=pending.height
+             FROM public.canonical_blocks c
              JOIN public.blocks b ON b.hash=c.block_hash AND b.height=c.height AND b.timestamp IS NOT NULL
              CROSS JOIN LATERAL (
                  SELECT p.id,bt.position,o.data_size::text AS data_size
@@ -2091,6 +2089,8 @@ impl BlockStore {
                  AND c.height<=(SELECT imported_through FROM public.block_index_state WHERE singleton)
                  AND ($1::bigint IS NULL OR c.height >= $1)
                  AND ($5::bigint IS NULL OR c.height BETWEEN $5 AND $6)
+                 AND (SELECT sum(t.roots)>sum(t.completed) FROM public.bundle_totals t
+                     WHERE t.height=c.height)
              ORDER BY c.height,roots.position LIMIT 64";
         static REVERSE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
             FORWARD
