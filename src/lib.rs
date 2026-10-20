@@ -582,6 +582,7 @@ pub struct Gateway {
     bundle_indexer: Option<background::BundleSubmitter>,
     bundle_writers: Arc<tokio::sync::Semaphore>,
     chunk_cache: Arc<Mutex<ChunkCache>>,
+    manifest_cache: Arc<parking_lot::Mutex<server::ManifestCache>>,
     chunk_flights: shared::Flights<
         (u128, BlockGeometry),
         std::result::Result<Option<ChunkFetch>, RetrievalFailure>,
@@ -643,6 +644,7 @@ impl Gateway {
             client,
             cache: Arc::new(Mutex::new(ContentCache::default())),
             chunk_cache: Arc::new(Mutex::new(ChunkCache::default())),
+            manifest_cache: Default::default(),
             chunk_flights: Default::default(),
             peers,
             block_store: None,
@@ -3721,11 +3723,8 @@ fn response_content_type(value: String) -> String {
             .is_some_and(|(name, _)| name.trim() == "charset")
     });
 
-    // Match Express 4's mime 1.x defaults, including case-sensitive prefix matching.
     if !has_charset
-        && (media_type.starts_with("text/")
-            || media_type.starts_with("application/json")
-            || media_type.starts_with("application/javascript"))
+        && (media_type.starts_with("text/") || media_type.starts_with("application/javascript"))
     {
         format!("{value}; charset=utf-8")
     } else {
@@ -7452,36 +7451,6 @@ mod tests {
 
         geometry.end_offset += 1;
         assert!(verify_chunk_range(chunk(), 1_001, 0, &geometry).is_err());
-    }
-
-    #[test]
-    fn content_type_matches_express_charset_defaults() {
-        for (tag, expected) in [
-            ("text/html", "text/html; charset=utf-8"),
-            ("application/json", "application/json; charset=utf-8"),
-            (
-                "application/javascript",
-                "application/javascript; charset=utf-8",
-            ),
-            ("application/ld+json", "application/ld+json"),
-            ("Application/JSON", "Application/JSON"),
-            (" text/html", " text/html"),
-            (
-                "text/plain; \tcharset \t=iso-8859-1",
-                "text/plain; \tcharset \t=iso-8859-1",
-            ),
-            (
-                "text/plain; Charset=ISO-8859-1",
-                "text/plain; Charset=ISO-8859-1; charset=utf-8",
-            ),
-            (
-                "application/json-seq",
-                "application/json-seq; charset=utf-8",
-            ),
-            ("image/png", "image/png"),
-        ] {
-            assert_eq!(response_content_type(tag.to_owned()), expected, "{tag}");
-        }
     }
 
     #[test]

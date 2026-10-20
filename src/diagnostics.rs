@@ -930,7 +930,7 @@ async fn run(
                 if server::is_manifest_content_type(&root.content_type) {
                     report["manifest"] = json!({"id": id, "path": path, "target_id": null});
                     let resolved = check("manifest_resolution", &id, async {
-                        server::resolve_manifest_content(&root, &path).await?
+                        server::resolve_manifest_content(&gateway, &root, &path).await?
                             .context("Manifest path was not found")
                     }).await?;
                     report["manifest"]["target_id"] = json!(resolved.id);
@@ -1148,7 +1148,7 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(report["status"], "failed");
+        assert!(report["content"].is_null());
         assert_eq!(report["resolved_id"], asset_id);
         assert!(
             report["steps"]

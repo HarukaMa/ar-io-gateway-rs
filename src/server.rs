@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     future::Future,
     io,
@@ -60,6 +60,7 @@ const MAX_ANT_RECORDS: usize = 1024;
 const MANIFEST_CONTENT_TYPE: &str = "application/x.arweave-manifest+json";
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
 const MAX_MANIFEST_PATH_BYTES: usize = 4096;
+const MAX_CACHED_MANIFEST_PATHS: usize = 1024;
 const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
 // ponytail: cap Range parsing and multipart bookkeeping; raise only for a measured client need.
 const MAX_RANGE_HEADER_BYTES: usize = 8 * 1024;
@@ -432,9 +433,68 @@ struct Manifest {
     paths: serde_json::Map<String, serde_json::Value>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ManifestResolution {
     pub(crate) id: String,
     pub(crate) fallback: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct ManifestCache {
+    entries: HashMap<String, CachedManifest>,
+    paths: usize,
+    clock: u128,
+}
+
+struct CachedManifest {
+    digest: String,
+    paths: HashMap<String, Option<ManifestResolution>>,
+    used: u128,
+}
+
+impl ManifestCache {
+    fn get(&mut self, verified: &VerifiedData, path: &str) -> Option<Option<ManifestResolution>> {
+        let manifest = self.entries.get_mut(&verified.id)?;
+        if manifest.digest != verified.etag {
+            return None;
+        }
+        let resolution = manifest.paths.get(path)?.clone();
+        self.clock += 1;
+        manifest.used = self.clock;
+        Some(resolution)
+    }
+
+    fn insert(&mut self, verified: &VerifiedData, path: &str, target: Option<ManifestResolution>) {
+        if self
+            .entries
+            .get(&verified.id)
+            .is_some_and(|entry| entry.digest != verified.etag)
+        {
+            self.paths -= self.entries.remove(&verified.id).unwrap().paths.len();
+        }
+        self.clock += 1;
+        let manifest = self
+            .entries
+            .entry(verified.id.clone())
+            .or_insert_with(|| CachedManifest {
+                digest: verified.etag.clone(),
+                paths: HashMap::new(),
+                used: self.clock,
+            });
+        manifest.used = self.clock;
+        if manifest.paths.insert(path.to_owned(), target).is_none() {
+            self.paths += 1;
+        }
+        while self.paths > MAX_CACHED_MANIFEST_PATHS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(id, _)| id.clone())
+                .unwrap();
+            self.paths -= self.entries.remove(&oldest).unwrap().paths.len();
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -611,6 +671,7 @@ const SIGNATURE_TRIGGERS: &[&str] = &[
 const SIGNATURE_EXTRA_HEADERS: &[&str] = &[
     "content-type",
     "content-digest",
+    "repr-digest",
     "x-ar-io-root-data-item-offset",
     "x-ar-io-root-data-offset",
     "x-ar-io-root-item-offset",
@@ -749,7 +810,7 @@ fn info_response(state: &AppState, identity: RequestIdentity) -> Response {
         "ans104IndexFilter": filter,
         "supportedManifestVersions": ["0.1.0", "0.2.0"],
         // The upstream ar-io-node release whose feature set this build tracks.
-        "release": "85-pre-rs",
+        "release": "85-rs",
         "services": {
             "bundlers": state.config.bundler_urls.iter()
                 .map(|url| serde_json::json!({"url": url})).collect::<Vec<_>>(),
@@ -1645,7 +1706,7 @@ async fn retrieve_response(
         });
     }
 
-    let target = resolve_manifest_content(&verified, manifest_path).await;
+    let target = resolve_manifest_content(&state.gateway, &verified, manifest_path).await;
     let target = match target {
         Ok(Some(target)) => target,
         Ok(None) => return error_response(StatusCode::NOT_FOUND, "Not found"),
@@ -1709,6 +1770,7 @@ pub(crate) fn is_manifest_content_type(value: &str) -> bool {
 }
 
 pub(crate) async fn resolve_manifest_content(
+    gateway: &Gateway,
     verified: &VerifiedData,
     path: &str,
 ) -> Result<Option<ManifestResolution>> {
@@ -1716,8 +1778,22 @@ pub(crate) async fn resolve_manifest_content(
         verified.bytes.len() <= MAX_MANIFEST_BYTES,
         "manifest exceeds size limit"
     );
+    ensure!(
+        path.len() <= MAX_MANIFEST_PATH_BYTES,
+        "manifest path exceeds size limit"
+    );
+    let path = path.trim_end_matches('/');
+    if let Some(target) = gateway.manifest_cache.lock().get(verified, path) {
+        return Ok(target);
+    }
     let bytes = verified.bytes.read_all(MAX_MANIFEST_BYTES).await?;
-    resolve_manifest(&bytes, path)
+    let parse_path = path.to_owned();
+    let target = super::cpu_work(move || resolve_manifest(&bytes, &parse_path)).await?;
+    gateway
+        .manifest_cache
+        .lock()
+        .insert(verified, path, target.clone());
+    Ok(target)
 }
 
 fn resolve_manifest(bytes: &[u8], path: &str) -> Result<Option<ManifestResolution>> {
@@ -2318,6 +2394,16 @@ enum ByteRangeError {
     Unsatisfiable,
 }
 
+fn uses_byte_range(headers: &HeaderMap) -> bool {
+    headers.get("range").is_some_and(|value| {
+        value.to_str().map_or(true, |value| {
+            value.split_once('=').is_none_or(|(unit, _)| {
+                unit.trim().is_empty() || unit.trim().eq_ignore_ascii_case("bytes")
+            })
+        })
+    })
+}
+
 fn parse_byte_ranges(
     value: &str,
     total: usize,
@@ -2325,9 +2411,10 @@ fn parse_byte_ranges(
     if value.len() > MAX_RANGE_HEADER_BYTES {
         return Err(ByteRangeError::Malformed);
     }
-    let value = value
-        .strip_prefix("bytes=")
-        .ok_or(ByteRangeError::Malformed)?;
+    let (unit, value) = value.split_once('=').ok_or(ByteRangeError::Malformed)?;
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return Err(ByteRangeError::Malformed);
+    }
     let mut ranges = Vec::new();
     for (index, value) in value.split(',').enumerate() {
         if index == MAX_BYTE_RANGES {
@@ -2627,10 +2714,25 @@ async fn verified_response(
         Some(resolution) => format!("\"{digest}.{}\"", resolution.resolved_id),
         None => verified.etag.clone(),
     };
+    let range_header = request_headers
+        .get("range")
+        .filter(|_| {
+            request_headers
+                .get("if-range")
+                .is_none_or(|value| value.as_bytes() == etag.as_bytes())
+        })
+        .filter(|_| uses_byte_range(request_headers));
     let mut builder = Response::builder()
         .header("accept-ranges", "bytes")
         .header("etag", etag.as_str())
-        .header("content-digest", content_digest)
+        .header(
+            if range_header.is_some() {
+                "repr-digest"
+            } else {
+                "content-digest"
+            },
+            content_digest,
+        )
         .header("x-ar-io-data-id", verified.id.as_str())
         .header("x-ar-io-digest", digest)
         .header("x-ar-io-stable", "true")
@@ -2665,13 +2767,7 @@ async fn verified_response(
         );
     }
 
-    let range = request_headers
-        .get("range")
-        .filter(|_| {
-            request_headers
-                .get("if-range")
-                .is_none_or(|value| value.as_bytes() == etag.as_bytes())
-        })
+    let range = range_header
         .map(|value| {
             value
                 .to_str()
@@ -5091,6 +5187,37 @@ mod tests {
     }
 
     #[test]
+    fn manifest_cache_is_digest_scoped_and_bounded() {
+        let mut cache = ManifestCache::default();
+        let mut manifest = response_fixture(b"first manifest");
+        let target = ManifestResolution {
+            id: URL_SAFE_NO_PAD.encode([1; 32]),
+            fallback: false,
+        };
+        cache.insert(&manifest, "index.html", Some(target.clone()));
+        cache.insert(&manifest, "missing", None);
+        assert_eq!(
+            cache.get(&manifest, "index.html"),
+            Some(Some(target.clone()))
+        );
+        assert_eq!(cache.get(&manifest, "missing"), Some(None));
+        assert_eq!(cache.get(&manifest, "other"), None);
+        manifest.etag = response_fixture(b"changed manifest").etag;
+        assert_eq!(cache.get(&manifest, "index.html"), None);
+        cache.insert(&manifest, "index.html", None);
+        assert_eq!(cache.get(&manifest, "index.html"), Some(None));
+        assert_eq!(cache.get(&manifest, "missing"), None);
+        for index in 0..MAX_CACHED_MANIFEST_PATHS {
+            manifest.id = index.to_string();
+            cache.insert(&manifest, "index.html", Some(target.clone()));
+        }
+        assert!(cache.paths <= MAX_CACHED_MANIFEST_PATHS);
+        assert_eq!(cache.get(&manifest, "index.html"), Some(Some(target)));
+        manifest.id = response_fixture(b"first manifest").id;
+        assert_eq!(cache.get(&manifest, "index.html"), None);
+    }
+
+    #[test]
     fn resolves_manifests_and_encodes_sandbox_hosts() {
         const INDEX_ID: &str = "cG7Hdi_iTQPoEYgQJFqJ8NMpN4KoZ-vH_j7pG4iP7NI";
         const PATH_ID: &str = "fZ4d7bkCAUiXSfo3zFsPiQvpLVKVtXUKB6kiLNt2XVQ";
@@ -5213,6 +5340,110 @@ mod tests {
                 } else {
                     b"hello".as_slice()
                 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn range_units_and_digests_match_the_selected_representation() {
+        let config = ServerConfig::new(
+            "127.0.0.1:0",
+            "example.org",
+            "http://127.0.0.1:1",
+            ARNS_PROGRAM,
+            ANT_PROGRAM,
+            1,
+        )
+        .unwrap();
+        let limits = stream_limits();
+        let permits = Arc::new(Semaphore::new(1));
+        let expected_digest = format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(b"hello")));
+        for (range, conditional, if_range, status, representation_digest) in [
+            ("items=0-1", false, false, StatusCode::OK, false),
+            ("BYTES=1-3", false, false, StatusCode::PARTIAL_CONTENT, true),
+            (
+                "bytes=9-",
+                false,
+                false,
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                true,
+            ),
+            ("bytes=bad", false, false, StatusCode::BAD_REQUEST, true),
+            ("=0-1", false, false, StatusCode::BAD_REQUEST, true),
+            ("bytes=1-3", true, false, StatusCode::NOT_MODIFIED, true),
+            ("bytes=1-3", false, true, StatusCode::OK, false),
+        ] {
+            let verified = response_fixture(b"hello");
+            let mut headers = HeaderMap::new();
+            headers.insert("range", range.parse().unwrap());
+            if conditional {
+                headers.insert("if-none-match", verified.etag.parse().unwrap());
+            }
+            if if_range {
+                headers.insert("if-range", "\"old\"".parse().unwrap());
+            }
+            let response = verified_response(
+                verified,
+                None,
+                &config,
+                &headers,
+                &limits,
+                request_permit(&permits).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), status, "{range}");
+            let (present, absent) = if representation_digest {
+                ("repr-digest", "content-digest")
+            } else {
+                ("content-digest", "repr-digest")
+            };
+            assert_eq!(response.headers()[present], expected_digest, "{range}");
+            assert!(!response.headers().contains_key(absent), "{range}");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            if status == StatusCode::OK {
+                assert_eq!(bytes.as_ref(), b"hello");
+            } else if status == StatusCode::PARTIAL_CONTENT {
+                assert_eq!(bytes.as_ref(), b"ell");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preserves_uploaded_json_content_types() {
+        let config = ServerConfig::new(
+            "127.0.0.1:0",
+            "example.org",
+            "http://127.0.0.1:1",
+            ARNS_PROGRAM,
+            ANT_PROGRAM,
+            1,
+        )
+        .unwrap();
+        let limits = stream_limits();
+        let permits = Arc::new(Semaphore::new(1));
+        for content_type in ["application/json", "application/json; charset=us-ascii"] {
+            let mut verified = response_fixture(br#"{"name":"example"}"#);
+            verified.content_type = content_type.to_owned();
+            let response = verified_response(
+                verified,
+                None,
+                &config,
+                &HeaderMap::new(),
+                &limits,
+                request_permit(&permits).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.headers()["content-type"], content_type);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                br#"{"name":"example"}"#,
             );
         }
     }
@@ -5536,7 +5767,7 @@ mod signing_tests {
         };
         let mut response = Response::builder()
             .status(206)
-            .header("content-digest", "sha-256=:YWJj:")
+            .header("repr-digest", "sha-256=:YWJj:")
             .header("x-ar-io-verified", "true")
             .body(Body::empty())
             .unwrap();
@@ -5555,7 +5786,7 @@ mod signing_tests {
             .unwrap();
         let signature = Signature::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
         let base = format!(
-            "\"@status\": 206\n\"content-digest\": sha-256=:YWJj:\n\"x-ar-io-verified\": true\n\"@method\";req: GET\n\"@path\";req: /raw/id\n\"@signature-params\": {params}"
+            "\"@status\": 206\n\"repr-digest\": sha-256=:YWJj:\n\"x-ar-io-verified\": true\n\"@method\";req: GET\n\"@path\";req: /raw/id\n\"@signature-params\": {params}"
         );
         let public = signer.key.verifying_key();
         public.verify_strict(base.as_bytes(), &signature).unwrap();
