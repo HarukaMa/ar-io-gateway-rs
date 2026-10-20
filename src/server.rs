@@ -1520,19 +1520,12 @@ async fn serve_raw(
             {
                 return response;
             }
-            verified_response(
-                verified,
-                None,
-                &state.config,
-                &headers,
-                &state.gateway.config,
-                permit,
-            )
-            .await
-            .unwrap_or_else(|error| {
-                eprintln!("response construction failed: {error:#}");
-                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-            })
+            verified_response(verified, None, &headers, &state.gateway.config, permit)
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("response construction failed: {error:#}");
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+                })
         }
         Err(error) => retrieval_error_response(error),
     }
@@ -1655,7 +1648,7 @@ async fn serve_arns_path(
     if resolution.index > usize::from(resolution.limit) {
         return error_response(StatusCode::PAYMENT_REQUIRED, "Payment Required");
     }
-    retrieve_response(
+    let mut response = retrieve_response(
         state,
         &resolution.resolved_id,
         path,
@@ -1665,7 +1658,28 @@ async fn serve_arns_path(
         headers,
         permit,
     )
-    .await
+    .await;
+    for (name, value) in [
+        ("x-arns-name", resolution.name.as_str()),
+        ("x-arns-basename", resolution.basename.as_str()),
+        ("x-arns-record", resolution.record.as_str()),
+        ("x-arns-resolved-id", resolution.resolved_id.as_str()),
+        ("x-arns-ttl-seconds", &resolution.ttl.to_string()),
+        (
+            "x-arns-ant-program-id",
+            state.config.ant_program_id.as_str(),
+        ),
+        ("x-arns-ant-id", resolution.ant_id.as_str()),
+        ("x-arns-resolved-at", &resolution.resolved_at.to_string()),
+        ("x-arns-undername-limit", &resolution.limit.to_string()),
+        ("x-arns-record-index", &resolution.index.to_string()),
+    ] {
+        response.headers_mut().insert(
+            name,
+            HeaderValue::from_str(value).expect("validated ArNS resolution header"),
+        );
+    }
+    response
 }
 
 async fn retrieve_response(
@@ -1691,19 +1705,12 @@ async fn retrieve_response(
         return response;
     }
     if !is_manifest_content_type(&verified.content_type) {
-        return verified_response(
-            verified,
-            resolution,
-            &state.config,
-            headers,
-            &state.gateway.config,
-            permit,
-        )
-        .await
-        .unwrap_or_else(|error| {
-            eprintln!("response construction failed: {error:#}");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-        });
+        return verified_response(verified, resolution, headers, &state.gateway.config, permit)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("response construction failed: {error:#}");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            });
     }
 
     let target = resolve_manifest_content(&state.gateway, &verified, manifest_path).await;
@@ -1742,7 +1749,6 @@ async fn retrieve_response(
     let mut response = verified_response(
         verified_target,
         resolution,
-        &state.config,
         headers,
         &state.gateway.config,
         permit,
@@ -2687,7 +2693,6 @@ async fn served_content_encoding(tagged: &str, body: &Content) -> Result<Option<
 async fn verified_response(
     verified: VerifiedData,
     resolution: Option<&Resolution>,
-    config: &ServerConfig,
     request_headers: &HeaderMap,
     limits: &Config,
     permit: RequestPermit,
@@ -2741,21 +2746,10 @@ async fn verified_response(
         .header("x-cache", if verified.cache_hit { "HIT" } else { "MISS" })
         .header("x-ar-io-hops", "1");
     if let Some(resolution) = resolution {
-        builder = builder
-            .header(
-                "cache-control",
-                format!("public, max-age={}", resolution.ttl),
-            )
-            .header("x-arns-name", resolution.name.as_str())
-            .header("x-arns-basename", resolution.basename.as_str())
-            .header("x-arns-record", resolution.record.as_str())
-            .header("x-arns-resolved-id", resolution.resolved_id.as_str())
-            .header("x-arns-ttl-seconds", resolution.ttl.to_string())
-            .header("x-arns-ant-program-id", config.ant_program_id.as_str())
-            .header("x-arns-ant-id", resolution.ant_id.as_str())
-            .header("x-arns-resolved-at", resolution.resolved_at.to_string())
-            .header("x-arns-undername-limit", resolution.limit.to_string())
-            .header("x-arns-record-index", resolution.index.to_string());
+        builder = builder.header(
+            "cache-control",
+            format!("public, max-age={}", resolution.ttl),
+        );
     } else {
         builder = builder.header(
             "cache-control",
@@ -3785,6 +3779,176 @@ mod tests {
             assert!(!body.contains("private-key"));
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn preserves_arns_resolution_when_content_is_unavailable() {
+        let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/",
+                axum::routing::post(|body: axum::body::Bytes| async move {
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let account = match request["params"][0].as_str().unwrap() {
+                        "E8Vm6GR2CDdsx5FRaxQ7iVoN832mTjufN8zuB2pvzpYn" => {
+                            Some((ARNS_ACCOUNT, ARNS_PROGRAM))
+                        }
+                        "3JEvMXaLmWvya2jtEX7pgzxHqZB5iiK2GQNdFXcjj26G" => {
+                            Some((ANT_ACCOUNT, ANT_PROGRAM))
+                        }
+                        _ => None,
+                    };
+                    let value = account.map(|(data, owner)| {
+                        serde_json::json!({
+                            "data": [data, "base64"],
+                            "owner": owner,
+                            "executable": false,
+                            "space": STANDARD.decode(data).unwrap().len(),
+                        })
+                    });
+                    json_response(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "result": {"value": value},
+                    }))
+                }),
+            )
+            .route(
+                "/graphql",
+                axum::routing::post(|| async {
+                    json_response(&serde_json::json!({"data": {"transactions": {"edges": []}}}))
+                }),
+            )
+            .fallback({
+                let unavailable = unavailable.clone();
+                move || {
+                    let unavailable = unavailable.clone();
+                    async move {
+                        if unavailable.load(std::sync::atomic::Ordering::Relaxed) {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::NOT_FOUND
+                        }
+                    }
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let _upstream = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let state = Arc::new(AppState {
+            gateway: Gateway::new(
+                Config::new(
+                    &upstream,
+                    &upstream,
+                    vec![upstream.clone()],
+                    Duration::from_secs(2),
+                    1,
+                    4096,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            config: ServerConfig::new(
+                "127.0.0.1:0",
+                "example.com",
+                &upstream,
+                ARNS_PROGRAM,
+                ANT_PROGRAM,
+                2,
+            )
+            .unwrap(),
+            request_permits: Arc::new(Semaphore::new(2)),
+            chunk_permits: Arc::new(Semaphore::new(1)),
+            diagnostic_permits: Semaphore::new(1),
+            started_at: Instant::now(),
+            indexing_status: Mutex::new(serde_json::Value::Null),
+        });
+        let app = Router::new()
+            .route("/", get(serve_arns))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (method, missing_upstream, status, cache_control) in [
+            (
+                Method::HEAD,
+                false,
+                StatusCode::NOT_FOUND,
+                "public, max-age=60, must-revalidate",
+            ),
+            (
+                Method::GET,
+                false,
+                StatusCode::NOT_FOUND,
+                "public, max-age=60, must-revalidate",
+            ),
+            (
+                Method::GET,
+                true,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no-store",
+            ),
+        ] {
+            unavailable.store(missing_upstream, std::sync::atomic::Ordering::Relaxed);
+            let response = client
+                .request(method, &base)
+                .header(HOST, "lolcchekc.example.com")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()["x-arns-resolved-id"],
+                "3F_yldqW_zt6Ci_47w-7O76lPpegpu1rs7H2iyultVY"
+            );
+            assert_eq!(response.headers()["x-arns-ttl-seconds"], "3600");
+            assert_eq!(
+                response.headers()["x-arns-ant-id"],
+                "H8Pya8AGbnt39Em7Zy5EHiXGY1MEuV5MpSM2JXzNYYY3"
+            );
+            assert_eq!(response.headers()[CACHE_CONTROL], cache_control);
+            assert!(!response.headers().contains_key("x-ar-io-verified"));
+        }
+        let response = client
+            .get(&base)
+            .header(HOST, "missing.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!response.headers().contains_key("x-arns-resolved-id"));
+        assert!(!response.headers().contains_key("x-arns-ttl-seconds"));
+
+        let mut manifest = response_fixture(
+            br#"{"manifest":"arweave/paths","version":"0.1.0","index":{"path":"missing.html"},"paths":{}}"#,
+        );
+        manifest.id = "3F_yldqW_zt6Ci_47w-7O76lPpegpu1rs7H2iyultVY".to_owned();
+        manifest.content_type = MANIFEST_CONTENT_TYPE.to_owned();
+        state
+            .gateway
+            .cache
+            .lock()
+            .unwrap()
+            .insert(manifest, 1, 4096);
+        let response = client
+            .get(&base)
+            .header(HOST, "lolcchekc.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers()["x-arns-resolved-id"],
+            "3F_yldqW_zt6Ci_47w-7O76lPpegpu1rs7H2iyultVY"
+        );
+        assert_eq!(response.headers()["x-arns-ttl-seconds"], "3600");
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            "public, max-age=60, must-revalidate"
+        );
     }
 
     #[tokio::test]
@@ -4979,15 +5143,6 @@ mod tests {
         let mut limits = stream_limits();
         limits.stream_idle_timeout = Duration::from_secs(5);
         limits.stream_timeout = Duration::from_secs(30);
-        let config = ServerConfig::new(
-            "127.0.0.1:0",
-            "example.com",
-            "http://127.0.0.1:1",
-            ARNS_PROGRAM,
-            ANT_PROGRAM,
-            1,
-        )
-        .unwrap();
         let permits = Arc::new(Semaphore::new(1));
         let budget = Arc::new(SpoolBudget::new(GZIP_HELLO.len()));
         for (consume, expire) in [(true, false), (false, false), (false, true)] {
@@ -5004,7 +5159,6 @@ mod tests {
             let response = verified_response(
                 verified,
                 None,
-                &config,
                 &headers,
                 &limits,
                 request_permit(&permits).unwrap(),
@@ -5111,7 +5265,6 @@ mod tests {
         let response = verified_response(
             verified.clone(),
             Some(&resolution),
-            &config,
             &HeaderMap::new(),
             &stream_limits(),
             request_permit(&Arc::new(Semaphore::new(1))).unwrap(),
@@ -5122,9 +5275,6 @@ mod tests {
         assert_eq!(headers["content-type"], "text/html; charset=utf-8");
         assert_eq!(headers["content-length"], "5");
         assert_eq!(headers["x-ar-io-verified"], "true");
-        assert_eq!(headers["x-arns-name"], "lolcchekc");
-        assert_eq!(headers["x-arns-record"], "@");
-        assert_eq!(headers["x-arns-ttl-seconds"], "3600");
         assert_eq!(headers["cache-control"], "public, max-age=3600");
         let composite = format!("\"{digest_url}.{}\"", resolution.resolved_id);
         assert_eq!(headers["etag"], composite.as_str());
@@ -5137,7 +5287,6 @@ mod tests {
             let response = verified_response(
                 verified.clone(),
                 Some(&resolution),
-                &config,
                 &conditional,
                 &stream_limits(),
                 request_permit(&Arc::new(Semaphore::new(1))).unwrap(),
@@ -5289,15 +5438,6 @@ mod tests {
 
     #[tokio::test]
     async fn if_range_requires_a_matching_strong_validator() {
-        let config = ServerConfig::new(
-            "127.0.0.1:0",
-            "example.org",
-            "http://127.0.0.1:1",
-            ARNS_PROGRAM,
-            ANT_PROGRAM,
-            8,
-        )
-        .unwrap();
         let limits = stream_limits();
         let permits = Arc::new(Semaphore::new(1));
         let etag = response_fixture(b"hello").etag;
@@ -5315,7 +5455,6 @@ mod tests {
             let response = verified_response(
                 response_fixture(b"hello"),
                 None,
-                &config,
                 &headers,
                 &limits,
                 request_permit(&permits).unwrap(),
@@ -5346,15 +5485,6 @@ mod tests {
 
     #[tokio::test]
     async fn range_units_and_digests_match_the_selected_representation() {
-        let config = ServerConfig::new(
-            "127.0.0.1:0",
-            "example.org",
-            "http://127.0.0.1:1",
-            ARNS_PROGRAM,
-            ANT_PROGRAM,
-            1,
-        )
-        .unwrap();
         let limits = stream_limits();
         let permits = Arc::new(Semaphore::new(1));
         let expected_digest = format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(b"hello")));
@@ -5385,7 +5515,6 @@ mod tests {
             let response = verified_response(
                 verified,
                 None,
-                &config,
                 &headers,
                 &limits,
                 request_permit(&permits).unwrap(),
@@ -5413,15 +5542,6 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_uploaded_json_content_types() {
-        let config = ServerConfig::new(
-            "127.0.0.1:0",
-            "example.org",
-            "http://127.0.0.1:1",
-            ARNS_PROGRAM,
-            ANT_PROGRAM,
-            1,
-        )
-        .unwrap();
         let limits = stream_limits();
         let permits = Arc::new(Semaphore::new(1));
         for content_type in ["application/json", "application/json; charset=us-ascii"] {
@@ -5430,7 +5550,6 @@ mod tests {
             let response = verified_response(
                 verified,
                 None,
-                &config,
                 &HeaderMap::new(),
                 &limits,
                 request_permit(&permits).unwrap(),
@@ -5449,15 +5568,6 @@ mod tests {
     }
     #[tokio::test]
     async fn serves_single_ranges_and_etag_conditionals() {
-        let config = ServerConfig::new(
-            "127.0.0.1:0",
-            "ar.mrx.im",
-            "http://127.0.0.1:1",
-            ARNS_PROGRAM,
-            ANT_PROGRAM,
-            8,
-        )
-        .unwrap();
         let limits = stream_limits();
         let permits = Arc::new(Semaphore::new(1));
         let verified = || response_fixture(b"hello");
@@ -5467,7 +5577,6 @@ mod tests {
         let response = verified_response(
             verified(),
             None,
-            &config,
             &headers,
             &limits,
             request_permit(&permits).unwrap(),
@@ -5492,7 +5601,6 @@ mod tests {
         let response = verified_response(
             verified(),
             None,
-            &config,
             &headers,
             &limits,
             request_permit(&permits).unwrap(),
@@ -5514,7 +5622,6 @@ mod tests {
         let response = verified_response(
             verified(),
             None,
-            &config,
             &headers,
             &limits,
             request_permit(&permits).unwrap(),

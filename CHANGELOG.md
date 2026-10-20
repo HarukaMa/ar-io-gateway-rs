@@ -2,6 +2,7 @@
 
 ## 85-rs
 
+- Preserve resolved ArNS headers on content retrieval errors, including missing content and manifest paths.
 - Preserve uploaded JSON Content-Type parameters without adding a charset.
 - Accept case-insensitive byte ranges and ignore unknown range units.
 - Use signed Repr-Digest headers for whole-item digests on range responses.
