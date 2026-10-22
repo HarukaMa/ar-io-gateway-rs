@@ -917,7 +917,7 @@ async fn run(
                 }).await?;
                 anyhow::ensure!(resolution.index <= usize::from(resolution.limit), "ArNS undername exceeds the allowed limit");
                 let id = resolution.resolved_id.clone();
-                report["resolution"] = serde_json::to_value(resolution)?;
+                report["resolution"] = serde_json::to_value(resolution.as_ref())?;
                 id
             };
             report["resolved_id"] = json!(id);

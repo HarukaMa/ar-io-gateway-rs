@@ -57,6 +57,7 @@ const ARNS_RECORD_SEED: &[u8] = b"arns_record";
 const ANT_RECORD_SEED: &[u8] = b"ant_record";
 const MAX_SOLANA_ACCOUNT_BYTES: usize = 4096;
 const MAX_ANT_RECORDS: usize = 1024;
+const MAX_CACHED_ARNS_RESOLUTIONS: usize = 4096;
 const MANIFEST_CONTENT_TYPE: &str = "application/x.arweave-manifest+json";
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
 const MAX_MANIFEST_PATH_BYTES: usize = 4096;
@@ -94,6 +95,9 @@ pub struct ServerConfig {
     gar_program_id: String,
     arns_program_id: String,
     ant_program_id: String,
+    arns_cache: Arc<Mutex<ArnsCache>>,
+    arns_flights:
+        crate::shared::Flights<String, Result<Option<Arc<Resolution>>, super::RetrievalFailure>>,
     max_concurrent_requests: usize,
     bundler_urls: Vec<String>,
     owned_wallets: HashSet<[u8; 32]>,
@@ -212,6 +216,8 @@ impl ServerConfig {
             gar_program_id: "89fNiiwgpFSPHKuqfNUkgYTYjtAJAhyqHjXmgXeppGpf".to_owned(),
             arns_program_id: arns_program_id.to_owned(),
             ant_program_id: ant_program_id.to_owned(),
+            arns_cache: Default::default(),
+            arns_flights: Default::default(),
             max_concurrent_requests,
             bundler_urls: vec!["https://turbo.ardrive.io/".to_owned()],
             owned_wallets: HashSet::new(),
@@ -419,6 +425,45 @@ pub(crate) struct Resolution {
     pub(crate) limit: u16,
     pub(crate) index: usize,
     resolved_at: u128,
+    #[serde(skip)]
+    expires_at: StreamInstant,
+}
+
+#[derive(Default)]
+struct ArnsCache {
+    entries: HashMap<String, (Arc<Resolution>, u128)>,
+    clock: u128,
+}
+
+impl ArnsCache {
+    fn get(&mut self, name: &str) -> Option<Arc<Resolution>> {
+        let (resolution, used) = self.entries.get_mut(name)?;
+        if resolution.expires_at <= StreamInstant::now() {
+            self.entries.remove(name);
+            return None;
+        }
+        self.clock += 1;
+        *used = self.clock;
+        Some(resolution.clone())
+    }
+
+    fn insert(&mut self, resolution: Arc<Resolution>) {
+        if resolution.expires_at <= StreamInstant::now() {
+            return;
+        }
+        self.clock += 1;
+        self.entries
+            .insert(resolution.name.clone(), (resolution, self.clock));
+        if self.entries.len() > MAX_CACHED_ARNS_RESOLUTIONS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(name, _)| name.clone())
+                .unwrap();
+            self.entries.remove(&oldest);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1183,17 +1228,20 @@ async fn serve_resolver(State(state): State<Arc<AppState>>, Path(name): Path<Str
         "limit": resolution.limit,
     }));
     for (name, value) in [
-        ("x-arns-resolved-id", resolution.resolved_id),
-        ("x-arns-ttl-seconds", resolution.ttl.to_string()),
-        ("x-arns-ant-program-id", state.config.ant_program_id.clone()),
-        ("x-arns-ant-id", resolution.ant_id),
-        ("x-arns-resolved-at", resolution.resolved_at.to_string()),
-        ("x-arns-record-index", resolution.index.to_string()),
-        ("x-arns-undername-limit", resolution.limit.to_string()),
+        ("x-arns-resolved-id", resolution.resolved_id.as_str()),
+        ("x-arns-ttl-seconds", &resolution.ttl.to_string()),
+        (
+            "x-arns-ant-program-id",
+            state.config.ant_program_id.as_str(),
+        ),
+        ("x-arns-ant-id", resolution.ant_id.as_str()),
+        ("x-arns-resolved-at", &resolution.resolved_at.to_string()),
+        ("x-arns-record-index", &resolution.index.to_string()),
+        ("x-arns-undername-limit", &resolution.limit.to_string()),
     ] {
         response.headers_mut().insert(
             name,
-            HeaderValue::from_str(&value).expect("validated resolution header"),
+            HeaderValue::from_str(value).expect("validated resolution header"),
         );
     }
     response
@@ -2016,22 +2064,53 @@ pub(crate) async fn resolve_arns(
     gateway: &Gateway,
     config: &ServerConfig,
     name: String,
+) -> Result<Option<Arc<Resolution>>> {
+    if let Some(resolution) = config.arns_cache.lock().get(&name) {
+        return Ok(Some(resolution));
+    }
+    let cache = config.arns_cache.clone();
+    let gateway = gateway.clone();
+    let rpc_url = config.solana_rpc_url.clone();
+    let arns_program = config.arns_program_id.clone();
+    let ant_program = config.ant_program_id.clone();
+    crate::shared::run(&config.arns_flights, name.clone(), async move {
+        if let Some(resolution) = cache.lock().get(&name) {
+            return Ok(Some(resolution));
+        }
+        let resolution =
+            resolve_arns_uncached(&gateway, &rpc_url, &arns_program, &ant_program, name)
+                .await
+                .map_err(super::RetrievalFailure::from)?
+                .map(Arc::new);
+        if let Some(resolution) = &resolution {
+            cache.lock().insert(resolution.clone());
+        }
+        Ok(resolution)
+    })
+    .await
+    .map_err(Into::into)
+}
+
+async fn resolve_arns_uncached(
+    gateway: &Gateway,
+    rpc_url: &Url,
+    arns_program: &str,
+    ant_program: &str,
+    name: String,
 ) -> Result<Option<Resolution>> {
+    let started_at = StreamInstant::now();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?;
     let (basename, undername) = split_arns_name(&name)?;
 
     let name_hash: [u8; 32] = Sha256::digest(basename.as_bytes()).into();
     let (arns_address, arns_bump) = derive_pda(
-        &config.arns_program_id,
+        arns_program,
         &[ARNS_RECORD_SEED, name_hash.as_slice()],
         "ArNS record",
     )?;
-    let Some(arns_bytes) = account_info(
-        gateway,
-        &config.solana_rpc_url,
-        &arns_address,
-        &config.arns_program_id,
-    )
-    .await?
+    let Some(arns_bytes) = account_info(gateway, rpc_url, &arns_address, arns_program).await?
     else {
         return Ok(None);
     };
@@ -2039,23 +2118,24 @@ pub(crate) async fn resolve_arns(
     ensure!(arns.name == basename, "ArNS account name mismatch");
     ensure!(arns.bump == arns_bump, "ArNS record bump mismatch");
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?;
-    if let Some(end_timestamp) = arns.end_timestamp
-        && !arns_is_active(
+    let lease_remaining = if let Some(end_timestamp) = arns.end_timestamp {
+        let remaining = arns_lease_remaining(
             end_timestamp,
-            arns_grace_period(gateway, config).await?,
-            now.as_secs(),
-        )?
-    {
-        return Ok(None);
-    }
+            arns_grace_period(gateway, rpc_url, arns_program).await?,
+            now,
+        )?;
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        Some(remaining)
+    } else {
+        None
+    };
 
     let (index, record) = if undername == "@" {
         let undername_hash: [u8; 32] = Sha256::digest(b"@").into();
         let (ant_address, ant_bump) = derive_pda(
-            &config.ant_program_id,
+            ant_program,
             &[
                 ANT_RECORD_SEED,
                 arns.ant.as_slice(),
@@ -2063,13 +2143,7 @@ pub(crate) async fn resolve_arns(
             ],
             "ANT record",
         )?;
-        let Some(ant_bytes) = account_info(
-            gateway,
-            &config.solana_rpc_url,
-            &ant_address,
-            &config.ant_program_id,
-        )
-        .await?
+        let Some(ant_bytes) = account_info(gateway, rpc_url, &ant_address, ant_program).await?
         else {
             return Ok(None);
         };
@@ -2078,14 +2152,8 @@ pub(crate) async fn resolve_arns(
         ensure!(record.undername == "@", "ANT root record mismatch");
         (0, record)
     } else {
-        let Some(selected) = ant_undername(
-            gateway,
-            &config.solana_rpc_url,
-            &config.ant_program_id,
-            &arns.ant,
-            &undername,
-        )
-        .await?
+        let Some(selected) =
+            ant_undername(gateway, rpc_url, ant_program, &arns.ant, &undername).await?
         else {
             return Ok(None);
         };
@@ -2096,6 +2164,8 @@ pub(crate) async fn resolve_arns(
         "ANT record does not target Arweave"
     );
     decode_fixed::<32>(&record.target, "resolved data ID")?;
+    let ttl = Duration::from_secs(u64::from(record.ttl));
+    let lifetime = lease_remaining.map_or(ttl, |remaining| remaining.min(ttl));
 
     Ok(Some(Resolution {
         name,
@@ -2107,29 +2177,27 @@ pub(crate) async fn resolve_arns(
         limit: arns.undername_limit,
         index,
         resolved_at: now.as_millis(),
+        expires_at: started_at + lifetime,
     }))
 }
 
-async fn arns_grace_period(gateway: &Gateway, config: &ServerConfig) -> Result<i64> {
-    let (address, expected_bump) =
-        derive_pda(&config.arns_program_id, &[ARNS_CONFIG_SEED], "ArNS config")?;
-    let bytes = account_info(
-        gateway,
-        &config.solana_rpc_url,
-        &address,
-        &config.arns_program_id,
-    )
-    .await?
-    .context("ArNS config account is missing")?;
+async fn arns_grace_period(gateway: &Gateway, rpc_url: &Url, arns_program: &str) -> Result<i64> {
+    let (address, expected_bump) = derive_pda(arns_program, &[ARNS_CONFIG_SEED], "ArNS config")?;
+    let bytes = account_info(gateway, rpc_url, &address, arns_program)
+        .await?
+        .context("ArNS config account is missing")?;
     let (grace_period, bump) = decode_arns_config(&bytes)?;
     ensure!(bump == expected_bump, "ArNS config bump mismatch");
     Ok(grace_period)
 }
-fn arns_is_active(end_timestamp: i64, grace_period: i64, now: u64) -> Result<bool> {
+fn arns_lease_remaining(end_timestamp: i64, grace_period: i64, now: Duration) -> Result<Duration> {
     let expires_at = end_timestamp
         .checked_add(grace_period)
         .context("ArNS lease expiry overflow")?;
-    Ok(i64::try_from(now).context("system time is too large")? < expires_at)
+    if i64::try_from(now.as_secs()).context("system time is too large")? >= expires_at {
+        return Ok(Duration::ZERO);
+    }
+    Ok(Duration::from_secs(expires_at as u64).saturating_sub(now))
 }
 
 fn solana_request_error(error: anyhow::Error) -> anyhow::Error {
@@ -2748,7 +2816,13 @@ async fn verified_response(
     if let Some(resolution) = resolution {
         builder = builder.header(
             "cache-control",
-            format!("public, max-age={}", resolution.ttl),
+            format!(
+                "public, max-age={}",
+                resolution
+                    .expires_at
+                    .saturating_duration_since(StreamInstant::now())
+                    .as_secs()
+            ),
         );
     } else {
         builder = builder.header(
@@ -3784,31 +3858,39 @@ mod tests {
     #[tokio::test]
     async fn preserves_arns_resolution_when_content_is_unavailable() {
         let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rpc_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let app = Router::new()
             .route(
                 "/",
-                axum::routing::post(|body: axum::body::Bytes| async move {
-                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    let account = match request["params"][0].as_str().unwrap() {
-                        "E8Vm6GR2CDdsx5FRaxQ7iVoN832mTjufN8zuB2pvzpYn" => {
-                            Some((ARNS_ACCOUNT, ARNS_PROGRAM))
+                axum::routing::post({
+                    let rpc_calls = rpc_calls.clone();
+                    move |body: axum::body::Bytes| {
+                        let rpc_calls = rpc_calls.clone();
+                        async move {
+                            rpc_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            let account = match request["params"][0].as_str().unwrap() {
+                                "E8Vm6GR2CDdsx5FRaxQ7iVoN832mTjufN8zuB2pvzpYn" => {
+                                    Some((ARNS_ACCOUNT, ARNS_PROGRAM))
+                                }
+                                "3JEvMXaLmWvya2jtEX7pgzxHqZB5iiK2GQNdFXcjj26G" => {
+                                    Some((ANT_ACCOUNT, ANT_PROGRAM))
+                                }
+                                _ => None,
+                            };
+                            let value = account.map(|(data, owner)| {
+                                serde_json::json!({
+                                    "data": [data, "base64"],
+                                    "owner": owner,
+                                    "executable": false,
+                                    "space": STANDARD.decode(data).unwrap().len(),
+                                })
+                            });
+                            json_response(&serde_json::json!({
+                                "jsonrpc": "2.0", "id": 1, "result": {"value": value},
+                            }))
                         }
-                        "3JEvMXaLmWvya2jtEX7pgzxHqZB5iiK2GQNdFXcjj26G" => {
-                            Some((ANT_ACCOUNT, ANT_PROGRAM))
-                        }
-                        _ => None,
-                    };
-                    let value = account.map(|(data, owner)| {
-                        serde_json::json!({
-                            "data": [data, "base64"],
-                            "owner": owner,
-                            "executable": false,
-                            "space": STANDARD.decode(data).unwrap().len(),
-                        })
-                    });
-                    json_response(&serde_json::json!({
-                        "jsonrpc": "2.0", "id": 1, "result": {"value": value},
-                    }))
+                    }
                 }),
             )
             .route(
@@ -3850,7 +3932,7 @@ mod tests {
             .unwrap(),
             config: ServerConfig::new(
                 "127.0.0.1:0",
-                "example.com",
+                "example.com,other.example",
                 &upstream,
                 ARNS_PROGRAM,
                 ANT_PROGRAM,
@@ -3893,9 +3975,14 @@ mod tests {
             ),
         ] {
             unavailable.store(missing_upstream, std::sync::atomic::Ordering::Relaxed);
+            let host = if method == Method::HEAD {
+                "lolcchekc.example.com"
+            } else {
+                "lolcchekc.other.example"
+            };
             let response = client
                 .request(method, &base)
-                .header(HOST, "lolcchekc.example.com")
+                .header(HOST, host)
                 .send()
                 .await
                 .unwrap();
@@ -3911,6 +3998,7 @@ mod tests {
             );
             assert_eq!(response.headers()[CACHE_CONTROL], cache_control);
             assert!(!response.headers().contains_key("x-ar-io-verified"));
+            assert_eq!(rpc_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
         }
         let response = client
             .get(&base)
@@ -3949,6 +4037,169 @@ mod tests {
             response.headers()[CACHE_CONTROL],
             "public, max-age=60, must-revalidate"
         );
+    }
+
+    #[tokio::test]
+    async fn arns_cache_coalesces_refreshes_and_never_serves_expired_failures() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let mut ant = STANDARD.decode(ANT_ACCOUNT).unwrap();
+        ant[93..97].copy_from_slice(&10_u32.to_le_bytes());
+        let ant = Arc::new(Mutex::new(ant));
+        let app = Router::new().route(
+            "/",
+            post({
+                let calls = calls.clone();
+                let unavailable = unavailable.clone();
+                let ant = ant.clone();
+                move |body: axum::body::Bytes| {
+                    let calls = calls.clone();
+                    let unavailable = unavailable.clone();
+                    let ant = ant.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        if unavailable.load(Ordering::Relaxed) {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let account = match request["params"][0].as_str().unwrap() {
+                            "E8Vm6GR2CDdsx5FRaxQ7iVoN832mTjufN8zuB2pvzpYn" => {
+                                Some((ARNS_ACCOUNT.to_owned(), ARNS_PROGRAM))
+                            }
+                            "3JEvMXaLmWvya2jtEX7pgzxHqZB5iiK2GQNdFXcjj26G" => {
+                                Some((STANDARD.encode(&*ant.lock()), ANT_PROGRAM))
+                            }
+                            _ => None,
+                        };
+                        let value = account.map(|(data, owner)| {
+                            serde_json::json!({
+                                "space": STANDARD.decode(&data).unwrap().len(),
+                                "data": [data, "base64"], "owner": owner, "executable": false,
+                            })
+                        });
+                        json_response(&serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1, "result": {"value": value},
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let gateway = Gateway::new(
+            Config::new(
+                &upstream,
+                &upstream,
+                vec![upstream.clone()],
+                Duration::from_secs(2),
+                1,
+                4096,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let config = ServerConfig::new(
+            "127.0.0.1:0",
+            "example.com",
+            &upstream,
+            ARNS_PROGRAM,
+            ANT_PROGRAM,
+            8,
+        )
+        .unwrap();
+        let (first, second) = tokio::join!(
+            resolve_arns(&gateway, &config, "lolcchekc".into()),
+            resolve_arns(&gateway, &config, "lolcchekc".into()),
+        );
+        let first = first.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second.unwrap().unwrap()));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let target = URL_SAFE_NO_PAD.encode([9; 32]);
+        ant.lock()[49..92].copy_from_slice(target.as_bytes());
+        let hit = resolve_arns(&gateway, &config, "lolcchekc".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.resolved_id, first.resolved_id);
+        assert_eq!(hit.resolved_at, first.resolved_at);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::time::resume();
+        unavailable.store(true, Ordering::Relaxed);
+        for _ in 0..2 {
+            assert!(
+                resolve_arns(&gateway, &config, "lolcchekc".into())
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        unavailable.store(false, Ordering::Relaxed);
+        let refreshed = resolve_arns(&gateway, &config, "lolcchekc".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.resolved_id, target);
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+
+        ant.lock()[93..97].copy_from_slice(&0_u32.to_le_bytes());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::time::resume();
+        for _ in 0..3 {
+            let resolution = resolve_arns(&gateway, &config, "lolcchekc".into())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolution.ttl, 0);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 12);
+        for _ in 0..2 {
+            assert!(
+                resolve_arns(&gateway, &config, "missing".into())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 14);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn arns_cache_expires_at_the_deadline_and_evicts_the_least_used_name() {
+        let mut cache = ArnsCache::default();
+        let resolution = |name: String| {
+            Arc::new(Resolution {
+                name,
+                basename: String::new(),
+                record: "@".into(),
+                resolved_id: URL_SAFE_NO_PAD.encode([1; 32]),
+                ttl: 10,
+                ant_id: String::new(),
+                limit: 0,
+                index: 0,
+                resolved_at: 0,
+                expires_at: StreamInstant::now() + Duration::from_secs(10),
+            })
+        };
+        for index in 0..MAX_CACHED_ARNS_RESOLUTIONS {
+            cache.insert(resolution(index.to_string()));
+        }
+        assert!(cache.get("0").is_some());
+        cache.insert(resolution("new".into()));
+        assert_eq!(cache.entries.len(), MAX_CACHED_ARNS_RESOLUTIONS);
+        assert!(cache.get("1").is_none());
+        assert!(cache.get("0").is_some());
+        tokio::time::advance(Duration::from_millis(9999)).await;
+        assert!(cache.get("0").is_some());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(cache.get("0").is_none());
     }
 
     #[tokio::test]
@@ -4077,8 +4328,14 @@ mod tests {
 
     #[test]
     fn checks_lease_expiry_and_config_pda() {
-        assert!(arns_is_active(100, 10, 109).unwrap());
-        assert!(!arns_is_active(100, 10, 110).unwrap());
+        assert_eq!(
+            arns_lease_remaining(100, 10, Duration::from_millis(109_500)).unwrap(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            arns_lease_remaining(100, 10, Duration::from_secs(110)).unwrap(),
+            Duration::ZERO
+        );
         let mut config = vec![0; 182];
         config[..8].copy_from_slice(&ARNS_CONFIG_DISCRIMINATOR);
         config[104..112].copy_from_slice(&10_i64.to_le_bytes());
@@ -4092,7 +4349,7 @@ mod tests {
             "ENuQZZYp778k5cCAovtD4gS2JxHQ3jVd3fKmNmtcZqQ2"
         );
         assert_eq!(config_bump, 255);
-        assert!(arns_is_active(i64::MAX, 1, 0).is_err());
+        assert!(arns_lease_remaining(i64::MAX, 1, Duration::ZERO).is_err());
     }
 
     #[test]
@@ -5223,7 +5480,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn builds_verified_arns_response_headers() {
         let bytes = b"hello".to_vec();
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
@@ -5252,6 +5509,7 @@ mod tests {
             limit: 100,
             index: 0,
             resolved_at: 1,
+            expires_at: StreamInstant::now() + Duration::from_secs(3600),
         };
         let config = ServerConfig::new(
             "127.0.0.1:0",
@@ -5295,6 +5553,17 @@ mod tests {
             .unwrap();
             assert_eq!(response.status(), status);
         }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let aged = verified_response(
+            verified.clone(),
+            Some(&resolution),
+            &HeaderMap::new(),
+            &stream_limits(),
+            request_permit(&Arc::new(Semaphore::new(1))).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(aged.headers()[CACHE_CONTROL], "public, max-age=3540");
 
         let mut host_headers = HeaderMap::new();
         host_headers.insert(HOST, "lolcchekc.ar.mrx.im:3000".parse().unwrap());

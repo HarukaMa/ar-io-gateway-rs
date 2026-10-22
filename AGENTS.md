@@ -16,7 +16,7 @@
 - Every Rust-owned request path runs end to end in Rust. Do not call legacy Node services or read live legacy SQLite databases.
 - Isolate HTTP execution capacity from indexing, unbundling, repair, and maintenance within the same process. Keep CPU-heavy and blocking work off HTTP workers. Bound work, database concurrency, memory, queues, and request duration. Preserve cancellation and backpressure.
 - Resolve ArNS and ANT state directly through the configured trusted Solana RPC. Validate account ownership, canonical PDAs, layouts, linkage, and name lifecycle rules. Permit per-ANT `getProgramAccounts` reads filtered by mint and record discriminator, with bounded response size, concurrency, and deadlines. Add ANT indexing only when measured resolution performance requires it.
-- Keep resolver-side ArNS and ANT lookups uncached so each request queries current finalized state.
+- Share a bounded in-process ArNS/ANT resolution cache by full name across gateway roots. Expire entries at the ANT record TTL or ArNS lease/grace deadline, coalesce concurrent lookups, and fail closed on failed refreshes after expiry. Do not retain zero-TTL, missing, or failed resolutions.
 
 ## Verification and trust
 

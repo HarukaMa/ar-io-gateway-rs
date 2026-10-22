@@ -7,5 +7,6 @@
 - Accept case-insensitive byte ranges and ignore unknown range units.
 - Use signed Repr-Digest headers for whole-item digests on range responses.
 - Cache verified manifest path resolutions, including missing paths, with bounded memory. Revalidate the manifest anchor and content policy before cache lookup.
+- Share bounded ArNS resolution caching across gateway roots until the ANT TTL or ArNS lease/grace expiry. Coalesce concurrent lookups, never retain zero-TTL or missing results, and fail closed when an expired entry cannot refresh. Content cache lifetimes use the remaining resolution TTL.
 
 Index Sharing remains outside the current release scope. Range requests retain full content verification before serving.
