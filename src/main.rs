@@ -137,9 +137,9 @@ async fn main() -> Result<()> {
             }
         }
         // Indexing nothing while marking every bundle complete would silently drop coverage.
-        if index_bundles == index_filter_never && env::var_os("ANS104_INDEX_FILTER").is_some() {
+        if index_bundles && index_filter_never {
             bail!(
-                "ANS104_INDEX_FILTER must not be {{\"never\":true}} when bundle indexing is enabled, and must be {{\"never\":true}} when it is disabled"
+                "ANS104_INDEX_FILTER must not be {{\"never\":true}} when bundle indexing is enabled"
             );
         }
         let max_concurrent_requests = env::var("AR_IO_MAX_CONCURRENT_REQUESTS")
