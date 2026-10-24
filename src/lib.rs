@@ -5,6 +5,7 @@ pub mod database;
 pub mod diagnostics;
 mod disk_cache;
 mod historical;
+pub mod index_filter;
 pub mod indexer;
 mod json_bundle;
 mod packing;
@@ -106,6 +107,8 @@ pub struct Config {
     pub index_max_bytes: usize,
     /// Follow the trusted chain from genesis when AR_IO_INDEX_CHAIN is enabled.
     pub index_chain: bool,
+    /// Which verified bundle items are written to the index, from ANS104_INDEX_FILTER.
+    pub index_filter: index_filter::IndexFilter,
     pub retrieval_timeout: Duration,
     pub stream_idle_timeout: Duration,
     pub stream_timeout: Duration,
@@ -156,6 +159,7 @@ impl Config {
             index_bundle_start_height: 0,
             index_max_bytes: 8 * 1024 * 1024 * 1024,
             index_chain: false,
+            index_filter: index_filter::IndexFilter::default(),
             retrieval_timeout: Duration::from_secs(30 * 60),
             stream_idle_timeout: Duration::from_secs(30),
             stream_timeout: Duration::from_secs(30 * 60),

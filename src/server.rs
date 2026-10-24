@@ -839,10 +839,14 @@ fn info_response(state: &AppState, identity: RequestIdentity) -> Response {
     if root.is_none() && !state.config.owned_wallets.is_empty() {
         return empty_error_response(StatusCode::NOT_FOUND);
     }
-    let filter = if state.gateway.bundle_indexer.is_some() {
-        serde_json::json!({"always": true})
+    let (unbundle_filter, index_filter) = if state.gateway.bundle_indexer.is_some() {
+        (
+            serde_json::json!({"always": true}),
+            state.gateway.config.index_filter.source().clone(),
+        )
     } else {
-        serde_json::json!({"never": true})
+        let never = serde_json::json!({"never": true});
+        (never.clone(), never)
     };
     let mut info = serde_json::json!({
         "programIds": {
@@ -851,8 +855,8 @@ fn info_response(state: &AppState, identity: RequestIdentity) -> Response {
             "arns": state.config.arns_program_id,
             "ant": state.config.ant_program_id,
         },
-        "ans104UnbundleFilter": filter,
-        "ans104IndexFilter": filter,
+        "ans104UnbundleFilter": unbundle_filter,
+        "ans104IndexFilter": index_filter,
         "supportedManifestVersions": ["0.1.0", "0.2.0"],
         // The upstream ar-io-node release whose feature set this build tracks.
         "release": "85-rs",

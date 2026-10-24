@@ -74,6 +74,13 @@ async fn main() -> Result<()> {
         .parse::<bool>()
         .context("invalid AR_IO_INDEX_CHAIN")?;
     config.index_chain = index_chain;
+    if command == "serve" {
+        if let Ok(value) = env::var("ANS104_INDEX_FILTER") {
+            config.index_filter = ar_io_gateway::index_filter::IndexFilter::parse(&value)
+                .context("invalid ANS104_INDEX_FILTER")?;
+        }
+    }
+    let index_filter_never = config.index_filter.is_never();
     let mut gateway = Gateway::new(config)?;
     if let Ok(url) = env::var("DATABASE_URL") {
         if command == "serve" && args.len() == 0 {
@@ -115,21 +122,25 @@ async fn main() -> Result<()> {
             .transpose()
             .context("invalid AR_IO_INDEX_BUNDLES")?
             .unwrap_or(index_chain);
-        for name in ["ANS104_UNBUNDLE_FILTER", "ANS104_INDEX_FILTER"] {
-            if let Ok(value) = env::var(name) {
-                let filter: serde_json::Value =
-                    serde_json::from_str(&value).with_context(|| format!("invalid {name}"))?;
-                let expected = if index_bundles {
-                    serde_json::json!({"always": true})
-                } else {
-                    serde_json::json!({"never": true})
-                };
-                if filter != expected {
-                    bail!(
-                        "{name} must be {expected} when AR_IO_INDEX_BUNDLES={index_bundles}; selective filters are not supported"
-                    );
-                }
+        let expected = if index_bundles {
+            serde_json::json!({"always": true})
+        } else {
+            serde_json::json!({"never": true})
+        };
+        if let Ok(value) = env::var("ANS104_UNBUNDLE_FILTER") {
+            let filter: serde_json::Value =
+                serde_json::from_str(&value).context("invalid ANS104_UNBUNDLE_FILTER")?;
+            if filter != expected {
+                bail!(
+                    "ANS104_UNBUNDLE_FILTER must be {expected} when AR_IO_INDEX_BUNDLES={index_bundles}; selective unbundling is not supported"
+                );
             }
+        }
+        // Indexing nothing while marking every bundle complete would silently drop coverage.
+        if index_bundles == index_filter_never && env::var_os("ANS104_INDEX_FILTER").is_some() {
+            bail!(
+                "ANS104_INDEX_FILTER must not be {{\"never\":true}} when bundle indexing is enabled, and must be {{\"never\":true}} when it is disabled"
+            );
         }
         let max_concurrent_requests = env::var("AR_IO_MAX_CONCURRENT_REQUESTS")
             .unwrap_or_else(|_| "128".to_owned())

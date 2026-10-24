@@ -1582,6 +1582,7 @@ async fn index_bundle_source(
             &root_id,
             content,
             format,
+            block_height,
             cache_hit,
             reused_facts,
         )
@@ -1669,7 +1670,7 @@ pub(crate) async fn index_streamed_bundle(
         crate::streaming::ChunkSource::new(gateway, geometry),
         usize::try_from(size).context("bundle size exceeds addressable range")?,
     );
-    persist_bundle(gateway, store, id, content, format, false, false).await
+    persist_bundle(gateway, store, id, content, format, height, false, false).await
 }
 
 async fn persist_bundle(
@@ -1678,6 +1679,7 @@ async fn persist_bundle(
     root_id: &[u8; 32],
     content: crate::content::Content,
     format: crate::BundleFormat,
+    height: u64,
     cache_hit: bool,
     reused_facts: bool,
 ) -> Result<u64> {
@@ -1689,7 +1691,13 @@ async fn persist_bundle(
     let batch_size = gateway.config.bundle_batch_size;
     let mut occurrences = 0;
     let started = Instant::now();
-    let mut batch = next_bundle_batch(&mut traversal, batch_size).await?;
+    let mut batch = next_bundle_batch(
+        &mut traversal,
+        batch_size,
+        &gateway.config.index_filter,
+        height,
+    )
+    .await?;
     let mut verification_time = started.elapsed();
     let mut persistence_time = Duration::ZERO;
     loop {
@@ -1727,7 +1735,13 @@ async fn persist_bundle(
         // Verify the next batch while this one commits. Commits stay ordered on one store.
         let verify = async {
             let started = Instant::now();
-            let next = next_bundle_batch(&mut traversal, batch_size).await?;
+            let next = next_bundle_batch(
+                &mut traversal,
+                batch_size,
+                &gateway.config.index_filter,
+                height,
+            )
+            .await?;
             Ok::<_, anyhow::Error>((next, started.elapsed()))
         };
         let (committed, (next, verified)) = tokio::try_join!(commit, verify)?;
@@ -1741,6 +1755,8 @@ async fn persist_bundle(
 async fn next_bundle_batch(
     traversal: &mut BundleTraversal,
     batch_size: usize,
+    filter: &crate::index_filter::IndexFilter,
+    height: u64,
 ) -> Result<(Vec<ObjectMetadata>, Vec<BundleLocation>, bool)> {
     crate::profiling::measure(crate::profiling::Stage::Traversal, async {
         let mut objects = Vec::with_capacity(batch_size);
@@ -1751,6 +1767,17 @@ async fn next_bundle_batch(
                 complete = true;
                 break;
             };
+            // Nested bundles stay indexed so their descendants keep a stored parent.
+            let nested_bundle = crate::BundleFormat::from_pairs(
+                object
+                    .tags
+                    .iter()
+                    .map(|(name, value)| (name.as_slice(), value.as_slice())),
+            )
+            .is_ok();
+            if !nested_bundle && !filter.matches(&object, height) {
+                continue;
+            }
             objects.push(object);
             locations.push(location);
         }
@@ -1902,6 +1929,54 @@ mod bundle_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn index_filter_skips_matching_items_but_keeps_nested_parents() -> Result<()> {
+        let oracle_tags: &[(&[u8], &[u8])] = &[(b"type", b"redstone-oracles")];
+        let (oracle, oracle_id) = signed_data_item(b"price", oracle_tags);
+        let (plain, plain_id) = signed_data_item(b"plain", &[]);
+        let (inner_oracle, inner_oracle_id) = signed_data_item(b"inner price", oracle_tags);
+        let parent_tags: &[(&[u8], &[u8])] = &[
+            (b"Bundle-Format", b"binary"),
+            (b"Bundle-Version", b"2.0.0"),
+            (b"type", b"redstone-oracles"),
+        ];
+        let (parent, parent_id) = signed_data_item(&encode_bundle(&[&inner_oracle]), parent_tags);
+        let bytes = encode_bundle(&[&oracle, &plain, &parent]);
+        let root_id = [0xae; 32];
+        let filter = crate::index_filter::IndexFilter::parse(
+            r#"{"not":{"and":[{"tags":[{"name":"type","value":"redstone-oracles"}]},{"blockHeight":{"max":100}}]}}"#,
+        )?;
+        let collect = |height: u64| {
+            let bytes = bytes.clone();
+            let filter = filter.clone();
+            async move {
+                let mut traversal =
+                    BundleTraversal::new(bytes.into(), &root_id, crate::BundleFormat::Binary)
+                        .await?;
+                let mut kept = Vec::new();
+                loop {
+                    let (objects, locations, complete) =
+                        next_bundle_batch(&mut traversal, 1, &filter, height).await?;
+                    assert_eq!(objects.len(), locations.len());
+                    kept.extend(locations);
+                    if complete {
+                        return Ok::<_, anyhow::Error>(kept);
+                    }
+                }
+            }
+        };
+        let all = collect(101).await?;
+        let ids: Vec<_> = all.iter().map(|location| location.id.clone()).collect();
+        assert_eq!(
+            ids,
+            [oracle_id, plain_id, parent_id, inner_oracle_id].map(|id| id.to_vec())
+        );
+        let filtered = collect(100).await?;
+        // Offsets and paths of kept items are those of the unfiltered traversal.
+        assert_eq!(filtered, [all[1].clone(), all[2].clone()]);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires ar_io_rust_test; takes a temporary bundle-progress table lock"]
     async fn bundle_writer_limit_bounds_commits_and_releases_on_cancel() -> Result<()> {
@@ -1954,6 +2029,7 @@ mod bundle_tests {
                     &root_id,
                     encode_bundle(&[]).into(),
                     crate::BundleFormat::Binary,
+                    0,
                     false,
                     false,
                 )
@@ -2010,6 +2086,7 @@ mod bundle_tests {
                 &root_id,
                 encode_bundle(&[]).into(),
                 crate::BundleFormat::Binary,
+                0,
                 false,
                 false,
             ),
@@ -2161,18 +2238,55 @@ mod bundle_tests {
                     "rejected parent format changed stored rows");
             }
             // Batch size 1 pipelines the nested parent and its child through separate commits.
-            let mut config = crate::Config::new(
-                "http://127.0.0.1:1",
-                "http://127.0.0.1:1",
-                vec!["http://127.0.0.1:1".into()],
-                Duration::from_secs(10),
-                1,
-                1024,
-            )?;
-            config.bundle_batch_size = 1;
-            let gateway = Gateway::new(config)?;
+            let gateway_with = |filter: &str| -> Result<Gateway> {
+                let mut config = crate::Config::new(
+                    "http://127.0.0.1:1",
+                    "http://127.0.0.1:1",
+                    vec!["http://127.0.0.1:1".into()],
+                    Duration::from_secs(10),
+                    1,
+                    1024,
+                )?;
+                config.bundle_batch_size = 1;
+                config.index_filter = crate::index_filter::IndexFilter::parse(filter)?;
+                Gateway::new(config)
+            };
+            // Skipping every leaf keeps nested parents, and the last batch commits empty.
+            let filtered = gateway_with(&format!(r#"{{"blockHeight":{{"min":{}}}}}"#, height + 1))?;
+            let parents: Vec<_> = locations.iter()
+                .filter(|location| locations.iter().any(|child| child.parent_id == location.id))
+                .collect();
+            let mut filtered_rows = None;
+            for _ in 0..2 {
+                let kept = persist_bundle(&filtered, &mut store, &root_id, bytes.clone().into(),
+                    crate::BundleFormat::Json, height as u64, false, false).await?;
+                ensure!(kept == parents.len() as u64 && !parents.is_empty(),
+                    "filtered pass kept {kept} of {} nested parents", parents.len());
+                ensure!(store.bundle_complete(&root_id).await?, "filtered JSON root was not completed");
+                ensure!(store.bundle_location(&leaf_id).await?.is_none(), "filtered leaf was indexed");
+                let leaf_rows: i64 = client.query_one(
+                    "SELECT count(*) FROM public.objects WHERE id=$1", &[&leaf_id],
+                ).await?.get(0);
+                ensure!(leaf_rows == 0, "filtered leaf metadata was written");
+                for parent in &parents {
+                    let indexed = store.bundle_location(&parent.id).await?.context("nested parent was not indexed")?;
+                    verify_indexed_bundle(bytes.clone().into(), crate::BundleFormat::Json,
+                        parent.id.as_slice().try_into()?, &indexed, None).await?;
+                }
+                let rows: Vec<i64> = client.query_one(counts, &[]).await?.get(0);
+                ensure!(*filtered_rows.get_or_insert_with(|| rows.clone()) == rows, "filtered replay changed rows");
+            }
+            // Completion is final, so a later filter change cannot add skipped items.
+            let gateway = gateway_with(r#"{"always":true}"#)?;
+            let error = persist_bundle(&gateway, &mut store, &root_id, bytes.clone().into(),
+                crate::BundleFormat::Json, 0, false, false).await
+                .expect_err("completed filtered root acquired skipped items");
+            ensure!(format!("{error:#}").contains("completed bundle cannot acquire new occurrences"),
+                "unexpected completed-root error: {error:#}");
+            ensure!(store.bundle_location(&leaf_id).await?.is_none(), "rejected unfiltered pass indexed the leaf");
+            client.execute("DELETE FROM public.bundle_progress WHERE root_key=$1", &[&root_key]).await?;
             let occurrences = persist_bundle(&gateway, &mut store, &root_id, bytes.clone().into(),
-                crate::BundleFormat::Json, false, false).await?;
+                crate::BundleFormat::Json, 0, false, false).await?;
             ensure!(occurrences == locations.len() as u64 && locations.len() >= 2,
                 "pipelined batches reported {occurrences} of {} occurrences", locations.len());
             let indexed = store.bundle_location(&leaf_id).await?.context("JSON child has no indexed location")?;
