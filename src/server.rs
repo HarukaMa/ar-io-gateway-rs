@@ -102,6 +102,7 @@ pub struct ServerConfig {
     bundler_urls: Vec<String>,
     owned_wallets: HashSet<[u8; 32]>,
     max_expected_data_item_indexing_interval_seconds: Option<u64>,
+    indexes: Option<Arc<crate::index_publication::Publisher>>,
 }
 
 impl ServerConfig {
@@ -222,6 +223,7 @@ impl ServerConfig {
             bundler_urls: vec!["https://turbo.ardrive.io/".to_owned()],
             owned_wallets: HashSet::new(),
             max_expected_data_item_indexing_interval_seconds: None,
+            indexes: None,
         })
     }
 
@@ -400,6 +402,29 @@ impl ServerConfig {
             });
             self.owned_wallets.insert(wallet_key);
         }
+        Ok(self)
+    }
+
+    /// Publish the bands under `dir` as the first gateway identity.
+    pub fn with_indexes(mut self, dir: &FilePath) -> Result<Self> {
+        let root = self
+            .arns_root_hosts
+            .first()
+            .context("AR_IO_INDEXES_DIR requires AR_IO_IDENTITIES_FILE")?;
+        let signer = root
+            .signer
+            .as_ref()
+            .context("AR_IO_INDEXES_DIR requires HTTPSIG signing keys")?;
+        let wallet = root
+            .wallet
+            .as_deref()
+            .context("the first identity has no wallet")?;
+        self.indexes = Some(crate::index_publication::Publisher::start(
+            dir.to_owned(),
+            &root.host,
+            wallet,
+            signer.key.clone(),
+        )?);
         Ok(self)
     }
 }
@@ -644,6 +669,8 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         .route("/ar-io/peers", get(serve_peers))
         .route("/ar-io/resolver/{name}", get(serve_resolver))
         .route("/ar-io/offsets/{id}", get(serve_offsets))
+        .route("/ar-io/indexes", get(serve_index_publication))
+        .route("/ar-io/indexes/{*path}", get(serve_index_path))
         .route("/", get(serve_arns))
         .route("/chunk/{offset}", get(serve_chunk))
         .route("/chunk/{offset}/data", get(serve_chunk_data))
@@ -712,6 +739,10 @@ const SIGNATURE_TRIGGERS: &[&str] = &[
     "x-arweave-chunk-data-root",
     "x-arweave-chunk-tx-id",
     "x-ar-io-chunk-source-type",
+    "x-ar-io-index-publication",
+    "x-ar-io-index-file",
+    "x-ar-io-index-torrent",
+    "x-ar-io-index-feed",
 ];
 const SIGNATURE_EXTRA_HEADERS: &[&str] = &[
     "content-type",
@@ -876,7 +907,365 @@ fn info_response(state: &AppState, identity: RequestIdentity) -> Response {
             }
         }
     }
+    if let Some(view) = published_indexes(state, identity) {
+        info["indexes"] = serde_json::json!({
+            "manifestUrl": "/ar-io/indexes",
+            "names": view.names,
+            "feeds": view.names.iter()
+                .map(|name| (name.clone(), serde_json::json!(format!("/ar-io/indexes/feed/{name}.xml"))))
+                .collect::<serde_json::Map<_, _>>(),
+        });
+    }
     json_response(&info)
+}
+
+/// The publication served for this request's host: only the first identity publishes.
+fn published_indexes(
+    state: &AppState,
+    identity: RequestIdentity,
+) -> Option<Arc<crate::index_publication::View>> {
+    (identity.0 == Some(0))
+        .then(|| state.config.indexes.as_ref()?.view())
+        .flatten()
+}
+
+fn index_digest_field(sha256_hex: &str) -> String {
+    let bytes: Vec<u8> = (0..sha256_hex.len())
+        .step_by(2)
+        .filter_map(|index| u8::from_str_radix(&sha256_hex[index..index + 2], 16).ok())
+        .collect();
+    format!("sha-256=:{}:", STANDARD.encode(bytes))
+}
+
+fn index_response(status: StatusCode, content_type: &str, body: &'static str) -> Response {
+    Response::builder()
+        .status(status)
+        .header("cache-control", "no-store")
+        .header("content-type", content_type)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn index_not_found() -> Response {
+    index_response(StatusCode::NOT_FOUND, "application/json", "{}")
+}
+
+fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag)
+        })
+}
+
+fn served_index_bytes(
+    served: &crate::index_publication::Served,
+    headers: &HeaderMap,
+    etag: String,
+    cache_control: &str,
+    content_type: &str,
+    trigger: (&'static str, &str),
+) -> Response {
+    let builder = Response::builder()
+        .header("etag", &etag)
+        .header("cache-control", cache_control);
+    if if_none_match(headers, &etag) {
+        return builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .unwrap();
+    }
+    builder
+        .header(trigger.0, trigger.1)
+        .header("content-type", content_type)
+        .header("content-digest", index_digest_field(&served.sha256))
+        .header("content-length", served.body.len().to_string())
+        .body(Body::from(served.body.clone()))
+        .unwrap()
+}
+
+async fn serve_index_publication(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<RequestIdentity>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(view) = published_indexes(&state, identity) else {
+        return index_not_found();
+    };
+    let etag = format!("\"{}\"", view.sha256);
+    let builder = Response::builder()
+        .header("etag", &etag)
+        .header("cache-control", "public, max-age=60")
+        .header("x-ar-io-index-publication", "1");
+    if headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        == Some(etag.as_str())
+    {
+        return builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .unwrap();
+    }
+    builder
+        .header("content-type", "application/json")
+        .header("content-digest", index_digest_field(&view.sha256))
+        .header("content-length", view.document.len().to_string())
+        .body(Body::from(view.document.clone()))
+        .unwrap()
+}
+
+async fn serve_index_path(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<RequestIdentity>,
+    Path(path): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    use crate::index_publication::{valid_index_name, valid_path_segment};
+    let Some(view) = published_indexes(&state, identity) else {
+        return index_not_found();
+    };
+    let is_hex = |value: &str, len: usize| {
+        value.len() == len
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let segments: Vec<&str> = path.split('/').collect();
+    match segments.as_slice() {
+        ["feed", file] => {
+            let Some(name) = file
+                .strip_suffix(".xml")
+                .filter(|name| valid_index_name(name))
+            else {
+                return index_response(StatusCode::BAD_REQUEST, "text/plain", "Invalid feed name");
+            };
+            let Some(feed) = view.feeds.get(name) else {
+                return index_not_found();
+            };
+            let etag = format!("\"rss2-1-{}\"", &feed.sha256[..32]);
+            served_index_bytes(
+                feed,
+                &headers,
+                etag,
+                "public, max-age=60",
+                "application/rss+xml; charset=utf-8",
+                ("x-ar-io-index-feed", &view.sha256),
+            )
+        }
+        ["torrents", file] => {
+            let Some(infohash) = file
+                .strip_suffix(".torrent")
+                .filter(|hash| is_hex(hash, 40))
+            else {
+                return index_response(
+                    StatusCode::BAD_REQUEST,
+                    "text/plain",
+                    "Invalid torrent name",
+                );
+            };
+            let Some(torrent) = view.torrents.get(infohash) else {
+                return index_not_found();
+            };
+            served_index_bytes(
+                torrent,
+                &headers,
+                format!("\"{}\"", torrent.sha256),
+                "public, max-age=86400",
+                "application/x-bittorrent",
+                ("x-ar-io-index-torrent", infohash),
+            )
+        }
+        ["blob", digest] if is_hex(digest, 64) => match view.blobs.get(*digest) {
+            Some(file) => {
+                serve_index_file(
+                    &state,
+                    file,
+                    "public, max-age=31536000, immutable",
+                    &method,
+                    &headers,
+                )
+                .await
+            }
+            None => index_not_found(),
+        },
+        ["webseed", torrent, file] if is_hex(torrent, 16) => {
+            if !valid_path_segment(file) {
+                return index_response(StatusCode::BAD_REQUEST, "text/plain", "Invalid file name");
+            }
+            match view.web_seeds.get(&format!("{torrent}/{file}")) {
+                Some(entry) => {
+                    serve_index_file(
+                        &state,
+                        entry,
+                        "public, max-age=31536000, immutable",
+                        &method,
+                        &headers,
+                    )
+                    .await
+                }
+                None => index_not_found(),
+            }
+        }
+        [name, band, file] => {
+            if !valid_index_name(name) || !valid_path_segment(band) || !valid_path_segment(file) {
+                return index_response(
+                    StatusCode::BAD_REQUEST,
+                    "text/plain",
+                    "Invalid index, band or file name",
+                );
+            }
+            match view.files.get(&format!("{name}/{band}/{file}")) {
+                // A name is not an address: caches must revalidate it.
+                Some(entry) => {
+                    serve_index_file(&state, entry, "public, no-cache", &method, &headers).await
+                }
+                None => index_not_found(),
+            }
+        }
+        _ => index_not_found(),
+    }
+}
+
+/// One published file, as upstream serves it: a single range at most, and
+/// never bytes that no longer match the size and time that were hashed.
+async fn serve_index_file(
+    state: &AppState,
+    entry: &crate::index_publication::PublishedFile,
+    cache_control: &str,
+    method: &Method,
+    headers: &HeaderMap,
+) -> Response {
+    let path = entry.path.clone();
+    let opened = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)?;
+        let metadata = file.metadata()?;
+        let modified = crate::index_publication::modified_ns(&metadata)?;
+        anyhow::Ok((file, metadata.len(), modified))
+    })
+    .await;
+    let file = match opened {
+        Ok(Ok((file, size, modified))) if size == entry.size && modified == entry.modified_ns => {
+            file
+        }
+        result => {
+            if let Ok(Err(error)) = result {
+                eprintln!(
+                    "published index file {} is unavailable: {error:#}",
+                    entry.path.display()
+                );
+            }
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("cache-control", "no-store")
+                .header("retry-after", "60")
+                .header("content-type", "text/plain")
+                .body(Body::from("Index file is being updated"))
+                .unwrap();
+        }
+    };
+    let size = entry.size as usize;
+    let etag = format!("\"{}\"", entry.sha256);
+    let builder = Response::builder()
+        .header("etag", &etag)
+        .header("accept-ranges", "bytes")
+        .header("content-type", "application/octet-stream")
+        .header("repr-digest", index_digest_field(&entry.sha256));
+    if headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        == Some(etag.as_str())
+    {
+        return builder
+            .header("cache-control", cache_control)
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .unwrap();
+    }
+    let mut range = None;
+    if uses_byte_range(headers) && size > 0 {
+        let value = headers
+            .get("range")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        match parse_byte_ranges(value, size) {
+            Ok(mut ranges) => {
+                ranges.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::new();
+                for (start, end) in ranges {
+                    match merged.last_mut() {
+                        Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+                        _ => merged.push((start, end)),
+                    }
+                }
+                // Several ranges are answered with the whole file.
+                if let [single] = merged.as_slice() {
+                    range = Some(*single);
+                }
+            }
+            Err(ByteRangeError::Malformed) => {
+                return index_response(
+                    StatusCode::BAD_REQUEST,
+                    "text/plain",
+                    "Malformed 'range' header",
+                );
+            }
+            Err(ByteRangeError::Unsatisfiable) => {
+                let mut response = index_response(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "text/plain",
+                    "Range not satisfiable",
+                );
+                response.headers_mut().insert(
+                    "content-range",
+                    HeaderValue::from_str(&format!("bytes */{size}")).unwrap(),
+                );
+                return response;
+            }
+        }
+    }
+    let (start, end) = range.unwrap_or((0, size.saturating_sub(1)));
+    let length = if size == 0 { 0 } else { end - start + 1 };
+    let mut builder = builder
+        .header("cache-control", cache_control)
+        .header("x-ar-io-index-file", &entry.sha256)
+        .header("content-length", length.to_string());
+    builder = match range {
+        Some(_) => builder
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("content-range", format!("bytes {start}-{end}/{size}")),
+        None => builder
+            .status(StatusCode::OK)
+            .header("content-digest", index_digest_field(&entry.sha256)),
+    };
+    if *method == Method::HEAD || length == 0 {
+        return builder.body(Body::empty()).unwrap();
+    }
+    let permit = match request_permit(&state.request_permits) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let body = Content::published_file(file, size)
+        .slice(start..end + 1)
+        .map(|content| content_body(content, &state.gateway.config, permit));
+    match body {
+        Ok(body) => match body.await {
+            Ok(body) => builder.body(body).unwrap(),
+            Err(error) => {
+                eprintln!("published index file stream failed: {error:#}");
+                empty_error_response(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        },
+        Err(error) => {
+            eprintln!("published index file slice failed: {error:#}");
+            empty_error_response(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 fn counter_rate(
@@ -1382,7 +1771,7 @@ async fn serve_peers(State(state): State<Arc<AppState>>) -> Response {
     json_response(&state.gateway.peers.snapshot())
 }
 
-fn iso_utc_date(now: SystemTime) -> Result<String> {
+pub(crate) fn iso_utc_date(now: SystemTime) -> Result<String> {
     let elapsed = now
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?;

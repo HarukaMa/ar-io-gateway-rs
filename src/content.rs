@@ -116,13 +116,14 @@ enum ContentFile {
         len: usize,
         _cache_lock: Arc<std::fs::File>,
     },
+    Published(std::fs::File),
 }
 
 impl ContentFile {
     fn read_exact_at(&self, mut bytes: &mut [u8], mut offset: u64) -> io::Result<()> {
         let file = match self {
             Self::Temporary(file) => &file.temp,
-            Self::Persistent { file, .. } => file,
+            Self::Persistent { file, .. } | Self::Published(file) => file,
         };
         while !bytes.is_empty() {
             // Never mix shared-handle cursor reads with positional reads on Windows.
@@ -336,13 +337,22 @@ impl Content {
         })
     }
 
+    /// A read-only file served as is, such as a published index band file.
+    pub(crate) fn published_file(file: std::fs::File, len: usize) -> Self {
+        Self(Storage::File {
+            file: Arc::new(ContentFile::Published(file)),
+            offset: 0,
+            len,
+        })
+    }
+
     pub(crate) fn persistent_blob(&self) -> Option<([u8; 32], usize, usize)> {
         let Storage::File { file, offset, .. } = &self.0 else {
             return None;
         };
         match file.as_ref() {
             ContentFile::Persistent { hash, len, .. } => Some((*hash, *len, *offset)),
-            ContentFile::Temporary(_) => None,
+            ContentFile::Temporary(_) | ContentFile::Published(_) => None,
         }
     }
 

@@ -6,6 +6,7 @@ pub mod diagnostics;
 mod disk_cache;
 mod historical;
 pub mod index_filter;
+mod index_publication;
 pub mod indexer;
 mod json_bundle;
 mod packing;

@@ -172,6 +172,9 @@ async fn main() -> Result<()> {
             env::var("BUNDLER_URLS").ok().as_deref(),
             indexing_interval,
         )?;
+        if let Some(dir) = env::var_os("AR_IO_INDEXES_DIR").filter(|value| !value.is_empty()) {
+            config = config.with_indexes(std::path::Path::new(&dir))?;
+        }
         let worker = if index_chain || index_bundles {
             let url = env::var("DATABASE_URL").context("indexing requires DATABASE_URL")?;
             let (indexed_gateway, worker) =
