@@ -1763,27 +1763,38 @@ async fn next_bundle_batch(
         let mut locations = Vec::with_capacity(batch_size);
         let mut complete = false;
         while locations.len() < batch_size {
-            let Some((object, location)) = traversal.next().await? else {
+            let Some((object, location)) = traversal.next_matching(filter, height).await? else {
                 complete = true;
                 break;
             };
-            // Nested bundles stay indexed so their descendants keep a stored parent.
-            let nested_bundle = crate::BundleFormat::from_pairs(
-                object
-                    .tags
-                    .iter()
-                    .map(|(name, value)| (name.as_slice(), value.as_slice())),
-            )
-            .is_ok();
-            if !nested_bundle && !filter.matches(&object, height) {
-                continue;
-            }
             objects.push(object);
             locations.push(location);
         }
         Ok((objects, locations, complete))
     })
     .await
+}
+
+/// Nested bundles stay indexed so their descendants keep a stored parent.
+fn filter_keeps(
+    filter: &crate::index_filter::IndexFilter,
+    height: u64,
+    owner_address: Option<[u8; 32]>,
+    tags: &[crate::ItemTag],
+) -> bool {
+    let nested_bundle = crate::BundleFormat::from_pairs(
+        tags.iter()
+            .map(|tag| (tag.name.as_ref(), tag.value.as_ref())),
+    )
+    .is_ok();
+    nested_bundle
+        || filter.matches(
+            owner_address
+                .as_ref()
+                .map_or(&[][..], |address| address.as_slice()),
+            tags,
+            height,
+        )
 }
 
 struct BundleFrame {
@@ -1813,7 +1824,17 @@ impl BundleTraversal {
         })
     }
 
+    #[cfg(test)]
     async fn next(&mut self) -> Result<Option<(ObjectMetadata, BundleLocation)>> {
+        self.next_matching(&crate::index_filter::IndexFilter::default(), 0)
+            .await
+    }
+
+    async fn next_matching(
+        &mut self,
+        filter: &crate::index_filter::IndexFilter,
+        height: u64,
+    ) -> Result<Option<(ObjectMetadata, BundleLocation)>> {
         while let Some(parent) = self.stack.last_mut() {
             tokio::task::yield_now().await;
             let entry = match parent.pending.take() {
@@ -1829,8 +1850,27 @@ impl BundleTraversal {
             };
             let offset = entry.offset() as u128;
             let json = entry.is_json();
-            let Some(item) = entry.verify(None).await? else {
-                continue;
+            let item = match entry {
+                // Bundle bytes are proven against the root's data root, so an
+                // item the filter rejects needs no signature check.
+                crate::BundleEntry::Binary { bytes, .. } => {
+                    let header = crate::read_data_item_header(&bytes, &id).await?;
+                    if !filter_keeps(filter, height, header.owner_address(), &header.tags) {
+                        continue;
+                    }
+                    crate::verify_data_item_header(bytes, header, &id).await?
+                }
+                entry => {
+                    let Some(item) = entry.verify(None).await? else {
+                        continue;
+                    };
+                    let owner_address =
+                        (!item.owner.is_empty()).then(|| crate::sha256(&[&item.owner]));
+                    if !filter_keeps(filter, height, owner_address, &item.tags) {
+                        continue;
+                    }
+                    item
+                }
             };
             let id = item.id(&id);
             let mut path = parent.path.clone();
@@ -1974,6 +2014,39 @@ mod bundle_tests {
         let filtered = collect(100).await?;
         // Offsets and paths of kept items are those of the unfiltered traversal.
         assert_eq!(filtered, [all[1].clone(), all[2].clone()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn filtered_items_are_skipped_without_signature_verification() -> Result<()> {
+        let (mut oracle, _) = signed_data_item(b"price", &[(b"type", b"redstone-oracles")]);
+        *oracle.last_mut().unwrap() ^= 1;
+        let (plain, plain_id) = signed_data_item(b"plain", &[]);
+        let bytes = encode_bundle(&[&oracle, &plain]);
+        let filter = crate::index_filter::IndexFilter::parse(
+            r#"{"not":{"tags":[{"name":"type","value":"redstone-oracles"}]}}"#,
+        )?;
+        let mut traversal = BundleTraversal::new(
+            bytes.clone().into(),
+            &[0xaf; 32],
+            crate::BundleFormat::Binary,
+        )
+        .await?;
+        let (objects, locations, complete) =
+            next_bundle_batch(&mut traversal, 8, &filter, 0).await?;
+        assert!(complete);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(locations[0].id, plain_id.to_vec());
+
+        let mut traversal =
+            BundleTraversal::new(bytes.into(), &[0xaf; 32], crate::BundleFormat::Binary).await?;
+        let unfiltered = crate::index_filter::IndexFilter::default();
+        assert!(
+            next_bundle_batch(&mut traversal, 8, &unfiltered, 0)
+                .await
+                .is_err(),
+            "a kept item with a bad signature must still fail verification"
+        );
         Ok(())
     }
 

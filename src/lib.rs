@@ -4232,8 +4232,31 @@ fn data_item_signature_payload(
     ])
 }
 
-async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Result<VerifiedItem> {
-    let item_size = item.len();
+/// A binary data item's header fields, parsed but not yet verified.
+struct DataItemHeader {
+    legacy: bool,
+    unsigned: bool,
+    signature_type: u16,
+    signature: axum::body::Bytes,
+    owner: axum::body::Bytes,
+    target: axum::body::Bytes,
+    anchor: axum::body::Bytes,
+    raw_tags: axum::body::Bytes,
+    tags: Vec<ItemTag>,
+    data_offset: usize,
+}
+
+impl DataItemHeader {
+    /// The owner address the index stores for this item. Unsigned AO items have none.
+    fn owner_address(&self) -> Option<[u8; 32]> {
+        (!self.unsigned).then(|| sha256(&[&self.owner]))
+    }
+}
+
+async fn read_data_item_header(
+    item: &content::Content,
+    expected_id: &[u8; 32],
+) -> Result<DataItemHeader> {
     let header = item
         .read_at(0, item.len().min(MAX_DATA_ITEM_FIXED_HEADER_BYTES))
         .await?;
@@ -4276,19 +4299,55 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
     let tags_end = cursor
         .checked_add(tag_bytes_len)
         .context("data item tag offset overflow")?;
-    let raw_tags_bytes = if tags_end <= header.len() {
+    let raw_tags = if tags_end <= header.len() {
         header.slice(cursor..tags_end)
     } else {
         item.read_at(cursor, tag_bytes_len)
             .await
             .context("data item tags are truncated")?
     };
-    cursor = tags_end;
-    let raw_tags = raw_tags_bytes.as_ref();
-    let tags = parse_avro_tags(&raw_tags_bytes, tag_count)?;
+    let tags = parse_avro_tags(&raw_tags, tag_count)?;
+    Ok(DataItemHeader {
+        legacy,
+        unsigned,
+        signature_type,
+        signature: header.slice_ref(signature),
+        owner: header.slice_ref(owner),
+        target: header.slice_ref(target),
+        anchor: header.slice_ref(anchor),
+        raw_tags,
+        tags,
+        data_offset: tags_end,
+    })
+}
+
+async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Result<VerifiedItem> {
+    let header = read_data_item_header(&item, expected_id).await?;
+    verify_data_item_header(item, header, expected_id).await
+}
+
+async fn verify_data_item_header(
+    item: content::Content,
+    header: DataItemHeader,
+    expected_id: &[u8; 32],
+) -> Result<VerifiedItem> {
+    let DataItemHeader {
+        legacy,
+        unsigned,
+        signature_type,
+        signature,
+        owner,
+        target,
+        anchor,
+        raw_tags,
+        tags,
+        data_offset: cursor,
+    } = header;
+    let item_size = item.len();
+    let raw_tags = raw_tags.as_ref();
     let data = item.slice(cursor..item.len())?;
 
-    let signed_identity = sha256(&[signature]) == *expected_id;
+    let signed_identity = sha256(&[&signature]) == *expected_id;
     let content_identity = unsigned || (!legacy && !signed_identity);
     let (body_hash, body_sha384) = data.hashes().await?;
     let data_hash = sha384(&[
@@ -4299,14 +4358,21 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
         deep_hash_list(&[
             deep_hash_blob(b"dataitem"),
             deep_hash_blob(b"1"),
-            deep_hash_blob(owner),
-            deep_hash_blob(target),
-            deep_hash_blob(anchor),
+            deep_hash_blob(&owner),
+            deep_hash_blob(&target),
+            deep_hash_blob(&anchor),
             deep_hash_blob(raw_tags),
             data_hash,
         ])
     } else {
-        data_item_signature_payload(signature_type, owner, target, anchor, raw_tags, data_hash)
+        data_item_signature_payload(
+            signature_type,
+            &owner,
+            &target,
+            &anchor,
+            raw_tags,
+            data_hash,
+        )
     };
     if content_identity {
         let identity_payload = if unsigned {
@@ -4315,8 +4381,8 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
             data_item_signature_payload(
                 signature_type,
                 &[0; 512],
-                target,
-                anchor,
+                &target,
+                &anchor,
                 raw_tags,
                 data_hash,
             )
@@ -4330,16 +4396,12 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
         // AO unsigned IDs commit to the preimage. They carry no signer metadata.
         (Bytes::new(), Bytes::new())
     } else {
-        let signature_bytes = header.slice_ref(signature);
-        let owner_bytes = header.slice_ref(owner);
         cpu_work(move || {
-            verify_data_item_signature(signature_type, &owner_bytes, &signature_bytes, &payload)?;
-            Ok((signature_bytes, owner_bytes))
+            verify_data_item_signature(signature_type, &owner, &signature, &payload)?;
+            Ok((signature, owner))
         })
         .await?
     };
-    let target_bytes = header.slice_ref(target);
-    let anchor_bytes = header.slice_ref(anchor);
 
     Ok(VerifiedItem {
         data,
@@ -4349,8 +4411,8 @@ async fn verify_data_item(item: content::Content, expected_id: &[u8; 32]) -> Res
         signature_type,
         signature: signature_bytes,
         owner: owner_bytes,
-        target: target_bytes,
-        anchor: anchor_bytes,
+        target,
+        anchor,
         tags,
     })
 }

@@ -1,4 +1,4 @@
-//! `ANS104_INDEX_FILTER`: which verified bundle items are written to the index.
+//! `ANS104_INDEX_FILTER`: which bundle items are written to the index.
 //!
 //! Follows upstream r85 filter JSON (`always`, `never`, `not`, `and`, `or`, `tags`,
 //! `attributes.owner_address`) plus `blockHeight` with inclusive `min`/`max`, which
@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 
-use crate::database::ObjectMetadata;
+use crate::ItemTag;
 
 #[derive(Clone, Debug)]
 pub struct IndexFilter {
@@ -66,8 +66,9 @@ impl IndexFilter {
         self.rule == Rule::Never
     }
 
-    pub(crate) fn matches(&self, item: &ObjectMetadata, height: u64) -> bool {
-        self.rule.matches(item, height)
+    /// `owner_address` is empty for items without a signer.
+    pub(crate) fn matches(&self, owner_address: &[u8], tags: &[ItemTag], height: u64) -> bool {
+        self.rule.matches(owner_address, tags, height)
     }
 }
 
@@ -172,25 +173,29 @@ fn parse_tag(value: &Value) -> Result<TagMatch> {
 }
 
 impl Rule {
-    fn matches(&self, item: &ObjectMetadata, height: u64) -> bool {
+    fn matches(&self, owner_address: &[u8], tags: &[ItemTag], height: u64) -> bool {
         match self {
             Rule::Always => true,
             Rule::Never => false,
-            Rule::Not(rule) => !rule.matches(item, height),
-            Rule::And(rules) => rules.iter().all(|rule| rule.matches(item, height)),
-            Rule::Or(rules) => rules.iter().any(|rule| rule.matches(item, height)),
+            Rule::Not(rule) => !rule.matches(owner_address, tags, height),
+            Rule::And(rules) => rules
+                .iter()
+                .all(|rule| rule.matches(owner_address, tags, height)),
+            Rule::Or(rules) => rules
+                .iter()
+                .any(|rule| rule.matches(owner_address, tags, height)),
             // Upstream semantics: every listed tag must be matched by some item tag.
             Rule::Tags(wanted) => wanted.iter().all(|wanted| {
-                item.tags.iter().any(|(name, value)| {
-                    *name == wanted.name
+                tags.iter().any(|tag| {
+                    tag.name.as_ref() == wanted.name
                         && match &wanted.value {
                             TagValue::Any => true,
-                            TagValue::Exact(expected) => value == expected,
-                            TagValue::Prefix(prefix) => value.starts_with(prefix),
+                            TagValue::Exact(expected) => tag.value.as_ref() == expected.as_slice(),
+                            TagValue::Prefix(prefix) => tag.value.starts_with(prefix),
                         }
                 })
             }),
-            Rule::Owner(address) => item.owner_address == address,
+            Rule::Owner(address) => owner_address == address.as_slice(),
             Rule::BlockHeight { min, max } => (*min..=*max).contains(&height),
         }
     }
@@ -202,28 +207,27 @@ mod tests {
 
     const REDSTONE: &str = "I-5rWUehEv-MjdK9gFw09RxfSLQX9DIHxG614Wf8qo0";
 
-    fn item(owner: &str, tags: &[(&str, &str)]) -> ObjectMetadata {
-        ObjectMetadata {
-            id: vec![7; 32],
-            kind: 1,
-            signature: Vec::new(),
-            anchor: Vec::new(),
+    struct Item {
+        owner_address: Vec<u8>,
+        tags: Vec<ItemTag>,
+    }
+
+    fn item(owner: &str, tags: &[(&str, &str)]) -> Item {
+        Item {
             owner_address: URL_SAFE_NO_PAD.decode(owner).unwrap(),
-            owner_public_key: Vec::new(),
-            target: Vec::new(),
-            data_size: 0,
-            content_type: None,
-            content_encoding: None,
-            signature_type: 1,
-            format: None,
-            quantity: None,
-            reward: None,
-            denomination: None,
-            data_root: None,
             tags: tags
                 .iter()
-                .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
+                .map(|(name, value)| ItemTag {
+                    name: name.as_bytes().to_vec().into(),
+                    value: value.as_bytes().to_vec().into(),
+                })
                 .collect(),
+        }
+    }
+
+    impl IndexFilter {
+        fn keeps(&self, item: &Item, height: u64) -> bool {
+            self.matches(&item.owner_address, &item.tags, height)
         }
     }
 
@@ -245,12 +249,12 @@ mod tests {
             REDSTONE,
             &[("type", "redstone-oracles"), ("dataServiceId", "x")],
         );
-        assert!(!filter.matches(&oracle, 1_755_000));
-        assert!(!filter.matches(&oracle, 1_870_999));
-        assert!(filter.matches(&oracle, 1_871_000));
-        assert!(filter.matches(&item(REDSTONE, &[("type", "other")]), 1_755_000));
+        assert!(!filter.keeps(&oracle, 1_755_000));
+        assert!(!filter.keeps(&oracle, 1_870_999));
+        assert!(filter.keeps(&oracle, 1_871_000));
+        assert!(filter.keeps(&item(REDSTONE, &[("type", "other")]), 1_755_000));
         let other_owner = "fcoN_xJeisVsPXA-trzVAuIiqO3ydLQxM-L4XbrQKzY";
-        assert!(filter.matches(
+        assert!(filter.keeps(
             &item(other_owner, &[("type", "redstone-oracles")]),
             1_755_000
         ));
@@ -263,18 +267,18 @@ mod tests {
         )
         .unwrap();
         let owner = "fcoN_xJeisVsPXA-trzVAuIiqO3ydLQxM-L4XbrQKzY";
-        assert!(filter.matches(
+        assert!(filter.keeps(
             &item(
                 owner,
                 &[("App-Name", "A"), ("Content-Type", "image/png"), ("X", "")]
             ),
             0
         ));
-        assert!(!filter.matches(
+        assert!(!filter.keeps(
             &item(owner, &[("App-Name", "A"), ("Content-Type", "image/png")]),
             0
         ));
-        assert!(!filter.matches(
+        assert!(!filter.keeps(
             &item(
                 owner,
                 &[("app-name", "A"), ("Content-Type", "image/png"), ("X", "")]
