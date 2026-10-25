@@ -1247,17 +1247,14 @@ impl Gateway {
             .map(|cache| cache.flights())
             .unwrap_or(&self.chunk_flights);
         let gateway = self.clone();
-        tokio::time::timeout(
-            self.config.request_timeout.min(CHUNK_DEADLINE),
-            shared::run(flights, (offset, geometry), async move {
-                gateway
-                    .fetch_verified_chunk_inner(offset, geometry)
-                    .await
-                    .map_err(RetrievalFailure::from)
-            }),
-        )
+        // The peer budget lives in `hedged_requests`, which excludes admission waits.
+        shared::run(flights, (offset, geometry), async move {
+            gateway
+                .fetch_verified_chunk_inner(offset, geometry)
+                .await
+                .map_err(RetrievalFailure::from)
+        })
         .await
-        .context("verified chunk retrieval timed out")?
         .map_err(anyhow::Error::from)
     }
 
@@ -1267,50 +1264,59 @@ impl Gateway {
         geometry: BlockGeometry,
     ) -> Result<Option<ChunkFetch>> {
         if let (Some(cache), Some(store)) = (&self.disk_cache, &self.block_store) {
-            let cached = async {
-                let Some(_publication) = cache.publication_guard() else {
-                    return Ok(None);
-                };
-                while let Some(entry) = store.cached_chunk(offset, geometry).await? {
-                    let candidate = async {
-                        let Some(bytes) = cache
-                            .load_chunk_bytes(entry.hash, usize::try_from(entry.end - entry.start)?)
-                            .await?
-                        else {
-                            return Ok(None);
-                        };
-                        let chunk = Chunk {
-                            chunk: bytes,
-                            data_path: entry.data_path.clone().into(),
-                            tx_path: entry.tx_path.clone().into(),
-                            packing: packing::Packing::Unpacked,
-                        };
-                        let proof =
-                            cpu_work(move || verify_chunk_proof(chunk, offset, &geometry, None))
-                                .await?;
-                        ensure!(
-                            proof.first_offset.checked_add(proof.data.start) == Some(entry.start)
-                                && proof.first_offset.checked_add(proof.data.end)
-                                    == Some(entry.end)
-                                && proof.data.data_hash == entry.hash,
-                            "cached chunk interval mismatch"
-                        );
-                        Ok::<_, anyhow::Error>(Some(proof))
+            let cached =
+                tokio::time::timeout(self.config.request_timeout.min(CHUNK_DEADLINE), async {
+                    let Some(_publication) = cache.publication_guard() else {
+                        return Ok(None);
+                    };
+                    while let Some(entry) = store.cached_chunk(offset, geometry).await? {
+                        let candidate = async {
+                            let Some(bytes) = cache
+                                .load_chunk_bytes(
+                                    entry.hash,
+                                    usize::try_from(entry.end - entry.start)?,
+                                )
+                                .await?
+                            else {
+                                return Ok(None);
+                            };
+                            let chunk = Chunk {
+                                chunk: bytes,
+                                data_path: entry.data_path.clone().into(),
+                                tx_path: entry.tx_path.clone().into(),
+                                packing: packing::Packing::Unpacked,
+                            };
+                            let proof = cpu_work(move || {
+                                verify_chunk_proof(chunk, offset, &geometry, None)
+                            })
+                            .await?;
+                            ensure!(
+                                proof.first_offset.checked_add(proof.data.start)
+                                    == Some(entry.start)
+                                    && proof.first_offset.checked_add(proof.data.end)
+                                        == Some(entry.end)
+                                    && proof.data.data_hash == entry.hash,
+                                "cached chunk interval mismatch"
+                            );
+                            Ok::<_, anyhow::Error>(Some(proof))
+                        }
+                        .await;
+                        if let Ok(Some(proof)) = candidate {
+                            cache.touch(entry.hash);
+                            return Ok(Some(ChunkFetch {
+                                proof: Arc::new(proof),
+                                source_host: entry.source_host,
+                                cache_hit: true,
+                            }));
+                        }
+                        store.forget_cached_chunk(&entry.hash, entry.start).await?;
                     }
-                    .await;
-                    if let Ok(Some(proof)) = candidate {
-                        cache.touch(entry.hash);
-                        return Ok(Some(ChunkFetch {
-                            proof: Arc::new(proof),
-                            source_host: entry.source_host,
-                            cache_hit: true,
-                        }));
-                    }
-                    store.forget_cached_chunk(&entry.hash, entry.start).await?;
-                }
-                Ok::<_, anyhow::Error>(None)
-            }
-            .await;
+                    Ok::<_, anyhow::Error>(None)
+                })
+                .await
+                .unwrap_or_else(|elapsed| {
+                    Err(anyhow::Error::from(elapsed).context("chunk cache lookup timed out"))
+                });
             cache.record_lookup(shared::cache_requested(), &cached);
             match cached {
                 Ok(Some(chunk)) => return Ok(Some(chunk)),
