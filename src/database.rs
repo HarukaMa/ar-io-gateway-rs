@@ -6623,8 +6623,11 @@ mod tests {
                     };
                     gateway.save_content_cache(&mut verified, None).await?;
                     let restored_gateway = fresh();
-                    let (restored, _) = restored_gateway.load_content_cache(&id).await?.context("content metadata missing")?;
+                    let (mut restored, _) = restored_gateway.load_content_cache(&id).await?.context("content metadata missing")?;
                     ensure!(restored.cache_hit, "complete chunk coverage reported a miss");
+                    ensure!(!restored.stable_anchor);
+                    ensure!(restored_gateway.current_anchor(&mut restored).await?);
+                    ensure!(restored.stable_anchor, "stable cached content was not promoted");
                     if index == 0 {
                         store.forget_cached_chunk(&hashes[1], previous + size as u128 + 1).await?;
                         let (partial, _) = restored_gateway.load_content_cache(&id).await?.unwrap();

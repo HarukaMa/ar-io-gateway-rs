@@ -978,7 +978,8 @@ impl Gateway {
         Ok(data)
     }
 
-    async fn current_anchor(&self, data: &VerifiedData) -> Result<bool> {
+    // Also promotes `stable_anchor` once the block is stable canonical.
+    async fn current_anchor(&self, data: &mut VerifiedData) -> Result<bool> {
         if data.stable_anchor {
             return Ok(true);
         }
@@ -988,7 +989,8 @@ impl Gateway {
         if let Some(store) = &self.block_store
             && let Some(hash) = store.stable_canonical_hash(data.block_height).await?
         {
-            return Ok(hash.as_slice() == expected);
+            data.stable_anchor = hash.as_slice() == expected;
+            return Ok(data.stable_anchor);
         }
         Ok(self
             .trusted_block_index(data.block_height, data.block_height)
@@ -1007,8 +1009,8 @@ impl Gateway {
         let retrieve: futures_util::future::BoxFuture<'static, _> = Box::pin(retrieve);
         Box::pin(async move {
             let cached = { cache.lock().unwrap().get(id) };
-            if let Some(data) = cached {
-                if self.current_anchor(&data).await? {
+            if let Some(mut data) = cached {
+                if self.current_anchor(&mut data).await? {
                     if let Some(cache) = &self.disk_cache {
                         cache.touch_object(decode_fixed::<32>(&data.id, "data ID")?);
                         if data.bytes.is_memory() {
@@ -1030,9 +1032,9 @@ impl Gateway {
             let cache = Arc::clone(cache);
             let result = shared::run(&flights, id.to_owned(), async move {
                 let result = async {
-                    let data = retrieve.await?;
+                    let mut data = retrieve.await?;
                     ensure!(
-                        gateway.current_anchor(&data).await?,
+                        gateway.current_anchor(&mut data).await?,
                         "content block changed during retrieval"
                     );
                     if cache_result {
@@ -1047,12 +1049,12 @@ impl Gateway {
                 .await;
                 result.map_err(RetrievalFailure::from)
             });
-            let data = retrieval_deadline(self.config.retrieval_timeout, result)
+            let mut data = retrieval_deadline(self.config.retrieval_timeout, result)
                 .await
                 .context("verified retrieval timed out")?
                 .map_err(anyhow::Error::from)?;
             ensure!(
-                self.current_anchor(&data).await?,
+                self.current_anchor(&mut data).await?,
                 "coalesced content block changed"
             );
             Ok(data)
@@ -1072,9 +1074,9 @@ impl Gateway {
     pub async fn retrieve_bundled(&self, id: &str) -> Result<VerifiedData> {
         retrieval_deadline(self.config.retrieval_timeout, async {
             decode_fixed::<32>(id, "data item ID")?;
-            if let Some((data, None)) = self.load_content_cache(id).await? {
+            if let Some((mut data, None)) = self.load_content_cache(id).await? {
                 ensure!(
-                    self.current_anchor(&data).await?,
+                    self.current_anchor(&mut data).await?,
                     "cached content block changed"
                 );
                 return Ok(data);
@@ -1753,7 +1755,7 @@ impl Gateway {
                     eprintln!("content cache admission failed: {error:#}");
                 }
                 ensure!(
-                    self.current_anchor(&data).await?,
+                    self.current_anchor(&mut data).await?,
                     "bundle block changed during retrieval"
                 );
                 Ok(Some(data))

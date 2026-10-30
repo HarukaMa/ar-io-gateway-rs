@@ -1,5 +1,9 @@
 # Changelog
 
+## 88-pre-rs
+
+- Report `X-AR-IO-Stable` from the verified block's stability. Data within the fork depth of the trusted tip is labelled unstable and cached for 12 hours without `immutable`. Stable data keeps the 30-day `immutable` tier, including content restored from the disk cache.
+
 ## 85-rs
 
 - Preserve resolved ArNS headers on content retrieval errors, including missing content and manifest paths.

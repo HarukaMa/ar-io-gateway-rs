@@ -890,7 +890,7 @@ fn info_response(state: &AppState, identity: RequestIdentity) -> Response {
         "ans104IndexFilter": index_filter,
         "supportedManifestVersions": ["0.1.0", "0.2.0"],
         // The upstream ar-io-node release whose feature set this build tracks.
-        "release": "85-rs",
+        "release": "88-pre-rs",
         "services": {
             "bundlers": state.config.bundler_urls.iter()
                 .map(|url| serde_json::json!({"url": url})).collect::<Vec<_>>(),
@@ -3201,7 +3201,14 @@ async fn verified_response(
         )
         .header("x-ar-io-data-id", verified.id.as_str())
         .header("x-ar-io-digest", digest)
-        .header("x-ar-io-stable", "true")
+        .header(
+            "x-ar-io-stable",
+            if verified.stable_anchor {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .header("x-ar-io-verified", "true")
         .header("x-ar-io-trusted", "true")
         .header("x-cache", if verified.cache_hit { "HIT" } else { "MISS" })
@@ -3218,14 +3225,18 @@ async fn verified_response(
             ),
         );
     } else {
-        builder = builder.header(
-            "cache-control",
-            if verified.content_length > 100 * 1024 * 1024 {
-                "private, max-age=2592000, immutable"
-            } else {
-                "public, max-age=2592000, immutable"
-            },
-        );
+        let visibility = if verified.content_length > 100 * 1024 * 1024 {
+            "private"
+        } else {
+            "public"
+        };
+        // Upstream's stable and unstable-trusted tiers.
+        let max_age = if verified.stable_anchor {
+            "max-age=2592000, immutable"
+        } else {
+            "max-age=43200"
+        };
+        builder = builder.header("cache-control", format!("{visibility}, {max_age}"));
     }
 
     let range = range_header
@@ -6226,6 +6237,30 @@ mod tests {
                     .as_ref(),
                 br#"{"name":"example"}"#,
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn unstable_data_is_labelled_and_cached_briefly() {
+        let limits = stream_limits();
+        let permits = Arc::new(Semaphore::new(1));
+        for (stable, label, cache_control) in [
+            (true, "true", "public, max-age=2592000, immutable"),
+            (false, "false", "public, max-age=43200"),
+        ] {
+            let mut verified = response_fixture(b"hello");
+            verified.stable_anchor = stable;
+            let response = verified_response(
+                verified,
+                None,
+                &HeaderMap::new(),
+                &limits,
+                request_permit(&permits).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.headers()["x-ar-io-stable"], label);
+            assert_eq!(response.headers()[CACHE_CONTROL], cache_control);
         }
     }
     #[tokio::test]
