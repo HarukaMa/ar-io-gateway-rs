@@ -66,6 +66,8 @@ const MAX_DISCOVERY_LOCATIONS: usize = 2;
 const MAX_DISCOVERY_PATHS: usize = 64;
 const MAX_DISCOVERY_PARK: Duration = Duration::from_secs(600);
 const NOT_FOUND_TTL: Duration = Duration::from_secs(60);
+// Short so an ID becomes servable soon after a parked source returns.
+const UNCONFIRMED_NOT_FOUND_TTL: Duration = Duration::from_secs(30);
 const MAX_NOT_FOUND_ENTRIES: usize = 65_536;
 const MAX_PROOF_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_INDEX_BYTES: usize = 256 * 99;
@@ -630,7 +632,8 @@ pub struct Gateway {
     >,
     // Expiry instants. Discovery sources come from config, so the parked map stays tiny.
     parked_sources: Arc<Mutex<HashMap<String, Instant>>>,
-    not_found: Arc<Mutex<HashMap<String, Instant>>>,
+    // Expiry and whether discovery confirmed the absence.
+    not_found: Arc<Mutex<HashMap<String, (Instant, bool)>>>,
     discovery_stats: Arc<DiscoveryStats>,
 }
 
@@ -979,17 +982,17 @@ impl Gateway {
 
     pub async fn retrieve(&self, id: &str) -> Result<VerifiedData> {
         decode_fixed::<32>(id, "data ID")?;
-        if self
-            .not_found
-            .lock()
-            .unwrap()
-            .get(id)
-            .is_some_and(|expiry| *expiry > Instant::now())
+        if let Some(&(expiry, confirmed)) = self.not_found.lock().unwrap().get(id)
+            && expiry > Instant::now()
         {
             self.discovery_stats
                 .negative_cache_hits
                 .fetch_add(1, Ordering::Relaxed);
-            return Err(ContentNotFound.into());
+            return Err(if confirmed {
+                ContentNotFound.into()
+            } else {
+                UnconfirmedNotFound.into()
+            });
         }
         let worker = self.clone();
         let key = id.to_owned();
@@ -1027,7 +1030,9 @@ impl Gateway {
         .await
         .inspect_err(|error| {
             if error.is::<ContentNotFound>() {
-                self.remember_not_found(id);
+                self.remember_not_found(id, true);
+            } else if error.is::<UnconfirmedNotFound>() {
+                self.remember_not_found(id, false);
             }
         })?;
         // Node's L1 content source returns 404 when there are no data chunks.
@@ -1076,16 +1081,21 @@ impl Gateway {
             })
     }
 
-    fn remember_not_found(&self, id: &str) {
+    fn remember_not_found(&self, id: &str, confirmed: bool) {
         let now = Instant::now();
         let mut entries = self.not_found.lock().unwrap();
         if entries.len() >= MAX_NOT_FOUND_ENTRIES {
-            entries.retain(|_, expiry| *expiry > now);
+            entries.retain(|_, (expiry, _)| *expiry > now);
             if entries.len() >= MAX_NOT_FOUND_ENTRIES {
                 return;
             }
         }
-        entries.insert(id.to_owned(), now + NOT_FOUND_TTL);
+        let ttl = if confirmed {
+            NOT_FOUND_TTL
+        } else {
+            UNCONFIRMED_NOT_FOUND_TTL
+        };
+        entries.insert(id.to_owned(), (now + ttl, confirmed));
     }
 
     // Also promotes `stable_anchor` once the block is stable canonical.
@@ -1988,10 +1998,13 @@ impl Gateway {
                 .map_or(Duration::from_secs(60), Duration::from_secs)
                 .clamp(Duration::from_secs(1), MAX_DISCOVERY_PARK);
             eprintln!("parked {source} for {}s after HTTP 429", park.as_secs());
+            let until = Instant::now() + park;
             self.parked_sources
                 .lock()
                 .unwrap()
-                .insert(source.to_owned(), Instant::now() + park);
+                .entry(source.to_owned())
+                .and_modify(|expiry| *expiry = (*expiry).max(until))
+                .or_insert(until);
             return Err(SourceRateLimited(source.to_owned()).into());
         }
         let response: GraphQlResponse = read_json_response(
@@ -7211,10 +7224,13 @@ mod tests {
         use axum::{Router, http::StatusCode, response::IntoResponse};
 
         let limited_hits = Arc::new(AtomicUsize::new(0));
+        let answered_hits = Arc::new(AtomicUsize::new(0));
         let app = Router::new().fallback({
             let limited_hits = limited_hits.clone();
+            let answered_hits = answered_hits.clone();
             move |uri: axum::http::Uri, body: axum::body::Bytes| {
                 let limited_hits = limited_hits.clone();
+                let answered_hits = answered_hits.clone();
                 async move {
                     match uri.path() {
                         "/limited/graphql" => {
@@ -7227,6 +7243,7 @@ mod tests {
                         }
                         // arweave.net's encoding of an L1 transaction with no parent.
                         "/graphql" => {
+                            answered_hits.fetch_add(1, Ordering::SeqCst);
                             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                             let id = request["variables"]["ids"][0].clone();
                             serde_json::json!({"data": {"transactions": {"edges": [{
@@ -7265,6 +7282,18 @@ mod tests {
             limited_hits.load(Ordering::SeqCst),
             1,
             "parked source was queried again"
+        );
+
+        // A repeated unconfirmed miss is answered from the short negative cache.
+        let error = gateway
+            .retrieve(&URL_SAFE_NO_PAD.encode([1; 32]))
+            .await
+            .unwrap_err();
+        assert!(error.is::<UnconfirmedNotFound>(), "{error:#}");
+        assert_eq!(
+            answered_hits.load(Ordering::SeqCst),
+            2,
+            "repeat miss queried discovery"
         );
 
         // Without an answering source the miss stays an upstream failure.

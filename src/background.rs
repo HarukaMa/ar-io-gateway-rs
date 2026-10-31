@@ -540,6 +540,10 @@ pub(crate) async fn start(
                 drop(runtime);
                 result
             })();
+            match &result {
+                Ok(()) => eprintln!("bundle worker stopped"),
+                Err(error) => eprintln!("bundle worker stopped: {error:#}"),
+            }
             let _ = finished.send(());
             result
         })
