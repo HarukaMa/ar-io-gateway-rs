@@ -600,6 +600,15 @@ impl ContentCache {
     }
 }
 
+/// Discovery traffic since the last summary, including requests the old path would have sent.
+#[derive(Default)]
+struct DiscoveryStats {
+    graphql_sent: AtomicUsize,
+    parked_skips: AtomicUsize,
+    l1_skips: AtomicUsize,
+    negative_cache_hits: AtomicUsize,
+}
+
 #[derive(Clone)]
 pub struct Gateway {
     config: Config,
@@ -622,6 +631,7 @@ pub struct Gateway {
     // Expiry instants. Discovery sources come from config, so the parked map stays tiny.
     parked_sources: Arc<Mutex<HashMap<String, Instant>>>,
     not_found: Arc<Mutex<HashMap<String, Instant>>>,
+    discovery_stats: Arc<DiscoveryStats>,
 }
 
 impl Gateway {
@@ -689,6 +699,7 @@ impl Gateway {
             bundle_indexer: None,
             parked_sources: Default::default(),
             not_found: Default::default(),
+            discovery_stats: Default::default(),
         })
     }
 
@@ -975,6 +986,9 @@ impl Gateway {
             .get(id)
             .is_some_and(|expiry| *expiry > Instant::now())
         {
+            self.discovery_stats
+                .negative_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
             return Err(ContentNotFound.into());
         }
         let worker = self.clone();
@@ -1029,6 +1043,24 @@ impl Gateway {
             }
         }
         Ok(data)
+    }
+
+    pub(crate) fn log_discovery_stats(&self) {
+        let stats = &self.discovery_stats;
+        let counts = [
+            &stats.graphql_sent,
+            &stats.parked_skips,
+            &stats.l1_skips,
+            &stats.negative_cache_hits,
+        ]
+        .map(|count| count.swap(0, Ordering::Relaxed));
+        if counts.iter().any(|count| *count > 0) {
+            let [sent, parked, l1, negative] = counts;
+            eprintln!(
+                "discovery stats: graphql_sent={sent} parked_skips={parked} l1_skips={l1} negative_cache_hits={negative} sources={}",
+                self.config.graphql_sources.len()
+            );
+        }
     }
 
     // Only rate-limit parking failed, and at least one source still answered.
@@ -1876,6 +1908,9 @@ impl Gateway {
             .await?
             .is_some()
             {
+                self.discovery_stats
+                    .l1_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 return Ok(None);
             }
         }
@@ -1930,8 +1965,10 @@ impl Gateway {
             .get(source)
             .is_some_and(|expiry| *expiry > Instant::now())
         {
+            self.discovery_stats.parked_skips.fetch_add(1, Ordering::Relaxed);
             return Err(SourceRateLimited(source.to_owned()).into());
         }
+        self.discovery_stats.graphql_sent.fetch_add(1, Ordering::Relaxed);
         let response = self
             .client
             .post(source)
@@ -1950,6 +1987,7 @@ impl Gateway {
                 .and_then(|value| value.to_str().ok()?.trim().parse().ok())
                 .map_or(Duration::from_secs(60), Duration::from_secs)
                 .clamp(Duration::from_secs(1), MAX_DISCOVERY_PARK);
+            eprintln!("parked {source} for {}s after HTTP 429", park.as_secs());
             self.parked_sources
                 .lock()
                 .unwrap()

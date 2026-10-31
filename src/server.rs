@@ -618,6 +618,15 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
             }
         }
     });
+    let stats_state = state.clone();
+    refresh_tasks.spawn(async move {
+        let mut ticks = interval(Duration::from_secs(10 * 60));
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            stats_state.gateway.log_discovery_stats();
+        }
+    });
     let gateway_state = state.clone();
     refresh_tasks.spawn(async move {
         let mut ticks = interval(Duration::from_secs(60 * 60));
