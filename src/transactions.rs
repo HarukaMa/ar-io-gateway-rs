@@ -401,6 +401,30 @@ pub(super) fn verify_block_data_root(
     Ok(())
 }
 
+/// Returns the transaction's data size and block-relative end offset, using the
+/// same ordering and padding as `verify_block_data_root`. Callers still prove
+/// the result against the block's tx_root through chunk tx_paths.
+pub(super) fn transaction_end_offset(
+    height: u64,
+    mut transactions: Vec<(Vec<u8>, Option<i16>, u128)>,
+    id: &[u8],
+) -> Result<Option<(u128, u128)>> {
+    transactions.sort_unstable_by(|left, right| (left.1, &left.0).cmp(&(right.1, &right.0)));
+    let mut end = 0u128;
+    for (transaction_id, _, size) in transactions {
+        end = end.checked_add(size).context("block data size overflow")?;
+        if transaction_id == id {
+            return Ok(Some((size, end)));
+        }
+        if height >= FORK_2_5_HEIGHT {
+            end = end
+                .checked_add((MAX_CHUNK_SIZE - size % MAX_CHUNK_SIZE) % MAX_CHUNK_SIZE)
+                .context("block padding overflow")?;
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn optional_text_tag<'a>(
     tags: impl Iterator<Item = (&'a [u8], &'a [u8])>,
     expected: &[u8],
@@ -1071,6 +1095,40 @@ mod tests {
             std::mem::swap(&mut left[0].data_size, &mut right[0].data_size);
             assert!(verify_block_data_root(&block, &mut objects).is_err());
         }
+    }
+
+    #[test]
+    fn transaction_end_offsets_follow_record_order_and_fork_padding() {
+        let transactions = vec![
+            (vec![3; 32], Some(2), 10),
+            (vec![1; 32], Some(2), MAX_CHUNK_SIZE + 5),
+            (vec![9; 32], Some(1), 7),
+        ];
+        // Format sorts before ID, and 2.5+ pads every transaction to a chunk boundary.
+        for (height, expected) in [
+            (
+                FORK_2_5_HEIGHT - 1,
+                [7, 7 + MAX_CHUNK_SIZE + 5, 17 + MAX_CHUNK_SIZE + 5],
+            ),
+            (
+                FORK_2_5_HEIGHT,
+                [7, 2 * MAX_CHUNK_SIZE + 5, 3 * MAX_CHUNK_SIZE + 10],
+            ),
+        ] {
+            for ((id, size), end) in [([9; 32], 7), ([1; 32], MAX_CHUNK_SIZE + 5), ([3; 32], 10)]
+                .into_iter()
+                .zip(expected)
+            {
+                assert_eq!(
+                    transaction_end_offset(height, transactions.clone(), &id).unwrap(),
+                    Some((size, end))
+                );
+            }
+        }
+        assert_eq!(
+            transaction_end_offset(FORK_2_5_HEIGHT, transactions, &[4; 32]).unwrap(),
+            None
+        );
     }
 
     #[test]

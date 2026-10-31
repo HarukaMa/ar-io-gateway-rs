@@ -64,6 +64,9 @@ const MAX_JSON_BYTES: usize = 1024 * 1024;
 const MAX_GRAPHQL_SOURCES: usize = 4;
 const MAX_DISCOVERY_LOCATIONS: usize = 2;
 const MAX_DISCOVERY_PATHS: usize = 64;
+const MAX_DISCOVERY_PARK: Duration = Duration::from_secs(600);
+const NOT_FOUND_TTL: Duration = Duration::from_secs(60);
+const MAX_NOT_FOUND_ENTRIES: usize = 65_536;
 const MAX_PROOF_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_INDEX_BYTES: usize = 256 * 99;
 const MAX_BLOCK_TRANSACTIONS: usize = 1000;
@@ -492,6 +495,29 @@ impl std::fmt::Display for ContentNotFound {
 
 impl std::error::Error for ContentNotFound {}
 
+/// No source located the ID, but a parked discovery source never answered.
+#[derive(Debug)]
+pub(crate) struct UnconfirmedNotFound;
+
+impl std::fmt::Display for UnconfirmedNotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("content not found by the available discovery sources")
+    }
+}
+
+impl std::error::Error for UnconfirmedNotFound {}
+
+#[derive(Debug)]
+struct SourceRateLimited(String);
+
+impl std::fmt::Display for SourceRateLimited {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} is rate limited", self.0)
+    }
+}
+
+impl std::error::Error for SourceRateLimited {}
+
 #[derive(Debug)]
 pub(crate) struct AttemptFailures {
     context: &'static str,
@@ -513,6 +539,7 @@ impl std::error::Error for AttemptFailures {}
 #[derive(Clone)]
 enum RetrievalFailure {
     NotFound,
+    Unconfirmed,
     Other(Arc<anyhow::Error>),
 }
 
@@ -592,6 +619,9 @@ pub struct Gateway {
         (u128, BlockGeometry),
         std::result::Result<Option<ChunkFetch>, RetrievalFailure>,
     >,
+    // Expiry instants. Discovery sources come from config, so the parked map stays tiny.
+    parked_sources: Arc<Mutex<HashMap<String, Instant>>>,
+    not_found: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl Gateway {
@@ -657,6 +687,8 @@ impl Gateway {
             disk_cache: None,
             direct_cache: Arc::new(Mutex::new(ContentCache::default())),
             bundle_indexer: None,
+            parked_sources: Default::default(),
+            not_found: Default::default(),
         })
     }
 
@@ -936,6 +968,15 @@ impl Gateway {
 
     pub async fn retrieve(&self, id: &str) -> Result<VerifiedData> {
         decode_fixed::<32>(id, "data ID")?;
+        if self
+            .not_found
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|expiry| *expiry > Instant::now())
+        {
+            return Err(ContentNotFound.into());
+        }
         let worker = self.clone();
         let key = id.to_owned();
         // Keep the retrieval state machine off the Windows HTTP thread's stack.
@@ -957,12 +998,24 @@ impl Gateway {
                 Ok(None) => worker.retrieve_direct(id).await,
                 Err(discovery_error) => match worker.retrieve_direct(id).await {
                     Ok(data) => Ok(data),
-                    Err(error) if error.is::<ContentNotFound>() => Err(discovery_error),
+                    Err(error) if error.is::<ContentNotFound>() => {
+                        if worker.discovery_only_parked(&discovery_error) {
+                            eprintln!("unconfirmed not found for {id}: {discovery_error:#}");
+                            Err(UnconfirmedNotFound.into())
+                        } else {
+                            Err(discovery_error)
+                        }
+                    }
                     Err(error) => Err(error),
                 },
             }
         }))
-        .await?;
+        .await
+        .inspect_err(|error| {
+            if error.is::<ContentNotFound>() {
+                self.remember_not_found(id);
+            }
+        })?;
         // Node's L1 content source returns 404 when there are no data chunks.
         if data.content_length == 0
             && matches!(&data.indexing_root, Some(IndexingRoot::Complete(root)) if root.data.id == data.id)
@@ -976,6 +1029,31 @@ impl Gateway {
             }
         }
         Ok(data)
+    }
+
+    // Only rate-limit parking failed, and at least one source still answered.
+    fn discovery_only_parked(&self, error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<AttemptFailures>()
+            .is_some_and(|failures| {
+                failures.errors.len() < self.config.graphql_sources.len()
+                    && failures
+                        .errors
+                        .iter()
+                        .all(|error| error.is::<SourceRateLimited>())
+            })
+    }
+
+    fn remember_not_found(&self, id: &str) {
+        let now = Instant::now();
+        let mut entries = self.not_found.lock().unwrap();
+        if entries.len() >= MAX_NOT_FOUND_ENTRIES {
+            entries.retain(|_, expiry| *expiry > now);
+            if entries.len() >= MAX_NOT_FOUND_ENTRIES {
+                return;
+            }
+        }
+        entries.insert(id.to_owned(), now + NOT_FOUND_TTL);
     }
 
     // Also promotes `stable_anchor` once the block is stable canonical.
@@ -1789,6 +1867,17 @@ impl Gateway {
                     .await
                     .map(Some);
             }
+            // Indexed L1 transactions have no parent bundle to discover.
+            if diagnostics::check(
+                "indexed_transaction_lookup",
+                id,
+                Box::pin(store.transaction_placement(&item_id)),
+            )
+            .await?
+            .is_some()
+            {
+                return Ok(None);
+            }
         }
         let mut seen = HashSet::new();
         let mut discoveries = FuturesUnordered::new();
@@ -1834,17 +1923,47 @@ impl Gateway {
 
     async fn discover_from(&self, id: &str, source: &str) -> Result<Vec<BundleHint>> {
         diagnostics::check("bundle_discovery", id, async {
-        let response: GraphQlResponse = self
-            .request_json(
-                self.client
-                    .post(source)
-                    .json(&serde_json::json!({
-                        "query": "query($ids: [ID!]!, $limit: Int!) { transactions(ids: $ids, first: $limit) { edges { node { id bundledIn { id } data { size } } } } }",
-                        "variables": { "ids": [id], "limit": MAX_DISCOVERY_LOCATIONS }
-                    })),
-            )
+        if self
+            .parked_sources
+            .lock()
+            .unwrap()
+            .get(source)
+            .is_some_and(|expiry| *expiry > Instant::now())
+        {
+            return Err(SourceRateLimited(source.to_owned()).into());
+        }
+        let response = self
+            .client
+            .post(source)
+            .json(&serde_json::json!({
+                "query": "query($ids: [ID!]!, $limit: Int!) { transactions(ids: $ids, first: $limit) { edges { node { id bundledIn { id } data { size } } } } }",
+                "variables": { "ids": [id], "limit": MAX_DISCOVERY_LOCATIONS }
+            }))
+            .send()
             .await
+            .context("HTTP request failed")
             .context("failed to discover data location")?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let park = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()?.trim().parse().ok())
+                .map_or(Duration::from_secs(60), Duration::from_secs)
+                .clamp(Duration::from_secs(1), MAX_DISCOVERY_PARK);
+            self.parked_sources
+                .lock()
+                .unwrap()
+                .insert(source.to_owned(), Instant::now() + park);
+            return Err(SourceRateLimited(source.to_owned()).into());
+        }
+        let response: GraphQlResponse = read_json_response(
+            response
+                .error_for_status()
+                .context("HTTP source rejected request")
+                .context("failed to discover data location")?,
+        )
+        .await
+        .context("failed to discover data location")?;
         let edges = response.data.transactions.edges;
         ensure!(edges.len() <= MAX_DISCOVERY_LOCATIONS, "discovery response exceeds location limit");
         let mut hints = Vec::with_capacity(edges.len());
@@ -1855,12 +1974,13 @@ impl Gateway {
                 return Err(diagnostics::wrong_item(id, &node.id).into());
             }
             decode_fixed::<32>(&node.id, "discovered data item ID")?;
-            let Some(parent) = node.bundled_in else {
+            // arweave.net reports L1 transactions with an empty parent ID instead of null.
+            let Some(parent) = node.bundled_in.filter(|parent| !parent.id.is_empty()) else {
                 continue;
             };
             let parent_id = parent.id;
             decode_fixed::<32>(&parent_id, "discovered parent ID")
-                .context("discovery returned an invalid or empty parent bundle ID")?;
+                .context("discovery returned an invalid parent bundle ID")?;
             ensure!(parent_id != id, "data item cannot be its own parent");
             let size = parse_u128(&node.data.size, "discovered data item size")?;
             if !seen.insert((parent_id.clone(), size)) {
@@ -1963,220 +2083,273 @@ impl Gateway {
     }
 
     async fn authenticate_root(&self, id: &str) -> Result<AuthenticatedRoot> {
-        diagnostics::check("transaction_authentication", id, async {
-            decode_fixed::<32>(id, "transaction ID")?;
-
-            let status: TxStatus = diagnostics::check("transaction_status", id, async {
-                let status_url = endpoint(&self.config.archive_url, &format!("tx/{id}/status"));
-                let response = self
-                    .client
-                    .get(&status_url)
-                    .send()
-                    .await
-                    .context("failed to fetch transaction status")?;
-                if response.status() == reqwest::StatusCode::NOT_FOUND
-                    && response.url().as_str() == status_url
-                {
-                    return Err(ContentNotFound.into());
-                }
-                read_json_response(
-                    response
-                        .error_for_status()
-                        .context("transaction status source rejected request")?,
-                )
-                .await
-            })
-            .await?;
-            decode_fixed::<48>(&status.block_indep_hash, "status block hash")?;
-
-            let indexed = diagnostics::check("indexed_block_anchor", id, async {
-                Ok(match &self.block_store {
-                    Some(store)
-                        if store
-                            .stable_canonical_hash(status.block_height)
-                            .await?
-                            .is_some() =>
-                    {
-                        store.block_pair(status.block_height).await?
+        // Boxed: this state machine is large enough to overflow the Windows main thread stack.
+        Box::pin(diagnostics::check(
+            "transaction_authentication",
+            id,
+            async {
+                let item_id = decode_fixed::<32>(id, "transaction ID")?;
+                let placement = match &self.block_store {
+                    Some(store) => {
+                        diagnostics::check(
+                            "indexed_transaction_lookup",
+                            id,
+                            Box::pin(store.transaction_placement(&item_id)),
+                        )
+                        .await?
                     }
-                    _ => None,
-                })
-            })
-            .await?;
-            let stable_anchor;
-            let entries: Vec<BlockIndexEntry> = if let Some((previous, block)) = indexed {
-                stable_anchor = true;
-                [block, previous]
-                    .into_iter()
-                    .map(|entry| BlockIndexEntry {
-                        hash: URL_SAFE_NO_PAD.encode(&entry.hash),
-                        tx_root: URL_SAFE_NO_PAD.encode(&entry.tx_root),
-                        weave_size: entry.weave_size.to_string(),
+                    None => None,
+                };
+
+                let status = if let Some((block_height, block_hash)) = &placement {
+                    TxStatus {
+                        block_height: *block_height,
+                        block_indep_hash: URL_SAFE_NO_PAD.encode(block_hash),
+                    }
+                } else {
+                    diagnostics::check("transaction_status", id, async {
+                        let status_url =
+                            endpoint(&self.config.archive_url, &format!("tx/{id}/status"));
+                        let response = self
+                            .client
+                            .get(&status_url)
+                            .send()
+                            .await
+                            .context("failed to fetch transaction status")?;
+                        if response.status() == reqwest::StatusCode::NOT_FOUND
+                            && response.url().as_str() == status_url
+                        {
+                            return Err(ContentNotFound.into());
+                        }
+                        read_json_response(
+                            response
+                                .error_for_status()
+                                .context("transaction status source rejected request")?,
+                        )
+                        .await
                     })
-                    .collect()
-            } else {
-                let info: NodeInfo = self
-                    .get_json(&self.config.trusted_node_url, "info")
+                    .await?
+                };
+                decode_fixed::<48>(&status.block_indep_hash, "status block hash")?;
+
+                let indexed = diagnostics::check("indexed_block_anchor", id, async {
+                    Ok(match &self.block_store {
+                        Some(store)
+                            if store
+                                .stable_canonical_hash(status.block_height)
+                                .await?
+                                .is_some() =>
+                        {
+                            store.block_pair(status.block_height).await?
+                        }
+                        _ => None,
+                    })
+                })
+                .await?;
+                let stable_anchor;
+                let entries: Vec<BlockIndexEntry> = if let Some((previous, block)) = indexed {
+                    stable_anchor = true;
+                    [block, previous]
+                        .into_iter()
+                        .map(|entry| BlockIndexEntry {
+                            hash: URL_SAFE_NO_PAD.encode(&entry.hash),
+                            tx_root: URL_SAFE_NO_PAD.encode(&entry.tx_root),
+                            weave_size: entry.weave_size.to_string(),
+                        })
+                        .collect()
+                } else {
+                    let info: NodeInfo = self
+                        .get_json(&self.config.trusted_node_url, "info")
+                        .await
+                        .context("failed to fetch trusted node height")?;
+                    ensure!(
+                        info.height >= status.block_height,
+                        "transaction block is above the trusted node tip"
+                    );
+                    stable_anchor = info.height - status.block_height >= CONSENSUS_DEPTH;
+                    let index_path = format!(
+                        "block_index/{}/{}",
+                        status.block_height.saturating_sub(1),
+                        status.block_height
+                    );
+                    self.request_json(
+                        self.client
+                            .get(endpoint(&self.config.trusted_node_url, &index_path))
+                            .header("x-block-format", "1"),
+                    )
                     .await
-                    .context("failed to fetch trusted node height")?;
+                    .context("failed to fetch trusted block index")?
+                };
                 ensure!(
-                    info.height >= status.block_height,
-                    "transaction block is above the trusted node tip"
+                    entries.len() == if status.block_height == 0 { 1 } else { 2 },
+                    "trusted block index returned incomplete geometry"
                 );
-                stable_anchor = info.height - status.block_height >= CONSENSUS_DEPTH;
-                let index_path = format!(
-                    "block_index/{}/{}",
-                    status.block_height.saturating_sub(1),
-                    status.block_height
+                let block = &entries[0];
+                let previous_block = entries.get(1);
+                ensure!(
+                    block.hash == status.block_indep_hash,
+                    "archival status does not match the trusted block index"
                 );
-                self.request_json(
-                    self.client
-                        .get(endpoint(&self.config.trusted_node_url, &index_path))
-                        .header("x-block-format", "1"),
-                )
-                .await
-                .context("failed to fetch trusted block index")?
-            };
-            ensure!(
-                entries.len() == if status.block_height == 0 { 1 } else { 2 },
-                "trusted block index returned incomplete geometry"
-            );
-            let block = &entries[0];
-            let previous_block = entries.get(1);
-            ensure!(
-                block.hash == status.block_indep_hash,
-                "archival status does not match the trusted block index"
-            );
-            let remaining = AtomicUsize::new(usize::MAX);
-            let (mut header, (transaction, mut verified)) = tokio::try_join!(
-                diagnostics::check(
-                    "block_authentication",
-                    id,
-                    self.authenticate_block(block, status.block_height, Some(id)),
-                ),
-                diagnostics::check(
-                    "transaction_signature",
-                    id,
-                    self.fetch_transaction(id, status.block_height, &remaining),
-                ),
-            )?;
-            let root_metadata = (self.bundle_indexer.is_some()
-                && require_bundle_tags(&transaction.tags).is_ok())
-            .then(|| verified.metadata.clone());
-            let data_size = verified.metadata.data_size;
-            let content_encoding =
-                response_content_encoding(verified.metadata.content_encoding.take())?;
-            if transaction.format == 1 && transaction.denomination == 0 {
-                let previous_size = previous_block
+                let remaining = AtomicUsize::new(usize::MAX);
+                let (mut header, (transaction, mut verified)) = tokio::try_join!(
+                    diagnostics::check(
+                        "block_authentication",
+                        id,
+                        self.authenticate_block(block, status.block_height, Some(id)),
+                    ),
+                    diagnostics::check(
+                        "transaction_signature",
+                        id,
+                        self.fetch_transaction(id, status.block_height, &remaining),
+                    ),
+                )?;
+                let root_metadata = (self.bundle_indexer.is_some()
+                    && require_bundle_tags(&transaction.tags).is_ok())
+                .then(|| verified.metadata.clone());
+                let data_size = verified.metadata.data_size;
+                let content_encoding =
+                    response_content_encoding(verified.metadata.content_encoding.take())?;
+                if transaction.format == 1 && transaction.denomination == 0 {
+                    let previous_size = previous_block
+                        .map(|previous| {
+                            parse_u128(&previous.weave_size, "previous block weave size")
+                        })
+                        .transpose()?
+                        .unwrap_or(0);
+                    ensure!(
+                        parse_u128(&block.weave_size, "block weave size")?
+                            .checked_sub(previous_size)
+                            == Some(parse_u128(&header.block_size, "block size")?),
+                        "block size does not match trusted weave geometry"
+                    );
+                    if let Some(previous) = previous_block {
+                        ensure!(
+                            header.previous_block == previous.hash,
+                            "block predecessor does not match trusted index"
+                        );
+                    }
+                    // Legacy signatures bind concatenated fields, not the data boundary.
+                    // Authenticate the ID-to-payload association before returning inline bytes.
+                    (header, _) = self
+                        .verify_block_transactions(
+                            header,
+                            vec![verified.metadata],
+                            usize::MAX - remaining.load(Ordering::Relaxed),
+                            None,
+                        )
+                        .await?;
+                }
+                let facts = root_metadata
+                    .map(|object| {
+                        Ok::<_, anyhow::Error>(indexer::RootFacts {
+                            block_hash: decode_fixed::<48>(&block.hash, "bundle block hash")?,
+                            timestamp: header.timestamp,
+                            transaction_ids: header
+                                .txs
+                                .iter()
+                                .map(|id| {
+                                    decode_fixed::<32>(id, "block transaction ID")
+                                        .map(|id| id.to_vec())
+                                })
+                                .collect::<Result<_>>()?,
+                            object,
+                        })
+                    })
+                    .transpose()?;
+                if let Some(bytes) = verified.inline_data {
+                    return Ok(AuthenticatedRoot {
+                        id: id.to_owned(),
+                        bytes: bytes.into(),
+                        block_height: status.block_height,
+                        block_hash: decode_fixed::<48>(&block.hash, "verified block hash")?,
+                        stable_anchor,
+                        tags: transaction.tags,
+                        content_encoding,
+                        facts,
+                    });
+                }
+
+                let block_weave_size = parse_u128(&block.weave_size, "block weave size")?;
+                let previous_weave_size = previous_block
                     .map(|previous| parse_u128(&previous.weave_size, "previous block weave size"))
                     .transpose()?
                     .unwrap_or(0);
                 ensure!(
-                    parse_u128(&block.weave_size, "block weave size")?.checked_sub(previous_size)
-                        == Some(parse_u128(&header.block_size, "block size")?),
-                    "block size does not match trusted weave geometry"
+                    block_weave_size > previous_weave_size,
+                    "invalid block weave geometry"
                 );
-                if let Some(previous) = previous_block {
+                let indexed_end = match (&self.block_store, &placement) {
+                    (Some(store), Some((block_height, block_hash))) => {
+                        diagnostics::check("indexed_transaction_offset", id, async {
+                            let sizes = Box::pin(store.block_transaction_sizes(block_hash)).await?;
+                            // Fall back to the archive when the block is only partly indexed.
+                            if sizes.len() != header.txs.len() {
+                                return Ok(None);
+                            }
+                            transactions::transaction_end_offset(*block_height, sizes, &item_id)
+                        })
+                        .await?
+                    }
+                    _ => None,
+                };
+                let end_offset = if let Some((indexed_size, relative_end)) = indexed_end {
                     ensure!(
-                        header.previous_block == previous.hash,
-                        "block predecessor does not match trusted index"
+                        indexed_size == data_size,
+                        "transaction size and indexed size differ"
                     );
-                }
-                // Legacy signatures bind concatenated fields, not the data boundary.
-                // Authenticate the ID-to-payload association before returning inline bytes.
-                (header, _) = self
-                    .verify_block_transactions(
-                        header,
-                        vec![verified.metadata],
-                        usize::MAX - remaining.load(Ordering::Relaxed),
-                        None,
-                    )
-                    .await?;
-            }
-            let facts = root_metadata
-                .map(|object| {
-                    Ok::<_, anyhow::Error>(indexer::RootFacts {
-                        block_hash: decode_fixed::<48>(&block.hash, "bundle block hash")?,
-                        timestamp: header.timestamp,
-                        transaction_ids: header
-                            .txs
-                            .iter()
-                            .map(|id| {
-                                decode_fixed::<32>(id, "block transaction ID").map(|id| id.to_vec())
-                            })
-                            .collect::<Result<_>>()?,
-                        object,
-                    })
-                })
-                .transpose()?;
-            if let Some(bytes) = verified.inline_data {
-                return Ok(AuthenticatedRoot {
+                    previous_weave_size
+                        .checked_add(relative_end)
+                        .context("transaction offset overflow")?
+                } else {
+                    let offset: TxOffset = self
+                        .get_json(&self.config.archive_url, &format!("tx/{id}/offset"))
+                        .await
+                        .context("failed to fetch transaction offset")?;
+                    ensure!(
+                        parse_u128(&offset.size, "offset data size")? == data_size,
+                        "transaction size and offset size differ"
+                    );
+                    parse_u128(&offset.offset, "transaction end offset")?
+                };
+                let first_offset = end_offset
+                    .checked_sub(data_size - 1)
+                    .context("transaction offset underflow")?;
+                ensure!(
+                    first_offset > previous_weave_size,
+                    "transaction starts before its block"
+                );
+                ensure!(
+                    end_offset <= block_weave_size,
+                    "transaction ends after its block"
+                );
+
+                let geometry = Geometry {
+                    tx_root: decode_fixed(&block.tx_root, "block tx_root")?,
+                    data_root: decode_fixed(&transaction.data_root, "transaction data root")?,
+                    block_weave_size,
+                    previous_weave_size,
+                    first_offset,
+                    end_offset,
+                    data_size,
+                };
+
+                let expected_len =
+                    usize::try_from(data_size).context("parent size exceeds addressable range")?;
+                Ok(AuthenticatedRoot {
                     id: id.to_owned(),
-                    bytes: bytes.into(),
+                    bytes: Content::streamed(
+                        streaming::ChunkSource::new(self, geometry),
+                        expected_len,
+                    ),
                     block_height: status.block_height,
                     block_hash: decode_fixed::<48>(&block.hash, "verified block hash")?,
                     stable_anchor,
                     tags: transaction.tags,
                     content_encoding,
                     facts,
-                });
-            }
-
-            let offset: TxOffset = self
-                .get_json(&self.config.archive_url, &format!("tx/{id}/offset"))
-                .await
-                .context("failed to fetch transaction offset")?;
-            let offset_size = parse_u128(&offset.size, "offset data size")?;
-            let end_offset = parse_u128(&offset.offset, "transaction end offset")?;
-            ensure!(
-                offset_size == data_size,
-                "transaction size and offset size differ"
-            );
-
-            let block_weave_size = parse_u128(&block.weave_size, "block weave size")?;
-            let previous_weave_size = previous_block
-                .map(|previous| parse_u128(&previous.weave_size, "previous block weave size"))
-                .transpose()?
-                .unwrap_or(0);
-            ensure!(
-                block_weave_size > previous_weave_size,
-                "invalid block weave geometry"
-            );
-            let first_offset = end_offset
-                .checked_sub(data_size - 1)
-                .context("transaction offset underflow")?;
-            ensure!(
-                first_offset > previous_weave_size,
-                "transaction starts before its block"
-            );
-            ensure!(
-                end_offset <= block_weave_size,
-                "transaction ends after its block"
-            );
-
-            let geometry = Geometry {
-                tx_root: decode_fixed(&block.tx_root, "block tx_root")?,
-                data_root: decode_fixed(&transaction.data_root, "transaction data root")?,
-                block_weave_size,
-                previous_weave_size,
-                first_offset,
-                end_offset,
-                data_size,
-            };
-
-            let expected_len =
-                usize::try_from(data_size).context("parent size exceeds addressable range")?;
-            Ok(AuthenticatedRoot {
-                id: id.to_owned(),
-                bytes: Content::streamed(streaming::ChunkSource::new(self, geometry), expected_len),
-                block_height: status.block_height,
-                block_hash: decode_fixed::<48>(&block.hash, "verified block hash")?,
-                stable_anchor,
-                tags: transaction.tags,
-                content_encoding,
-                facts,
-            })
-        })
+                })
+            },
+        ))
         .await
     }
 
@@ -3558,6 +3731,8 @@ impl From<anyhow::Error> for RetrievalFailure {
     fn from(error: anyhow::Error) -> Self {
         if error.is::<ContentNotFound>() {
             Self::NotFound
+        } else if error.is::<UnconfirmedNotFound>() {
+            Self::Unconfirmed
         } else {
             Self::Other(Arc::new(error))
         }
@@ -3568,6 +3743,7 @@ impl From<RetrievalFailure> for anyhow::Error {
     fn from(error: RetrievalFailure) -> Self {
         match error {
             RetrievalFailure::NotFound => ContentNotFound.into(),
+            RetrievalFailure::Unconfirmed => UnconfirmedNotFound.into(),
             RetrievalFailure::Other(error) => anyhow::Error::new(SharedFailure(error)),
         }
     }
@@ -6990,6 +7166,81 @@ mod tests {
             }
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn parked_discovery_source_yields_unconfirmed_not_found() {
+        use axum::{Router, http::StatusCode, response::IntoResponse};
+
+        let limited_hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().fallback({
+            let limited_hits = limited_hits.clone();
+            move |uri: axum::http::Uri, body: axum::body::Bytes| {
+                let limited_hits = limited_hits.clone();
+                async move {
+                    match uri.path() {
+                        "/limited/graphql" => {
+                            limited_hits.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                [(axum::http::header::RETRY_AFTER, "30")],
+                            )
+                                .into_response()
+                        }
+                        // arweave.net's encoding of an L1 transaction with no parent.
+                        "/graphql" => {
+                            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            let id = request["variables"]["ids"][0].clone();
+                            serde_json::json!({"data": {"transactions": {"edges": [{
+                                "node": {"id": id, "bundledIn": {"id": ""}, "data": {"size": "1"}},
+                            }]}}})
+                            .to_string()
+                            .into_response()
+                        }
+                        _ => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = Config::new(
+            &url,
+            &url,
+            vec![url.clone()],
+            Duration::from_secs(2),
+            1,
+            1024,
+        )
+        .unwrap();
+        config.graphql_sources = vec![format!("{url}/graphql"), format!("{url}/limited/graphql")];
+        let gateway = Gateway::new(config.clone()).unwrap();
+        for byte in [1, 2] {
+            let error = gateway
+                .retrieve(&URL_SAFE_NO_PAD.encode([byte; 32]))
+                .await
+                .unwrap_err();
+            assert!(error.is::<UnconfirmedNotFound>(), "{error:#}");
+        }
+        assert_eq!(
+            limited_hits.load(Ordering::SeqCst),
+            1,
+            "parked source was queried again"
+        );
+
+        // Without an answering source the miss stays an upstream failure.
+        config.graphql_sources = vec![format!("{url}/limited/graphql")];
+        let error = Gateway::new(config)
+            .unwrap()
+            .retrieve(&URL_SAFE_NO_PAD.encode([3; 32]))
+            .await
+            .unwrap_err();
+        assert!(
+            !error.is::<UnconfirmedNotFound>() && !error.is::<ContentNotFound>(),
+            "{error:#}"
+        );
+        server.abort();
     }
 
     async fn check_data_item(signature_type: u16, owner: &[u8], signature: &[u8], data: &[u8]) {

@@ -351,7 +351,7 @@ pub(crate) fn error_text(error: &anyhow::Error, public: bool) -> String {
         "discovery response exceeds location limit",
         "discovered ancestor is not a supported bundle",
         "discovery returned the wrong data item",
-        "discovery returned an invalid or empty parent bundle ID",
+        "discovery returned an invalid parent bundle ID",
         "a data item cannot be its own parent",
         "bundle item table exceeds parent bounds",
         "bundle item exceeds parent bounds",
@@ -1800,7 +1800,7 @@ mod tests {
     async fn public_diagnostic_explains_missing_parent_location() {
         let id = URL_SAFE_NO_PAD.encode([7; 32]);
         let response = json!({"data": {"transactions": {"edges": [{
-            "node": {"id": id, "bundledIn": {"id": ""}, "data": {"size": "12862"}}
+            "node": {"id": id, "bundledIn": {"id": "invalid"}, "data": {"size": "12862"}}
         }]}}});
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1835,7 +1835,7 @@ mod tests {
         )
         .unwrap();
         let report = diagnose_public(&gateway, &resolver, &id).await;
-        let reason = "discovery returned an invalid or empty parent bundle ID";
+        let reason = "discovery returned an invalid parent bundle ID";
         assert_eq!(report["status"], "failed", "{report}");
         assert_eq!(report["error"], reason, "{report}");
         assert!(report["content"].is_null());

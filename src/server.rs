@@ -1968,7 +1968,7 @@ async fn serve_raw(
                     error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
                 })
         }
-        Err(error) => retrieval_error_response(error),
+        Err(error) => retrieval_error_response(&id, error),
     }
 }
 
@@ -2138,7 +2138,7 @@ async fn retrieve_response(
     }
     let verified = match state.gateway.retrieve(id).await {
         Ok(verified) => verified,
-        Err(error) => return retrieval_error_response(error),
+        Err(error) => return retrieval_error_response(id, error),
     };
     if let Some(response) =
         blocked_response(&state.gateway, id, Some(verified.etag.trim_matches('"'))).await
@@ -2176,7 +2176,7 @@ async fn retrieve_response(
     }
     let verified_target = match state.gateway.retrieve(&target.id).await {
         Ok(verified) => verified,
-        Err(error) => return retrieval_error_response(error),
+        Err(error) => return retrieval_error_response(&target.id, error),
     };
     if let Some(response) = blocked_response(
         &state.gateway,
@@ -3424,21 +3424,33 @@ fn is_data_id_shape(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
-fn retrieval_error_response(error: anyhow::Error) -> Response {
+fn retrieval_error_response(id: &str, error: anyhow::Error) -> Response {
     if error.is::<crate::ContentNotFound>() {
         error_response(StatusCode::NOT_FOUND, "Not found")
+    } else if error.is::<crate::UnconfirmedNotFound>() {
+        // A parked discovery source might still know this ID, so never let caches keep it.
+        let mut response = error_response(StatusCode::NOT_FOUND, "Not found");
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
     } else {
-        upstream_error_response("verified retrieval failed", error)
+        eprintln!("verified retrieval failed for {id}: {error:#}");
+        unavailable_response("verified retrieval failed", &error)
     }
 }
 
 fn upstream_error_response(context: &str, error: anyhow::Error) -> Response {
     eprintln!("{context}: {error:#}");
+    unavailable_response(context, &error)
+}
+
+fn unavailable_response(context: &str, error: &anyhow::Error) -> Response {
     let mut response = html_error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         &format!(
             "{context}: {}",
-            crate::diagnostics::public_error_text(&error)
+            crate::diagnostics::public_error_text(error)
         ),
     );
     response
@@ -4358,7 +4370,14 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         }));
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        // Confirmed misses are cached, so the upstream failure must run first.
         for (method, missing_upstream, status, cache_control) in [
+            (
+                Method::GET,
+                true,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no-store",
+            ),
             (
                 Method::HEAD,
                 false,
@@ -4370,12 +4389,6 @@ mod tests {
                 false,
                 StatusCode::NOT_FOUND,
                 "public, max-age=60, must-revalidate",
-            ),
-            (
-                Method::GET,
-                true,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no-store",
             ),
         ] {
             unavailable.store(missing_upstream, std::sync::atomic::Ordering::Relaxed);
@@ -5769,7 +5782,7 @@ mod tests {
     async fn keeps_verification_failures_distinct_from_missing_content() {
         let missing =
             anyhow::Error::new(crate::ContentNotFound).context("retrieving manifest target");
-        let response = retrieval_error_response(missing);
+        let response = retrieval_error_response("missing", missing);
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             response.headers()[CACHE_CONTROL],
@@ -5777,7 +5790,7 @@ mod tests {
         );
         let invalid = anyhow::anyhow!("chunk hash does not match data_path")
             .context("http://user:secret@127.0.0.1:1984/private-key <script>alert('x')</script>");
-        let response = retrieval_error_response(invalid);
+        let response = retrieval_error_response("invalid", invalid);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
         assert_eq!(

@@ -2842,6 +2842,60 @@ impl BlockStore {
         }))
     }
 
+    /// Canonical block height and hash of an indexed L1 transaction.
+    pub(crate) async fn transaction_placement(&self, id: &[u8]) -> Result<Option<(u64, Vec<u8>)>> {
+        ensure!(id.len() == 32, "transaction ID must be 32 bytes");
+        let Some(row) = self
+            .client
+            .query_opt(
+                "SELECT cb.height, cb.block_hash
+                 FROM public.objects o
+                 JOIN public.canonical_placements p ON p.object_key=o.key AND p.kind=0
+                 JOIN public.canonical_blocks cb ON cb.height=p.block_height
+                 JOIN public.block_transactions bt ON bt.block_hash=cb.block_hash
+                   AND bt.position=p.position AND bt.object_key=o.key
+                 JOIN public.block_index_state s
+                   ON s.singleton AND cb.height > s.start_height AND cb.height <= s.imported_through
+                 WHERE public.object_id_prefix(o.id)=public.object_id_prefix($1)
+                   AND o.id=$1 AND o.kind=0 AND o.metadata_complete",
+                &[&id],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            u64::try_from(row.try_get::<_, i64>(0)?)?,
+            row.try_get(1)?,
+        )))
+    }
+
+    /// ID, format, and data size of the block's complete L1 transactions.
+    pub(crate) async fn block_transaction_sizes(
+        &self,
+        block_hash: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Option<i16>, u128)>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT o.id, o.format, o.data_size::text
+                 FROM public.block_transactions bt
+                 JOIN public.objects o ON o.key=bt.object_key
+                 WHERE bt.block_hash=$1 AND o.kind=0 AND o.metadata_complete",
+                &[&block_hash],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.try_get(0)?,
+                    row.try_get(1)?,
+                    row.try_get::<_, String>(2)?.parse()?,
+                ))
+            })
+            .collect()
+    }
+
     pub(crate) async fn record_objects(&mut self, objects: &[ObjectMetadata]) -> Result<()> {
         let ids: Vec<_> = objects.iter().map(|object| object.id.as_slice()).collect();
         let dictionary_keys = self.intern_tags(objects).await?;
