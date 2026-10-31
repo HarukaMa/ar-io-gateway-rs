@@ -700,12 +700,19 @@ async fn download_pending(
     });
     let mut downloads = FuturesUnordered::new();
     let mut cursor = if range.is_none() {
-        timeout(
-            gateway.config.request_timeout,
-            checkpoint_store.bundle_scan_cursor(),
-        )
-        .await
-        .context("loading bundle scan cursor timed out")??
+        loop {
+            match timeout(
+                gateway.config.request_timeout,
+                checkpoint_store.bundle_scan_cursor(),
+            )
+            .await
+            .context("loading bundle scan cursor timed out")
+            .and_then(|result| result)
+            {
+                Ok(cursor) => break cursor,
+                Err(error) => checkpoint_read_failed(admission, &error).await,
+            }
+        }
     } else {
         None
     };
@@ -736,9 +743,17 @@ async fn download_pending(
         }
         was_paused = paused;
         if !paused && range.is_none() && cursor.is_none() {
-            let state = timeout(gateway.config.request_timeout, checkpoint_store.state())
+            let state = match timeout(gateway.config.request_timeout, checkpoint_store.state())
                 .await
-                .context("loading bundle scan boundary timed out")??;
+                .context("loading bundle scan boundary timed out")
+                .and_then(|result| result)
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    checkpoint_read_failed(admission, &error).await;
+                    continue;
+                }
+            };
             let Some(height) = state.and_then(|state| {
                 state
                     .imported_through
@@ -891,16 +906,32 @@ async fn download_pending(
             && (!exhausted || range.is_none())
         {
             if rewind_live {
-                if let Some(scan) = cursor.as_mut()
-                    && let Some(state) =
-                        timeout(gateway.config.request_timeout, checkpoint_store.state())
-                            .await
-                            .context("loading live scan checkpoint timed out")??
-                {
-                    // Revisit the unstable window after metadata changes or a restart.
-                    scan.rewind_live(i64::try_from(state.checkpoint.height)?);
+                if let Some(scan) = cursor.as_mut() {
+                    match timeout(gateway.config.request_timeout, checkpoint_store.state())
+                        .await
+                        .context("loading live scan checkpoint timed out")
+                        .and_then(|result| result)
+                    {
+                        Ok(state) => {
+                            if let Some(state) = state {
+                                // Revisit the unstable window after metadata changes or a restart.
+                                scan.rewind_live(i64::try_from(state.checkpoint.height)?);
+                            }
+                            rewind_live = false;
+                        }
+                        // Downloads may be in flight, so scan on and rewind before the next page.
+                        Err(error) => {
+                            eprintln!("reading bundle scan progress failed: {error:#}");
+                            admission.failed(
+                                "Couldn't read the bundle scan position",
+                                None,
+                                &error,
+                            );
+                        }
+                    }
+                } else {
+                    rewind_live = false;
                 }
-                rewind_live = false;
             }
             discovery_poll_at = next_poll;
             let after = cursor.clone();
@@ -989,6 +1020,13 @@ async fn download_pending(
             _ = tokio::time::sleep(POLL_INTERVAL), if pending.is_some() => {}
         }
     }
+}
+
+// A stalled database delays the scan instead of stopping the worker.
+async fn checkpoint_read_failed(admission: &Admission, error: &anyhow::Error) {
+    eprintln!("reading bundle scan progress failed: {error:#}");
+    admission.failed("Couldn't read the bundle scan position", None, error);
+    tokio::time::sleep(RETRY_INTERVAL).await;
 }
 
 async fn fetch_scheduled(
@@ -1378,6 +1416,103 @@ mod tests {
             tokio::select! {
                 result = &mut running => bail!("scheduler exited before checkpoint retry: {result:?}"),
                 result = timeout(RETRY_INTERVAL + Duration::from_secs(5), persisted) => result.context("checkpoint was not retried after unlocking")??,
+            }
+            Ok(())
+        }.await;
+        store.save_bundle_scan_cursor(original.as_ref()).await?;
+        ensure!(
+            store.bundle_scan_cursor().await? == original,
+            "test cursor was not restored"
+        );
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ar_io_rust_test; temporarily changes its bundle cursor and locks block_index_state"]
+    async fn bundle_scheduler_survives_stalled_progress_reads() -> Result<()> {
+        let url = std::env::var("DATABASE_URL")?;
+        let (mut client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+        let _driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(connection));
+        let database: String = client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        let source: String = client
+            .query_one(
+                "SELECT source FROM public.block_index_state WHERE singleton",
+                &[],
+            )
+            .await?
+            .get(0);
+        let mut config = Config::new(
+            &source,
+            "http://127.0.0.1:1",
+            vec!["http://127.0.0.1:1".to_owned()],
+            Duration::from_secs(5),
+            1,
+            1024,
+        )?;
+        config.index_bundle_start_height = i64::MAX as u64;
+        let gateway = Gateway::new(config)?.with_database(&url).await?;
+        let store = gateway.block_store.as_ref().unwrap();
+        let original = store.bundle_scan_cursor().await?;
+        let initial = BundleScan {
+            boundary: 0,
+            live: None,
+            backfill: None,
+        };
+        store.save_bundle_scan_cursor(Some(&initial)).await?;
+        let result = async {
+            let admission = Admission::new(1024, 1, false);
+            let _reservation = admission.reserve([1; 32], 0).unwrap();
+            admission.track_scan([1; 32], 0, None);
+            // Paused, the scheduler loads its cursor and waits before any scan read.
+            admission.paused.store(true, Ordering::Relaxed);
+            let (sender, _receiver) = mpsc::channel(1);
+            let mut running = Box::pin(download_pending(&gateway, sender, &admission, None));
+            tokio::select! {
+                result = &mut running => bail!("scheduler exited while paused: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            }
+            // Blocks even plain reads of the progress row, like a stalled database.
+            let transaction = client.transaction().await?;
+            transaction.batch_execute(
+                "SET LOCAL lock_timeout='1s';
+                 LOCK TABLE public.block_index_state IN ACCESS EXCLUSIVE MODE"
+            ).await?;
+            // Unpausing makes the scheduler re-read the live scan checkpoint.
+            admission.paused.store(false, Ordering::Relaxed);
+            admission.changed.notify_one();
+            let failed = async {
+                loop {
+                    let message = admission.status.lock().last_failure.as_ref()
+                        .map(|failure| failure["message"].clone());
+                    if message.is_some_and(|message| message == "Couldn't read the bundle scan position") {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut running => bail!("scheduler exited on a stalled progress read: {result:?}"),
+                result = timeout(Duration::from_secs(20), failed) => result.context("live scan checkpoint read did not time out")?,
+            }
+            transaction.rollback().await?;
+            let persisted = async {
+                loop {
+                    if store.bundle_scan_cursor().await?.is_none() {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut running => bail!("scheduler exited before recovering: {result:?}"),
+                result = timeout(RETRY_INTERVAL + Duration::from_secs(10), persisted) => result.context("scheduler did not recover after unlocking")??,
             }
             Ok(())
         }.await;
