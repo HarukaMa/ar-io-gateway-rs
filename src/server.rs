@@ -58,6 +58,8 @@ const ANT_RECORD_SEED: &[u8] = b"ant_record";
 const MAX_SOLANA_ACCOUNT_BYTES: usize = 4096;
 const MAX_ANT_RECORDS: usize = 1024;
 const MAX_CACHED_ARNS_RESOLUTIONS: usize = 4096;
+// Grace period is a program-wide setting that only matters for names past their lease end.
+const ARNS_CONFIG_TTL: Duration = Duration::from_secs(3600);
 const MANIFEST_CONTENT_TYPE: &str = "application/x.arweave-manifest+json";
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
 const MAX_MANIFEST_PATH_BYTES: usize = 4096;
@@ -458,6 +460,7 @@ pub(crate) struct Resolution {
 struct ArnsCache {
     entries: HashMap<String, (Arc<Resolution>, u128)>,
     clock: u128,
+    grace_period: Option<(StreamInstant, i64)>,
 }
 
 impl ArnsCache {
@@ -2479,11 +2482,17 @@ pub(crate) async fn resolve_arns(
         if let Some(resolution) = cache.lock().get(&name) {
             return Ok(Some(resolution));
         }
-        let resolution =
-            resolve_arns_uncached(&gateway, &rpc_url, &arns_program, &ant_program, name)
-                .await
-                .map_err(super::RetrievalFailure::from)?
-                .map(Arc::new);
+        let resolution = resolve_arns_uncached(
+            &gateway,
+            &rpc_url,
+            &arns_program,
+            &ant_program,
+            &cache,
+            name,
+        )
+        .await
+        .map_err(super::RetrievalFailure::from)?
+        .map(Arc::new);
         if let Some(resolution) = &resolution {
             cache.lock().insert(resolution.clone());
         }
@@ -2498,6 +2507,7 @@ async fn resolve_arns_uncached(
     rpc_url: &Url,
     arns_program: &str,
     ant_program: &str,
+    cache: &Mutex<ArnsCache>,
     name: String,
 ) -> Result<Option<Resolution>> {
     let started_at = StreamInstant::now();
@@ -2523,7 +2533,7 @@ async fn resolve_arns_uncached(
     let lease_remaining = if let Some(end_timestamp) = arns.end_timestamp {
         let remaining = arns_lease_remaining(
             end_timestamp,
-            arns_grace_period(gateway, rpc_url, arns_program).await?,
+            arns_grace_period(gateway, rpc_url, arns_program, cache).await?,
             now,
         )?;
         if remaining.is_zero() {
@@ -2583,13 +2593,24 @@ async fn resolve_arns_uncached(
     }))
 }
 
-async fn arns_grace_period(gateway: &Gateway, rpc_url: &Url, arns_program: &str) -> Result<i64> {
+async fn arns_grace_period(
+    gateway: &Gateway,
+    rpc_url: &Url,
+    arns_program: &str,
+    cache: &Mutex<ArnsCache>,
+) -> Result<i64> {
+    if let Some((expires_at, grace_period)) = cache.lock().grace_period
+        && expires_at > StreamInstant::now()
+    {
+        return Ok(grace_period);
+    }
     let (address, expected_bump) = derive_pda(arns_program, &[ARNS_CONFIG_SEED], "ArNS config")?;
     let bytes = account_info(gateway, rpc_url, &address, arns_program)
         .await?
         .context("ArNS config account is missing")?;
     let (grace_period, bump) = decode_arns_config(&bytes)?;
     ensure!(bump == expected_bump, "ArNS config bump mismatch");
+    cache.lock().grace_period = Some((StreamInstant::now() + ARNS_CONFIG_TTL, grace_period));
     Ok(grace_period)
 }
 fn arns_lease_remaining(end_timestamp: i64, grace_period: i64, now: Duration) -> Result<Duration> {
