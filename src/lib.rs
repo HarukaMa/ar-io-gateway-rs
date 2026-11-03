@@ -5967,7 +5967,7 @@ mod tests {
         );
         let peak = requests.peak.load(Ordering::SeqCst);
         assert!(
-            (2..=16).contains(&peak),
+            (2..=64).contains(&peak),
             "background peak in-flight requests: {peak}"
         );
         let range = 137..bytes.len() - 83;

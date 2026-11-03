@@ -81,7 +81,7 @@ impl ChunkSource {
         // Reserve one request slot for gaps left by smaller proof chunks.
         let pending = stream::iter((offset..end).step_by(size))
             .map(read.clone())
-            .buffered(if background { 15 } else { 7 });
+            .buffered(if background { 63 } else { 7 });
         Ok(stream::try_unfold(
             (Box::pin(pending), None::<(usize, Bytes)>, offset),
             move |(mut pending, mut next, position)| {
