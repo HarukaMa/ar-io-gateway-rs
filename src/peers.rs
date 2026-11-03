@@ -176,6 +176,7 @@ where
                                     deadline = Some(Instant::now() + remaining);
                                 }
                                 attempted.insert(source.clone());
+                                launch_at = Instant::now() + peers.chunk_hedge_delay(&source);
                                 active.push(async move {
                                     let _permit = permit;
                                     let timer = crate::profiling::start_origin(&source);
@@ -183,7 +184,6 @@ where
                                     if let Some(timer) = timer { timer.finish(result.is_ok(), 0); }
                                     (source, result)
                                 });
-                                launch_at = Instant::now() + Duration::from_millis(150);
                             }
                             Ok(None) => exhausted = true,
                             Err(error) => return Some(((String::new(), Err(error)),
@@ -603,6 +603,25 @@ impl PeerState {
         }
         let sources = ranked.into_iter().map(|(_, _, url)| url).collect();
         Ok(sources)
+    }
+
+    /// Background backups launch once a request runs well past the source's usual
+    /// full-chunk time. A fixed short delay duplicated nearly every request to
+    /// high-latency peers. HTTP reads keep the short delay for tail latency.
+    pub(crate) fn chunk_hedge_delay(&self, url: &str) -> Duration {
+        const MIN: f64 = 0.15;
+        if crate::BACKGROUND_CPU.try_with(|()| ()).is_err() {
+            return Duration::from_secs_f64(MIN);
+        }
+        let state = self.state.lock();
+        let expected = state
+            .chunk_stats
+            .get(url.trim_end_matches('/'))
+            .and_then(|stats| stats.timing)
+            .map_or(MIN, |(latency, rate)| {
+                1.5 * (latency + 262_144.0 / rate.max(1.0))
+            });
+        Duration::from_secs_f64(expected.clamp(MIN, 2.0))
     }
 
     pub(crate) fn record_chunk_result(
@@ -1457,6 +1476,49 @@ mod tests {
             assert_eq!(source, "http://hedge-backup.test");
             assert_eq!(started.elapsed(), Duration::from_millis(150));
         }
+        for source in &sources {
+            let _all = chunk_slots(source)?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_chunk_backups_wait_for_the_source_usual_time() -> Result<()> {
+        use futures_util::StreamExt;
+        let peers = PeerState::new("http://127.0.0.1:1984")?;
+        let sources = vec![
+            "http://hedge-slow.test".to_owned(),
+            "http://hedge-slow-backup.test".to_owned(),
+        ];
+        peers.chunk_candidates(1, &sources)?;
+        peers.record_chunk_result(
+            &sources[0],
+            Some((
+                Duration::from_millis(400),
+                Duration::from_millis(100),
+                262_144,
+            )),
+        );
+        let slow = |source| async move {
+            if source == "http://hedge-slow.test" {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        };
+        let first_backup = || async {
+            let started = Instant::now();
+            let fetches = hedged_requests(&peers, 1, &sources, &slow, crate::CHUNK_DEADLINE);
+            tokio::pin!(fetches);
+            let (source, result) = fetches.next().await.unwrap();
+            result?;
+            assert_eq!(source, "http://hedge-slow-backup.test");
+            Ok::<_, anyhow::Error>(started.elapsed())
+        };
+        assert_eq!(first_backup().await?, Duration::from_millis(150));
+        assert_eq!(
+            crate::BACKGROUND_CPU.scope((), first_backup()).await?,
+            Duration::from_millis(750)
+        );
         for source in &sources {
             let _all = chunk_slots(source)?.try_acquire_many_owned(CHUNK_ORIGIN_LIMIT as u32)?;
         }
