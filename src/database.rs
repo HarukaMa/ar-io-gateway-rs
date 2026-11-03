@@ -2363,6 +2363,11 @@ impl BlockStore {
                     .isolation_level(IsolationLevel::ReadCommitted)
                     .start()
                     .await?;
+                // Cold HDD index pages can push a full batch past the 15s connection
+                // default. The commit's request timeout still bounds the whole batch.
+                transaction
+                    .batch_execute("SET LOCAL statement_timeout='60s'")
+                    .await?;
                 let checkpoint: i64 = transaction
                     .query_one(
                         "SELECT checkpoint_height FROM public.block_index_state WHERE singleton",
