@@ -6011,7 +6011,7 @@ mod tests {
         server.abort();
     }
 
-    async fn retrieval_fixture(
+    pub(super) async fn retrieval_fixture(
         data: &[u8],
         tags: &[(&[u8], &[u8])],
         bundled_item: Option<(&str, usize)>,

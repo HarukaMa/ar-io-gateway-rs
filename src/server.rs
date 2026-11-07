@@ -1962,25 +1962,46 @@ async fn serve_raw(
     if let Some(response) = blocked_response(&state.gateway, &id, None).await {
         return response;
     }
-    match state.gateway.retrieve(&id).await {
-        Ok(verified) => {
-            if let Some(response) = blocked_response(
-                &state.gateway,
-                &verified.id,
-                Some(verified.etag.trim_matches('"')),
-            )
-            .await
-            {
-                return response;
-            }
-            verified_response(verified, None, &headers, &state.gateway.config, permit)
-                .await
-                .unwrap_or_else(|error| {
-                    eprintln!("response construction failed: {error:#}");
-                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-                })
-        }
-        Err(error) => retrieval_error_response(&id, error),
+    let (verified, permit) = match retrieve_detached(&state, &id, permit).await {
+        Ok(retrieved) => retrieved,
+        Err(response) => return response,
+    };
+    if let Some(response) = blocked_response(
+        &state.gateway,
+        &verified.id,
+        Some(verified.etag.trim_matches('"')),
+    )
+    .await
+    {
+        return response;
+    }
+    verified_response(verified, None, &headers, &state.gateway.config, permit)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("response construction failed: {error:#}");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+        })
+}
+
+// Keep admission slots until retrieval finishes, so aborted clients still warm the cache.
+async fn retrieve_detached(
+    state: &AppState,
+    id: &str,
+    permit: RequestPermit,
+) -> Result<(VerifiedData, RequestPermit), Response> {
+    let gateway = state.gateway.clone();
+    let key = id.to_owned();
+    let retrieval = tokio::spawn(crate::HTTP_CACHE_LOOKUP.scope((), async move {
+        let result = gateway.retrieve(&key).await;
+        (result, permit)
+    }));
+    match retrieval.await {
+        Ok((Ok(verified), permit)) => Ok((verified, permit)),
+        Ok((Err(error), _)) => Err(retrieval_error_response(id, error)),
+        Err(error) => Err(upstream_error_response(
+            "retrieval task failed",
+            error.into(),
+        )),
     }
 }
 
@@ -2148,9 +2169,9 @@ async fn retrieve_response(
     if let Some(response) = blocked_response(&state.gateway, id, None).await {
         return response;
     }
-    let verified = match state.gateway.retrieve(id).await {
-        Ok(verified) => verified,
-        Err(error) => return retrieval_error_response(id, error),
+    let (verified, permit) = match retrieve_detached(state, id, permit).await {
+        Ok(retrieved) => retrieved,
+        Err(response) => return response,
     };
     if let Some(response) =
         blocked_response(&state.gateway, id, Some(verified.etag.trim_matches('"'))).await
@@ -2186,9 +2207,9 @@ async fn retrieve_response(
     if let Some(response) = blocked_response(&state.gateway, &target.id, None).await {
         return response;
     }
-    let verified_target = match state.gateway.retrieve(&target.id).await {
-        Ok(verified) => verified,
-        Err(error) => return retrieval_error_response(&target.id, error),
+    let (verified_target, permit) = match retrieve_detached(state, &target.id, permit).await {
+        Ok(retrieved) => retrieved,
+        Err(response) => return response,
     };
     if let Some(response) = blocked_response(
         &state.gateway,
@@ -4962,6 +4983,104 @@ mod tests {
             payload
         );
         assert_eq!(fetches.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_data_request_finishes_retrieval_and_caches() {
+        use std::sync::atomic::Ordering;
+
+        let (fixture, id, _, _fixture_server, chunk_requests) =
+            crate::tests::retrieval_fixture(b"continued cold data", &[], None).await;
+        let upstream = fixture.config.trusted_node_url.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let proxy = Router::new().fallback({
+            let started = started.clone();
+            let release = release.clone();
+            move |uri: Uri| {
+                let started = started.clone();
+                let release = release.clone();
+                let target = format!("{}{uri}", upstream.trim_end_matches('/'));
+                async move {
+                    if uri.path().starts_with("/chunk/") {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                    let response = client.get(target).send().await.unwrap();
+                    let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+                    (status, response.bytes().await.unwrap().to_vec())
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let _proxy = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            axum::serve(listener, proxy).await.unwrap();
+        }));
+        let state = Arc::new(AppState {
+            gateway: Gateway::new(
+                Config::new(
+                    &proxy_url,
+                    &proxy_url,
+                    vec![proxy_url.clone()],
+                    Duration::from_secs(5),
+                    1,
+                    16 * 1024,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            config: ServerConfig::new(
+                "127.0.0.1:0",
+                "example.com",
+                &proxy_url,
+                ARNS_PROGRAM,
+                ANT_PROGRAM,
+                2,
+            )
+            .unwrap(),
+            request_permits: Arc::new(Semaphore::new(2)),
+            chunk_permits: Arc::new(Semaphore::new(1)),
+            diagnostic_permits: Semaphore::new(1),
+            started_at: Instant::now(),
+            indexing_status: Mutex::new(serde_json::Value::Null),
+        });
+        let decoded = decode_fixed::<32>(&id, "data ID").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HOST,
+            HeaderValue::from_str(&format!("{}.example.com", sandbox_name(&decoded))).unwrap(),
+        );
+        let request = |state: Arc<AppState>| {
+            let id = id.clone();
+            let headers = headers.clone();
+            async move {
+                let uri = Uri::try_from(format!("/raw/{id}")).unwrap();
+                serve_raw(State(state), Path(id), Method::GET, uri, headers).await
+            }
+        };
+
+        let caller = tokio::spawn(request(state.clone()));
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.notify_one();
+        let idle = tokio::time::timeout(
+            Duration::from_secs(5),
+            state.request_permits.acquire_many(2),
+        )
+        .await
+        .expect("detached retrieval finished")
+        .unwrap();
+        drop(idle);
+
+        let cached = request(state.clone()).await;
+        assert_eq!(cached.status(), StatusCode::OK);
+        assert_eq!(cached.headers()["x-cache"], "HIT");
+        assert_eq!(chunk_requests.load(Ordering::Relaxed), 1);
     }
 
     fn stream_limits() -> Config {
