@@ -55,7 +55,9 @@ pub(crate) fn chunk_slots(source: &str) -> Result<std::sync::Arc<tokio::sync::Se
     Ok(slots)
 }
 
+// Background indexing can keep its whole budget busy, so HTTP reads get their own pool.
 static CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(192);
+static HTTP_CHUNK_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(192);
 static CHUNK_CAPACITY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 struct ChunkPermit {
@@ -77,16 +79,18 @@ async fn admit_chunk(
     configured: &[String],
     attempted: &BTreeSet<String>,
 ) -> Result<Option<(String, ChunkPermit)>> {
+    let fetches = if crate::BACKGROUND_CPU.try_with(|()| ()).is_ok() {
+        &CHUNK_FETCHES
+    } else {
+        &HTTP_CHUNK_FETCHES
+    };
     loop {
         let changed = CHUNK_CAPACITY.notified();
         tokio::pin!(changed);
         changed.as_mut().enable();
         let global =
             crate::profiling::measure(crate::profiling::Stage::ChunkGlobalAdmission, async {
-                CHUNK_FETCHES
-                    .acquire()
-                    .await
-                    .context("chunk admission closed")
+                fetches.acquire().await.context("chunk admission closed")
             })
             .await?;
         let mut remaining = false;
