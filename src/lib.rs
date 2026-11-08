@@ -1570,6 +1570,29 @@ impl Gateway {
         .context("chunk cache publication task failed")?
     }
 
+    pub(crate) async fn chunk_tx_id(
+        &self,
+        offset: u128,
+        chunk: &VerifiedChunk,
+    ) -> Result<Option<String>> {
+        let Some(store) = &self.block_store else {
+            return Ok(None);
+        };
+        let data_root = decode_fixed::<32>(&chunk.data_root, "chunk data_root")?;
+        // Optional header: keep it well inside the observer's 3s reference probe.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let Some((_, block)) = store.block_for_offset(offset).await? else {
+                return Ok(None);
+            };
+            Ok(store
+                .chunk_transaction_id(&block.hash, &data_root, chunk.data_size)
+                .await?
+                .map(|id| URL_SAFE_NO_PAD.encode(id)))
+        })
+        .await
+        .context("chunk tx id lookup timed out")?
+    }
+
     async fn trusted_chunk_anchor(&self, offset: u128) -> Result<Option<(BlockGeometry, u64)>> {
         if offset == 0 {
             return Ok(None);

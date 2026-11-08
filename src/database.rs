@@ -3427,6 +3427,27 @@ impl BlockStore {
             .await?;
         row.as_ref().map(pair_from_row).transpose()
     }
+
+    // Omits ambiguous matches, such as identical data uploaded twice in one block.
+    pub async fn chunk_transaction_id(
+        &self,
+        block_hash: &[u8],
+        data_root: &[u8; 32],
+        data_size: u128,
+    ) -> Result<Option<Vec<u8>>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT o.id FROM public.block_transactions bt
+                 JOIN public.objects o ON o.key=bt.object_key
+                 WHERE bt.block_hash=$1 AND o.kind=0 AND o.metadata_complete
+                   AND o.data_root=$2 AND o.data_size=$3::text::numeric
+                 LIMIT 2",
+                &[&block_hash, &data_root.as_slice(), &data_size.to_string()],
+            )
+            .await?;
+        Ok((rows.len() == 1).then(|| rows[0].get(0)))
+    }
 }
 
 fn local_config(url: &str) -> Result<Config> {
@@ -4775,6 +4796,67 @@ mod tests {
             ).await?;
             ensure!(store.pending_transactions(height as u64, height as u64, 1, &[]).await? == expected[1..],
                 "noncanonical first candidate prevented finding the next pending transaction");
+            Ok(())
+        }.await;
+        store.client.batch_execute("ROLLBACK").await?;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ar_io_rust_test; fixture changes are rolled back"]
+    async fn chunk_transaction_id_requires_one_matching_member() -> Result<()> {
+        let store = BlockStore::connect(&std::env::var("DATABASE_URL")?).await?;
+        let database: String = store
+            .client
+            .query_one("SELECT current_database()", &[])
+            .await?
+            .get(0);
+        ensure!(
+            database == "ar_io_rust_test",
+            "requires the dedicated test database"
+        );
+        store
+            .client
+            .batch_execute(
+                "BEGIN; SET LOCAL statement_timeout = '10s'; SET LOCAL lock_timeout = '1s'",
+            )
+            .await?;
+        let result: Result<()> = async {
+            let row = store.client.query_one(
+                "SELECT bt.block_hash, o.key, o.id, o.data_root, o.data_size::text
+                 FROM public.canonical_blocks c
+                 JOIN public.block_transactions bt ON bt.block_hash = c.block_hash
+                 JOIN public.objects o ON o.key = bt.object_key
+                 WHERE o.kind = 0 AND o.metadata_complete AND o.data_size > 0
+                   AND octet_length(o.data_root) = 32
+                 ORDER BY c.height, bt.position LIMIT 1", &[],
+            ).await?;
+            let hash: Vec<u8> = row.get(0);
+            let key: i64 = row.get(1);
+            let id: Vec<u8> = row.get(2);
+            let root: [u8; 32] = row.get::<_, Vec<u8>>(3).try_into().unwrap();
+            let size: u128 = row.get::<_, String>(4).parse()?;
+            ensure!(store.chunk_transaction_id(&hash, &root, size).await? == Some(id),
+                "unique member was not resolved");
+            ensure!(store.chunk_transaction_id(&hash, &root, size + 1).await?.is_none(),
+                "data size mismatch resolved a transaction");
+
+            let twin = store.client.query_one(
+                "INSERT INTO public.objects OVERRIDING SYSTEM VALUE
+                 SELECT copy.* FROM public.objects o
+                 CROSS JOIN LATERAL jsonb_populate_record(NULL::public.objects,to_jsonb(o) ||
+                     jsonb_build_object('key',nextval(pg_get_serial_sequence('public.objects','key')),
+                         'id',$1::bytea)) copy
+                 WHERE o.key=$2 RETURNING key",
+                &[&vec![0xa7u8; 32], &key],
+            ).await?;
+            store.client.execute(
+                "INSERT INTO public.block_transactions(block_hash,position,object_key)
+                 SELECT $1, max(position)+1, $2 FROM public.block_transactions WHERE block_hash=$1",
+                &[&hash, &twin.get::<_, i64>(0)],
+            ).await?;
+            ensure!(store.chunk_transaction_id(&hash, &root, size).await?.is_none(),
+                "ambiguous members resolved a transaction");
             Ok(())
         }.await;
         store.client.batch_execute("ROLLBACK").await?;

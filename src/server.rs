@@ -1893,12 +1893,33 @@ async fn serve_chunk_response(
         Err(error) => return upstream_error_response("chunk retrieval task failed", error.into()),
     };
     match result {
-        Ok(Some(chunk)) => chunk_response(chunk, raw, headers, &state.gateway.config, permit)
+        Ok(Some(chunk)) => {
+            let tx_id = if raw {
+                state
+                    .gateway
+                    .chunk_tx_id(offset, &chunk.0)
+                    .await
+                    .unwrap_or_else(|error| {
+                        eprintln!("chunk tx id lookup failed: {error:#}");
+                        None
+                    })
+            } else {
+                None
+            };
+            chunk_response(
+                chunk,
+                raw,
+                tx_id.as_deref(),
+                headers,
+                &state.gateway.config,
+                permit,
+            )
             .await
             .unwrap_or_else(|error| {
                 eprintln!("chunk response construction failed: {error:#}");
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-            }),
+            })
+        }
         Ok(None) => error_response(StatusCode::NOT_FOUND, "Not found"),
         Err(error) => upstream_error_response("verified chunk retrieval failed", error),
     }
@@ -3382,6 +3403,7 @@ async fn verified_response(
 async fn chunk_response(
     chunk: (Arc<VerifiedChunk>, bool),
     raw: bool,
+    tx_id: Option<&str>,
     request_headers: &HeaderMap,
     limits: &Config,
     permit: RequestPermit,
@@ -3449,6 +3471,9 @@ async fn chunk_response(
                 "x-arweave-chunk-tx-start-offset",
                 tx_start_offset.to_string(),
             );
+        if let Some(tx_id) = tx_id {
+            builder = builder.header("x-arweave-chunk-tx-id", tx_id);
+        }
     }
     if request_headers
         .get("if-none-match")
@@ -6536,6 +6561,7 @@ mod tests {
         let response = chunk_response(
             verified(),
             false,
+            None,
             &HeaderMap::new(),
             &limits,
             request_permit(&permits).unwrap(),
@@ -6561,6 +6587,7 @@ mod tests {
         let response = chunk_response(
             verified(),
             true,
+            None,
             &HeaderMap::new(),
             &limits,
             request_permit(&permits).unwrap(),
@@ -6593,6 +6620,7 @@ mod tests {
         let response = chunk_response(
             verified(),
             false,
+            None,
             &headers,
             &limits,
             request_permit(&permits).unwrap(),
