@@ -415,7 +415,8 @@ async fn cpu_work<T: Send + 'static>(
     let permit = profiling::measure(profiling::Stage::CpuAdmission, async {
         jobs.acquire().await.context("CPU work admission closed")
     })
-    .await?;
+    .await
+    .context(Unavailable)?;
     let profile = profiling::current();
     let dispatch = profiling::start(profiling::Stage::CpuDispatch);
     tokio::task::spawn_blocking(move || {
@@ -431,7 +432,8 @@ async fn cpu_work<T: Send + 'static>(
         result
     })
     .await
-    .context("CPU verification task failed")?
+    .context("CPU verification task failed")
+    .context(Unavailable)?
 }
 
 #[derive(Serialize, Deserialize)]
@@ -537,6 +539,34 @@ impl std::fmt::Display for AttemptFailures {
 }
 
 impl std::error::Error for AttemptFailures {}
+
+/// Marks a failure that says nothing about bundle bytes (a read or CPU pool
+/// failure). Indexing retries these instead of treating an item as invalid.
+#[derive(Debug)]
+pub(crate) struct Unavailable;
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("bundle content unavailable")
+    }
+}
+
+/// A signature type this build cannot verify. Its items are not proven invalid.
+#[derive(Debug)]
+pub(crate) struct UnsupportedSignatureType(u16);
+
+impl std::fmt::Display for UnsupportedSignatureType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "unsupported ANS-104 signature type {}", self.0)
+    }
+}
+
+impl std::error::Error for UnsupportedSignatureType {}
+
+/// Failures that do not prove bundle bytes invalid, so indexing keeps the bundle pending.
+pub(crate) fn keeps_bundle_pending(error: &anyhow::Error) -> bool {
+    error.is::<Unavailable>() || error.is::<UnsupportedSignatureType>()
+}
 
 #[derive(Clone)]
 enum RetrievalFailure {
@@ -4280,9 +4310,11 @@ struct BinaryBundleItems {
 
 impl BinaryBundleItems {
     async fn new(bundle: content::Content) -> Result<Self> {
+        ensure!(bundle.len() >= 32, "Could not read bundle header");
         let header = bundle
             .read_at(0, 32)
             .await
+            .context(Unavailable)
             .context("Could not read bundle header")?;
         let count = read_u256_usize(&header, "bundle item count")?;
         let cursor = 32;
@@ -4312,7 +4344,8 @@ impl BinaryBundleItems {
             self.table = self
                 .bundle
                 .read_at(self.cursor, self.remaining.min(256) * BUNDLE_ENTRY_SIZE)
-                .await?;
+                .await
+                .context(Unavailable)?;
         }
         let header = self.table.split_to(BUNDLE_ENTRY_SIZE);
         self.cursor += BUNDLE_ENTRY_SIZE;
@@ -4465,7 +4498,7 @@ fn data_item_signature_sizes(signature_type: u16) -> Result<(usize, usize)> {
         4 | 5 => Ok((64, 32)),
         6 => Ok((2_052, 1_025)),
         7 => Ok((65, 42)),
-        _ => bail!("unsupported ANS-104 signature type {signature_type}"),
+        _ => Err(UnsupportedSignatureType(signature_type).into()),
     }
 }
 
@@ -4517,7 +4550,8 @@ async fn read_data_item_header(
 ) -> Result<DataItemHeader> {
     let header = item
         .read_at(0, item.len().min(MAX_DATA_ITEM_FIXED_HEADER_BYTES))
-        .await?;
+        .await
+        .context(Unavailable)?;
     // Early binary items omit the type prefix. The signature hash selects
     // their layout even when the first signature bytes resemble a modern type.
     let legacy = header
@@ -4557,12 +4591,13 @@ async fn read_data_item_header(
     let tags_end = cursor
         .checked_add(tag_bytes_len)
         .context("data item tag offset overflow")?;
+    ensure!(tags_end <= item.len(), "data item tags are truncated");
     let raw_tags = if tags_end <= header.len() {
         header.slice(cursor..tags_end)
     } else {
         item.read_at(cursor, tag_bytes_len)
             .await
-            .context("data item tags are truncated")?
+            .context(Unavailable)?
     };
     let tags = parse_avro_tags(&raw_tags, tag_count)?;
     Ok(DataItemHeader {
@@ -4607,7 +4642,7 @@ async fn verify_data_item_header(
 
     let signed_identity = sha256(&[&signature]) == *expected_id;
     let content_identity = unsigned || (!legacy && !signed_identity);
-    let (body_hash, body_sha384) = data.hashes().await?;
+    let (body_hash, body_sha384) = data.hashes().await.context(Unavailable)?;
     let data_hash = sha384(&[
         &sha384(&[format!("blob{}", data.len()).as_bytes()]),
         &body_sha384,
@@ -4839,7 +4874,7 @@ fn verify_data_item_signature(
         ),
         6 => verify_aptos_multisignature(owner, signature, payload),
         7 => verify_typed_ethereum(owner, signature, payload),
-        _ => bail!("unsupported ANS-104 signature type {signature_type}"),
+        _ => Err(UnsupportedSignatureType(signature_type).into()),
     }
 }
 
@@ -5563,7 +5598,7 @@ mod tests {
         server.abort();
     }
 
-    fn note(value: u128) -> [u8; 32] {
+    pub(super) fn note(value: u128) -> [u8; 32] {
         let mut note = [0; 32];
         note[16..].copy_from_slice(&value.to_be_bytes());
         note

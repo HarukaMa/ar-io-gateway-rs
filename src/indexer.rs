@@ -1808,15 +1808,39 @@ struct BundleTraversal {
     stack: Vec<BundleFrame>,
 }
 
+/// Authenticated bytes that fail validation fail the same way on every retry,
+/// so they are skipped. Read, capacity, and unsupported-format failures still
+/// fail the bundle.
+fn skip_invalid(what: &str, parent: &[u8; 32], id: &[u8; 32], error: anyhow::Error) -> Result<()> {
+    if crate::keeps_bundle_pending(&error) {
+        return Err(error);
+    }
+    eprintln!(
+        "skipping {what} {} in bundle {}: {error:#}",
+        URL_SAFE_NO_PAD.encode(id),
+        URL_SAFE_NO_PAD.encode(parent)
+    );
+    Ok(())
+}
+
 impl BundleTraversal {
     async fn new(
         root: crate::content::Content,
         root_id: &[u8; 32],
         format: crate::BundleFormat,
     ) -> Result<Self> {
+        let items = match BundleItems::checked(root, format).await {
+            Ok(items) => items,
+            // JSON reads surface as plain I/O errors, so only binary framing is judged.
+            Err(error) if format == crate::BundleFormat::Binary => {
+                skip_invalid("binary framing of root", root_id, root_id, error)?;
+                return Ok(Self { stack: Vec::new() });
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             stack: vec![BundleFrame {
-                items: BundleItems::checked(root, format).await?,
+                items,
                 id: *root_id,
                 path: Vec::new(),
                 pending: None,
@@ -1854,11 +1878,23 @@ impl BundleTraversal {
                 // Bundle bytes are proven against the root's data root, so an
                 // item the filter rejects needs no signature check.
                 crate::BundleEntry::Binary { bytes, .. } => {
-                    let header = crate::read_data_item_header(&bytes, &id).await?;
+                    let header = match crate::read_data_item_header(&bytes, &id).await {
+                        Ok(header) => header,
+                        Err(error) => {
+                            skip_invalid("invalid item", &parent.id, &id, error)?;
+                            continue;
+                        }
+                    };
                     if !filter_keeps(filter, height, header.owner_address(), &header.tags) {
                         continue;
                     }
-                    crate::verify_data_item_header(bytes, header, &id).await?
+                    match crate::verify_data_item_header(bytes, header, &id).await {
+                        Ok(item) => item,
+                        Err(error) => {
+                            skip_invalid("invalid item", &parent.id, &id, error)?;
+                            continue;
+                        }
+                    }
                 }
                 entry => {
                     let Some(item) = entry.verify(None).await? else {
@@ -1873,6 +1909,7 @@ impl BundleTraversal {
                 }
             };
             let id = item.id(&id);
+            let parent_id = parent.id;
             let mut path = parent.path.clone();
             path.push(offset);
             let location = BundleLocation {
@@ -1886,18 +1923,26 @@ impl BundleTraversal {
             };
             let metadata = item.metadata(&id);
             if let Some(format) = item.bundle_format() {
-                let mut items = BundleItems::checked(item.data, format).await?;
-                if let Some(first) = items.next().await? {
-                    ensure!(
-                        self.stack.len() < MAX_BUNDLE_DEPTH,
-                        "nested bundle exceeds maximum depth {MAX_BUNDLE_DEPTH}"
-                    );
-                    self.stack.push(BundleFrame {
-                        items,
-                        id,
-                        path,
-                        pending: Some(first),
-                    });
+                match BundleItems::checked(item.data, format).await {
+                    Ok(mut items) => {
+                        if let Some(first) = items.next().await? {
+                            ensure!(
+                                self.stack.len() < MAX_BUNDLE_DEPTH,
+                                "nested bundle exceeds maximum depth {MAX_BUNDLE_DEPTH}"
+                            );
+                            self.stack.push(BundleFrame {
+                                items,
+                                id,
+                                path,
+                                pending: Some(first),
+                            });
+                        }
+                    }
+                    // The item itself verified, so it stays indexed without children.
+                    Err(error) if format == crate::BundleFormat::Binary => {
+                        skip_invalid("binary framing of item", &parent_id, &id, error)?;
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             return Ok(Some((metadata, location)));
@@ -2041,11 +2086,94 @@ mod bundle_tests {
         let mut traversal =
             BundleTraversal::new(bytes.into(), &[0xaf; 32], crate::BundleFormat::Binary).await?;
         let unfiltered = crate::index_filter::IndexFilter::default();
-        assert!(
-            next_bundle_batch(&mut traversal, 8, &unfiltered, 0)
-                .await
-                .is_err(),
-            "a kept item with a bad signature must still fail verification"
+        let (_, locations, complete) = next_bundle_batch(&mut traversal, 8, &unfiltered, 0).await?;
+        assert!(complete);
+        assert_eq!(
+            locations.len(),
+            1,
+            "a kept item with a bad signature must not be indexed"
+        );
+        assert_eq!(locations[0].id, plain_id.to_vec());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_items_are_skipped_and_valid_siblings_kept() -> Result<()> {
+        let (mut forged, _) = signed_data_item(b"forged", &[]);
+        *forged.last_mut().unwrap() ^= 1;
+        let long_name = vec![b'a'; 1025];
+        let (oversized, _) = signed_data_item(b"tag", &[(&long_name, b"v")]);
+        // Bundle-tagged, but its table is big-endian and does not parse.
+        let mut big_endian = vec![0; 32];
+        big_endian[31] = 3;
+        let (fake_parent, fake_parent_id) = signed_data_item(
+            &big_endian,
+            &[(b"bundle-format", b"binary"), (b"bundle-version", b"2.0.0")],
+        );
+        let (plain, plain_id) = signed_data_item(b"plain", &[]);
+        let bytes = encode_bundle(&[&forged, &oversized, &fake_parent, &plain]);
+        let mut traversal =
+            BundleTraversal::new(bytes.into(), &[0xb0; 32], crate::BundleFormat::Binary).await?;
+        let unfiltered = crate::index_filter::IndexFilter::default();
+        let (_, locations, complete) = next_bundle_batch(&mut traversal, 8, &unfiltered, 0).await?;
+        assert!(complete);
+        let ids: Vec<_> = locations
+            .iter()
+            .map(|location| location.id.clone())
+            .collect();
+        assert_eq!(ids, [fake_parent_id, plain_id].map(|id| id.to_vec()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_signature_types_keep_the_bundle_pending() -> Result<()> {
+        let (unknown, _) = signed_data_item(b"future", &[]);
+        let (plain, _) = signed_data_item(b"plain", &[]);
+        let mut bytes = encode_bundle(&[&plain, &unknown]);
+        let start = bytes.len() - unknown.len();
+        bytes[start..start + 2].copy_from_slice(&99u16.to_le_bytes());
+        let mut traversal =
+            BundleTraversal::new(bytes.into(), &[0xb3; 32], crate::BundleFormat::Binary).await?;
+        let unfiltered = crate::index_filter::IndexFilter::default();
+        let Err(error) = next_bundle_batch(&mut traversal, 8, &unfiltered, 0).await else {
+            anyhow::bail!("an unsupported signature type was skipped as invalid");
+        };
+        ensure!(error.is::<crate::UnsupportedSignatureType>(), "{error:#}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unreadable_bundle_bytes_fail_instead_of_completing_empty() -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let (item, _) = signed_data_item(b"payload", &[]);
+        let bytes = encode_bundle(&[&item]);
+        let tags: &[(&[u8], &[u8])] = &[];
+        let (gateway, _, corrupt, server, _) =
+            crate::tests::retrieval_fixture(&bytes, tags, None).await;
+        corrupt.store(true, Ordering::SeqCst);
+        let end = crate::tests::note(bytes.len() as u128);
+        let data_root = crate::hash_leaf(&crate::sha256(&[&bytes]), &end);
+        let geometry = crate::Geometry {
+            tx_root: crate::hash_leaf(&data_root, &end),
+            data_root,
+            block_weave_size: bytes.len() as u128,
+            previous_weave_size: 0,
+            first_offset: 1,
+            end_offset: bytes.len() as u128,
+            data_size: bytes.len() as u128,
+        };
+        let content = crate::content::Content::streamed(
+            crate::streaming::ChunkSource::new(&gateway, geometry),
+            bytes.len(),
+        );
+        let result = BundleTraversal::new(content, &[0xb2; 32], crate::BundleFormat::Binary).await;
+        server.abort();
+        let Err(error) = result else {
+            anyhow::bail!("an unreadable root was treated as invalid framing");
+        };
+        ensure!(
+            error.is::<crate::Unavailable>(),
+            "read failure lost its marker: {error:#}"
         );
         Ok(())
     }
@@ -2742,7 +2870,7 @@ mod bundle_tests {
     }
 
     #[tokio::test]
-    async fn valid_prefix_replays_after_a_later_signature_failure() {
+    async fn valid_prefix_replays_around_a_skipped_signature_failure() {
         let (leaf, _) = signed_data_item(b"resumable", &[]);
         let mut corrupt = leaf.clone();
         *corrupt.last_mut().unwrap() ^= 1;
@@ -2768,12 +2896,12 @@ mod bundle_tests {
                 vec![(32 + 257 * 64 + index * leaf.len()) as u128]
             );
         }
-        assert!(first.next().await.is_err());
-        assert!(replay.next().await.is_err());
+        assert!(first.next().await.unwrap().is_none());
+        assert!(replay.next().await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn malformed_tail_is_rejected_before_yielding_locations() {
+    async fn malformed_tail_yields_no_locations() {
         let (leaf, _) = signed_data_item(b"framing", &[]);
         let mut root = encode_bundle(&vec![leaf.as_slice(); 257]);
         root.push(0);
@@ -2781,11 +2909,11 @@ mod bundle_tests {
             root.clone().into(),
             crate::tests::spooled_content(&root).await,
         ] {
-            assert!(
+            let mut traversal =
                 BundleTraversal::new(content, &[9; 32], crate::BundleFormat::Binary)
                     .await
-                    .is_err()
-            );
+                    .unwrap();
+            assert!(traversal.next().await.unwrap().is_none());
         }
     }
 
@@ -2801,20 +2929,16 @@ mod bundle_tests {
                 .unwrap()
                 .is_none()
         );
-        let mut trailing = empty.clone();
-        trailing.push(0);
-        assert!(
-            BundleTraversal::new(trailing.into(), &[9; 32], crate::BundleFormat::Binary)
-                .await
-                .is_err()
-        );
-        let mut oversized = empty;
-        oversized[31] = 1;
-        assert!(
-            BundleTraversal::new(oversized.into(), &[9; 32], crate::BundleFormat::Binary)
-                .await
-                .is_err()
-        );
+        for malformed in [
+            [empty.as_slice(), &[0]].concat(),
+            [&empty[..31], &[1]].concat(),
+        ] {
+            let mut traversal =
+                BundleTraversal::new(malformed.into(), &[9; 32], crate::BundleFormat::Binary)
+                    .await
+                    .unwrap();
+            assert!(traversal.next().await.unwrap().is_none());
+        }
 
         let (leaf, _) = signed_data_item(b"deep", &[]);
         let mut root = encode_bundle(&[&leaf]);
