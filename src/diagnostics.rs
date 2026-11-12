@@ -331,6 +331,25 @@ pub(crate) fn error_text(error: &anyhow::Error, public: bool) -> String {
         "transaction ID is not the signature hash",
         "transaction signature verification failed",
         "data item signature verification failed",
+        "RSA transaction key or signature exceeds protocol limit",
+        "RSA data item key or signature exceeds protocol limit",
+        "invalid RSA transaction signature length",
+        "invalid RSA data item signature length",
+        "RSA transaction signature exceeds modulus",
+        "RSA data item signature exceeds modulus",
+        "RSA transaction encoded message exceeds historical width",
+        "RSA data item encoded message exceeds historical width",
+        "invalid RSA transaction PSS trailer",
+        "invalid RSA data item PSS trailer",
+        "RSA PSS salt separator missing",
+        "invalid RSA transaction PSS padding",
+        "invalid RSA data item PSS padding",
+        "data item tag count exceeds limit",
+        "data item tag bytes exceed limit",
+        "data item tag name exceeds limit",
+        "data item tag value exceeds limit",
+        "bundle item count exceeds u64",
+        "bundle root is outside imported block-index coverage",
         "data item content ID does not match its content",
         "JSON item signature hash differs from ID",
         "transaction data size and root disagree",
@@ -1761,8 +1780,12 @@ mod tests {
             "transaction metadata unavailable: https://private.invalid/key: transaction ID mismatch; https://private.invalid/other: transaction ID mismatch"
         );
         assert_eq!(error_text(&aggregate, true), "transaction ID mismatch");
+        let rsa = anyhow::anyhow!("invalid RSA data item PSS trailer")
+            .context("https://private.invalid/chunk");
+        assert_eq!(error_text(&rsa, true), "invalid RSA data item PSS trailer");
         let unknown = anyhow::anyhow!("password=secret at /private/storage/file");
         let public = error_text(&unknown, true);
+        assert!(!error_text(&anyhow::anyhow!("RSA key=secret"), true).contains("secret"));
         assert!(!public.contains("secret") && !public.contains("/private"));
         assert!(public.contains("local CLI"));
     }
