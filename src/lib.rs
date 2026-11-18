@@ -5823,12 +5823,12 @@ mod tests {
             .err()
             .unwrap();
         let failures = error.downcast_ref::<AttemptFailures>().unwrap();
-        // A packed response reached proof verification instead of being discarded.
+        // The parked packed response got the unpacking lane and reached proof verification.
         assert!(
-            failures.errors.iter().any(|error| {
-                let text = format!("{error:#}");
-                !text.contains("admission timed out") && !text.contains("chunk request timed out")
-            }),
+            failures
+                .errors
+                .iter()
+                .any(|error| format!("{error:#}").ends_with("tx_path is too short")),
             "{error:#}"
         );
         server.abort();
