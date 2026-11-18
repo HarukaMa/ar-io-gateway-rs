@@ -1476,7 +1476,9 @@ impl Gateway {
                 _ => {}
             }
         }
+        let peer_timeout = self.chunk_peer_timeout();
         let request = |source: String| async move {
+            let started = Instant::now();
             let attempt = diagnostics::ChunkAttempt::new(offset, &source);
             let (chunk, headers, body) = self
                 .fetch_chunk(&source, offset)
@@ -1489,10 +1491,17 @@ impl Gateway {
                 .as_ref()
                 .map(|token| token.clone().drop_guard());
             let job = match cancellation {
+                // The unpacking lane is shared. Waiting past the peer deadline would let
+                // parked packed responses hold every hedge slot until the chunk budget ends.
                 Some(token) => Some(
-                    packing::Job::acquire(token)
-                        .await
-                        .inspect_err(|error| attempt.failed(error))?,
+                    tokio::time::timeout(
+                        peer_timeout.saturating_sub(started.elapsed()),
+                        packing::Job::acquire(token),
+                    )
+                    .await
+                    .context("replica unpacking admission timed out")
+                    .and_then(|job| job)
+                    .inspect_err(|error| attempt.failed(error))?,
                 ),
                 None => None,
             };
@@ -2754,6 +2763,10 @@ impl Gateway {
         }
     }
 
+    fn chunk_peer_timeout(&self) -> Duration {
+        (self.config.request_timeout / 4).min(CHUNK_PEER_DEADLINE)
+    }
+
     async fn fetch_chunk(&self, source: &str, offset: u128) -> Result<(Chunk, Duration, Duration)> {
         let started = Instant::now();
         let (response, binary) = profiling::measure(
@@ -2764,7 +2777,7 @@ impl Gateway {
                 &self.config.chunk_sources,
                 source,
                 offset,
-                (self.config.request_timeout / 4).min(CHUNK_PEER_DEADLINE),
+                self.chunk_peer_timeout(),
             ),
         )
         .await?;
@@ -5595,6 +5608,97 @@ mod tests {
             result.unwrap();
         }
         assert!((2..=peers::CHUNK_ORIGIN_LIMIT).contains(&peak.load(Ordering::SeqCst)));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn parked_packed_responses_do_not_starve_unpacked_sources() {
+        let payload = b"verified chunk bytes";
+        let mut end = [0; 32];
+        end[16..].copy_from_slice(&(payload.len() as u128).to_be_bytes());
+        let hash = sha256(&[payload]);
+        let data_root = hash_leaf(&hash, &end);
+        let tx_root = hash_leaf(&data_root, &end);
+        let valid = serde_json::to_vec(&serde_json::json!({
+            "chunk": URL_SAFE_NO_PAD.encode(payload),
+            "data_path": URL_SAFE_NO_PAD.encode([hash.as_slice(), end.as_slice()].concat()),
+            "tx_path": URL_SAFE_NO_PAD.encode([data_root.as_slice(), end.as_slice()].concat()),
+        }))
+        .unwrap();
+        let packed = serde_json::to_vec(&serde_json::json!({
+            "chunk": "",
+            "data_path": "",
+            "tx_path": "",
+            "packing": format!("replica_2_9_{}", URL_SAFE_NO_PAD.encode([0; 32])),
+        }))
+        .unwrap();
+        let hits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&hits);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let host = request.headers()["host"].to_str().unwrap()[..1].to_owned();
+            let body = if host == "a" {
+                valid.clone()
+            } else {
+                packed.clone()
+            };
+            recorded.lock().unwrap().push(host);
+            async move { body }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // Only `a` serves unpacked bytes. The packed sources rank ahead of it.
+        let sources: Vec<_> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|host| format!("http://{host}.example.com:{}", address.port()))
+            .collect();
+        let mut gateway = Gateway::new(
+            Config::new(
+                &sources[0],
+                &sources[0],
+                sources.clone(),
+                Duration::from_secs(4),
+                1,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut client = reqwest::Client::builder().no_proxy();
+        for host in ["a", "b", "c", "d"] {
+            client = client.resolve(&format!("{host}.example.com"), address);
+        }
+        gateway.client = client.build().unwrap();
+        for source in &sources[1..] {
+            let fast = Duration::from_millis(1);
+            gateway
+                .peers
+                .record_chunk_result(source, Some((fast, fast, 262_144)));
+        }
+        // Step past the exploration probe, which would otherwise launch `a` first.
+        gateway.peers.chunk_candidates(1001, &sources).unwrap();
+        let geometry = BlockGeometry {
+            tx_root,
+            block_weave_size: 1100,
+            previous_weave_size: 1000,
+        };
+        let fetched = BACKGROUND_CPU
+            .scope((), async {
+                let _busy = packing::Job::acquire(tokio_util::sync::CancellationToken::new())
+                    .await
+                    .unwrap();
+                gateway.fetch_verified_chunk_inner(1001, geometry).await
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.source_host, "a.example.com");
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.last().map(String::as_str), Some("a"), "{hits:?}");
+        for host in ["b", "c", "d"] {
+            assert!(hits.iter().any(|hit| hit == host), "{hits:?}");
+        }
+        assert_eq!(fetched.proof.bytes.as_ref(), payload);
         server.abort();
     }
 
