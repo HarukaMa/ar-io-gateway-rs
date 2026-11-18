@@ -1477,6 +1477,13 @@ impl Gateway {
             }
         }
         let peer_timeout = self.chunk_peer_timeout();
+        let budget = self.config.request_timeout.min(CHUNK_DEADLINE);
+        let deadline = tokio::time::Instant::now() + budget;
+        // The first packed response that misses its bounded unpacking wait leaves its hedge
+        // slot and keeps waiting here until the chunk deadline, so packed-only chunks survive.
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let parked_tx = Mutex::new(Some(parked_tx));
+        let parked = &parked_tx;
         let request = |source: String| async move {
             let started = Instant::now();
             let attempt = diagnostics::ChunkAttempt::new(offset, &source);
@@ -1493,16 +1500,26 @@ impl Gateway {
             let job = match cancellation {
                 // The unpacking lane is shared. Waiting past the peer deadline would let
                 // parked packed responses hold every hedge slot until the chunk budget ends.
-                Some(token) => Some(
-                    tokio::time::timeout(
-                        peer_timeout.saturating_sub(started.elapsed()),
-                        packing::Job::acquire(token),
-                    )
-                    .await
-                    .context("replica unpacking admission timed out")
-                    .and_then(|job| job)
-                    .inspect_err(|error| attempt.failed(error))?,
-                ),
+                Some(token) => match tokio::time::timeout(
+                    peer_timeout.saturating_sub(started.elapsed()),
+                    packing::Job::acquire(token),
+                )
+                .await
+                {
+                    Ok(job) => Some(job.inspect_err(|error| attempt.failed(error))?),
+                    Err(elapsed) => {
+                        let error = anyhow::Error::from(elapsed)
+                            .context("replica unpacking admission timed out");
+                        let sender = parked.lock().unwrap().take();
+                        match sender {
+                            Some(sender) => {
+                                let _ = sender.send((source, chunk, headers, body, attempt));
+                            }
+                            None => attempt.failed(&error),
+                        }
+                        return Err(error);
+                    }
+                },
                 None => None,
             };
             attempt.verifying();
@@ -1518,11 +1535,57 @@ impl Gateway {
             offset,
             &self.config.chunk_sources,
             &request,
-            self.config.request_timeout.min(CHUNK_DEADLINE),
+            budget,
         );
         tokio::pin!(fetches);
+        let fallback = async {
+            let (source, chunk, headers, body, attempt) = parked_rx.await.ok()?;
+            let result = async {
+                let token = tokio_util::sync::CancellationToken::new();
+                let _cancelled = token.clone().drop_guard();
+                let job = tokio::time::timeout_at(deadline, packing::Job::acquire(token))
+                    .await
+                    .context("replica unpacking admission timed out")??;
+                attempt.verifying();
+                cpu_work(move || verify_chunk_proof(chunk, offset, &geometry, Some(&job))).await
+            }
+            .await;
+            Some((
+                source,
+                match result {
+                    Ok(proof) => {
+                        attempt.verified(proof.bytes.len());
+                        Ok((proof, headers, body, attempt))
+                    }
+                    Err(error) => {
+                        attempt.failed(&error);
+                        Err(error)
+                    }
+                },
+            ))
+        };
+        tokio::pin!(fallback);
         let mut invalid = Vec::new();
-        while let Some((source, result)) = fetches.next().await {
+        let (mut fetching, mut fallback_pending) = (true, true);
+        while fetching || fallback_pending {
+            let (source, result) = tokio::select! {
+                item = fetches.next(), if fetching => match item {
+                    Some(item) => item,
+                    None => {
+                        fetching = false;
+                        // Once every request is done, nothing else can be parked.
+                        fallback_pending &= parked_tx.lock().unwrap().is_none();
+                        continue;
+                    }
+                },
+                item = &mut fallback, if fallback_pending => {
+                    fallback_pending = false;
+                    match item {
+                        Some(item) => item,
+                        None => continue,
+                    }
+                }
+            };
             match result {
                 Ok((proof, headers, body, attempt)) => {
                     self.peers
@@ -5699,6 +5762,75 @@ mod tests {
             assert!(hits.iter().any(|hit| hit == host), "{hits:?}");
         }
         assert_eq!(fetched.proof.bytes.as_ref(), payload);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn packed_only_chunks_wait_for_unpacking_until_the_chunk_deadline() {
+        let packed = serde_json::to_vec(&serde_json::json!({
+            "chunk": "",
+            "data_path": "",
+            "tx_path": "",
+            "packing": format!("replica_2_9_{}", URL_SAFE_NO_PAD.encode([0; 32])),
+        }))
+        .unwrap();
+        let app = axum::Router::new().fallback(move || {
+            let body = packed.clone();
+            async move { body }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let sources: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|host| format!("http://{host}.example.com:{}", address.port()))
+            .collect();
+        let mut gateway = Gateway::new(
+            Config::new(
+                &sources[0],
+                &sources[0],
+                sources.clone(),
+                Duration::from_secs(4),
+                1,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut client = reqwest::Client::builder().no_proxy();
+        for host in ["a", "b", "c"] {
+            client = client.resolve(&format!("{host}.example.com"), address);
+        }
+        gateway.client = client.build().unwrap();
+        let geometry = BlockGeometry {
+            tx_root: [0; 32],
+            block_weave_size: 1100,
+            previous_weave_size: 1000,
+        };
+        // The lane frees up after every peer deadline (1 s) but well inside the chunk deadline.
+        let error = BACKGROUND_CPU
+            .scope((), async {
+                let busy = packing::Job::acquire(tokio_util::sync::CancellationToken::new())
+                    .await
+                    .unwrap();
+                let release = async {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    drop(busy);
+                };
+                tokio::join!(release, gateway.fetch_verified_chunk_inner(1001, geometry)).1
+            })
+            .await
+            .err()
+            .unwrap();
+        let failures = error.downcast_ref::<AttemptFailures>().unwrap();
+        // A packed response reached proof verification instead of being discarded.
+        assert!(
+            failures.errors.iter().any(|error| {
+                let text = format!("{error:#}");
+                !text.contains("admission timed out") && !text.contains("chunk request timed out")
+            }),
+            "{error:#}"
+        );
         server.abort();
     }
 
