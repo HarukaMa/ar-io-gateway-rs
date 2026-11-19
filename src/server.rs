@@ -760,6 +760,8 @@ const SIGNATURE_EXTRA_HEADERS: &[&str] = &[
     "content-type",
     "content-digest",
     "repr-digest",
+    "x-ar-io-root-arweave-start-offset",
+    "x-ar-io-root-arweave-data-size",
     "x-ar-io-root-data-item-offset",
     "x-ar-io-root-data-offset",
     "x-ar-io-root-item-offset",
@@ -902,7 +904,7 @@ fn info_response(state: &AppState, identity: RequestIdentity) -> Response {
         "ans104IndexFilter": index_filter,
         "supportedManifestVersions": ["0.1.0", "0.2.0"],
         // The upstream ar-io-node release whose feature set this build tracks.
-        "release": "88-pre-rs",
+        "release": "88-rs",
         "services": {
             "bundlers": state.config.bundler_urls.iter()
                 .map(|url| serde_json::json!({"url": url})).collect::<Vec<_>>(),
@@ -1652,6 +1654,145 @@ async fn serve_resolver(State(state): State<Arc<AppState>>, Path(name): Path<Str
     response
 }
 
+#[derive(Debug)]
+struct BundleOffsets {
+    item_start: u64,
+    data_start: u64,
+    item_size: u64,
+    direct_child: bool,
+}
+
+#[derive(Debug)]
+struct DataOffsets {
+    root: [u8; 32],
+    data_size: u64,
+    content_type: Option<String>,
+    item: Option<BundleOffsets>,
+    weave: Option<(u64, u64)>,
+}
+
+impl DataOffsets {
+    fn json(&self, root_id: &str) -> serde_json::Value {
+        let mut json = serde_json::json!({
+            "rootTxId": root_id,
+            "dataSize": self.data_size,
+        });
+        if let Some(content_type) = &self.content_type {
+            json["contentType"] = serde_json::json!(content_type);
+        }
+        if let Some(item) = &self.item {
+            json["rootOffset"] = serde_json::json!(item.item_start);
+            json["rootDataOffset"] = serde_json::json!(item.data_start);
+            json["size"] = serde_json::json!(item.item_size);
+            if item.direct_child {
+                json["path"] = serde_json::json!([root_id]);
+            }
+        }
+        if let Some((start, size)) = self.weave {
+            json["rootArweaveStartOffset"] = serde_json::json!(start);
+            json["rootArweaveDataSize"] = serde_json::json!(size);
+            json["itemArweaveStartOffset"] =
+                serde_json::json!(start + self.item.as_ref().map_or(0, |item| item.item_start));
+            json["dataArweaveStartOffset"] =
+                serde_json::json!(start + self.item.as_ref().map_or(0, |item| item.data_start));
+        }
+        json
+    }
+
+    fn add_headers(&self, headers: &mut HeaderMap) {
+        if let Some(item) = &self.item {
+            let root_id = HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(self.root)).unwrap();
+            if item.direct_child {
+                headers.insert("x-ar-io-root-path", root_id.clone());
+            }
+            headers.insert("x-ar-io-root-transaction-id", root_id);
+            let offset = HeaderValue::from(item.item_start);
+            headers.insert("x-ar-io-root-data-item-offset", offset.clone());
+            headers.insert("x-ar-io-root-item-offset", offset);
+            headers.insert("x-ar-io-root-item-size", HeaderValue::from(item.item_size));
+            headers.insert(
+                "x-ar-io-root-data-offset",
+                HeaderValue::from(item.data_start),
+            );
+        }
+        if let Some((start, size)) = self.weave {
+            headers.insert(
+                "x-ar-io-root-arweave-start-offset",
+                HeaderValue::from(start),
+            );
+            headers.insert("x-ar-io-root-arweave-data-size", HeaderValue::from(size));
+        }
+    }
+}
+
+async fn indexed_data_offsets(
+    store: &crate::database::BlockStore,
+    id: &[u8; 32],
+    direct: bool,
+) -> Result<Option<DataOffsets>> {
+    if !direct && let Some(indexed) = store.bundle_location(id).await? {
+        let target = indexed.locations.last().context("missing indexed target")?;
+        let mut item_start = 0u128;
+        let mut data_start = 0u128;
+        for location in &indexed.locations {
+            // Encoded JSON items have no contiguous raw byte range in the root.
+            if location.json {
+                return Ok(None);
+            }
+            item_start = data_start
+                .checked_add(location.item_offset)
+                .context("indexed item offset overflow")?;
+            data_start = item_start
+                .checked_add(location.data_offset)
+                .context("indexed data offset overflow")?;
+        }
+        let root = indexed
+            .root_id
+            .as_slice()
+            .try_into()
+            .context("invalid indexed root ID")?;
+        let item = BundleOffsets {
+            item_start: u64::try_from(item_start)?,
+            data_start: u64::try_from(data_start)?,
+            item_size: u64::try_from(target.item_size)?,
+            direct_child: indexed.locations.len() == 1,
+        };
+        let weave = match store.stable_transaction_weave(&root).await {
+            Ok(Some(weave))
+                if item
+                    .item_start
+                    .checked_add(item.item_size)
+                    .is_some_and(|end| end <= weave.size)
+                    && weave.start.checked_add(item.data_start).is_some() =>
+            {
+                Some((weave.start, weave.size))
+            }
+            Ok(_) => None,
+            Err(error) => {
+                eprintln!("indexed root weave lookup failed: {error:#}");
+                None
+            }
+        };
+        return Ok(Some(DataOffsets {
+            root,
+            data_size: u64::try_from(indexed.data_size)?,
+            item: Some(item),
+            content_type: indexed.content_type,
+            weave,
+        }));
+    }
+    Ok(store
+        .stable_transaction_weave(id)
+        .await?
+        .map(|weave| DataOffsets {
+            root: *id,
+            data_size: weave.size,
+            content_type: weave.content_type,
+            item: None,
+            weave: Some((weave.start, weave.size)),
+        }))
+}
+
 async fn serve_offsets(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let Ok(id) = decode_fixed::<32>(&id, "data ID") else {
         return error_response(StatusCode::BAD_REQUEST, "Must provide a valid data ID");
@@ -1664,44 +1805,14 @@ async fn serve_offsets(State(state): State<Arc<AppState>>, Path(id): Path<String
         let Some(store) = &state.gateway.block_store else {
             return Ok(None);
         };
-        let Some(indexed) = store.bundle_location(&id).await? else {
-            return Ok(None);
-        };
-        let target = indexed.locations.last().context("missing indexed target")?;
-        let mut root_offset = 0u128;
-        let mut data_offset = 0u128;
-        for location in &indexed.locations {
-            // JSON payloads require decoding and have no raw root-byte data range.
-            if location.json {
-                return Ok(None);
-            }
-            root_offset = data_offset
-                .checked_add(location.item_offset)
-                .context("indexed item offset overflow")?;
-            data_offset = root_offset
-                .checked_add(location.data_offset)
-                .context("indexed data offset overflow")?;
-        }
-        let root_id = URL_SAFE_NO_PAD.encode(&indexed.root_id);
-        let mut offsets = serde_json::json!({
-            "rootTxId": root_id,
-            "rootOffset": root_offset,
-            "rootDataOffset": data_offset,
-            "size": target.item_size,
-            "dataSize": indexed.data_size,
-        });
-        if indexed.locations.len() == 1 {
-            offsets["path"] = serde_json::json!([root_id]);
-        }
-        if let Some(content_type) = indexed.content_type {
-            offsets["contentType"] = serde_json::json!(content_type);
-        }
-        Ok::<_, anyhow::Error>(Some((root_id, offsets)))
+        indexed_data_offsets(store, &id, false).await
     };
     match tokio::time::timeout(state.gateway.config.retrieval_timeout, lookup).await {
         // The root transaction header triggers HTTPSIG, binding the body via Content-Digest.
-        Ok(Ok(Some((root_id, offsets)))) => {
-            let body = serde_json::to_vec(&offsets).expect("response contains only JSON values");
+        Ok(Ok(Some(offsets))) => {
+            let root_id = URL_SAFE_NO_PAD.encode(offsets.root);
+            let body = serde_json::to_vec(&offsets.json(&root_id))
+                .expect("response contains only JSON values");
             let digest = format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(&body)));
             Response::builder()
                 .header("content-type", "application/json; charset=utf-8")
@@ -1870,11 +1981,16 @@ async fn serve_chunk_response(
 ) -> Response {
     let mut permit = match request_permit(&state.request_permits) {
         Ok(permit) => permit,
-        Err(response) => return response,
+        Err(response) => return retryable_chunk_response(response),
     };
     permit.chunk = match state.chunk_permits.clone().try_acquire_owned() {
         Ok(permit) => Some(permit),
-        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),
+        Err(_) => {
+            return retryable_chunk_response(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+            ));
+        }
     };
     if offset.is_empty() || !offset.bytes().all(|byte| byte.is_ascii_digit()) {
         return unmatched_response(method, uri);
@@ -1890,7 +2006,12 @@ async fn serve_chunk_response(
     }));
     let (result, permit) = match retrieval.await {
         Ok(result) => result,
-        Err(error) => return upstream_error_response("chunk retrieval task failed", error.into()),
+        Err(error) => {
+            return retryable_chunk_response(upstream_error_response(
+                "chunk retrieval task failed",
+                error.into(),
+            ));
+        }
     };
     match result {
         Ok(Some(chunk)) => {
@@ -1921,8 +2042,21 @@ async fn serve_chunk_response(
             })
         }
         Ok(None) => error_response(StatusCode::NOT_FOUND, "Not found"),
-        Err(error) => upstream_error_response("verified chunk retrieval failed", error),
+        Err(error) => retryable_chunk_response(upstream_error_response(
+            "verified chunk retrieval failed",
+            error,
+        )),
     }
+}
+
+fn retryable_chunk_response(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("5"));
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn serve_arns(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1977,10 +2111,10 @@ async fn serve_raw(
         Ok(decoded_id) => decoded_id,
         Err(_) => return invalid_id_response(&id),
     };
-    if let Some(response) = sandbox_redirect(&state, &decoded_id, &uri, &headers) {
+    if let Some(response) = blocked_response(&state.gateway, &id, None).await {
         return response;
     }
-    if let Some(response) = blocked_response(&state.gateway, &id, None).await {
+    if let Some(response) = sandbox_redirect(&state, &decoded_id, &uri, &headers) {
         return response;
     }
     let (verified, permit) = match retrieve_detached(&state, &id, permit).await {
@@ -1996,7 +2130,7 @@ async fn serve_raw(
     {
         return response;
     }
-    verified_response(verified, None, &headers, &state.gateway.config, permit)
+    serve_verified_response(&state, verified, None, &headers, permit)
         .await
         .unwrap_or_else(|error| {
             eprintln!("response construction failed: {error:#}");
@@ -2063,7 +2197,9 @@ async fn serve_path(
     let (id, manifest_path) = path.split_once('/').unwrap_or((&path, ""));
     if let Ok(decoded_id) = decode_fixed::<32>(id, "data ID") {
         if let Some(response) = sandbox_redirect(&state, &decoded_id, &uri, &headers) {
-            return response;
+            return blocked_response(&state.gateway, id, None)
+                .await
+                .unwrap_or(response);
         }
         return retrieve_response(
             &state,
@@ -2200,7 +2336,7 @@ async fn retrieve_response(
         return response;
     }
     if !is_manifest_content_type(&verified.content_type) {
-        return verified_response(verified, resolution, headers, &state.gateway.config, permit)
+        return serve_verified_response(state, verified, resolution, headers, permit)
             .await
             .unwrap_or_else(|error| {
                 eprintln!("response construction failed: {error:#}");
@@ -2241,18 +2377,12 @@ async fn retrieve_response(
     {
         return response;
     }
-    let mut response = verified_response(
-        verified_target,
-        resolution,
-        headers,
-        &state.gateway.config,
-        permit,
-    )
-    .await
-    .unwrap_or_else(|error| {
-        eprintln!("response construction failed: {error:#}");
-        error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-    });
+    let mut response = serve_verified_response(state, verified_target, resolution, headers, permit)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("response construction failed: {error:#}");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+        });
     if fallback && response.status() != StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS {
         response.headers_mut().insert(
             CACHE_CONTROL,
@@ -3221,6 +3351,49 @@ async fn served_content_encoding(tagged: &str, body: &Content) -> Result<Option<
     };
     let head = body.read_at(0, body.len().min(magic.len())).await?;
     Ok((head[..] == magic[..head.len()]).then_some(coding))
+}
+
+async fn serve_verified_response(
+    state: &AppState,
+    verified: VerifiedData,
+    resolution: Option<&Resolution>,
+    headers: &HeaderMap,
+    permit: RequestPermit,
+) -> Result<Response> {
+    let limits = &state.gateway.config;
+    let offsets = if let Some(store) = &state.gateway.block_store
+        && verified.block_hash.is_some()
+    {
+        let id = decode_fixed::<32>(&verified.id, "verified data ID")?;
+        let direct = matches!(&verified.indexing_root,
+            Some(crate::IndexingRoot::Complete(root)) if root.data.id == verified.id);
+        if direct && !verified.stable_anchor {
+            None
+        } else {
+            match tokio::time::timeout(
+                limits.request_timeout.min(Duration::from_millis(500)),
+                indexed_data_offsets(store, &id, direct),
+            )
+            .await
+            {
+                Ok(Ok(offsets)) => offsets.filter(|offsets| {
+                    u128::from(offsets.data_size) == verified.content_length as u128
+                }),
+                Ok(Err(error)) => {
+                    eprintln!("response offset lookup failed: {error:#}");
+                    None
+                }
+                Err(_) => None,
+            }
+        }
+    } else {
+        None
+    };
+    let mut response = verified_response(verified, resolution, headers, limits, permit).await?;
+    if let Some(offsets) = offsets {
+        offsets.add_headers(response.headers_mut());
+    }
+    Ok(response)
 }
 
 async fn verified_response(
@@ -4991,6 +5164,8 @@ mod tests {
             .expect("cancelled retrieval released its capacity")
             .unwrap();
         assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(saturated.headers()["retry-after"], "5");
+        assert_eq!(saturated.headers()[CACHE_CONTROL], "no-store");
         release.notify_one();
         let available = tokio::time::timeout(Duration::from_secs(5), state.chunk_permits.acquire())
             .await
@@ -5276,6 +5451,9 @@ mod tests {
             ("deep.example.com".to_owned(), "/blocked".to_owned()),
             ("deep.example.com".to_owned(), "/missing".to_owned()),
             (sandbox_host(3), format!("/raw/{blocked_id}")),
+            ("example.com".to_owned(), format!("/{blocked_id}")),
+            ("example.com".to_owned(), format!("/{blocked_id}/path")),
+            ("127.0.0.1".to_owned(), format!("/raw/{blocked_id}")),
             (sandbox_host(4), format!("/raw/{hashed_id}")),
             ("blocked-name.deep.example.com".to_owned(), "/".to_owned()),
             (sandbox_host(3), "/".to_owned()),
@@ -6765,6 +6943,14 @@ mod signing_tests {
             .header("x-ar-io-verified", "true")
             .body(Body::empty())
             .unwrap();
+        DataOffsets {
+            root: [7; 32],
+            data_size: 567,
+            content_type: None,
+            item: None,
+            weave: Some((1234, 567)),
+        }
+        .add_headers(response.headers_mut());
         signer.sign(&mut response, &Method::GET, "/raw/id").unwrap();
         let params = response.headers()["signature-input"]
             .to_str()
@@ -6780,13 +6966,15 @@ mod signing_tests {
             .unwrap();
         let signature = Signature::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
         let base = format!(
-            "\"@status\": 206\n\"repr-digest\": sha-256=:YWJj:\n\"x-ar-io-verified\": true\n\"@method\";req: GET\n\"@path\";req: /raw/id\n\"@signature-params\": {params}"
+            "\"@status\": 206\n\"repr-digest\": sha-256=:YWJj:\n\"x-ar-io-root-arweave-data-size\": 567\n\"x-ar-io-root-arweave-start-offset\": 1234\n\"x-ar-io-verified\": true\n\"@method\";req: GET\n\"@path\";req: /raw/id\n\"@signature-params\": {params}"
         );
         let public = signer.key.verifying_key();
         public.verify_strict(base.as_bytes(), &signature).unwrap();
         for (before, after) in [
             ("206", "200"),
             ("YWJj", "YWJk"),
+            ("1234", "1235"),
+            ("567", "568"),
             ("true", "false"),
             ("GET", "HEAD"),
             ("/raw/id", "/raw/other"),

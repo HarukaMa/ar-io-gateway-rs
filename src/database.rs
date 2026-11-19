@@ -305,6 +305,12 @@ pub(crate) struct IndexedBundle {
     pub(crate) locations: Vec<BundleLocation>,
 }
 
+pub(super) struct TransactionWeave {
+    pub(super) start: u64,
+    pub(super) size: u64,
+    pub(super) content_type: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct BundleCursor {
     pub(crate) height: i64,
@@ -2873,6 +2879,75 @@ impl BlockStore {
             u64::try_from(row.try_get::<_, i64>(0)?)?,
             row.try_get(1)?,
         )))
+    }
+
+    pub(super) async fn stable_transaction_weave(
+        &self,
+        id: &[u8; 32],
+    ) -> Result<Option<TransactionWeave>> {
+        let id = id.as_slice();
+        let Some(row) = self
+            .client
+            .query_opt(
+                "SELECT b.height,b.hash,previous.weave_size::text,b.weave_size::text,tx.content_type
+                 FROM public.objects tx
+                 JOIN public.canonical_placements placement ON placement.object_key=tx.key AND placement.kind=0
+                 JOIN public.canonical_blocks c ON c.height=placement.block_height
+                 JOIN public.blocks b ON b.height=c.height AND b.hash=c.block_hash AND b.timestamp IS NOT NULL
+                 JOIN public.block_transactions bt
+                   ON bt.block_hash=b.hash AND bt.position=placement.position AND bt.object_key=tx.key
+                 JOIN public.canonical_blocks p ON p.height=b.height-1 AND p.block_hash=b.previous_hash
+                 JOIN public.blocks previous ON previous.height=p.height AND previous.hash=p.block_hash
+                 JOIN public.block_index_state s ON s.singleton AND b.height>s.start_height
+                   AND b.height<=s.imported_through AND b.height<=s.checkpoint_height
+                 WHERE public.object_id_prefix(tx.id)=public.object_id_prefix($1)
+                   AND tx.id=$1 AND tx.kind=0 AND tx.metadata_complete AND tx.data_size>0
+                   AND NOT EXISTS (
+                     SELECT 1 FROM public.block_transactions member
+                     JOIN public.objects object ON object.key=member.object_key
+                     WHERE member.block_hash=b.hash AND NOT object.metadata_complete
+                   )",
+                &[&id],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Complete, stable block membership and transaction metadata cannot change.
+        let height = u64::try_from(row.try_get::<_, i64>(0)?)?;
+        let hash: Vec<u8> = row.try_get(1)?;
+        let previous: u128 = row.try_get::<_, String>(2)?.parse()?;
+        let weave: u128 = row.try_get::<_, String>(3)?.parse()?;
+        let sizes = self.block_transaction_sizes(&hash).await?;
+        let block_size = sizes.iter().try_fold(0u128, |sum, (_, _, size)| {
+            let size = if height >= super::FORK_2_5_HEIGHT {
+                size.div_ceil(super::MAX_CHUNK_SIZE)
+                    .checked_mul(super::MAX_CHUNK_SIZE)?
+            } else {
+                *size
+            };
+            sum.checked_add(size)
+        });
+        if block_size.is_none() || block_size != weave.checked_sub(previous) {
+            return Ok(None);
+        }
+        let Some((size, end)) = super::transactions::transaction_end_offset(height, sizes, id)?
+        else {
+            return Ok(None);
+        };
+        let Some(start) = previous
+            .checked_add(end)
+            .filter(|&end| end <= weave && u64::try_from(end).is_ok())
+            .and_then(|end| end.checked_sub(size.checked_sub(1)?))
+            .filter(|&start| start > previous)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(TransactionWeave {
+            start: u64::try_from(start)?,
+            size: u64::try_from(size)?,
+            content_type: row.try_get(4)?,
+        }))
     }
 
     /// ID, format, and data size of the block's complete L1 transactions.

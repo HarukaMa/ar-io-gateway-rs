@@ -1,8 +1,10 @@
 # Changelog
 
-## 88-pre-rs
+## 88-rs
 
 - Report `X-AR-IO-Stable` from the verified block's stability. Data within the fork depth of the trusted tip is labelled unstable and cached for 12 hours without `immutable`. Stable data keeps the 30-day `immutable` tier, including content restored from the disk cache.
+- Publish signed absolute weave offsets for stable L1 transactions and indexed binary bundle paths. `/ar-io/offsets/{id}` now also answers L1 IDs with known geometry.
+- Return 451 for blocked IDs before a sandbox redirect. Temporary chunk failures include `Retry-After: 5` and `Cache-Control: no-store`.
 - Skip bundle items that fail ANS-104 validation (signature, tag limits, malformed header) and index their valid siblings. A bundle-tagged item with invalid binary framing is indexed as a plain item without children, and a root with invalid binary framing completes with no items. Read failures, verification-capacity failures, and unsupported signature types still leave the bundle pending for retry.
 - Bound the wait for replica unpacking by the per-peer chunk deadline. Packed chunk responses queued behind the shared unpacking lane no longer hold every hedge slot until the chunk budget expires, so unpacked sources still get tried and the packed peer is recorded as failed. The first packed response that misses the bounded wait keeps waiting outside the hedge slots until the chunk deadline, so chunks only packed peers hold are still unpacked.
 
