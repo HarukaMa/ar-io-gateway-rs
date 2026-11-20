@@ -625,6 +625,18 @@ impl BlockStore {
         Ok(reader)
     }
 
+    pub(super) async fn offset_reader(&self) -> Result<Self> {
+        let reader = self.reconnect().await?;
+        reader
+            .client
+            .batch_execute(
+                "SET default_transaction_read_only=on; SET statement_timeout='400ms';
+             SET lock_timeout='100ms'; SET max_parallel_workers_per_gather=0",
+            )
+            .await?;
+        Ok(reader)
+    }
+
     async fn status_query(&self, sql: &str) -> Result<serde_json::Value> {
         let mut config = self.connection_config.clone();
         config.options(

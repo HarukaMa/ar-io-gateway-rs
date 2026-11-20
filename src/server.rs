@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     future::Future,
     io,
@@ -434,6 +434,7 @@ impl ServerConfig {
 struct AppState {
     gateway: Gateway,
     config: ServerConfig,
+    offsets: Option<Arc<OffsetReader>>,
     request_permits: Arc<Semaphore>,
     chunk_permits: Arc<Semaphore>,
     diagnostic_permits: Semaphore,
@@ -599,6 +600,10 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
         .context("failed to bind HTTP listener")?;
+    let offsets = match &gateway.block_store {
+        Some(store) => Some(Arc::new(OffsetReader::new(store.offset_reader().await?))),
+        None => None,
+    };
     println!("listening on http://{}", listener.local_addr()?);
     let state = Arc::new(AppState {
         request_permits: Arc::new(Semaphore::new(config.max_concurrent_requests)),
@@ -606,6 +611,7 @@ pub async fn serve(gateway: Gateway, config: ServerConfig) -> Result<()> {
         diagnostic_permits: Semaphore::new(1),
         started_at: Instant::now(),
         indexing_status: Mutex::new(serde_json::Value::Null),
+        offsets,
         gateway,
         config,
     });
@@ -1725,72 +1731,171 @@ impl DataOffsets {
     }
 }
 
-async fn indexed_data_offsets(
-    store: &crate::database::BlockStore,
-    id: &[u8; 32],
-    direct: bool,
-) -> Result<Option<DataOffsets>> {
-    if !direct && let Some(indexed) = store.bundle_location(id).await? {
-        let target = indexed.locations.last().context("missing indexed target")?;
-        let mut item_start = 0u128;
-        let mut data_start = 0u128;
-        for location in &indexed.locations {
-            // Encoded JSON items have no contiguous raw byte range in the root.
-            if location.json {
-                return Ok(None);
-            }
-            item_start = data_start
-                .checked_add(location.item_offset)
-                .context("indexed item offset overflow")?;
-            data_start = item_start
-                .checked_add(location.data_offset)
-                .context("indexed data offset overflow")?;
+const MAX_CACHED_OFFSETS: usize = 4096;
+
+#[derive(Default)]
+struct OffsetCache {
+    entries: HashMap<[u8; 32], Arc<DataOffsets>>,
+    order: VecDeque<[u8; 32]>,
+}
+
+struct OffsetReader {
+    store: crate::database::BlockStore,
+    slot: Arc<Semaphore>,
+    cache: Mutex<OffsetCache>,
+}
+
+impl OffsetReader {
+    fn new(store: crate::database::BlockStore) -> Self {
+        Self {
+            store,
+            slot: Arc::new(Semaphore::new(1)),
+            cache: Mutex::new(OffsetCache::default()),
         }
-        let root = indexed
-            .root_id
-            .as_slice()
-            .try_into()
-            .context("invalid indexed root ID")?;
-        let item = BundleOffsets {
-            item_start: u64::try_from(item_start)?,
-            data_start: u64::try_from(data_start)?,
-            item_size: u64::try_from(target.item_size)?,
-            direct_child: indexed.locations.len() == 1,
-        };
-        let weave = match store.stable_transaction_weave(&root).await {
-            Ok(Some(weave))
-                if item
-                    .item_start
-                    .checked_add(item.item_size)
-                    .is_some_and(|end| end <= weave.size)
-                    && weave.start.checked_add(item.data_start).is_some() =>
-            {
-                Some((weave.start, weave.size))
-            }
-            Ok(_) => None,
-            Err(error) => {
-                eprintln!("indexed root weave lookup failed: {error:#}");
-                None
-            }
-        };
-        return Ok(Some(DataOffsets {
-            root,
-            data_size: u64::try_from(indexed.data_size)?,
-            item: Some(item),
-            content_type: indexed.content_type,
-            weave,
-        }));
     }
-    Ok(store
-        .stable_transaction_weave(id)
-        .await?
-        .map(|weave| DataOffsets {
+
+    fn cached(&self, id: &[u8; 32], direct: bool) -> Option<Arc<DataOffsets>> {
+        self.cache
+            .lock()
+            .entries
+            .get(id)
+            .filter(|entry| !direct || entry.item.is_none())
+            .cloned()
+    }
+
+    fn remember(&self, id: [u8; 32], offsets: &Arc<DataOffsets>) {
+        // Misses and relative-only answers can gain a stable location later.
+        if offsets.weave.is_none() {
+            return;
+        }
+        let mut cache = self.cache.lock();
+        if cache.entries.contains_key(&id) {
+            return;
+        }
+        if cache.order.len() == MAX_CACHED_OFFSETS {
+            let oldest = cache.order.pop_front().unwrap();
+            cache.entries.remove(&oldest);
+        }
+        cache.entries.insert(id, Arc::clone(offsets));
+        cache.order.push_back(id);
+    }
+
+    async fn lookup(
+        self: &Arc<Self>,
+        id: [u8; 32],
+        direct: bool,
+        timeout: Duration,
+    ) -> Result<Option<Arc<DataOffsets>>> {
+        if let Some(hit) = self.cached(&id, direct) {
+            return Ok(Some(hit));
+        }
+        let slot = Arc::clone(&self.slot).try_acquire_owned()?;
+        tokio::time::timeout(timeout, async {
+            if let Some(hit) = self.cached(&id, direct) {
+                return Ok(Some(hit));
+            }
+            let reader = Arc::clone(self);
+            // Keep admission until PostgreSQL finishes, even when the caller leaves.
+            tokio::spawn(async move {
+                let _slot = slot;
+                reader.read_index(&id, direct).await
+            })
+            .await?
+        })
+        .await
+        .context("indexed offset lookup timed out")?
+    }
+
+    async fn root(&self, id: &[u8; 32]) -> Result<Option<Arc<DataOffsets>>> {
+        if let Some(hit) = self.cached(id, true) {
+            return Ok(Some(hit));
+        }
+        let Some(weave) = self.store.stable_transaction_weave(id).await? else {
+            return Ok(None);
+        };
+        let offsets = Arc::new(DataOffsets {
             root: *id,
             data_size: weave.size,
             content_type: weave.content_type,
             item: None,
             weave: Some((weave.start, weave.size)),
-        }))
+        });
+        self.remember(*id, &offsets);
+        Ok(Some(offsets))
+    }
+
+    async fn read_index(&self, id: &[u8; 32], direct: bool) -> Result<Option<Arc<DataOffsets>>> {
+        if !direct && let Some(indexed) = self.store.bundle_location(id).await? {
+            let target = indexed.locations.last().context("missing indexed target")?;
+            let mut item_start = 0u128;
+            let mut data_start = 0u128;
+            for location in &indexed.locations {
+                // Encoded JSON items have no contiguous raw byte range in the root.
+                if location.json {
+                    return Ok(None);
+                }
+                item_start = data_start
+                    .checked_add(location.item_offset)
+                    .context("indexed item offset overflow")?;
+                data_start = item_start
+                    .checked_add(location.data_offset)
+                    .context("indexed data offset overflow")?;
+            }
+            let root = indexed
+                .root_id
+                .as_slice()
+                .try_into()
+                .context("invalid indexed root ID")?;
+            let item = BundleOffsets {
+                item_start: u64::try_from(item_start)?,
+                data_start: u64::try_from(data_start)?,
+                item_size: u64::try_from(target.item_size)?,
+                direct_child: indexed.locations.len() == 1,
+            };
+            let weave = match self.root(&root).await {
+                Ok(Some(offsets))
+                    if item
+                        .item_start
+                        .checked_add(item.item_size)
+                        .is_some_and(|end| end <= offsets.data_size) =>
+                {
+                    offsets
+                        .weave
+                        .filter(|(start, _)| start.checked_add(item.data_start).is_some())
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    eprintln!("indexed root weave lookup failed: {error:#}");
+                    None
+                }
+            };
+            let offsets = Arc::new(DataOffsets {
+                root,
+                data_size: u64::try_from(indexed.data_size)?,
+                item: Some(item),
+                content_type: indexed.content_type,
+                weave,
+            });
+            self.remember(*id, &offsets);
+            return Ok(Some(offsets));
+        }
+        self.root(id).await
+    }
+}
+
+fn offset_lookup_unavailable(error: &anyhow::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    error.is::<tokio::sync::TryAcquireError>()
+        || error.is::<tokio::time::error::Elapsed>()
+        || error
+            .downcast_ref::<tokio_postgres::Error>()
+            .and_then(tokio_postgres::Error::code)
+            .is_some_and(|code| {
+                matches!(
+                    *code,
+                    SqlState::LOCK_NOT_AVAILABLE | SqlState::QUERY_CANCELED
+                )
+            })
 }
 
 async fn serve_offsets(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -1801,15 +1906,17 @@ async fn serve_offsets(State(state): State<Arc<AppState>>, Path(id): Path<String
         Ok(permit) => permit,
         Err(response) => return response,
     };
-    let lookup = async {
-        let Some(store) = &state.gateway.block_store else {
-            return Ok(None);
-        };
-        indexed_data_offsets(store, &id, false).await
+    let offsets = match &state.offsets {
+        Some(reader) => {
+            reader
+                .lookup(id, false, state.gateway.config.request_timeout)
+                .await
+        }
+        None => Ok(None),
     };
-    match tokio::time::timeout(state.gateway.config.retrieval_timeout, lookup).await {
+    match offsets {
         // The root transaction header triggers HTTPSIG, binding the body via Content-Digest.
-        Ok(Ok(Some(offsets))) => {
+        Ok(Some(offsets)) => {
             let root_id = URL_SAFE_NO_PAD.encode(offsets.root);
             let body = serde_json::to_vec(&offsets.json(&root_id))
                 .expect("response contains only JSON values");
@@ -1823,7 +1930,7 @@ async fn serve_offsets(State(state): State<Arc<AppState>>, Path(id): Path<String
                 .body(Body::from(body))
                 .unwrap()
         }
-        Ok(Ok(None)) => {
+        Ok(None) => {
             let mut response = error_response(StatusCode::NOT_FOUND, "Offsets not found");
             response.headers_mut().insert(
                 CACHE_CONTROL,
@@ -1831,8 +1938,18 @@ async fn serve_offsets(State(state): State<Arc<AppState>>, Path(id): Path<String
             );
             response
         }
-        result => {
-            eprintln!("indexed offset lookup failed: {result:?}");
+        Err(error) if offset_lookup_unavailable(&error) => {
+            let mut response = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Offset lookup temporarily unavailable",
+            );
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => {
+            eprintln!("indexed offset lookup failed: {error:#}");
             let mut response = error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to resolve offsets",
@@ -3361,7 +3478,7 @@ async fn serve_verified_response(
     permit: RequestPermit,
 ) -> Result<Response> {
     let limits = &state.gateway.config;
-    let offsets = if let Some(store) = &state.gateway.block_store
+    let offsets = if let Some(reader) = &state.offsets
         && verified.block_hash.is_some()
     {
         let id = decode_fixed::<32>(&verified.id, "verified data ID")?;
@@ -3370,20 +3487,22 @@ async fn serve_verified_response(
         if direct && !verified.stable_anchor {
             None
         } else {
-            match tokio::time::timeout(
-                limits.request_timeout.min(Duration::from_millis(500)),
-                indexed_data_offsets(store, &id, direct),
-            )
-            .await
+            match reader
+                .lookup(
+                    id,
+                    direct,
+                    limits.request_timeout.min(Duration::from_millis(500)),
+                )
+                .await
             {
-                Ok(Ok(offsets)) => offsets.filter(|offsets| {
+                Ok(offsets) => offsets.filter(|offsets| {
                     u128::from(offsets.data_size) == verified.content_length as u128
                 }),
-                Ok(Err(error)) => {
+                Err(error) if offset_lookup_unavailable(&error) => None,
+                Err(error) => {
                     eprintln!("response offset lookup failed: {error:#}");
                     None
                 }
-                Err(_) => None,
             }
         }
     } else {
@@ -4130,6 +4249,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         }));
         let state = Arc::new(AppState {
+            offsets: None,
             gateway: Gateway::new(stream_limits()).unwrap(),
             config: ServerConfig::new(
                 "127.0.0.1:0",
@@ -4583,6 +4703,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         }));
         let state = Arc::new(AppState {
+            offsets: None,
             gateway: Gateway::new(
                 Config::new(
                     &upstream,
@@ -4945,6 +5066,7 @@ mod tests {
             1024,
         );
         let state = AppState {
+            offsets: None,
             gateway,
             config: ServerConfig::new(
                 "127.0.0.1:0",
@@ -5103,6 +5225,7 @@ mod tests {
             axum::serve(listener, upstream).await.unwrap();
         }));
         let state = Arc::new(AppState {
+            offsets: None,
             gateway: Gateway::new(
                 Config::new(
                     &upstream_url,
@@ -5219,6 +5342,7 @@ mod tests {
             axum::serve(listener, proxy).await.unwrap();
         }));
         let state = Arc::new(AppState {
+            offsets: None,
             gateway: Gateway::new(
                 Config::new(
                     &proxy_url,
@@ -5378,6 +5502,7 @@ mod tests {
         .unwrap();
         let serving_store = Arc::clone(gateway.block_store.as_ref().unwrap());
         let state = Arc::new(AppState {
+            offsets: None,
             gateway,
             config,
             request_permits: Arc::new(Semaphore::new(2)),
@@ -5752,6 +5877,7 @@ mod tests {
                 gateway.config.cache_max_bytes,
             );
         let state = Arc::new(AppState {
+            offsets: None,
             gateway,
             config,
             request_permits: Arc::new(Semaphore::new(4)),
@@ -5981,6 +6107,7 @@ mod tests {
             gateway.config.cache_max_bytes,
         );
         let state = Arc::new(AppState {
+            offsets: None,
             gateway,
             config: ServerConfig::new(
                 "127.0.0.1:0",
